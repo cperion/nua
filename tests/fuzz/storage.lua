@@ -32,9 +32,10 @@ local NUA = os.getenv('NUA_DIST') and ('%q'):format(os.getenv('NUA_DIST')) or ('
 -- a program carries the runtime words it reaches; only runtime/nua_rt.c (traps) links beside it
 -- as an archive member, pulled only by a program that calls into the runtime
 local RT = TMP .. '/libnua_rt.a'
-assert(os.execute(('cc -std=c99 -O1 -pthread -I%q -c %q -o %q && ar rcs %q %q'):format(
-    root .. '/runtime', root .. '/runtime/nua_rt.c', TMP .. '/nua_rt.o', RT, TMP .. '/nua_rt.o')) == 0
-    or os.execute('true'), 'cannot build the runtime archive')
+local CC = os.getenv('CC') or 'cc'
+assert(os.execute(('%s -std=c99 -O1 -pthread -I%q -c %q -o %q && ar rcs %q %q'):format(
+    CC, root .. '/runtime', root .. '/runtime/nua_rt.c', TMP .. '/nua_rt.o', RT, TMP .. '/nua_rt.o')) == 0,
+    'cannot build the runtime archive')
 
 local function sh(cmd)
     local p = io.popen('(' .. cmd .. ') 2>&1; echo "__rc=$?"')
@@ -392,8 +393,8 @@ int main(void) { printf("%%llu\n", (unsigned long long)run(%s)); return 0; }
 ]]):format(prog.model.arg and 'uint32_t' or 'void', prog.model.arg and tostring(prog.model.arg) or ''))
     for _, lv in ipairs { 'O0', 'O2' } do
         local bin = TMP .. '/' .. name .. '_' .. lv
-        ok, out = sh(('cc -std=c99 -Wall -Wextra -Werror -pedantic -%s -I%q %q %q %s -o %q'):format(
-            lv, root .. '/runtime', TMP .. '/' .. name .. '.c', TMP .. '/' .. name .. '_main.c', RT, bin))
+        ok, out = sh(('%s -std=c99 -Wall -Wextra -Werror -pedantic -%s -I%q %q %q %s -o %q'):format(
+            CC, lv, root .. '/runtime', TMP .. '/' .. name .. '.c', TMP .. '/' .. name .. '_main.c', RT, bin))
         if not ok then
             fail(('%s: link %s\n%s'):format(name, lv, out))
             goto continue

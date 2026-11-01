@@ -451,7 +451,7 @@ end
 
 local import_capped = do(document: Ref Document, stats: Ref Stats, n: U32): Unit
     counted stats do
-    clamped(document, 100) do
+    clamped document 100 do
     transaction document do(..)
         insert n
     endall
@@ -547,7 +547,7 @@ end
 local on_key = do(document: Ref Document, key: U8): Unit
     for _, binding in ipairs editor_keys do
         if key == binding.code then
-            apply(document, binding.command)
+            apply document binding.command
         end
     end
 end
@@ -1016,7 +1016,7 @@ Over a description known while compiling, the engine dissolves:
 local greeting = { Command.insert 5, Command.move(Direction.left()), Command.insert 1 }
 local type_greeting = do(document: Ref Document): Unit
     for i = 1, #greeting do
-        apply(document, greeting[i])
+        apply document greeting[i]
     end
 end
 ```
@@ -1039,7 +1039,7 @@ Over a description known only at run time, the same engine is a loop with a `swi
 local replay = do(document: Ref Document, commands: Ref(Grow Command)): Unit
     local i: U32 = 0
     while i < commands.length do
-        apply(document, commands[i])
+        apply document commands[i]
         i = i + 1
     end
 end

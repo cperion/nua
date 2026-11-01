@@ -885,23 +885,26 @@ io.write(stop 5, "\n")
 ### 14.3 The single binary
 
 `make dist` builds a single executable, `build/dist/nua`. It embeds Nua's own parts
-and depends on the host for the rest: LuaJIT, libgccjit, the C compiler, binutils
-and the C library are dependencies, not vendored copies. Building GCC or LuaJIT is
-not part of this project; packagers already ship both.
+and uses the selected dependency toolchain for LuaJIT, libgccjit and the C compiler.
+`make bootstrap` fetches pinned sources and builds GCC/libgccjit, LuaJIT and LPeg
+locally; the original host-dependency setup remains available with `LOCAL_DEPS=0`.
+Source pins are tracked, not dependency copies or Git submodules, so normal history
+stays in jj. Binutils, libc and platform headers remain host prerequisites. See
+[building Nua](building.md) for the local build and its non-hermetic limits.
 
 What the binary contains, and where each part comes from:
 
 | Part | How it is included |
 |---|---|
-| LuaJIT | **the host's**, linked dynamically (`libluajit-5.1`) |
-| libgccjit | **the host's**, loaded at run time (`NUA_GCCJIT`, else the loader's search path) |
+| LuaJIT | **the selected toolchain's**, linked dynamically (`libluajit-5.1`) |
+| libgccjit | **the selected toolchain's**, loaded at run time (`NUA_GCCJIT`, else the loader's search path) |
 | Nua (`nua.lua`, `nua/*.lua`, `macro/*.lua`) | embedded as **LuaJIT bytecode**: no source parsing at startup |
 | `lib/*.nua` | embedded sources: the compiler still specializes them with the program |
 | the runtime | compiled at dist time (C plus the Nua policy), linked into `nua` with `-rdynamic`, so gccjit'd code binds to `nua_*` in the process |
 | `libnua_rt.a` | built once at dist time, embedded, written out for `nua build` and for C harnesses |
 | the runtime headers | embedded |
 | header answers for the shipped libraries | precomputed at dist time with the host `cc` (`tools/tables.lua`), embedded as `runtime/header_tables.lua`, tagged with the C-library identity they were recorded against |
-| the C compiler | **the host's `cc`**, for probes and for linking |
+| the C compiler | **the selected `CC`** (else host `cc`), for probes and for linking |
 | `as`, `ld` | **the host's binutils**, on `PATH` |
 | the C library | **the host's**, dynamically, in process and in built executables |
 | temporary files | a **work directory per run** (`$TMPDIR/nua-run-<hash>-<pid>/`), holding only the runtime archive and headers, because the host `cc` needs paths; removed when the process exits |
@@ -932,7 +935,8 @@ version) and the differential fuzzer runs every backend, which is what checks th
 nothing in the language depends on how the code got there.
 
 **Licence.** The `nua` binary is GPLv3; it links libgccjit (GPLv3) dynamically.
-LuaJIT is MIT and stays the host's. The runtime library is GPLv3 with the GCC Runtime
+LuaJIT is MIT and remains a dynamically linked dependency, whether built locally
+or supplied by the host. The runtime library is GPLv3 with the GCC Runtime
 Library Exception, as libgcc is, so a program `nua build` produces links
 `libnua_rt.a` and the host's libc and may carry any licence its author chooses. The
 header the compiler emits into generated C carries the same exception, so `-o out.c`

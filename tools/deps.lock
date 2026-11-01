@@ -1,0 +1,16 @@
+# Reviewed source pins. Sourced by tools/deps.sh; update deliberately, then rebuild.
+# GCC release archives include generated files; no host Flex/Bison is needed.
+GCC_VERSION=15.2.0
+GCC_URL=https://gcc.gnu.org/pub/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz
+GCC_SHA512=89047a2e07bd9da265b507b516ed3635adb17491c7f4f67cf090f0bd5b3fc7f2ee6e4cc4008beef7ca884b6b71dffe2bb652b21f01a702e17b468cca2d10b2de
+GMP_VERSION=6.2.1
+GMP_SHA512=8904334a3bcc5c896ececabc75cda9dec642e401fb5397c4992c4fabea5e962c9ce8bd44e8e4233c34e55c8010cc28db0545f5f750cbdbb5f00af538dc763be9
+MPFR_VERSION=4.1.0
+MPFR_SHA512=410208ee0d48474c1c10d3d4a59decd2dfa187064183b09358ec4c4666e34d74383128436b404123b831e585d81a9176b24c7ced9d913967c5fce35d4040a0b4
+MPC_VERSION=1.2.1
+MPC_SHA512=3279f813ab37f47fdcc800e4ac5f306417d07f539593ca715876e43e04896e1d5bceccfb288ef2908a3f24b760747d0dbd0392a24b9b341bc3e12082e5c836ee
+LUAJIT_URL=https://github.com/LuaJIT/LuaJIT.git
+LUAJIT_REF=ea9eb7edb5eac4a9d175d74523db34fac0fa5180
+LUAJIT_COMMIT=ea9eb7edb5eac4a9d175d74523db34fac0fa5180
+LPEG_URL=https://www.inf.puc-rio.br/~roberto/lpeg/lpeg-1.1.0.tar.gz
+LPEG_SHA256=4b155d67d2246c1ffa7ad7bc466c1ea899bbc40fef0257cc9c03cecbaed4352a

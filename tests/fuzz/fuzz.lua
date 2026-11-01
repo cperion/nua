@@ -47,9 +47,10 @@ os.execute('mkdir -p ' .. TMP)
 -- a program carries the runtime words it reaches; only runtime/nua_rt.c (traps) links beside it
 -- as an archive member, pulled only by a program that calls into the runtime
 local RT = TMP .. '/libnua_rt.a'
-assert(os.execute(('cc -std=c99 -O1 -pthread -I%q -c %q -o %q && ar rcs %q %q'):format(
-    root .. '/runtime', root .. '/runtime/nua_rt.c', TMP .. '/nua_rt.o', RT, TMP .. '/nua_rt.o')) == 0
-    or os.execute('true'), 'cannot build the runtime archive')
+local CC = os.getenv('CC') or 'cc'
+assert(os.execute(('%s -std=c99 -O1 -pthread -I%q -c %q -o %q && ar rcs %q %q'):format(
+    CC, root .. '/runtime', root .. '/runtime/nua_rt.c', TMP .. '/nua_rt.o', RT, TMP .. '/nua_rt.o')) == 0,
+    'cannot build the runtime archive')
 
 local function sh(cmd)
     local p = io.popen('(' .. cmd .. ') 2>&1; echo "__rc=$?"')
@@ -84,7 +85,7 @@ end
 local sanitizers = {}
 local function have_sanitizer(kind)
     if sanitizers[kind] ~= nil then return sanitizers[kind] end
-    local ok = os.execute(('printf "int main(void){return 0;}" | cc -x c -fsanitize=%s - -o /dev/null >/dev/null 2>&1'):format(kind))
+    local ok = os.execute(('printf "int main(void){return 0;}" | %s -x c -fsanitize=%s - -o /dev/null >/dev/null 2>&1'):format(CC, kind))
     sanitizers[kind] = (ok == 0 or ok == true)
     if not sanitizers[kind] then
         io.write(('  (%s sanitizer unavailable here: skipping those runs)\n'):format(kind))
@@ -202,8 +203,8 @@ local function run_program(prog, vectors, opts)
         local flags = lv == 'ubsan' and '-O1 -fsanitize=undefined -fno-sanitize-recover=all'
             or lv == 'asan' and '-O1 -fsanitize=address -fno-omit-frame-pointer'
             or ('-' .. lv)
-        local okc, out = sh(('cc -std=c99 -w %s -I%s/runtime %s %s %s -pthread -o %s/p_%s && %s/p_%s'):format(
-            flags, root, c, dm, RT, TMP, lv, TMP, lv))
+        local okc, out = sh(('%s -std=c99 -w %s -I%s/runtime %s %s %s -pthread -o %s/p_%s && %s/p_%s'):format(
+            CC, flags, root, c, dm, RT, TMP, lv, TMP, lv))
         local tab = {}
         if okc then
             for k, v in out:gmatch('(%S+) (%d+)') do tab[tonumber(k) or k] = v end

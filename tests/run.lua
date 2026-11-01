@@ -15,7 +15,7 @@ local function sh(cmd)
     return rc == 0, out
 end
 local function sq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
-local CC = 'cc -std=c99 -Wall -Wextra -Werror -pedantic -O1 -I' .. root .. '/runtime'
+local CC = (os.getenv('CC') or 'cc') .. ' -std=c99 -Wall -Wextra -Werror -pedantic -O1 -I' .. root .. '/runtime'
 local build = os.getenv('TMPDIR') or '/tmp'
 package.path = root .. '/?.lua;' .. package.path
 local policy_for = require('nua.runtime_build').source
@@ -397,7 +397,7 @@ do
         end
         local input = table.concat(sources_text, ' ') .. ' -pthread -I' .. sq(root .. '/runtime')
         local bin = sq(build .. '/nua_' .. harness)
-        add(harness .. ': runtime', 'cc -std=c99 -Wall -Wextra -Werror -pedantic -O1 '
+        add(harness .. ': runtime', CC .. ' '
             .. input .. ' -o ' .. bin .. ' && ' .. bin)
         if HARNESS_SAN[harness] and clang then
             local bin = sq(build .. '/nua_' .. harness .. '.san')
@@ -450,6 +450,7 @@ if have_jit then
     end
     do
         local cmds, apply = {}, {}
+        local seeded
         local function add(label, cmd) cmds[#cmds + 1] = cmd; apply[#apply + 1] = label end
         for i, name in ipairs(names) do
             if built[i] and mains[i] then
@@ -457,7 +458,7 @@ if have_jit then
                 add(name .. ': gccjit run',
                     ('%s %s %s %s -pthread -o %s.bin && %s.bin'):format(CC, o, mains[i], shared_sources, sq(o), sq(o)))
                 if name == 'channels' then
-                    add(name .. ': gccjit deterministic schedule', ('NUA_SCHED_SEED=7 %s.bin'):format(sq(o)))
+                    seeded = ('NUA_SCHED_SEED=7 %s.bin'):format(sq(o))
                 end
                 if name == 'io' then
                     add(name .. ': gccjit run on io_uring',
@@ -467,6 +468,12 @@ if have_jit then
             end
         end
         par(cmds, apply)
+        -- This executable is linked by the preceding batch. Do not race its
+        -- producer by running the seeded variant in that same parallel batch.
+        if seeded then
+            local ok, out = sh(seeded)
+            check('channels: gccjit deterministic schedule', ok, out)
+        end
     end
     local okn, outn = sh(('luajit %s/tests/native.lua'):format(root))
     check('in-process backend', okn, outn)

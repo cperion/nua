@@ -43,6 +43,31 @@ The original provenance and CLI patch record are retained under `docs/luamacro/`
 references there to the earlier repository/layout are historical, not dependencies
 of Nua. See `docs/luamacro/INTEGRATION.md` for the active layout.
 
+## Pinned build dependencies
+
+The optional local bootstrap downloads source into ignored `build/deps/` and installs
+under `.local/`. These are external build dependencies, not imported Nua source.
+[`tools/deps.lock`](tools/deps.lock) records exact versions/revisions and archive
+checksums; [the build guide](docs/building.md) describes verification and updates.
+Keep the upstream copyright notices, licence files and corresponding source when
+redistributing any resulting dependency binaries; this list is not a relicensing.
+
+- **GCC 15.2.0 / libgccjit**: <https://gcc.gnu.org/>. GCC is GPL-3.0-or-later;
+  individual components have their upstream terms. The GCC Runtime Library
+  Exception applies to designated runtime components, **not** to libgccjit itself.
+  GCC archive hashes are pinned from the upstream release checksum manifest.
+- **GMP 6.2.1**: <https://gmplib.org/>, dual LGPL-3.0-or-later / GPL-2.0-or-later.
+- **MPFR 4.1.0**: <https://www.mpfr.org/>, LGPL-3.0-or-later.
+- **MPC 1.2.1**: <https://www.multiprecision.org/>, LGPL-3.0-or-later.
+  The three prerequisite hashes match GCC 15.2.0's `contrib/prerequisites.sha512`.
+- **LuaJIT 2.1**, exact commit in the lock: <https://github.com/LuaJIT/LuaJIT>,
+  MIT; see its `COPYRIGHT` for attribution and included third-party notices.
+- **LPeg 1.1.0**: <https://www.inf.puc-rio.br/~roberto/lpeg/>, MIT;
+  the source archive retains the licence in `lpeg.html`.
+
+No changes are made to the existing LuaMacro attribution above or to Nua's runtime
+exception below.
+
 ## Project licensing
 
 The incoming prototype declares Nua GPL version 3 or later (`COPYING`). Its runtime

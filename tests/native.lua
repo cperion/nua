@@ -224,8 +224,8 @@ check('dead array stores retain bounds checks', sv.stage_dead_write(1) == 1
 
 -- Load the model harness's foreign probes rather than exempting its layouts.
 local support = root .. '/build/tmp/map-model-support.so'
-local command = ('cc -shared -fPIC -DNUA_MAP_MODEL_SUPPORT_ONLY -I%q %q -o %q')
-    :format(root .. '/runtime', root .. '/tests/map_models_main.c', support)
+local command = ('%s -shared -fPIC -DNUA_MAP_MODEL_SUPPORT_ONLY -I%q %q -o %q')
+    :format(os.getenv('CC') or 'cc', root .. '/runtime', root .. '/tests/map_models_main.c', support)
 local status = os.execute(command)
 check('build map model foreign probes', status == 0)
 local model_support = ffi.load(support, true)

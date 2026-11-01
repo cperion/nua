@@ -30,7 +30,30 @@ the residual IR, the two backends, the runtime, and
 covers `call` and `nua size`; [status and remaining work](docs/architecture.md#17-status-limits-and-remaining-work)
 says what is not implemented.
 
-## Requirements
+## Build
+
+On 64-bit Linux, build the pinned core dependencies and Nua without installing
+system packages:
+
+```sh
+make bootstrap                    # explicit network fetch, local dependencies, dist
+make doctor
+make test-build
+make test
+make test-native
+make test-dist
+```
+
+Source pins live in [the dependency lock](tools/deps.lock), not Git submodules:
+this keeps repository changes native to jj. GCC 15.2.0 (including libgccjit),
+LuaJIT, LPeg, and GCC's GMP/MPFR/MPC prerequisites build under ignored `build/deps/`
+and install under `.local/`. No dependency source or binary is committed.
+The completed local toolchain is selected by Make; incomplete or stale installs
+fail rather than silently selecting host libraries. `LOCAL_DEPS=0` selects the host
+setup below. See [building Nua](docs/building.md) for host prerequisites, offline
+builds, pin updates, and the distinction between a local build and a portable package.
+
+### Host dependencies (alternative)
 
 - LuaJIT and LPeg built for **Lua 5.1**, not another Lua ABI. `make dist` also
   needs the LuaJIT development files (`lua.h`) and `libluajit-5.1`.
@@ -57,10 +80,10 @@ make run PROGRAM=examples/csv.nua ARGS='examples/data/sales.csv price'
 ```
 
 The development targets default to two task workers; override with `NUA_WORKERS=N`.
-Generated files, logs and caches go under ignored `build/`. A local libgccjit copy
-may be placed at `.local/lib/libgccjit.so.0`; Make selects it if `NUA_GCCJIT` is unset.
-Otherwise install the platform's libgccjit package or set `NUA_GCCJIT` explicitly.
-No compiler binary or machine-specific dependency is committed.
+Generated files, logs and caches go under ignored `build/`. In host mode, a local
+libgccjit copy may be placed at `.local/lib/libgccjit.so.0`; Make selects it if
+`NUA_GCCJIT` is unset. Otherwise install the platform's libgccjit package or set
+`NUA_GCCJIT` explicitly. No compiler binary or machine-specific dependency is committed.
 
 ## Formatting
 
