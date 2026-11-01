@@ -1,0 +1,1 @@
+error "the Nua candidate must not override the Lua source loader"

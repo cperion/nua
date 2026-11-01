@@ -1,0 +1,277 @@
+-- The in-process backend: programs compiled by libgccjit into this process
+-- and called from Lua, a failed check raised as a Lua error, and native(word)
+-- specializing on values that exist only at run time.
+local root = arg[0]:match('^(.*)/tests/[^/]*$') or '.'
+package.path = root .. '/?.lua;' .. package.path
+local saved_arg = arg
+arg = { [0] = root .. '/nua.lua' }
+package.loaded['nua.driver_loaded'] = true
+local nua = dofile(root .. '/nua.lua')
+arg = saved_arg
+local ffi = require 'ffi'
+
+local fails, n = 0, 0
+local function check(name, ok, detail)
+    n = n + 1
+    if not ok then fails = fails + 1; print('FAIL  native: ' .. name .. (detail and ('\n' .. tostring(detail)) or '')) end
+end
+
+-- Omitted annotations infer native places, on the same prepared IR as C.
+local inferred = nua.load(root .. '/examples/inferred_locals.nua')
+check('inferred branch true', inferred.inferred_branch(true, 10) == 29)
+check('inferred branch false', inferred.inferred_branch(false, 10) == 27)
+check('inferred nested loops', inferred.inferred_loops(10) == 103)
+check('inferred empty loops', inferred.inferred_loops(0) == 3)
+check('inferred snapshots and references', inferred.inferred_snapshot(7) == 25)
+check('inferred array and Text constructors', inferred.inferred_storage(8) == 14)
+check('mixed explicit and inferred locals', inferred.inferred_mixed(7) == 17)
+
+-- Bare call statements retain receiver resolution and callable expressions.
+local bare = nua.load(root .. '/examples/bare_statements.nua')
+for i = 0, 16 do
+    check('bare opened calls ' .. i, bare.bare_opened(i) == i + 2)
+    check('bare method calls ' .. i, bare.bare_method(i) == i + 2)
+    check('bare qualified calls ' .. i, bare.bare_qualified(i) == i + 1)
+end
+check('bare lexical callable shadows opened method', bare.bare_shadow() == 10)
+check('callable expression does not invoke', bare.value_contexts() == 42)
+
+-- Tail calls retain compile-time callbacks and the activity's completion.
+local ar = nua.load(root .. '/examples/activity_returns.nua')
+for i = 0, 16 do
+    check('block-only activity return ' .. i, ar.return_logged(i) == i)
+    check('activity completes after callback return ' .. i, ar.return_completed(i) == i + (i > 3 and 10 or 12))
+    check('mixed static/dynamic tail call ' .. i, ar.return_apply(i) == i + 3)
+    check('recursive static callback ' .. i, ar.return_recursive(i) == i + 5)
+end
+check('tail call host configuration', ar.return_configured() == 7)
+check('tail call known native place', ar.return_known_local() == 9)
+
+-- Field-wise loop state must agree across backedges AND exits.
+local lf = nua.load(root .. '/examples/loop_fields.nua')
+for i = 0, 16 do
+    check('loop invariant fields ' .. i, lf.panel_extent(i) == 48 + 12 * i)
+    check('loop conditional fields ' .. i, lf.tally_odd(i) == math.floor(i / 2))
+    check('loop exit-only write ' .. i, lf.exit_change(i) == (i < 3 and 12 or 55))
+    check('loop nested exit ' .. i, lf.nested_exit(i) == (i < 2 and 7 or 12))
+    check('loop nested state ' .. i, lf.nested_loops(i) == 6 * i + 4)
+    check('loop field swap ' .. i, lf.swap_fields(i) == (i % 2 == 1 and 219 or 129))
+    check('loop snapshots ' .. i, lf.snapshots(i) == 3 * i * (i - 1) / 2 + 5 * i)
+    check('loop late address ' .. i, lf.late_address(i) == 36 + i)
+    check('loop hidden reference ' .. i, lf.hidden_record(i) == (i > 0 and 99 or 12))
+    check('loop native mutation ' .. i, lf.native_mutation(i) == (i > 0 and 99 or 12) + i)
+    check('loop tail-record state ' .. i, lf.tail_fields(i) == 3 * i + 3)
+    check('loop multiple exits ' .. i, lf.multiple_exits(i) == (i < 3 and 39 or i % 2 == 1 and 55 or 82))
+    check('loop boolean exit ' .. i, lf.bool_exit(i) == (i >= 3))
+end
+
+-- Opened boundary calls resolve the callable before applying the boundary.
+local opened = nua.load(root .. '/examples/opened_boundaries.nua')
+local adopted = nua.load(root .. '/examples/loop_adoption.nua')
+local matched = nua.load(root .. '/examples/immediate_matches.nua')
+for i = 0, 16 do
+    check('opened lexical boundary ' .. i, opened.opened_lexical(i) == 1 + 2 * i)
+    check('opened home boundary ' .. i, opened.opened_home(i) == 1 + i)
+    check('opened member boundary ' .. i, opened.opened_member(i) == 1 + 4 * i)
+    check('opened local boundary ' .. i, opened.opened_local(i) == 7 * i)
+    check('opened vocabulary boundary ' .. i, opened.opened_vocabulary(i) == i + 10)
+    check('sum field widens its tag ' .. i, adopted.sum_field(i) == (i == 0 and 100 or 3 * i))
+    check('sum loop state widens its tag ' .. i, adopted.sum_state(i) == (i == 0 and 100 or i))
+    check('adopted loop invariant ' .. i, adopted.evens(i) == 3 * math.floor((i + 1) / 2))
+    check('adopted syntactic alias ' .. i, adopted.mixed_aliases(i) == 4 * i)
+    check('adopted nested alias ' .. i, adopted.nested_aliases(i) == 3 * i * (i + 1) / 2)
+    check('adopted widening ' .. i, adopted.widening(i) == 3 * math.min(i, 3) + 5 * math.max(i - 3, 0))
+    check('adopted in-loop escape ' .. i, adopted.escape_inside(i) == 3 * i + i * (i - 1) / 2)
+    check('adopted between-loop escape ' .. i, adopted.escape_between(i) == 7 * i)
+    check('adopted exits ' .. i, adopted.exits(i) == 3 * math.floor((math.min(i, 10) + 1) / 2))
+    check('adopted callback return ' .. i, adopted.early_return(i) == 3 * math.min(i, 3))
+    local value = i == 0 and 10 or i == 1 and 20 or i == 2 and 32 or 0
+    local expected = i < 3 and value + 1 or 99
+    check('immediate native tags ' .. i, matched.native_match(i) == expected)
+    check('immediate explicit boundary ' .. i, matched.boundary_match(i) == expected)
+    check('immediate nested callback ' .. i, matched.callback_match(i) == (i == 1 and 122 or i == 2 and 134 or 7))
+    check('immediate same-tag state join ' .. i, matched.state_join(i) == (i % 2 == 0 and 11022 or 21043))
+    check('immediate constant payload ' .. i, matched.constant_payload(i) == 101)
+    check('immediate unknown tag ' .. i, matched.mixed_unknown(i) == (i == 0 and 1007 or (i < 3 and value or 90) + 900))
+    check('immediate recursive producer ' .. i, matched.recursive_match(i) == 2 * (i + 1))
+    check('immediate required table argument ' .. i, matched.required_table(i) == i + 9)
+    check('immediate ordered effects ' .. i, matched.side_effects(i) == (i % 2 == 0 and 110111 + i or 220220))
+    check('immediate record payload join ' .. i, matched.record_payload(i) == (i % 2 == 0 and 3 or 7))
+end
+check('adopted shared snapshot', adopted.spin(2, 123) == 7899)
+
+-- Native type descriptors use the same compact layouts as generated C.
+local compact = nua.load(root .. '/examples/storage_layout.nua', { check_layouts = true })
+check('compact record size', ffi.sizeof(compact.types.CompactCounter) == 4)
+check('compact nested size', ffi.sizeof(compact.types.CompactEnvelope) == 4)
+check('cross-instance write retains field', ffi.sizeof(compact.types.SharedCounter) == 8)
+check('exported nested ABI size', ffi.sizeof(compact.types.PublicEnvelope) == 16)
+for i = 0, 16 do
+    check('compact configuration ' .. i, compact.compact_count(i) == 7 + 3 * i)
+    check('compact nested configuration ' .. i, compact.compact_nested(i) == 11 + 5 * i)
+end
+
+local boundaries_ok, boundaries = pcall(require('tests.storage_boundaries'), nua)
+check('separate native units preserve record ABI', boundaries_ok, boundaries)
+if boundaries_ok then print(('native storage boundaries: %d checks passed'):format(boundaries)) end
+
+-- the guide's program
+local g = nua.load(root .. '/examples/guide.nua')
+check('outline_demo', g.outline_demo(5) == 10)
+check('tab_stop_4', g.tab_stop_4(5) == 8)
+check('ask (first_of, a timer, a task)', g.ask() == 42)
+local Document = g.types.Document
+local doc = Document { length = 3, cursor = 3, edits = 0 }
+check('type_word through a Ref', g.type_word(doc, 4) == 1 and doc.length == 7 and doc.cursor == 6 and doc.edits == 1)
+
+-- native globals and function values
+local gl = nua.load(root .. '/examples/globals.nua')
+check('global counter', gl.bump(2) == 2 and gl.bump(3) == 5)
+check('global initializer', gl.read_seed() == 100)
+check('global struct fields', gl.record(4) == 4001 and gl.record(6) == 10002)
+check('thread-local global', gl.bump_local(7) == 7 and gl.bump_local(1) == 8)
+check('function pointer parameter', gl.apply(ffi.cast('uint32_t (*)(uint32_t)', function(x) return x * 3 end), 7) == 21)
+local function op(p) return ffi.cast('uint32_t (*)(uint32_t)', p) end   -- the FFI sees a function pointer as void *
+check('function pointer result', op(gl.pick(0))(6) == 12 and op(gl.pick(1))(6) == 36 and gl.pick(2) == nil)
+gl.fill()
+check('functions in a global table', gl.through(0, 5) == 10 and gl.through(1, 5) == 25)
+
+-- tasks, channels, pools, blocking
+local ch = nua.load(root .. '/examples/channels.nua')
+local sq = 0
+for i = 0, 999 do sq = sq + i * i end
+check('sum_squares', ch.sum_squares(1000) == sq)
+check('tally', ch.tally(100, 40) == 100 * 101 / 2 - 40 * 41 / 2)
+check('take_or_time', ch.take_or_time() == 111)
+check('parallel_sleeps', ch.parallel_sleeps(4) == 200)
+
+-- a failed check in plain code is a Lua error, and the process goes on
+local arr = nua.load(root .. '/examples/arrays.nua')
+local a = arr.types.U32x4 { e = { 5, 6, 7, 8 } }
+check('pick', arr.pick(a, 2) == 7)
+local ok, err = pcall(arr.pick, a, 9)
+check('a trap becomes an error', not ok and tostring(err):find('slice index out of range', 1, true), err)
+check('and the process goes on', arr.pick(a, 3) == 8)
+
+-- a stale channel handle traps too, after its scope has ended
+local h = ch.types.Holder()
+ok, err = pcall(ch.use_after_scope, h)
+check('stale handle', not ok and tostring(err):find('Nua runtime check failed', 1, true), err)
+check('still running', ch.late_reply() == 42)
+
+-- Maps share the runtime table algorithm and generated semantic key adapters.
+local maps = nua.load(root .. '/examples/maps.nua')
+check('Map insertion and checked update', maps.map_tally(1000) == 1000)
+check('Map replace, ensure and find snapshots', maps.edit_counts(0xffffffff) == 20)
+local label = maps.types.Str { ptr = ffi.cast('uint8_t *', 'cat'), len = 3 }
+check('Map Chars key equality', maps.label_count(label) == 3)
+ok, err = pcall(maps.absent, 9)
+check('Map missing key traps', not ok and tostring(err):find('map-key', 1, true), err)
+check('Map after recovered trap', maps.map_tally(23) == 23)
+check('Map each snapshots and replacement', maps.map_each_sum(10) == 56)
+check('Map nested iteration and callback returns', maps.map_each_nested(10) == 291)
+ok, err = pcall(maps.map_each_mutation, 0)
+check('Map structural mutation through alias traps', not ok and tostring(err):find('structural mutation', 1, true), err)
+check('Map iteration after recovered trap', maps.map_each_sum(10) == 56)
+check('Map iteration across task suspension', maps.map_task_each(100) == 5051)
+
+-- stores and Grow arrays: helpers read from the same C the C backend prints
+local st = nua.load(root .. '/examples/stores.nua')
+check('stores run', type(st.churn) == 'function')
+
+-- Fixed-array values and owner-backed text views at both binding times.
+local sv = nua.load(root .. '/examples/staged_values.nua')
+local function text(s)
+    return sv.types.Str { ptr = ffi.cast('uint8_t *', s), len = #s }
+end
+check('known Chars empty and exact-capacity construction', sv.stage_empty() and sv.stage_filled(text('abcd')) == 4)
+local value = sv.stage_value()
+check('known Chars returned by value', value.len == 3 and value.bytes.e[0] == 97 and value.bytes.e[3] == 0)
+local binary = sv.stage_binary_value()
+check('embedded NUL survives known construction and native return', binary.len == 3
+    and binary.bytes.e[0] == 97 and binary.bytes.e[1] == 0 and binary.bytes.e[2] == 98 and binary.bytes.e[3] == 0)
+check('live view versus value copy', sv.stage_live(5) == 6 and sv.stage_shorter() and sv.stage_nested())
+check('view joins retain branch owners', sv.stage_branch(true) and not sv.stage_branch(false)
+    and sv.stage_choose_view(true) and not sv.stage_choose_view(false))
+local bytes_ok = true
+for byte = 0, 255 do
+    bytes_ok = bytes_ok and sv.stage_changed_byte(byte) == byte
+        and sv.stage_snapshot(byte) == byte + 90 and sv.stage_escape(byte) == byte
+        and sv.stage_partial(text('abc'), byte) == byte + 100 and sv.stage_split(byte) == byte + 100
+end
+check('all byte values, snapshots and raw address escape', bytes_ok)
+check('known text parsing and checked indexing', sv.stage_parse() == -12 and sv.stage_index(2) == 99)
+local arrays_ok = sv.stage_array_copy(5) == 31 and sv.stage_array_view() == 16 and sv.stage_array_nested() == 5
+for i = 0, 19 do
+    arrays_ok = arrays_ok and sv.stage_array_loop(i) == i * (i + 1) / 2
+        and sv.stage_view_loop(i) == (i == 0 and 97 or 65 + (i - 1) % 26)
+end
+check('array copies, views, nested writes and loop widening', arrays_ok)
+check('view length is captured independently of live bytes', sv.stage_captured_length(text(''))
+    and sv.stage_captured_length(text('abcd')))
+check('array joins distinguish signed floating zero', 1 / sv.stage_signed_zero(true) == -math.huge
+    and 1 / sv.stage_signed_zero(false) == math.huge)
+ok, err = pcall(sv.stage_filled, text('abcde'))
+check('dynamic Chars overflow traps', not ok and tostring(err):find('text longer', 1, true), err)
+ok, err = pcall(sv.stage_index, 3)
+check('dynamic owner-backed view bounds trap', not ok and tostring(err):find('index out of range', 1, true), err)
+check('successful call after view trap', sv.stage_live(5) == 6)
+check('array/text task captures are independent copies', sv.stage_task_copy(0) == 0
+    and sv.stage_task_copy(20) == 40 and sv.stage_task_copy(255) == 510)
+ok, err = pcall(sv.stage_dead_write, 2)
+check('dead array stores retain bounds checks', sv.stage_dead_write(1) == 1
+    and not ok and tostring(err):find('index out of range', 1, true), err)
+
+-- Load the model harness's foreign probes rather than exempting its layouts.
+local support = root .. '/build/tmp/map-model-support.so'
+local command = ('cc -shared -fPIC -DNUA_MAP_MODEL_SUPPORT_ONLY -I%q %q -o %q')
+    :format(root .. '/runtime', root .. '/tests/map_models_main.c', support)
+local status = os.execute(command)
+check('build map model foreign probes', status == 0)
+local model_support = ffi.load(support, true)
+local models = nua.load(root .. '/examples/map_models.nua')
+check('Nua map models in process', models.map_model(20000, 80, 128)
+    and models.strmap_model(20000, 80, 128))
+check('Nua map relocation aliases in process', models.map_table_alias(6) == 10
+    and models.map_arena_alias(128, 96) == 1064)
+
+-- every record of every example: the layout this backend assumes is the C layout
+for f in io.popen('ls ' .. root .. '/examples/*.nua'):lines() do
+    local okl, e = pcall(nua.load, f, { check_layouts = true })
+    -- two examples call C functions their harness defines: not in this process
+    local foreign = not okl and tostring(e):find('is not defined in this process', 1, true)
+        and (f:find('activities') or f:find('spec_core'))
+    check('layouts of ' .. f:match('[^/]+$'), okl or foreign, e)
+end
+
+-- run: native(word) specialized on a value that arrives at run time
+local prog = os.tmpname() .. '.nua'
+local f = assert(io.open(prog, 'w'))
+f:write([[
+local tab_stop = do(config, column: U32): U32
+    local width: U32 = config.tab_width
+    return (column / width + 1) * width
+end
+local width = tonumber(arg[1])
+local stop = native(tab_stop { tab_width = width })
+io.write(stop(5), "\n")
+local main = do(): I32
+    return 3
+end
+export main
+]])
+f:close()
+local p = io.popen(('luajit %s/nua.lua run %s 8; echo "rc=$?"'):format(root, prog))
+local out = p:read '*a'
+p:close()
+os.remove(prog)
+check('nua run, native(word), exit status from main', out == '8\nrc=3\n', out)
+
+-- a decoder made for its file: the header names the field, the first row its decimals
+p = io.popen(('luajit %s/nua.lua run %s/examples/csv.nua %s/examples/data/sales.csv price'):format(root, root, root))
+out = p:read '*a'
+p:close()
+check('csv decoder specialized on its header', out:find('5 rows, sum 128.29, min -1.25, max 100', 1, true), out)
+
+print(('%d native checks, %d failed'):format(n, fails))
+os.exit(fails == 0 and 0 or 1)

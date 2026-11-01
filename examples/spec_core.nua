@@ -1,0 +1,186 @@
+-- Programs from syntax.md sections 3 to 8 and architecture.md section 4, as one
+-- program.
+
+-- syntax §3.1 ordinary Lua builds native words
+local make_multiplier = do(k)
+    return do(x: U32): U32 =
+    x * k
+end
+
+local double = make_multiplier 2
+local triple = make_multiplier 3
+export double
+export triple
+
+-- syntax §3.4 words, autocurrying, saturated specialization
+local affine = do(
+    a: U32,
+    b: U32,
+    x: U32
+): U32 = a * x + b
+
+local transform = affine(4, 3)
+local use = do(x: U32): U32 =
+affine 4 3 x
+assert(host(affine(4, 3, 10)) == 43)
+export transform
+export use
+
+-- syntax §4.1 native conditionals
+local choose = do(
+    enabled: Bool,
+    k: U32,
+    x: U32
+): U32
+
+    if enabled then
+        return x * k
+    end
+
+    return x + k
+end
+
+local times8 = choose(true, 8)
+assert(host(choose(true, 8, 7)) == 56)
+local choose_use = do(flag: Bool, x: U32): U32
+    return choose flag 8 x
+end
+export times8
+export choose_use
+
+-- syntax §4.2 branch-local state
+local f = do(flag: Bool, x: U32): U32
+    local y = x
+
+    if flag then
+        y = y * 2
+    else
+        y = y + 1
+    end
+
+    return y
+end
+export f
+
+-- syntax §5.1 unannotated bindings are staged values
+local unannotated = do(x: U32): U32
+    local k = 4
+    local y = x * k
+
+    return y + 1
+end
+export unannotated
+
+-- syntax §5.2 typed locals are places
+local typed_local = do(x: U32): U32
+    local y = x
+
+    y = y + 1
+
+    return y
+end
+export typed_local
+
+-- syntax §6.1 generation-time loops
+local make_sum = do(n)
+    return do(x: U32): U32
+        local total = x
+
+        for i = 1, n do
+            total = total + i
+        end
+
+        return total
+    end
+end
+
+local add6 = make_sum 3
+export add6
+
+-- syntax §6.2 native loops
+local triangular = do(n: U32): U32
+    local total: U32 = 0
+
+    for i: U32 = 1, n do
+        total = total + i
+    end
+
+    return total
+end
+
+local fifteen = triangular 5
+assert(host fifteen == 15)
+local runtime_sum = do(n: U32): U32 =
+triangular n
+export runtime_sum
+
+-- architecture §4 effects stay residual
+local foreign_print = extern("foreign_print", { U32 }, Unit)
+
+local print_scaled = do(k: U32, x: U32): Unit
+    foreign_print(x * k)
+end
+
+local print_twice = print_scaled 2
+export print_twice
+
+-- syntax §8 methods
+local Counter = struct {
+    value: U32,
+}
+
+function Counter:add(n: U32): Unit
+    self.value = self.value + n
+end
+
+function Counter:get(): U32
+    return self.value
+end
+
+local count3 = do(a: U32, b: U32, c: U32): U32
+    local counter = Counter { value = 0 }
+    counter:add a
+    counter:add b
+    counter:add c
+    return counter:get()
+end
+assert(host(count3(1, 2, 3)) == 6)
+export count3
+
+-- syntax §16 a type's own equality: `==` and `~=` run the hook while compiling.
+-- A type with one cannot be a map key (syntax §15.2): `m:has` compares the
+-- semantic encoding, and a second equality could answer differently.
+local Money = struct {
+    cents: I64,
+}
+
+function Money.__eq(a: Money, b: Money): Bool
+    return a.cents == b.cents
+end
+
+local same_money = do(a: Money, b: Money): Bool return a == b end
+local differs_money = do(a: Money, b: Money): Bool return a ~= b end
+assert(host(same_money(Money { cents = 250 }, Money { cents = 250 })) == true)
+assert(host(differs_money(Money { cents = 250 }, Money { cents = 251 })) == true)
+
+-- A `call` in one arm takes the local's address, so it is storage on every path.
+-- A path that still holds a pending value writes it out before its own stores,
+-- not after them at the join.
+local bump = do(c: Ref Counter, n: U32): Unit
+    c.value = c.value + n
+end
+local branch_bump = do(flag: Bool, n: U32): U32
+    local counter = Counter { value = 0 }
+    if flag then
+        call bump(Ref counter, n)
+    else
+        bump(Ref counter, n * 2)
+    end
+    return counter:get()
+end
+assert(host(branch_bump(true, 3)) == 3)
+assert(host(branch_bump(false, 3)) == 6)
+export branch_bump
+
+-- a mutable method through a reference, materialized
+export Counter.add as "counter_add"

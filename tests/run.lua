@@ -1,0 +1,623 @@
+-- Run every example: compile to C, check the C strictly, link and run its harness.
+-- Then check that bad programs fail with the right diagnostic.
+--
+-- Independent shell steps run concurrently (NUA_TEST_JOBS, default: this
+-- machine's CPU count). Checks are still counted, and reported, in a fixed
+-- order. NUA_WORKERS is left alone: the runtime scheduler honours it, so test
+-- concurrency has its own variable.
+local root = arg[0]:match('^(.*)/tests/[^/]*$') or '.'
+local function sh(cmd)
+    local p = io.popen('(' .. cmd .. ') 2>&1; echo "__rc=$?"')
+    local out = p:read '*a'
+    p:close()
+    local rc = tonumber(out:match('__rc=(%d+)%s*$'))
+    out = out:gsub('__rc=%d+%s*$', '')
+    return rc == 0, out
+end
+local function sq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+local CC = 'cc -std=c99 -Wall -Wextra -Werror -pedantic -O1 -I' .. root .. '/runtime'
+local build = os.getenv('TMPDIR') or '/tmp'
+package.path = root .. '/?.lua;' .. package.path
+local policy_for = require('nua.runtime_build').source
+local policy = policy_for('poll')
+local failures, passes = 0, 0
+local check   -- reported by every phase; declared before the parallel driver uses it
+
+-- Backend and sanitizer variants repeat one program many times; they catch a
+-- different class of bug, not a different feature. Every feature keeps its
+-- single compile/run assertion below; these representatives carry the repeats.
+local SANITIZED = { staged_values = true, loop_fields = true }
+local HARNESS_SAN = { runtime_scheduler = true, runtime_channel = true }
+
+local function cpus()
+    local p = io.popen('nproc 2>/dev/null')
+    local n = tonumber((p:read '*a') or '')
+    p:close()
+    return n or 16
+end
+local JOBS = math.max(1, tonumber(os.getenv('NUA_TEST_JOBS') or '') or cpus())
+-- the compiler under test: the development entry point, or a built binary
+local NUA = os.getenv('NUA_BIN') or ('luajit ' .. root .. '/nua.lua')
+local par_dir = build .. '/nua_par'
+
+-- Run independent commands at once; results come back in input order.
+local function now()
+    local ok, ffi = pcall(require, 'ffi')
+    if ok then return tonumber(ffi.C.gettimeofday and 0 or 0) end
+    return os.time()
+end
+local start_time = os.time()
+
+-- Run commands a batch at a time and report each as it lands, so a long run
+-- still shows progress instead of sitting silent.
+local function par(cmds, labels, verdict)
+    local results, n = {}, #cmds
+    if n == 0 then return results end
+    local report = verdict or check
+    assert(os.execute('mkdir -p ' .. sq(par_dir)) == 0, 'cannot create ' .. par_dir)
+    for first = 1, n, JOBS do
+        local last = math.min(first + JOBS - 1, n)
+        local list = assert(io.open(par_dir .. '/list', 'w'))
+        for i = first, last do
+            local base = ('%s/j%06d'):format(par_dir, i)
+            local f = assert(io.open(base .. '.sh', 'w'))
+            f:write('(', cmds[i], ') >', sq(base .. '.out'), ' 2>&1\n')
+            f:write('echo $? >', sq(base .. '.rc'), '\n')
+            f:close()
+            list:write(base .. '.sh\n')
+        end
+        list:close()
+        os.execute(('xargs -P %d -n 1 sh < %s'):format(last - first + 1, sq(par_dir .. '/list')))
+        for i = first, last do
+            local base = ('%s/j%06d'):format(par_dir, i)
+            local rf = assert(io.open(base .. '.rc'))
+            local rc = rf:read '*a'; rf:close()
+            local of = assert(io.open(base .. '.out'))
+            local out = of:read '*a'; of:close()
+            results[i] = { ok = tonumber(rc) == 0, out = out }
+            if labels then report(labels[i], results[i].ok, out) end
+        end
+    end
+    return results
+end
+
+-- Run a named phase and report how long it took.
+local function phase(title)
+    local t = os.time()
+    io.write(('== %s\n'):format(title)); io.flush()
+    return function()
+        io.write(('== %s done in %ds\n'):format(title, os.time() - t)); io.flush()
+    end
+end
+
+check = function(name, ok, detail)
+    if ok then passes = passes + 1; print('ok    ' .. name)
+    else failures = failures + 1; print('FAIL  ' .. name .. '\n' .. (detail or '')) end
+    io.flush()
+end
+
+local function sources(p, backend)
+    return p .. ' ' .. root .. '/runtime/nua_rt.c' .. (backend and (' ' .. root .. '/runtime/' .. backend) or '')
+end
+-- A program's C carries the runtime words it reaches: beside it only runtime/nua_rt.c
+-- (traps) links. The shared policy unit is for code that does not carry them: the
+-- libgccjit objects and the runtime's own harnesses.
+-- nua_rt.c links as an archive member, pulled only when the program calls into it
+local shared_sources = sources(policy)
+local rt_archive = build .. '/libnua_rt_test.a'
+do
+    local ok, out = sh(('%s -c %s -o %s/nua_rt_test.o && rm -f %s && ar rcs %s %s/nua_rt_test.o')
+        :format(CC, sq(root .. '/runtime/nua_rt.c'), build, sq(rt_archive), sq(rt_archive), build))
+    assert(ok, out)
+end
+local rt_sources = sq(rt_archive)
+
+-- the runtime words a harness's C calls by name, which the program does not
+local function keep_for(name)
+    local f = io.open(root .. '/tests/' .. name .. '_main.c')
+    if not f then return '' end
+    local text = f:read '*a'; f:close()
+    local seen, list = {}, {}
+    for id in text:gmatch('nua_[%w_]+') do
+        if not seen[id] then seen[id] = true; list[#list + 1] = id end
+    end
+    return table.concat(list, ',')
+end
+
+local function have(program) return sh('command -v ' .. program) end
+local clang = have('clang')
+
+-- Every example compiles on its own; nothing later may read a missing C file.
+local examples, names, cpaths = {}, {}, {}
+for f in io.popen('ls ' .. root .. '/examples/*.nua'):lines() do
+    examples[#examples + 1] = f
+    names[#examples] = f:match('([^/]+)%.nua$')
+end
+local order = {}
+for i = 1, #examples do order[i] = i end
+table.sort(order, function(a, b) return names[a] < names[b] end)
+local ordered_examples, ordered_names = {}, {}
+for i, index in ipairs(order) do
+    ordered_examples[i], ordered_names[i] = examples[index], names[index]
+    cpaths[i] = build .. '/nua_' .. ordered_names[i] .. '.c'
+end
+examples, names = ordered_examples, ordered_names
+
+local compiled, strict = {}, {}
+do
+    local done = phase('compile examples')
+    local cmds, labels = {}, {}
+    for i, f in ipairs(examples) do
+        cmds[i] = ('%s --keep-runtime %s -o %s %s'):format(NUA, sq(keep_for(names[i])), cpaths[i], f)
+        labels[i] = names[i] .. ': compile'
+    end
+    local results = par(cmds, labels)
+    for i = 1, #examples do compiled[i] = results[i].ok end
+    done()
+
+    done = phase('strict C')
+    local strict_cmds, strict_labels, at, labels_of = {}, {}, {}, {}
+    for i = 1, #examples do
+        if compiled[i] then
+            at[#at + 1] = i
+            strict_cmds[#strict_cmds + 1] = ('%s -c %s -o %s.o'):format(CC, cpaths[i], cpaths[i])
+            labels_of[#labels_of + 1] = names[i] .. ': strict C'
+        end
+    end
+    local strict_results = par(strict_cmds, labels_of)
+    for n, i in ipairs(at) do strict[i] = strict_results[n].ok end
+    done()
+end
+
+-- Link and run each harness against the C backend.
+local ran, mains = {}, {}
+do
+    local done = phase('run harnesses')
+    local cmds, at, labels = {}, {}, {}
+    for i = 1, #examples do
+        local main = root .. '/tests/' .. names[i] .. '_main.c'
+        local fh = io.open(main)
+        mains[i] = fh and main or nil
+        if fh then fh:close() end
+        if strict[i] and mains[i] then
+            cmds[#cmds + 1] = ('%s %s %s %s -pthread -o %s.bin && %s.bin')
+                :format(CC, cpaths[i], mains[i], rt_sources, sq(cpaths[i]), sq(cpaths[i]))
+            at[#at + 1] = i
+            labels[#labels + 1] = names[i] .. ': run'
+        end
+    end
+    local results = par(cmds, labels)
+    for n, i in ipairs(at) do ran[i] = results[n].ok end
+    done()
+end
+
+-- Variants of the examples that did run: optimization levels, sanitizers, the
+-- other I/O backends, a seeded schedule, and thread checking where it applies.
+do
+    local cmds, apply = {}, {}
+    local function add(label, cmd)
+        cmds[#cmds + 1] = cmd
+        apply[#apply + 1] = label
+    end
+    for i, name in ipairs(names) do
+        if ran[i] then
+            local c, main = cpaths[i], mains[i]
+            if SANITIZED[name] and clang then
+                add(name .. ': ASan/UBSan',
+                    ('clang -std=c99 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all '
+                    .. '-I%s %s -pthread -o %s.asan && ASAN_OPTIONS=detect_leaks=1 %s.asan')
+                    :format(sq(root .. '/runtime'), c .. ' ' .. main .. ' ' .. rt_sources, sq(c), sq(c)))
+            end
+            if name == 'storage_layout' then
+                local input = assert(io.open(c)); local text = input:read('*a'); input:close()
+                local path = c .. '.layouts.c'
+                local out = assert(io.open(path, 'w')); out:write(text)
+                for record, size in pairs { CompactCounter = 4, CompactEnvelope = 4,
+                    SharedCounter = 8, PublicCounter = 8, PublicEnvelope = 16 } do
+                    out:write(('\ntypedef char check_%s[(sizeof(%s) == %d) ? 1 : -1];\n')
+                        :format(record, record, size))
+                end
+                out:close()
+                add(name .. ': compact C sizes and preserved ABI',
+                    ('%s -c %s -o %s'):format(CC, sq(path), sq(c .. '.layouts.o')))
+            end
+            if name == 'loop_fields' then
+                for _, opt in ipairs { 0, 2 } do
+                    add(name .. ': C O' .. opt,
+                        ('%s -O%d %s %s %s -pthread -o %s.o%d.bin && %s.o%d.bin')
+                        :format(CC, opt, c, main, rt_sources, sq(c), opt, sq(c), opt))
+                end
+            end
+            if name == 'staged_values' then
+                for _, word in ipairs { 'stage_empty', 'stage_value', 'stage_binary_value', 'stage_live', 'stage_shorter', 'stage_nested', 'stage_parse', 'stage_split' } do
+                    local generated = assert(io.open(c))
+                    local source = generated:read('*a'); generated:close()
+                    local body = source:match(word .. '%b()%s*(%b{})')
+                    check(word .. ': known construction leaves no copy loop',
+                        body and not body:find('for%s*%(') and not body:find('while%s*%('))
+                end
+            elseif name == 'ui_counter' then
+                local generated = assert(io.open(c))
+                local source = generated:read('*a'); generated:close()
+                local body = source:match('replay_counter%b()%s*(%b{})')
+                check('UI library: no whole-component materialization', body
+                    and not body:find('app%s*=') and not body:find('app.counter.visible', 1, true))
+                local allowed = { ['.counter.count.value'] = true,
+                    ['.counter.increment_button.enabled'] = true, ['.counter.confirm.visible'] = true }
+                for _, button in ipairs { '.counter.increment_button', '.counter.reset_button',
+                    '.counter.confirm.reset_button', '.counter.confirm.keep_button' } do
+                    allowed[button .. '.hovered'], allowed[button .. '.pressed'] = true, true
+                end
+                local only_mutable = body ~= nil
+                for path in (body or ''):gmatch('app(%.counter[%w_%.]+)') do
+                    if not allowed[path] then only_mutable = false end
+                end
+                check('UI library: only mutable leaves remain in replay', only_mutable)
+                local constants = body ~= nil
+                for field, value in pairs { increment_x = 24, increment_y = 76, reset_x = 176, reset_y = 220 } do
+                    if not (body or ''):find('observation->' .. field .. ' = ' .. value .. '.0f;', 1, true) then
+                        constants = false
+                    end
+                end
+                check('UI library: layout remains constant through replay', constants)
+            elseif name == 'ui_counter_generated' then
+                local generated = assert(io.open(c))
+                local source = generated:read('*a'); generated:close()
+                local body = source:match('run_counter_generated%b()%s*(%b{})')
+                check('UI counter: known event chain has no residual tags or handlers', body
+                    and not body:find('%.tag') and not body:find('switch%s*%(')
+                    and not body:find('handle%s*%(') and not body:find('route%s*%('))
+                local hit = body and body:find('>=%s*20u')
+                local increment = body and body:find('%.count%.value%s*=%s*[%w_%.]+%.count%.value%s*%+%s*1u')
+                check('UI counter: hit test leads to native increment', hit and increment and hit < increment
+                    and body:find('<%s*120u') and body:find('>=%s*60u') and body:find('<%s*90u'))
+                local allowed = { ['.count.value'] = true, ['.increment_button.enabled'] = true,
+                    ['.confirm.visible'] = true }
+                local observed, only_mutable = {}, body ~= nil
+                for path in (body or ''):gmatch('%.counter([%.%w_]+)') do
+                    observed[path] = true
+                    if not allowed[path] then only_mutable = false end
+                end
+                for path in pairs(allowed) do if not observed[path] then only_mutable = false end end
+                check('UI counter: only three mutable component leaves remain', only_mutable)
+                local constants = body ~= nil
+                for _, color in ipairs { 66051, 263430, 460809, 658188, 855567 } do
+                    if not (body or ''):find('%.color%s*=%s*' .. color .. 'u;') then constants = false end
+                end
+                for _, geometry in ipairs { { 'x', 20 }, { 'x', 128 }, { 'y', 140 },
+                    { 'width', 208 }, { 'width', 100 }, { 'height', 24 }, { 'height', 30 } } do
+                    if not (body or ''):find('%.' .. geometry[1] .. '%s*=%s*' .. geometry[2] .. 'u;') then
+                        constants = false
+                    end
+                end
+                check('UI counter: drawing positions sizes and all colors are constants', constants)
+                check('UI counter: no foreign input or drawing dependencies', not source:find('extern ', 1, true))
+                local known = source:match('known_counter%b()%s*(%b{})')
+                check('UI counter: known event sequence folds', known and known:find('return 0u;', 1, true))
+            elseif name == 'strmaps' or name == 'maps' then
+                local generated = assert(io.open(c))
+                local source = generated:read('*a'); generated:close()
+                -- the hash is Nua words in the program: it reads the process key in
+                -- place and runs the rounds itself (in a function `call` shares or
+                -- in the user's word), never an opaque C helper
+                local staged = source:find('nua_hash_key0', 1, true) and source:find('nua_hash_key1', 1, true)
+                for _, helper in ipairs { 'begin', 'init', 'bytes', 'u64', 'end' } do
+                    if source:find('nua_hash_' .. helper .. '(', 1, true) then staged = false end
+                end
+                check(name .. ': hashing is Nua, not an opaque C helper', not not staged)
+                local native_algorithm = false
+                for _, helper in ipairs { 'nua_map_probe', 'nua_map_insert', 'nua_map_remove',
+                    'nua_strmap_find', 'nua_strmap_insert', 'nua_strmap_remove' } do
+                    if source:find(helper .. '(', 1, true) then native_algorithm = true end
+                end
+                check(name .. ': no opaque native map algorithms', not native_algorithm)
+            elseif name == 'known_maps' then
+                local generated = assert(io.open(c))
+                local source = generated:read('*a'); generated:close()
+                local body = source:match('known_constant%b()%s*(%b{})')
+                check('known maps: lookup folds to its value', body and body:find('return 13u;', 1, true))
+                check('known maps: no mutable native heap', not source:find('nua_map_new', 1, true)
+                    and not source:find('nua_strmap_new', 1, true))
+            end
+            if name == 'io' then
+                local base = rt_sources
+                local backends = { { 'io_uring', 'uring', 'nua_io_uring.c', '' } }
+                if io.open('/usr/include/kqueue/sys/event.h') then
+                    backends[#backends + 1] = { 'kqueue', 'kqueue', nil, '-I/usr/include/kqueue -lkqueue' }
+                end
+                for _, be in ipairs(backends) do
+                    -- the backend is chosen when the program is built: it carries those runtime words
+                    local own = ('%s.%s.c'):format(c, be[1])
+                    local src = base .. (be[3] and (' ' .. root .. '/runtime/' .. be[3]) or '')
+                    add(name .. ': run on ' .. be[1],
+                        ('NUA_IO=%s %s --keep-runtime %s -o %s %s/examples/io.nua && %s %s %s %s -pthread %s -o %s.%s && %s.%s')
+                        :format(be[2], NUA, sq(keep_for('io')), sq(own), root, CC, sq(own), main, src, be[4], sq(c), be[1], sq(c), be[1]))
+                end
+                local src = base
+                add(name .. ': run on poll',
+                    ('%s %s %s %s -pthread -o %s.poll && %s.poll'):format(CC, c, main, src, sq(c), sq(c)))
+                if clang then
+                    add(name .. ': ThreadSanitizer on poll',
+                        ('clang -std=c99 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -I%s/runtime %s %s %s -pthread '
+                        .. '-o %s.tsan_poll && %s.tsan_poll'):format(root, c, main, src, sq(c), sq(c)))
+                end
+            end
+            if name == 'channels' then
+                add(name .. ': deterministic schedule', ('NUA_SCHED_SEED=7 %s.bin'):format(sq(c)))
+            end
+            if (name == 'atomics' or name == 'channels') and clang then
+                add(name .. ': ThreadSanitizer',
+                    ('clang -std=c99 -Wall -Wextra -Werror -O1 -g -fsanitize=thread -I%s/runtime %s %s %s -pthread '
+                    .. '-o %s.tsan && %s.tsan'):format(root, c, main, rt_sources, sq(c), sq(c)))
+            end
+        end
+    end
+    par(cmds, apply, function(label, ok, out)
+        if label:find('ThreadSanitizer', 1, true) then ok = ok and not out:find('ThreadSanitizer') end
+        check(label, ok, out)
+    end)
+end
+
+local oka, erra = pcall(dofile, root .. '/tests/array_value.lua')
+check('immutable array contents: persistence and sparse zeros', oka, erra)
+local okm, errm = pcall(dofile, root .. '/tests/map_types.lua')
+check('map types: recursive key/value rules', okm, errm)
+
+local okl, errl = pcall(dofile, root .. '/tests/storage_layout.lua')
+check('record storage layouts: residual use and ABI preservation', okl, errl)
+
+local okt, errt = pcall(dofile, root .. '/tests/task_globals.lua')
+check('task global writes: aliases calls callbacks and blocking', okt, errt)
+
+local okloop, errloop = pcall(dofile, root .. '/tests/loop_adoption.lua')
+check('reference-written loop state: invariants escapes and snapshots', okloop, errloop)
+
+local okretain, errretain = pcall(dofile, root .. '/tests/staging_retention.lua')
+check('staging retention: local identities and rollback storage', okretain, errretain)
+
+local okmatch, errmatch = pcall(dofile, root .. '/tests/immediate_matches.lua')
+check('immediate outcome matching: owned continuations and payload joins', okmatch, errmatch)
+
+local okr, errr = pcall(dofile, root .. '/tests/recursive_foreign.lua')
+check('recursive foreign layouts: construction and rejection', okr, errr)
+
+-- Runtime policy and storage models, before the compiler-facing tests.
+do
+    local harnesses = { 'map_hash', 'map_runtime', 'strmap_runtime', 'runtime_scheduler', 'runtime_channel', 'runtime_lifecycle' }
+    local cmds, apply = {}, {}
+    local function add(label, cmd) cmds[#cmds + 1] = cmd; apply[#apply + 1] = label end
+    -- glibc's fortified write() must have its result consumed, including in
+    -- runtime words specialized into their callers.
+    add('poll runtime: fortified C', ('%s -D_FORTIFY_SOURCE=2 -c %s -o %s')
+        :format(CC, sq(policy), sq(build .. '/nua_poll_fortified.o')))
+    for _, harness in ipairs(harnesses) do
+        local sources_text = { sq(policy) }
+        for _, f in ipairs { 'tests/' .. harness .. '_main.c', 'runtime/nua_rt.c' } do
+            sources_text[#sources_text + 1] = sq(root .. '/' .. f)
+        end
+        local input = table.concat(sources_text, ' ') .. ' -pthread -I' .. sq(root .. '/runtime')
+        local bin = sq(build .. '/nua_' .. harness)
+        add(harness .. ': runtime', 'cc -std=c99 -Wall -Wextra -Werror -pedantic -O1 '
+            .. input .. ' -o ' .. bin .. ' && ' .. bin)
+        if HARNESS_SAN[harness] and clang then
+            local bin = sq(build .. '/nua_' .. harness .. '.san')
+            add(harness .. ': ASan/UBSan', 'clang -std=c99 -Wall -Wextra -Werror -O1 -g '
+                .. '-fsanitize=address,undefined -fno-sanitize-recover=all ' .. input .. ' -o ' .. bin .. ' && ' .. bin)
+        end
+    end
+    par(cmds, apply)
+    if not clang then print('skip  runtime harness sanitizers: clang not found') end
+end
+
+-- Text's C helper accepts unrelated buffers and self-aliases across growth.
+-- Keep pointer comparisons separate from UBSan's pointer-overflow instrumentation.
+-- Pointer-subtract instrumentation also flags intentional uintptr_t address math.
+do
+    local rt = policy .. ' ' .. root .. '/runtime/nua_rt.c'
+    local main = root .. '/tests/text_runtime_main.c'
+    local bin = build .. '/nua_text_runtime'
+    local cmds = { ('%s %s %s -pthread -o %s && %s'):format(CC, main, rt, sq(bin), sq(bin)) }
+    local apply = { 'Text runtime: aliases and buffer growth' }
+    if clang then
+        for _, flags in ipairs { 'address,undefined', 'address,pointer-compare' } do
+            cmds[#cmds + 1] = ('clang -std=c99 -Wall -Wextra -Werror -O1 -g -fsanitize=%s '
+                .. '-fno-sanitize-recover=all -fno-omit-frame-pointer -I%s/runtime %s %s -pthread -o %s.%s '
+                .. '&& ASAN_OPTIONS=detect_leaks=1:detect_invalid_pointer_pairs=2 %s.%s')
+                :format(flags, root, main, rt, sq(bin), flags, sq(bin), flags)
+            apply[#apply + 1] = 'Text runtime: ' .. flags
+        end
+    else
+        print('skip  Text runtime sanitizers: clang not found')
+    end
+    par(cmds, apply)
+end
+
+-- the gccjit backend: the same harnesses, linked against libgccjit's object
+-- files, and the in-process backend
+local have_jit = sh(('luajit -e "package.path=[[%s/?.lua;]]..package.path; require([[nua.cjit]]).lib()"'):format(root))
+if have_jit then
+    local objects, built = {}, {}
+    do
+        local cmds = {}
+        for i, f in ipairs(examples) do
+            objects[i] = build .. '/nua_jit_' .. names[i] .. '.o'
+            cmds[i] = ('%s --gccjit -o %s %s'):format(NUA, objects[i], f)
+        end
+        local labels = {}
+        for i = 1, #examples do labels[i] = names[i] .. ': gccjit object' end
+        local results = par(cmds, labels)
+        for i = 1, #examples do built[i] = results[i].ok end
+    end
+    do
+        local cmds, apply = {}, {}
+        local function add(label, cmd) cmds[#cmds + 1] = cmd; apply[#apply + 1] = label end
+        for i, name in ipairs(names) do
+            if built[i] and mains[i] then
+                local o = objects[i]
+                add(name .. ': gccjit run',
+                    ('%s %s %s %s -pthread -o %s.bin && %s.bin'):format(CC, o, mains[i], shared_sources, sq(o), sq(o)))
+                if name == 'channels' then
+                    add(name .. ': gccjit deterministic schedule', ('NUA_SCHED_SEED=7 %s.bin'):format(sq(o)))
+                end
+                if name == 'io' then
+                    add(name .. ': gccjit run on io_uring',
+                        ('%s %s %s %s -pthread -o %s.uring && %s.uring')
+                        :format(CC, o, mains[i], sources(policy_for('uring'), 'nua_io_uring.c'), sq(o), sq(o)))
+                end
+            end
+        end
+        par(cmds, apply)
+    end
+    local okn, outn = sh(('luajit %s/tests/native.lua'):format(root))
+    check('in-process backend', okn, outn)
+else
+    print('skip  gccjit backend: libgccjit not found')
+end
+
+-- the differential fuzzer: its saved findings, and a few new programs
+if have_jit then
+    local results = par {
+        ('luajit %s/tests/fuzz/fuzz.lua --regressions'):format(root),
+        ('luajit %s/tests/fuzz/fuzz.lua --seed 424242 --count 5 --no-shrink'):format(root),
+        ('luajit %s/tests/fuzz/tasks.lua --quick'):format(root),
+        ('luajit %s/tests/fuzz/storage.lua --count 8'):format(root),
+    }
+    check('fuzz regressions agree on every run', results[1].ok, results[1].out)
+    check('fuzz: 5 programs agree on every run', results[2].ok, results[2].out)
+    check('task fuzzer agrees across schedules', results[3].ok, results[3].out)
+    check('storage model fuzzer agrees with the model', results[4].ok, results[4].out)
+end
+
+-- programs that must be rejected, with a fragment of the expected message
+do
+    local bad = dofile(root .. '/tests/errors.lua')
+    local cmds, labels, by_label = {}, {}, {}
+    for i, case in ipairs(bad) do
+        local path = ('%s/bad_%04d.nua'):format(par_dir, i)
+        local fh = assert(io.open(path, 'w')); fh:write(case.src); fh:close()
+        cmds[i] = ('%s %s'):format(NUA, sq(path))
+        labels[i] = 'rejects: ' .. case.name
+        by_label[labels[i]] = case
+    end
+    par(cmds, labels, function(label, ran_ok, out)
+        local case = by_label[label]
+        local expected = (not ran_ok) and out:find(case.expect, 1, true)
+        if expected and case.line then expected = out:find(':' .. case.line .. ':', 1, true) end
+        check(label, expected, out)
+    end)
+end
+
+-- the generated C keeps the checks nothing proves, and drops the ones a branch proved
+do
+    local expectations = {
+        { 'memory_views', 'if ((uint64_t)(i + 1u - 1u) >= (uint64_t)xs.len)', true,
+          'an index no fact covers stays checked' },
+        { 'memory_views', 'if ((uint64_t)i >= (uint64_t)xs.len)', false,
+          'an index the branch proved is not checked' },
+        { 'activities', 'at->value = at->value * 2u;\n    at->weight = at->weight + 1u;', true,
+          'one checked lookup serves the whole stretch' },
+        { 'activities', 'NodeStore_borrow', false, 'no C helper for a store lookup' },
+        { 'loop_fields', 'return 48u + panel.count * 12u;', true,
+          'unchanged record fields stay known after a loop' },
+        { 'loop_fields', 't.odd = t.odd + 1u;', true,
+          'unchanged record fields stay known inside a loop' },
+        { 'loop_fields', 'return 92.0f;', true,
+          'inline early returns preserve unchanged caller fields' },
+        { 'loop_fields', 'app.w', false,
+          'inline early returns do not materialize caller layout' },
+        { 'boundary', 'uint32_t t = weigh(a);\n    return t + weigh(b) + (a * 3u + a * 3u + a);', true,
+          'call makes a shared function, a plain application stays inline' },
+        { 'channels', 'nua_poll_recv(', true, 'first_of makes its attempts in the program' },
+        { 'channels', 'nua_first_of', false, 'no first_of interpreter is called' },
+        { 'channels', 'nua_case', false, 'no first_of case array is built' },
+        { 'channels', '\nvoid nua_task_wake(', true, 'the program carries the runtime words it reaches' },
+        { 'hello', 'nua_trap_recoverable', false, 'a program that never calls into the runtime carries none of it' },
+        { 'boundary', 'static uint32_t weigh_2(void) {\n    return 49u;\n}', true,
+          'a known argument under call specializes the function' },
+    }
+    local cmds = {}
+    for i, x in ipairs(expectations) do
+        cmds[i] = ('%s %s/examples/%s.nua'):format(NUA, root, x[1])
+    end
+    local labels = {}
+    for i, x in ipairs(expectations) do labels[i] = 'codegen: ' .. x[4] end
+    local results = par(cmds)
+    for i, x in ipairs(expectations) do
+        local has = results[i].out:find(x[2], 1, true) ~= nil
+        check(labels[i], results[i].ok and has == x[3], x[2])
+    end
+end
+
+-- nua size names what the generated C is made of
+do
+    local r = par { ('%s size %s/examples/strmaps.nua --top 3'):format(NUA:gsub(' %-o .*$', ''), root) }[1]
+    check('size: reports the generated C, its modules and the words worth a call',
+        r.ok and r.out:find('lines of C from', 1, true) and r.out:find('largest functions', 1, true)
+        and r.out:find('where the C comes from', 1, true) and r.out:find('lib/map.nua', 1, true)
+        and r.out:find('words evaluated in place', 1, true) and r.out:find('count lines of C', 1, true),
+        r.out)
+    -- the three profiles are a range, so the order is the check: sharing is never
+    -- larger than as written, and as written is never larger than everything in place
+    local c = par { ('%s size %s/examples/stores.nua --compare'):format(NUA:gsub(' %-o .*$', ''), root) }[1]
+    local got = {}
+    for name, n in (c.out or ''):gmatch('(%a+)%s+([%d,]+)') do got[name] = tonumber((n:gsub(',', ''))) end
+    check('size: --compare brackets the program between inline and all-shared',
+        c.ok and got.share and got.written and got.inline and got.share <= got.written
+        and got.written <= got.inline and not c.out:find('no all-shared form', 1, true), c.out)
+end
+
+-- --split: one translation unit per function beside one header, so a C compiler
+-- can build the program in parallel
+do
+    local dir = build .. '/nua_split'
+    os.execute('rm -rf ' .. sq(dir))
+    local split_ok, split_out = sh(('%s --split %s --keep-runtime %s %s/examples/stores.nua')
+        :format(NUA, sq(dir), sq(keep_for('stores')), root))
+    local units = 0
+    for _ in io.popen('ls ' .. sq(dir) .. '/*.c 2>/dev/null'):lines() do units = units + 1 end
+    -- the units are compiled from inside `dir`, so the runtime include is absolute
+    local rt_abs = (io.popen('cd ' .. sq(root) .. ' && pwd'):read '*l') .. '/runtime'
+    local CCABS = CC:gsub('%s%-I[^%s]+', '') .. ' -I' .. rt_abs
+    local compile_ok, compile_out = false, ''
+    if split_ok then
+        compile_ok, compile_out = sh(('cd %s && ls *.c | xargs -P 8 -n 1 %s -c'):format(sq(dir), CCABS))
+    end
+    local run_ok, run_out = false, ''
+    if compile_ok then
+        run_ok, run_out = sh(
+            ('%s %s/tests/stores_main.c %s/*.o %s/runtime/nua_rt.c -pthread -o %s/stores && %s/stores')
+            :format(CCABS, root, sq(dir), root, sq(dir), sq(dir)))
+    end
+    check('split: one C file per function compiles in parallel and links',
+        split_ok and units > 10 and compile_ok and run_ok and run_out:find('stores: ok', 1, true) ~= nil,
+        split_out .. compile_out .. run_out)
+end
+
+-- SDL3 is optional; when installed, compilation/runtime failures are failures.
+if sh('pkg-config --exists sdl3') then
+    local ok, out = sh(('luajit %s/tests/canvas.lua'):format(sq(root)))
+    check('canvas: SDL3 activity case study', ok, out)
+else
+    print('skip  canvas: SDL3 development package unavailable')
+end
+
+do
+    local ok, out = sh(('luajit %s/tests/ui.lua'):format(sq(root)))
+    check('UI: construction vocabularies and native records', ok, out)
+    if sh('pkg-config --exists sdl3 sdl3-ttf') then
+        local host_ok, host_out = sh(('luajit %s/tests/ui_sdl.lua'):format(sq(root)))
+        check('UI: SDL3 counter and font resource activity', host_ok, host_out)
+    else
+        print('skip  UI SDL: SDL3/SDL_ttf development packages unavailable')
+    end
+end
+
+local docs = par {
+    ('luajit %s/tests/listings.lua'):format(root),
+    ('luajit %s/tests/guide.lua'):format(root),
+}
+check("documentation listings are real output", docs[1].ok, docs[1].out)
+check('guide examples are real', docs[2].ok, docs[2].out)
+
+print(('%d passed, %d failed'):format(passes, failures))
+os.exit(failures == 0 and 0 or 1)

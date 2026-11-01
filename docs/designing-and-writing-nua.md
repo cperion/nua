@@ -1,0 +1,1229 @@
+# Designing and writing Nua
+
+**Status: a guide to designing and writing programs in Nua, beside [the language](syntax.md) and [the compiler](architecture.md), which own the rules.** It follows Let's guide, *Designing and writing Let*, and keeps what transfers. Where Nua differs, it says how and why.
+
+The guide follows from a few principles (§1). Its centre is the **activity**, and the construct you write to use one is the **instruction**: a call without a receiver, inside a block that opened one (§6). Activities shape run-time work, and the same construct, run while compiling, builds descriptions and types (§6.10).
+
+* **Part I** is a design process: ten steps, each with the question it answers, the diagram it produces and the condition for moving on.
+* **Part II** is about writing words.
+* **Part III** is house style.
+
+Every `lua` block below is an excerpt of [`examples/guide.nua`](../examples/guide.nua), which the test suite compiles to strict C and runs; every `c` block is that compilation's actual output. `tests/guide.lua` checks both, so this guide cannot drift from the language. The blocks are `nua fmt`'s default style, which is also the house style (§21). Diagrams are Mermaid, and their notation is explained where it is first used.
+
+## 0. Forms this guide relies on
+
+| Form | Used for |
+|---|---|
+| `local f = do(x: T): R ... end`, `do(x: T): R = e` | typed words: compiled to native code |
+| `function T:m(...): R ... end` | methods: the receiver is `self`, a reference |
+| `struct { ... }`, `oneof { ... }` | records and sums |
+| `s { name = do(p) ... end, name(p) = e }` | matching a sum: one handler per alternative |
+| untyped parameters, `f known` | compile-time parameters, partial application |
+| `f "lit"`, `f 1 2`, `f x do ... end` | literal application and saturating chains |
+| `do(ctx..)`, `do(..)`, `local ctx.. = e` | opening a record or a vocabulary; `do(..)` leaves it unnamed |
+| `insert n`, `note 1` inside an opened block | instructions: calls the innermost opened receiver resolves (§6.3) |
+| `keymap do(..) bind "h" (...) end` | a builder: an activity run while compiling that returns a description or a type (§6.10) |
+| `endall` | closing a spine of trailing blocks |
+| `s[id]`, `g[i]`, `pool[slot]`, `a[i]` | checked places |
+| `tasks do(scope..)`, `spawn do`, `first_of` | concurrency |
+| `require "nua.io"` | libraries, including I/O by completion |
+| `native word`, `nua run` | compile now, into this process, and call from Lua |
+| `call f(x)` | one site as a shared C function, for code size (§11.2) |
+| `T.__index`, `T.__add`, `T.__cast`, … | type hooks: what `x[k]`, an operator or a conversion means on a type |
+
+---
+
+# Part I — Designing
+
+## 1. The stance
+
+Nua puts **binding time** at the center. A program is Lua that runs while compiling. Typed words are evaluated in place with whatever is known, and only the work that depends on run time remains, as C. Let's question, "what is known, and when?", has an exact answer for every value in a Nua program:
+
+* **A Lua value** (a table, a string, a closure, a number in host code) exists only while compiling.
+* **A known native value** (`U32 4`, a constant field, a sum with a known tag) is computed while compiling. It shapes the C, and may vanish from it.
+* **A runtime value** (a parameter of an export, a read from a file) is in the C.
+
+Everything in this guide follows from a few principles of the language, each of which asks something of the way you design:
+
+| Principle | What it asks of you |
+|---|---|
+| **Binding time is the centre.** Work happens at the earliest time it can. | Find what is known before run time and hand it to the code as a description (§3); an engine over a known description loses its interpreter (§17). |
+| **A word is evaluated in place.** There is no inlining decision and no closure. | Write words at the size the meaning wants (§15). A block given to a word is code at that place, so activities cost nothing (§6). |
+| **Ownership is lexical.** Scopes own values, stores own slots, a borrow ends with its scope. | Give every mutable thing one owner and every relationship one kind (§5); keep borrows inside activities. |
+| **Nothing is hidden.** Every check, wait and allocation is a line of C. | Read the C (§11.1); state costs, failures and lifetimes in contracts. |
+| **Tasks share nothing.** Values cross by copy, buffers by move. | Draw concurrency as owners and messages, never as shared state (§8). |
+| **Grow the vocabulary, not the language.** Libraries and the runtime are Nua words; configuration, dialects and tests are Lua. | Say a domain as a vocabulary of words and instructions (§6.9, §6.10); a new macro is a last resort. |
+| **One thing, one spelling; names carry the reading.** Lexical scope is the only rule for names. | Speak in instructions that read as sentences (§19); when a line needs explaining, rename or redesign. |
+
+## 2. The process
+
+Design is ten steps. Each answers one question and produces one thing, usually a diagram. A step is done when its exit condition holds, and some later findings send you back to an earlier step.
+
+```mermaid
+flowchart TD
+    S0[0. Frame] --> S1[1. Binding times]
+    S1 --> S2[2. Values and outcomes]
+    S2 --> S3[3. Ownership]
+    S3 --> S4[4. Activities]
+    S4 --> S5[5. States]
+    S5 --> S6[6. Concurrency]
+    S6 --> S7[7. Composition and edges]
+    S7 --> S8[8. Skeleton]
+    S8 --> S9[9. Verify]
+    S9 --> Q{does the result match the design?}
+    Q -- a cost is wrong --> S1
+    Q -- an owner or an arrow is wrong --> S3
+    Q -- a body lacks verbs --> S4
+    Q -- yes --> Done[done: the code is now the source of truth]
+```
+
+| Step | Question | Produces | Done when |
+|---|---|---|---|
+| 0. Frame | What is the job? | one paragraph: inputs, outputs, scale, what must be fast | every later decision can point back to it |
+| 1. Binding times | What is known when? | a diagram in four lanes | everything known before steady state is marked to be a description |
+| 2. Values and outcomes | What does the program talk about? | records and sums | every outcome a caller acts on is a sum |
+| 3. Ownership | Who owns what, and what is each relationship? | a class diagram with roles and labelled arrows | every mutable thing has one owner; no reference outlives an activity |
+| 4. Activities | What bounded work happens, and what is said inside it? | a sequence diagram per use case, and each context's vocabulary | every activity's completion, and its abort, has an owner; every block speaks only its context's instructions and its enclosing activities' |
+| 5. States | What has a lifecycle? | state diagrams, then sums and transition words | every state is a variant; every match is complete |
+| 6. Concurrency | What runs at the same time? | a dataflow of tasks, channels and scopes | one owner task per entity; every channel has a closer, every scope an end |
+| 7. Composition and edges | Who connects the parts, where does the world come in? | a component diagram | the core is pure and depends on no edge |
+| 8. Skeleton | Does it hold together? | code that compiles, top-down | each diagram element has its code, and the compile-time asserts pass |
+| 9. Verify | Does it cost what we said? | the C read, tests, the fuzzer, numbers | step 0's requirements are met, or a step to go back to is chosen |
+
+**Going back.** Each symptom points to one step:
+
+* **A hot path still loops or switches over configuration:** step 1. Something placed at run time is known earlier.
+* **Two places want to change the same thing, or a reference must be kept:** step 3. An owner or an arrow is wrong; it should be an `Id` or a message.
+* **A body reaches around its context** for things the context does not offer: step 4. The activity lacks verbs, or two activities are mixed.
+* **A match grows a "cannot happen" arm:** step 5. A state is missing.
+* **Tasks need a lock, or a channel cannot be closed cleanly:** step 6. An entity's owner task or the scope structure is wrong.
+
+**Three habits throughout:**
+
+* **Answer one question per step.** Do not decide ownership while naming values, or concurrency while designing activities.
+* **Keep each diagram to a screen.** A diagram that does not fit covers two concerns.
+* **Hand over to the code.** Once the skeleton compiles, the code is the source of truth. Diagrams should then come from it (Nua's types and words are Lua values, so they can be walked and printed), not be maintained beside it.
+
+**Draft top-down.** Write the word you wish you had, then the words it needs. Nua compiles only what exports reach, so a draft costs nothing until something uses it.
+
+## 3. Step 1: binding times
+
+Place every piece of information the program uses in one of four lanes:
+
+| Lane | Examples | Becomes |
+|---|---|---|
+| **source** (while compiling) | record types, a key map, a protocol, limits | Lua values and descriptions |
+| **start-up** | a config file, command-line flags, a schema, a file's header | descriptions too, specialized on with `native` |
+| **steady state** | documents, connections, user data | runtime values |
+| **per event** | a keystroke, a request, a line | runtime values, the hot path |
+
+Anything in the first two lanes should reach the code as a description: a Lua table, a known value, or an untyped parameter. The engine is then specialized on it, not left to interpret it at run time.
+
+```mermaid
+flowchart LR
+    subgraph Source[while compiling]
+        A[Command type, key map, greeting script]
+    end
+    subgraph Startup[at start-up]
+        B[tab width from config] --> C[tab_stop compiled for it]
+    end
+    subgraph Steady[at run time]
+        D[documents] --> E[commands] --> F[edits]
+    end
+    A --> E
+    C --> E
+```
+
+*Lanes are binding times; an arrow from left to right is a value that is known before the code that uses it runs, so that code can be specialized on it.*
+
+**Start-up is a binding time.** `native word` compiles a word into this process and returns it as a Lua function, so a value read at start-up can be specialized on like a table written in the source: `native(tab_stop { tab_width = width })`. Keep the reading in Lua and the work in words; the same words compile ahead of time.
+
+**Where specializing pays, as measured.** Not every known value is worth a specialization:
+
+| What became known | Speedup measured |
+|---|---|
+| a scalar the code merely uses (a field's position, a count of decimals, a constant key) | 1.06–1.11× |
+| a dominant sum tag, guarded per element | 1.06–1.08× |
+| **a program interpreted per input (a 33-instruction bytecode)** | **16×** |
+
+Binding time matters most for **data that drives control flow**: programs, grammars, schemas, protocols, key maps, state machines. Making a constant known removes a load; making a description known removes the interpreter. Compiling with `native` costs about 20 ms for the smallest unit and 30–70 ms for a realistic one, so choose start-up specialization where it repays that many times over.
+
+## 4. Step 2: values and outcomes
+
+### 4.1 Values first
+
+Model records and sums before behavior. Anything that is stored, replayed, logged, undone or tested should be data:
+
+```lua
+local Direction = oneof { left: Unit, right: Unit }
+local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
+```
+
+Commands as data give undo, replay and tests one foundation, and (§17) they give specialization something to work with.
+
+### 4.2 Outcomes and failures
+
+An outcome a caller can act on is a sum, matched exhaustively. Do not encode absence as a magic value:
+
+```lua
+local Found = oneof { found: U32, missing: Unit }
+```
+
+```lua
+local find_nonzero = do(xs: Slice U32): Found
+    local i: U32 = 0
+    while i < xs.length do
+        if xs[i] ~= 0 then
+            return Found.found i
+        end
+        i = i + 1
+    end
+    return Found.missing()
+end
+```
+
+The libraries follow the same rule: a receive is `oneof { value: T, closed: Unit }`, and an I/O result is `oneof { done: U32, failed: I32 }`.
+
+**Which kind of failure is which:**
+
+| Situation | Expressed as | Example |
+|---|---|---|
+| a caller can act on it | a sum | `missing`, `closed`, `failed(errno)` |
+| an invariant is broken | a trap, at run time | an index out of range, a stale `Id`, a send on a closed channel |
+| it is wrong while still known | a compile-time error | `index-range` on a known index, `signed overflow in +` |
+| the world refused | an I/O outcome sum | `failed(e)`, `timed_out` |
+
+A compile-time error is reported even in an arm that dynamic control may never reach. Guard such arms with a condition the compiler can see, or keep the value unknown there.
+
+## 5. Step 3: ownership
+
+### 5.1 Roles and relationships
+
+**Every type plays one role:**
+
+| Role | What it is | Nua forms |
+|---|---|---|
+| **value** | copied freely; owned by whoever holds it | `struct`, `oneof`, `Array`, `Chars n` |
+| **entity** | has identity and persists; lives in a store, named by an `Id` | a struct in a `Store T` |
+| **owned** | resizable storage, created in place, moved only by `Ref` | `Store`, `Grow`, `Text`, `Map`; a struct holding one (a ring buffer) |
+| **view** | a window on someone else's storage, bounded by an activity | `Slice`, `Str` |
+| **handle** | a small name for something the runtime owns; crosses tasks | `Chan`, `Pool`, `Slot` |
+| **description** | known while compiling; shapes the code | a Lua table, a known value |
+
+**Every relationship is one of four kinds:**
+
+| Arrow | Meaning | Nua form |
+|---|---|---|
+| **field** | owns | a struct field (trees are fields) |
+| **name** | identifies without owning | an `Id T` (graphs are stores) |
+| **borrow** | uses for a while | a `Ref T` parameter, or an activity's context; ends with the activity |
+| **message** | crosses a task boundary | a channel (copies) or a pool slot (moves) |
+
+There is no fifth arrow. UML's inheritance becomes a `oneof` for variants, or a shared vocabulary for shared behavior. A reference that must outlive an activity is a design error: it is a `name` or a `message`.
+
+```mermaid
+classDiagram
+    class Document { <<value>> length; cursor; edits }
+    class Draft { <<value: context>> length; cursor; edits }
+    class Outline { <<owned>> headings: Store Heading }
+    class Heading { <<entity>> level; words }
+    class Command { <<value>> oneof move | insert | undo | quit }
+    class Greeting { <<description>> Lua list of Command }
+    Outline *-- Heading : owns (Store)
+    Outline ..> Heading : names (Id)
+    Draft ..> Document : borrows (transaction)
+    Greeting ..> Command : describes
+```
+
+*Stereotypes are roles; arrow labels are relationship kinds.*
+
+### 5.2 The rules
+
+* **Give mutable state one owner.** A scope owns its locals; a struct owns its fields; a store owns its slots. Other code receives access explicitly, as a `Ref`.
+* **Trees are fields; graphs are stores.** A `Store T` holds objects with stable identity, and an `Id T` names one without owning it:
+
+```lua
+local Heading = struct { level: U32, words: U32 }
+local Outline = struct { headings: Store Heading }
+
+local add_words = do(outline: Ref Outline, id: Id Heading, n: U32): U32
+    outline.headings[id].words = outline.headings[id].words + n
+    return outline.headings[id].words
+end
+```
+
+  `outline.headings[id]` is a place, checked at every use. Nothing holds its address past the stretch it was found in, so the store may grow between two uses.
+* **Copying a handle copies the handle.** A `Ref` writes through to its place, an `Id` identifies a slot, and a `Slot` moves between tasks. Copying any of them copies the name, not the thing.
+* **Aggregates hold no references.** A struct cannot contain a `Ref`, a `Slice` or a `Str`; long-lived relationships are `Id`s.
+* **Lua tables are for compile time.** Open, dynamic data is a Lua table while compiling. At run time, data has a shape.
+
+## 6. Step 4: activities
+
+> **Entities own what persists. Activities own or borrow what is needed for a purpose. Words express what happens inside.**
+
+An activity is a design role made of ordinary parts: a word that sets up a context, runs a body that opens it, and owns completion. In Nua it costs nothing extra: the body is a callback evaluated in place, and a private context is an ordinary local that folds away.
+
+**The activity is the centre of a Nua design.** Every lifetime in the language is one: a working copy and its commit, a file and its close, a borrow of growing storage (`g:view() do(xs)`), a guarded iteration (`m:each do(k, v)`), a `tasks` scope and its join, a `blocking` call. Inside an activity you speak **instructions**: calls written without a receiver, which the opened context resolves (§6.3). The same construct, run while compiling on a vocabulary, is a **builder** (§6.10). Design the activities, and the program's shape follows.
+
+### 6.1 Finding activities
+
+**Each use case is an activity.** For each, answer four questions:
+
+1. **What is the entity?** The thing that persists: a `Document`, an `Outline`.
+2. **What context does the work need?** A working copy, a borrowed place, a resource, an accumulator.
+3. **Who sets it up?** The activity word, before `body(...)`.
+4. **Who completes it?** The activity word, after `body(...)`: commit, roll back, give back, report.
+
+**Verbs go on the context; invariants stay on the entity.** The body speaks the context's methods (`Draft:insert`), not the entity's. The entity keeps only what must always hold of it. A free activity word such as `transaction(document: Ref Document, body)` lives beside `Document` without growing it.
+
+```mermaid
+sequenceDiagram
+    participant Caller as type_word
+    participant T as transaction (activity)
+    participant E as draft (context)
+    participant D as document (entity)
+    Caller->>T: transaction(document) do(draft..)
+    T->>E: setup: copy document into draft
+    Caller->>E: insert n, move_left()
+    T->>D: completion: commit draft into document
+```
+
+*A sequence diagram per use case: the activity word is its own participant, setup and completion are its messages, and the body's verbs go to the context.*
+
+### 6.2 Kinds of activity
+
+| Kind | Setup | Completion | Example |
+|---|---|---|---|
+| working copy | copy the entity into a context | commit, or discard | `transaction` |
+| in place | open a place | nothing; writes went through | `local node.. = g.nodes[id]` |
+| scoped resource | acquire | release | `with_file` |
+| accumulator | create the state | return a result from it | `counting` |
+| policy | nothing, or a measurement | record, check, clamp, retry | `counted`, `clamped` |
+| builder | a vocabulary | return a description or a type | `keymap`, `ui.component` (§6.10) |
+
+### 6.3 Enter an activity and speak its instructions
+
+```lua
+local Draft = struct { length: U32, cursor: U32, edits: U32 }
+
+function Draft:insert(n: U32): Unit
+    self.length = self.length + n
+    self.cursor = self.cursor + n
+    self.edits = self.edits + 1
+end
+```
+
+```lua
+local type_word = do(document: Ref Document, n: U32): U32
+    local moved: U32 = 0
+    transaction document do(..)
+        insert n
+        local before = cursor
+        move_left
+        moved = before - cursor
+    end
+    return moved
+end
+```
+
+`do(..)` opens the context without an unused receiver name. Bare calls use its methods (`insert n`, `move_left()`), and its fields are live places (`cursor`).
+
+Each of those lines is an **instruction**: a call without a receiver, resolved by the innermost opened context that has the name. A name the context lacks falls through to enclosing contexts (§6.8), and a local declared inside the block shadows the context. Instructions run in the order written, so a block reads as a list of sentences about one context. Open the context with a name (`do(draft..)`) only when you need to qualify a member that something closer shadows.
+
+### 6.4 Open to work; bind to remember
+
+An opened field name is the field's place: reading it reads the current value. A binding takes the value at that point: `local before = cursor` keeps the cursor from before `move_left()`. Opening a place keeps it a place: `local node.. = g.nodes[id]` works on the store's slot itself.
+
+### 6.5 The activity owns completion
+
+```lua
+local transaction = do(document: Ref Document, body): Unit
+    local draft = Draft { ..document }
+    body(Ref draft)
+    document = Document { ..draft }
+end
+```
+
+This one commits a working copy at the end. Its contract is its own: write through, commit, roll back, retry. Three boundaries hold:
+
+* the body's `return` leaves the body, not the activity;
+* cleanup and commit are the activity's code, not a side effect of opening;
+* a borrow cannot outlive its activity, but an owned result may leave it.
+
+The working copy costs nothing. The whole activity becomes field copies:
+
+```c
+uint32_t type_word(Document *document, uint32_t n) {
+    Draft draft;
+    draft.length = document->length;
+    draft.cursor = document->cursor;
+    draft.edits = document->edits;
+    draft.length = draft.length + n;
+    draft.cursor = draft.cursor + n;
+    draft.edits = draft.edits + 1u;
+    uint32_t before = draft.cursor;
+    if (draft.cursor > 0u) {
+        draft.cursor = draft.cursor - 1u;
+    }
+    uint32_t moved = before - draft.cursor;
+    document->length = draft.length;
+    document->cursor = draft.cursor;
+    document->edits = draft.edits;
+    return moved;
+}
+```
+
+### 6.6 The body decides; the activity completes
+
+A body cannot leave its activity, so it cannot abort by jumping out. **It returns an outcome, and the activity matches on it to choose its completion:**
+
+```lua
+local Outcome = oneof { commit: Unit, abort: U32 }
+
+local attempt = do(document: Ref Document, body): Bool
+    local draft = Draft { ..document }
+    local committed: Bool = body(Ref draft) {
+        commit() = true,
+        abort(reason) = false,
+    }
+    if committed then
+        document = Document { ..draft }
+    end
+    return committed
+end
+```
+
+```lua
+local type_capped = do(document: Ref Document, n: U32, cap: U32): Bool
+    return attempt document do(..)
+        insert n
+        if length > cap then
+            return Outcome.abort length
+        end
+        return Outcome.commit()
+    end
+end
+```
+
+```c
+bool type_capped(Document *document, uint32_t n, uint32_t cap) {
+    Draft draft;
+    draft.length = document->length;
+    draft.cursor = document->cursor;
+    draft.edits = document->edits;
+    draft.length = draft.length + n;
+    draft.cursor = draft.cursor + n;
+    draft.edits = draft.edits + 1u;
+    if (draft.length > cap) {
+        goto L1;
+    }
+    bool r = true;
+    goto L2;
+L1:;
+    r = false;
+L2:;
+    if (r) {
+        document->length = draft.length;
+        document->cursor = draft.cursor;
+        document->edits = draft.edits;
+    }
+    return r;
+}
+```
+
+The rule "the activity owns completion" holds when things go wrong too: the body says what happened, and the activity decides what that means for the entity. The outcome type is part of the activity's contract, so give it outcome names (`commit`, `abort`, `retry`), not flags.
+
+Match the body's outcome at the call when completion needs it immediately. Known-tag returns can jump directly to their handlers, without a temporary tagged sum. This preserves effects and payload joins; it does not let a nested call steal the body's completion or remove an explicit native boundary. Keep an outcome in a local when the program genuinely needs to carry it elsewhere.
+
+### 6.7 Stack activities instead of adding options
+
+Each policy is its own activity, and the order of the spine is the order of completion:
+
+```lua
+-- a policy that completes after the work inside it
+local clamped = do(document: Ref Document, max: U32, body): Unit
+    body
+    if document.length > max then
+        document.length = max
+        document.cursor = max
+    end
+end
+
+local import_capped = do(document: Ref Document, stats: Ref Stats, n: U32): Unit
+    counted stats do
+    clamped(document, 100) do
+    transaction document do(..)
+        insert n
+    endall
+end
+```
+
+The transaction commits first, then the clamp applies, then the count is recorded, exactly as the spine reads from the inside out. `endall` closes the spine; it adds no semantics.
+
+### 6.8 Nesting composes
+
+Nested activities do not need to know about each other. A name the inner context lacks falls through to the enclosing ones, innermost first, so a block can speak to several activities at once:
+
+```lua
+-- nested activities compose: a name the inner context lacks reaches the outer one
+local Log = struct { notes: U32 }
+
+function Log:note(count: U32): Unit
+    self.notes = self.notes + count
+end
+
+local logged = do(body): U32
+    local log = Log { notes = 0 }
+    body(Ref log)
+    return log.notes
+end
+
+local type_logged = do(document: Ref Document, n: U32): U32
+    return logged do(..)
+        transaction document do(..)
+            insert n
+            note 1
+        end
+    end
+end
+```
+
+`insert` is the draft's; `note` is not, so it reaches the log. Both contexts are private, so the log disappears and the result is a constant:
+
+```c
+uint32_t type_logged(Document *document, uint32_t n) {
+    Draft draft;
+    draft.length = document->length;
+    draft.cursor = document->cursor;
+    draft.edits = document->edits;
+    draft.length = draft.length + n;
+    draft.cursor = draft.cursor + n;
+    draft.edits = draft.edits + 1u;
+    document->length = draft.length;
+    document->cursor = draft.cursor;
+    document->edits = draft.edits;
+    return 1u;
+}
+```
+
+If the draft also had a `note`, the draft's would win: the innermost context always does. Shadowing is how nesting works, so use it on purpose. When an override would hide something the block needs, the outer name is too generic, or the two activities should not be nested.
+
+### 6.9 Design the context's vocabulary
+
+The context type is the vocabulary of its block. Design it the way you would design a small language for that purpose:
+
+* **Verbs for what happens**, as methods: `insert`, `move_left`, `note`. A verb keeps the context's invariants, so the block cannot break them by writing fields.
+* **Fields for what the block reads**: `cursor`, `length`. A field the block must not write is a sign that a verb is missing.
+* **One context per purpose.** A block that reaches around its context for things it does not offer is two activities mixed together (§2, going back to step 4).
+* **Outcomes for how it can end** (§6.6), named for what happened.
+* **Names that read in the block**: an instruction is read without its receiver, so `insert n` must say everything `draft:insert(n)` said.
+
+### 6.10 Builders: activities while compiling
+
+A **builder** is an activity whose context is a vocabulary, a Lua table, and whose completion returns a description or a type. It runs once, while the program is built: the block's instructions declare things, and the builder collects them. Nothing of the block survives, so a builder needs no current-builder global and no interface argument on every method.
+
+```lua
+-- a builder: the block declares, the builder returns a description
+local keymap = function(body)
+    local bindings = {}
+    local vocabulary = {
+        bind = function(key)
+            return function(command)
+                bindings[#bindings + 1] = { code = key:byte(), .command }
+            end
+        end,
+    }
+    body vocabulary
+    return bindings
+end
+
+local editor_keys = keymap do(..)
+    bind "h" (Command.move(Direction.left()))
+    bind "l" (Command.move(Direction.right()))
+    bind "u" (Command.undo())
+end
+
+-- the engine over the description: one test per binding, each command folded
+local on_key = do(document: Ref Document, key: U8): Unit
+    for _, binding in ipairs editor_keys do
+        if key == binding.code then
+            apply(document, binding.command)
+        end
+    end
+end
+```
+
+The description is known, so the engine (`apply`, §17) dissolves into one test per binding:
+
+```c
+void on_key(Document *document, uint8_t key) {
+    if (key == 104u) {
+        if (document->cursor > 0u) {
+            document->cursor = document->cursor - 1u;
+        }
+    }
+    if (key == 108u) {
+        if (document->cursor < document->length) {
+            document->cursor = document->cursor + 1u;
+        }
+    }
+    if (key == 117u) {
+        document->edits = document->edits + 1u;
+    }
+}
+```
+
+What a builder's vocabulary offers, and how to design one:
+
+* **Declarations** create named parts, often as nested builders with blocks of their own (`button "save_button" do(..)`).
+* **Properties** set a value on the current part (`px 4`, `caption "Save"`). Instructions run in order, so **a later setting wins**: no merge rules or priorities are needed.
+* **Variants** are nested blocks that record conditional settings (`hover do(..) bg blue_700 end`).
+* **Tokens** are names for known values, opened with the vocabulary (`md`, `red_600`); give them a kind so a wrong argument is an error at its line.
+* **Sharing** is a block applied to the current part (`use primary`).
+* **Nesting composes** exactly as in §6.8: a name the inner part lacks reaches the enclosing one.
+* **Keep builders pure** (§9.3): they build descriptions; engines, which are words, do the work.
+
+A builder is "describe, then run" (§17) with a syntax that reads like the domain. The UI library is the full example: a component is declared with a builder, its events become a sum, and its layout, routing and drawing are generated over the known tree ([UI components](ui-components.md), [UI style](ui-style.md)).
+
+## 7. Step 5: states
+
+Anything with a lifecycle is a state diagram first:
+
+```mermaid
+stateDiagram-v2
+    [*] --> reading
+    reading --> reading : bytes
+    reading --> rejected : bad line
+    rejected --> reading : next event
+    reading --> closed : hang up
+    closed --> [*]
+```
+
+In Nua a state diagram is a `oneof` of states and one word from state to state. Each transition is a value-to-value word, so it can be checked while compiling:
+
+```lua
+-- a lifecycle as a sum, and one word per transition
+local Conn = oneof { reading: U32, rejected: U32, closed: Unit }
+local Event = oneof { bytes: U32, bad_line: Unit, hang_up: Unit }
+
+local step = do(c: Conn, e: Event): Conn = c {
+    reading(n) = e {
+        bytes(k) = Conn.reading(n + k),
+        bad_line() = Conn.rejected n,
+        hang_up() = Conn.closed(),
+    },
+    rejected(n) = Conn.reading 0,
+    closed() = Conn.closed(),
+}
+```
+
+```lua
+assert(host(buffered_after(U32 4)) == 7)
+```
+
+* **Every state is a variant, and every match handles every variant.** A "cannot happen" arm means a state is missing from the diagram.
+* **A known event sequence dissolves the machine.** `buffered_after` starts from a known state and a known event kind, and compiles to `return 3u + k;`. Over runtime events the same `step` is a `switch`: one engine either way (§17).
+
+## 8. Step 6: concurrency
+
+Go's model, fitted to a language without a garbage collector: **tasks share no memory, and every lifetime is a scope.** Draw it as a dataflow: boxes are tasks, arrows are channels labelled copy or move, and frames are scopes.
+
+```mermaid
+flowchart TB
+    subgraph S[tasks scope: line_count]
+        R[reader] -- "Slot Chunk (move)" --> W
+        subgraph C[tasks scope: crew]
+            W[workers x N]
+        end
+        W -- "U32 counts (copy)" --> B[scope body: sums]
+    end
+    F[(file, opened outside)] --> R
+```
+
+### 8.1 Share nothing
+
+A spawned block sees the outside through copies taken when it is spawned. Assigning one is rejected, and a `Ref`, `Ptr`, `Slice` or `CString` cannot be copied in at all: each points into memory someone else owns. When the compiler says `a task shares no memory`, the design is asking for a message or a move.
+
+### 8.2 One owner task per entity
+
+An entity that several tasks need belongs to one task; the others send it requests and receive replies on channels they pass along. There is no shared state to draw, so the dataflow never needs a lock.
+
+### 8.3 Scopes own lifetimes
+
+A `tasks` scope ends when its body and all its tasks have, and its channels and pools retire with it. To wait for a group of workers and then act (Go's WaitGroup), give the group a scope of its own, and act when it ends. Every channel in the diagram has a closer, and every scope an end.
+
+### 8.4 Messages are copied; buffers move
+
+Use channels for messages. Use a pool for buffers: take a slot, fill it in place, send the slot. Ownership moves with it, and the receiver uses it in place. `pool[slot]` checks ownership at every use, so a slot used after it was sent traps.
+
+### 8.5 Putting it together
+
+This word counts the lines of a file. The scope body opens the file (a path is a `CString`, which no task may hold) and hands the `File` to a reader task. Workers run in a scope of their own, so `counts` closes exactly when the last worker finishes:
+
+```lua
+local line_count = do(workers, path: CString): U32
+    local total: U32 = 0
+    io.open(path, io.READ) {
+        done = do(file)
+            tasks do(..)
+                local chunks = pool(Chunk, 8)
+                local filled = channel(Slot Chunk, 8)
+                local counts = channel(U32, 8)
+                spawn do
+                    local more: Bool = true
+                    while more do
+                        local slot = chunks:take()
+                        io.read(file, chunks[slot].bytes) {
+                            done = do(n) chunks[slot].n = n end,
+                            failed = do(e) chunks[slot].n = 0 end,
+                        }
+                        if chunks[slot].n == 0 then
+                            chunks:release slot
+                            more = false
+                        else
+                            filled:send slot
+                        end
+                    end
+                    filled:close
+                end
+                -- the workers run in a scope of their own: when it ends, counts can close
+                spawn do
+                    tasks do(crew)
+                        for _ = 1, workers do
+                            crew.spawn do
+                                filled:each do(slot)
+                                    counts:send(count_lines chunks[slot])
+                                    chunks:release slot
+                                end
+                            end
+                        end
+                    end
+                    counts:close
+                end
+                counts:each do(lines)
+                    total = total + lines
+                end
+            end
+            io.close(file) { done = do() end, failed = do(e) end }
+        end,
+        failed = do(e) end,
+    }
+    return total
+end
+```
+
+Count what chunking cannot split: a word can straddle two chunks, a newline cannot. The reads go straight into pool slots, and the slots move to the workers, so no byte is copied between tasks.
+
+### 8.6 Choose, time out, block
+
+`first_of` takes whichever operation completes first. It admits operations the runtime can take back: receives, sends, takes and timers:
+
+```lua
+        first_of {
+            recv replies do(v) answer = v end,
+            after(seconds 1) do answer = 0 end,
+            closed = do end,
+        }
+```
+
+I/O is never a case, because the kernel's work cannot be taken back. Give an I/O operation a deadline, or spawn a task for it. A call into C that may block goes in `blocking do ... end`, so it never holds a worker.
+
+### 8.7 When it goes wrong
+
+* **Deadlock is reported, not hung.** The runtime names each wait with its source line.
+* **Misuse traps**: a send on a closed channel, a stale handle, a slot used by a task that does not own it.
+* **Cancellation is closing a channel.** There is no other mechanism, so no operation grows a third outcome.
+
+## 9. Step 7: composition and edges
+
+```mermaid
+flowchart LR
+    subgraph Edges
+        io[require nua.io] --- c[externs]
+    end
+    subgraph Core[pure core]
+        words[words from values to values]
+    end
+    root((exports)) --> Edges
+    root --> Core
+    cfg[[config, read in Lua]] -. start-up .-> Core
+```
+
+### 9.1 Roots, edges, core
+
+* **Exports are the composition roots.** C calls them, and they wire the parts together. Only what they reach is compiled.
+* **Effects enter at the edges.** Externs, `require "nua.io"` and the POSIX library are opened at the outside and passed in. The word that opens a file is not the word that parses it.
+* **The pure core decides.** Words from values to values are testable while compiling. Applied to known values, a typed word computes in the compiler, and Lua asserts the answer:
+
+```lua
+assert(host(tab_stop({ tab_width = 8 }, U32 3)) == 8)
+```
+
+### 9.2 What is Lua, and what is a word
+
+The line between host Lua and typed words is the main structural decision of a Nua program:
+
+| In host Lua | In typed words |
+|---|---|
+| reading configuration, flags and schemas | everything that runs |
+| building descriptions: types, tables, scripts | engines that consume descriptions |
+| generating types and vocabularies | the domain's verbs |
+| choosing what to compile (`export`, `native`) | |
+| compile-time tests (`assert(host(...))`) | |
+
+Modules are ordinary Lua values returned through `require` (see [module loading](architecture.md#13-modules-and-the-compilation-scope)). A library module exports types and words; a program module exports its edges.
+
+### 9.3 Discipline for compile-time Lua
+
+Lua at compile time can do anything, and a convention is not a sandbox. Keep generators and description builders:
+
+* **deterministic:** no clock, no unseeded randomness, no I/O except declared start-up input;
+* **pure:** functions of their inputs, because specialization keys and caching assume that equal inputs give equal code.
+
+## 10. Step 8: the skeleton
+
+Write code top-down, in this order:
+
+1. **Types** from steps 2, 3 and 5: values, entities, owned storage, sums.
+2. **The composition root,** with the words you wish you had.
+3. **The pure core,** with compile-time asserts as you go.
+4. **Activities and their contexts** from step 4.
+5. **Tasks and channels** from step 6.
+6. **Edges:** I/O and C.
+
+The skeleton is done when it compiles, its asserts pass, and every element of the diagrams has its counterpart in code.
+
+## 11. Step 9: verify
+
+### 11.1 Read the C
+
+Put cost requirements on the inner loops, codecs and engines that matter, then **read the C**: `luajit nua.lua program.nua` prints it. Know what stays:
+
+* **A check nothing proves stays.** `first_or` keeps one, because the fact `i < xs.length` does not travel from the producer's loop into the handler's joined payload. The immediate match removes the tagged sum, not this bounds check:
+
+```c
+uint32_t first_or(U32Slice xs, uint32_t fallback) {
+    uint32_t payload;
+    uint32_t i = 0u;
+    for (;;) {
+        if (i >= xs.len) break;
+        if (xs.ptr[i] != 0u) {
+            payload = i;
+            goto L1;
+        }
+        i = i + 1u;
+    }
+    return fallback;
+L1:;
+    if ((uint64_t)payload >= (uint64_t)xs.len) {
+        nua_trap("slice index out of range");
+    }
+    return xs.ptr[payload];
+}
+```
+
+* **A check a branch proved goes.** The loop's own `xs[i]` has none: the loop condition proved `i < xs.length`.
+* **Lookups are checked once per stretch.** `store[id]`, `g[i]` and `pool[slot]` look again after anything that could change the answer (a structural change, a slot moving, a call into C, a loop round), and not otherwise.
+* **Waits are calls.** Every channel operation, take, sleep and I/O operation is a visible call into the runtime.
+* **Allocation is in the runtime, and only there.** Task frames, channels and pools are allocated by the runtime. Stores and Grow arrays live on data stacks. Plain words allocate nothing.
+
+### 11.2 Code size and compile time
+
+The numerical reports and timings in this section are historical examples from
+before the boundary-free library/runtime reset. They explain the tools, not the
+current baseline. Use fresh measurements before making a new tuning decision.
+
+Evaluation in place is what makes a program small when little is left to do. It makes the C large when a large word is applied at many sites, because each site gets its own copy, and the C compiler then spends its time on all of them. `call` puts a function boundary at one site, and `nua size` finds the sites worth one. The language rule is in [the syntax](syntax.md#39-call-a-function-boundary-at-one-site).
+
+The loop, one change at a time:
+
+```sh
+luajit nua.lua program.nua | wc -l                  # 1. how much C
+time luajit nua.lua -o program.c program.nua        #    how long nua takes
+time cc -O1 -c program.c                            #    how long the C compiler takes
+luajit nua.lua size program.nua                     # 2. where it comes from
+luajit nua.lua size program.nua --compare           # 3. what one decision is worth
+luajit nua.lua --split out program.nua              # 4. one C file per function
+ls out/*.c | xargs -P16 -n1 cc -O2 -I runtime -c     #    built in parallel
+```
+
+Put `call` before one application, measure again, and keep the change only if the C shrank by a useful amount. When the program compiles in a time you accept, stop. A program over 20,000 lines of C prints a note on stderr pointing at `nua size`.
+
+The report says how much C each module wrote, names the largest functions, and gives the lines one shared copy would save for each word evaluated in place at several sites:
+
+```text
+examples/stores.nua: 1,546 lines of C from 108 source lines (14x), 16 functions
+
+where the C comes from
+       852   55%  lib/stacks.nua
+       142    9%  lib/storage.nua
+        47    3%  lib/storage_layout.nua
+        43    3%  examples/stores.nua
+        10    1%  runtime/tasks.nua
+         9    1%  runtime/process.nua
+       443   29%  declarations, headers and function prologues
+
+largest functions
+      506  uint32_t churn(uint32_t n)
+      200  uint32_t run(uint32_t n)
+      192  uint32_t sum_depths(uint32_t n)
+
+words evaluated in place at several sites (what one `call` would share)
+      saves   sites       each  word
+        463       6         93  add  (./lib/storage.nua:45)  every site is in a loop
+      examples/stores.nua:13  x6  555 lines  (in a loop)   return self.nodes:add Node {
+        321      18         19  region  (./lib/stacks.nua:120)
+      lib/storage_layout.nua:91  x17  323 lines  (in a loop)   return Items stacks.region(h.stack, h.base, bytes)
+      lib/stacks.nua:150  x1  17 lines   if n ~= 0 then move(stacks.region(index, dst, n), src, n) end
+        300      16         20  items  (./lib/storage_layout.nua:88)
+      lib/storage.nua:58  x6  120 lines  (in a loop)   local items = p.items s
+      lib/storage.nua:50  x6  120 lines  (in a loop)   local items = p.items s
+      lib/storage.nua:31  x4  80 lines   local items = p.items s
+
+"saves" and "each" count lines of C. Put `call` before the application at a
+site above (`call m:put(k, v)`), or inside the library word that is applied
+everywhere; every `call` of the same word and key then shares one function.
+A call site and its argument setup add lines back, so measure the C after a
+change: `saves` is the copies one shared function removes, not the net diff.
+```
+
+* **where the C comes from** is the C by the module that wrote it, so you can see whether the size is your program or a library's; the last line is declarations, headers and function headers. In this program half of it is `lib/stacks.nua`, the data-stack accessors, which every store or map operation reaches.
+* **largest functions** are the generated C functions by line count: one that dominates is a word that applies many large words.
+* **saves** is how many lines of C one shared copy per specialization key would remove; **sites** how many times the word was applied in place; **each** how many lines one application adds.
+* The lines under a word are its heaviest sites in your source: the applications to put `call` before.
+* A large **saves** with a small **each** means one small body copied hundreds of times: worth a boundary for size, but it is on whatever path reaches it, so check that the path is not hot.
+* Words of a line or two, or that would save under 100 lines, are left out.
+* Figures count nested words inside the words that contain them. Act on the first entry, then run the report again.
+* **`--split dir`** writes one C file per function beside a header, so the C compiler can work in parallel: on `examples/maps.nua` that is 141 units, 1.5 s as one unit against 0.9 s on 16 cores at `-O2` and 1.9 s against 0.9 s at `-O3`. Link with `-flto` if the cross-function inlining the single unit got for free matters; without it the map harness runs about 9% slower.
+* **`--compare`** compiles the program three ways: `inline` (every `call` ignored), `written` (as it is) and `share` (a boundary at every application that can have one). These are experiments, not tuning targets. The printed means do not measure runtime cost or lost specialization, and the all-shared experiment may be expensive or unavailable. Start without explicit boundaries; consider a few only when current measurements justify them. `--profile inline|share` gives the full report for one policy.
+* **Runtime and library words appear in the report too**, because the runtime is built with the program and its words are evaluated in place like any other ([architecture §12.2](architecture.md#122-the-runtime-is-built-with-the-program)). Their sites are named where they are written (`runtime/scheduler.nua:256`), and their `call`s are the libraries' business, not yours. Only what reaches the C is counted, so a word the runtime stages for a program that never names it is not in the list.
+
+**Start without boundaries.** The maintained libraries and runtime contain no explicit `call` directives. Hashing, maps, storage and scheduler policy specialize with their callers. Keep that fresh baseline: only if a concrete program is too large should a size report and runtime measurements motivate adding a few calls. Compiler fixtures deliberately retain calls to test the language feature; they are not tuning examples.
+
+**When not to.** Do not add `call` just because a report lists a repeated word. A boundary can block constant propagation and force register-local state into memory. Generated C size is not runtime speed, and a historical benchmark does not settle the current choice. A call also specializes on arguments known at its site, so many different constants can create many separate functions rather than one shared body.
+
+**Things that surprise.** A word containing `call` still runs at compile time on known inputs: `call` is ignored while evaluating at compile time, so `host(hash.sip24(...))` works. `return call f(x)` returns the call; it is not a tail jump. And `call` needs a native word: an untyped Lua function is an error, and a foreign function is already a call.
+
+**The runtime is in the count.** A program's C carries the runtime words it reaches ([architecture](architecture.md#122-the-runtime-is-built-with-the-program)). `hello` is 14 lines; `examples/channel_iteration.nua`, 18 source lines that iterate a channel, compiles to 2,455 lines of C, almost all of it the scheduler. A program that never waits carries none of that, so a size surprise in a program with tasks is usually the program, not the runtime.
+
+### 11.3 Tests
+
+* **The pure core:** compile-time asserts, `assert(host(...))`, next to the words.
+* **Exports:** `nua.load path` loads a program into the Lua test runner, often simpler than a C harness; C harnesses where the caller really is C.
+* **Anything that specializes:** the differential fuzzer (`nua fuzz`, `nua fuzz --storage`, `nua fuzz --tasks`), which checks that every binding-time split gives the same results on both backends.
+* **Edges:** real files, sockets and descriptors, at the edges only. The guide you are reading is checked this way: `make test` compiles [`examples/guide.nua`](../examples/guide.nua) to strict C, runs it against [`tests/guide_main.c`](../tests/guide_main.c), and compares this page with it.
+
+### 11.4 Measure
+
+Measure against the requirements written in step 0. When a number is wrong, the going-back rules (§2) say which step to revisit.
+
+---
+
+# Part II — Writing words
+
+## 12. Subject first, body last
+
+A call should read like a sentence: subject, verb, objects, continuation. A method makes the subject the receiver:
+
+```lua
+function Document:move_left(): Unit
+    if self.cursor > 0 then
+        self.cursor = self.cursor - 1
+    end
+end
+
+function Document:at_end(): Bool
+    return self.cursor == self.length
+end
+```
+
+Put the body last when the word establishes structure: `transaction document do(draft..) ... end`.
+
+## 13. Let the contract say copy or borrow
+
+| Operation | Usual design |
+|---|---|
+| maintain a component's own invariants | a method: `self` is a reference |
+| query or transform a value | a word taking `T` |
+| coordinate mutation from outside a component | a word taking `Ref T` |
+
+A `T` parameter is a copy; a `Ref T` parameter writes through. A method call on a value (not a place) works on a temporary, never silently on a copy the caller thinks it still has.
+
+## 14. A match reads as a protocol
+
+Handlers are named after outcomes, and the handler sugar `name(p) = e` keeps short arms short:
+
+```lua
+local first_or = do(xs: Slice U32, fallback: U32): U32
+    return find_nonzero(xs) {
+        found(i) = xs[i],
+        missing() = fallback,
+    }
+end
+```
+
+## 15. Keep known information available
+
+**An untyped parameter of a native word is a compile-time parameter.** Configuration, grammars, layouts and counts known before run time belong there, usually as Lua tables:
+
+```lua
+local tab_stop = do(config, column: U32): U32
+    local width: U32 = config.tab_width
+    return (column / width + 1) * width
+end
+
+local tab_stop_4 = tab_stop { tab_width = 4 }
+```
+
+```c
+uint32_t tab_stop_4(uint32_t column) {
+    return (column / 4u + 1u) * 4u;
+}
+```
+
+**Typed is not the same as runtime.** A typed parameter receives whatever the caller has: applied to a known value, it computes while compiling. An untyped parameter is always known. Do not erase known information by routing it through C, a store, or a channel on a hot path.
+
+**Do not decide inlining for speed.** Applying a word evaluates its body in place: there is no inlining decision to make, and no speed cost to small words. A C function appears for exactly two reasons: an export, or a word re-entered in non-tail position (recursion). A tail call is a loop. Write the words the domain needs, at the size the meaning wants, and decide sharing only for code size (§11.2).
+
+## 16. Connecting behavior
+
+| Connection | Use |
+|---|---|
+| ordinary result | a computation producing a value: the default |
+| subject block | a block receiving a thing to act on: `ch:each do(v) ... end` |
+| activity block | a block receiving a context and speaking its instructions: `do(draft..)`, `do(..)` |
+| builder block | a block declaring a structure while compiling: `keymap do(..)`, `ui.component "Name" do(..)` (§6.10) |
+| keyed handlers | one behavior per outcome: matching a sum, a receive, an I/O result |
+| channel | values crossing tasks (§8) |
+
+**Saturating chains.** `transaction document do(draft..) ... end` applies `transaction` to its arguments group by group until it is saturated. The signature decides the invocation point, not the parser. A pending runtime argument stays inside its chain; it never becomes a runtime closure (Nua has none).
+
+## 17. Describe, then run
+
+When a problem has structure (a grammar, a key map, a protocol), write the structure as data and an engine that consumes it. Keep one engine:
+
+```lua
+local apply = do(document: Ref Document, c: Command): Unit
+    c {
+        move = do(d)
+            d {
+                left() = document:move_left(),
+```
+
+Over a description known while compiling, the engine dissolves:
+
+```lua
+local greeting = { Command.insert 5, Command.move(Direction.left()), Command.insert 1 }
+local type_greeting = do(document: Ref Document): Unit
+    for i = 1, #greeting do
+        apply(document, greeting[i])
+    end
+end
+```
+
+```c
+void type_greeting(Document *document) {
+    document->length = document->length + 5u;
+    document->cursor = document->cursor + 5u;
+    if (document->cursor > 0u) {
+        document->cursor = document->cursor - 1u;
+    }
+    document->length = document->length + 1u;
+    document->cursor = document->cursor + 1u;
+}
+```
+
+Over a description known only at run time, the same engine is a loop with a `switch`:
+
+```lua
+local replay = do(document: Ref Document, commands: Ref(Grow Command)): Unit
+    local i: U32 = 0
+    while i < commands.length do
+        apply(document, commands[i])
+        i = i + 1
+    end
+end
+```
+
+A description is often best written with a builder (§6.10): the block reads like the domain, and the builder hands the engine a Lua table. Do not maintain a second, hand-specialized implementation. Read the C to confirm the interpretation vanished. This is where binding time pays most (§3): an engine over a known description loses its whole interpretive overhead.
+
+## 18. Arithmetic and operators
+
+Arithmetic is C's, exactly: folding while compiling follows C's widths, wraparound and conversions, and undefined behavior (signed overflow, division by zero, oversized shifts) is rejected where it is known. Operators belong to numbers. Bitwise operations are words (`band`, `bor`, `shr`) because Lua's operators cannot be staged for them. I/O, sending, matching and text are named words, never symbols.
+
+### 18.1 Type hooks
+
+A type's layout is a `struct`; what the language's operations mean on it is a hook stored on the type under a `__` name ([syntax §16](syntax.md#16-library-defined-types)): `__index` and `__newindex` for `x[k]`, `__cast` for a value given where the type is expected, `__add` and the other arithmetic hooks, `__eq`, `__lt` and `__le`, and `__member` for `x.name`. Hooks run while specializing, so whatever they build folds and residualizes with the caller, and they cost nothing at run time. The built-in types use the same hooks.
+
+**A hook gives an operation the meaning the reader already expects.** If the meaning needs explaining, it is a named word.
+
+**One identity per type.** `__eq` is the one hook that can disagree with something else in the language: a map compares the *semantic encoding* of a key (declared fields, the active payload, the used bytes of a `Chars`), not the type's hook. So a type that defines `__eq` — or a type a key encoding walks through — cannot be a map key, and the compiler says so where the map type is built ([syntax §15.2](syntax.md#152-semantic-keys-and-checked-references)). Key the map by the fields that compare structurally, or by an `Id`, which is identity by token, slot and generation.
+
+| Hook | Use it for | Not for |
+|---|---|---|
+| `__index`, `__newindex` | a container's element: `ring[i]` returns a checked place, as `store[id]` does | a lookup that can miss: that is `find`, returning a sum |
+| arithmetic, comparisons | numbers: fixed point, units, vectors, dual numbers | text, collections, anything that is not a number |
+| `__cast` | known host values becoming the type (literals), and explicit conversions `T(v)` | silent conversions between unrelated types |
+| `__member` | a family whose members follow from its parameters | members a method would declare: methods keep a type's vocabulary listable |
+
+```lua
+local Fixed = struct { raw: I32 }  -- a number with 16 fractional bits
+
+function Fixed.__cast(v, T)  -- a Lua number where a Fixed is expected
+    if type v == 'number' then
+        return Fixed { raw = I32(v * 65536) }
+    end
+end
+
+function Fixed.__add(a: Fixed, b: Fixed): Fixed
+    return Fixed { raw = a.raw + b.raw }
+end
+
+function Fixed.__lt(a: Fixed, b: Fixed): Bool  -- comparisons are staged in typed bodies: a native word
+    return a.raw < b.raw
+end
+```
+
+`x + 1.5` on a `Fixed` converts `1.5` through `__cast` while compiling, then adds two integers. A container is the same pattern on `__index`: [`examples/ring.nua`](../examples/ring.nua) is a bounded ring buffer written as a library, a struct holding a `Grow`, with methods and an `__index` that returns a `Ref`.
+
+**Fields are public.** A hook reads the representation with ordinary field access, and so can any caller. When a type has an invariant (a length within capacity, a head within bounds), only its methods and hooks write the fields that carry it; say so in the type's one-line promise, and check it in review.
+
+**Hooks follow the rules of compile-time Lua (§9.3):** deterministic, building values and choosing words, with no effects of their own.
+
+---
+
+# Part III — Style
+
+## 19. Naming
+
+> **A name is a promise. A vocabulary is a set of promises spoken together.**
+
+**PascalCase for types, including built-ins; snake_case for words and values.** Nua's own types already do: `U32`, `Store`, `Chan`, `Pool`, `Slot`, `Array`.
+
+| Role | Convention | Examples |
+|---|---|---|
+| entity or value type | PascalCase noun | `Document`, `Heading`, `Command` |
+| activity context type | PascalCase noun for what the body holds | `Draft`, `Batch`, `Tally` |
+| instance or parameter | snake_case role | `document`, `outline` |
+| action | imperative verb | `insert`, `apply`, `release` |
+| transformation | participle or adjective | `trimmed`, `translated` |
+| query | the thing returned | `line_count`, `tab_stop` |
+| predicate | proposition | `at_end`, `has_selection` |
+| activity word | purposeful word, or `with_` + resource | `transaction`, `attempt`, `counted`, `with_file` |
+| activity block parameter | snake_case noun, matching the context type | `draft`, `batch`, `file` |
+| declared part (a field a builder declares) | long, descriptive snake_case: what it is | `increment_button`, `question_label`, `count_display` |
+| builder instruction | the domain's own vocabulary | `bind`, `button`, `px`, `bg` |
+| outcome of a body | snake_case outcome | `commit`, `abort`, `retry` |
+| sum alternative | snake_case outcome | `found`, `missing`, `done`, `timed_out` |
+| library | snake_case domain | `io`, `posix` |
+
+**Activity words say what is guaranteed; contexts are nouns for what the body holds.** `transaction` guarantees a commit; the body holds a `draft`. The context type and the block parameter share one noun: `Draft`, `do(draft..)`. A gerund is the fallback only when the context is the state of an ongoing process with no natural noun.
+
+| Kind of activity | Activity word | Context |
+|---|---|---|
+| working copy | `transaction`, `attempt` | `Draft` / `draft` |
+| in place | (opening a place) | the entity's own name: `local node.. = g.nodes[id]` |
+| scoped resource | `with_file` | the resource: `file` |
+| accumulator | `counting`, `importing` | what accumulates: `Tally` / `tally`, `Batch` / `batch` |
+| policy | `counted`, `timed`, `clamped` | none |
+
+**Names carry the reading, not parentheses.** The house style drops every call parenthesis that grouping does not need: `release slot`, `insert 5`, `counted stats do`. That works only when names are descriptive. If a line is confusing without parentheses, adding them back hides the problem: the names are not descriptive enough (`p:release s` instead of `pool:release slot`), or the design is wrong (a word with a role-less argument, a chain that applies too much at once, a flag where a sum or two words belong). Rename or redesign until the line reads as a sentence.
+
+**Prefer long, descriptive names for declared things.** A declared part shares a namespace with its owner's methods, and a name that says what the part is (`increment_button`) never competes with one that says what a method does (`increment`). Instructions are read without their receiver, so their names must carry the whole meaning.
+
+**Let the receiver carry the subject:** `document:move_left()`, not `document:move_document_left()`. **Name for the call site:** no unexplained flags; prefer two words or a sum. **Use shadowing deliberately:** openings follow ordinary lexical shadowing, so later vocabularies can override earlier ones. When an override would obscure the subject, ask whether a name is too generic or a homonym should stay qualified (`do(crew)` instead of `do(crew..)` inside an opened scope).
+
+## 20. Spelling forms
+
+| Form | Use |
+|---|---|
+| juxtaposition | one simple argument, the default: `insert 5`, `release slot`, `Ref draft`, `tab_stop { tab_width = 4 }` |
+| parentheses | grouping and zero-argument calls in expressions; standalone `refresh`, `screen.refresh` and `screen:refresh` need no `()` |
+| `word` | zero-argument call statement |
+| `word()` | zero-argument invocation in an expression; also valid as an explicit statement |
+| trailing block | scopes, iteration, activities, builders |
+| instruction | inside an opened block, a call without a receiver: `insert n`, `note 1`, `bind "h" (...)` |
+| headed braces | construction (`Document { ... }`) or handlers (`s { ... }`) |
+| `do(x) = e` | a small expression lambda |
+| `do(x) ... end` | a callback with statements |
+| `endall` | the closing run of a trailing-block spine |
+| `local x = e` | a native local of `e`'s type, holding `e`'s value now; a Lua value stays a host binding |
+| `local x: T = e` | a type other than the initializer's, or storage declared without one |
+
+A standalone name is an instruction: `refresh` calls `refresh()`. In an expression the name remains a value: `local action = refresh` saves the callable, while `local result = refresh()` invokes it. The formatter's minimal call style removes empty parentheses only from call statements.
+
+Parentheses group; they do not explain. Application binds tighter than operators and takes a name's full postfix chain (`count_lines chunks[slot]` is `count_lines(chunks[slot])`), so parentheses are needed only where grouping differs. When a line needs them to be understood, rename or redesign (§19).
+
+## 21. Formatting
+
+**`nua fmt` is the house style.** Run `luajit nua.lua fmt --check` in CI and `--write` before committing; its defaults (4-space indentation, a 100-column soft target, minimal call parentheses) are this guide's. See [formatting](formatting.md) for its settings and guarantees. What it leaves to you:
+
+* **Where lines break.** The formatter keeps your statement and application line boundaries. Break a long application at its argument groups, and put each handler of a multiline match on its own line.
+* **Keep `do` on its owning call's line.** A `do` on the next line keeps its parentheses and reads as a separate argument.
+* **A flat spine for stacked activities:** the opening calls aligned, the innermost body indented once, one `endall`. The formatter keeps that shape.
+* **Multiline braces take a trailing comma.**
+* **One blank line between top-level words; `export name` directly after the word it exports; `require`s first.**
+
+## 22. Files and libraries
+
+* **A file is a vocabulary or a program.** A program file defines its words and exports its edges. A library returns ordinary Lua values through `require`. Bundled vocabularies live in `lib/` and use names such as `require "nua.io"`; project modules use their own names. Lua's `require "io"` still names Lua's I/O library. See [module loading](architecture.md#13-modules-and-the-compilation-scope) for paths and compilation lifetimes.
+* **Newspaper order:** `require`s; types; exported words, each with a one-line promise; private helpers.
+* **Dependencies point toward the domain.** Activities use entities; entities do not import every activity that can operate on them.
+
+## 23. Comments
+
+Explain why when the code says what. State what a signature cannot: an invariant, an ownership obligation, a cost condition. Give each exported word one sentence of promise. An overview of a subtle engine saves the reader a reconstruction; write it.
+
+## 24. Anti-patterns
+
+| Anti-pattern | Prefer |
+|---|---|
+| an engine interpreting, at run time, a description known earlier | specialize on it: an untyped parameter, or `native` at start-up |
+| hand-unrolling, or a second specialized copy of an engine | a host loop or a compile-time parameter over one engine |
+| a runtime parameter for configuration known before run time | an untyped parameter: a Lua table |
+| `dynamic e` to "help" the compiler | nothing; `dynamic` only makes a key repeat on purpose |
+| an extra word kept "for inlining" or avoided "for performance" | the word the meaning wants; evaluation inlines |
+| a `call` in a hot site, or on a word the report does not name | measure; share only what the report says pays |
+| references, slices or text views stored in structs | `Id`s, `Chars n`, or a `Ptr` at a foreign boundary |
+| the body's verbs added to the entity | a context type with those verbs, and an activity word |
+| an activity configured by flags | stacked policy activities |
+| a builder that keeps a current-builder global, or an interface argument passed to every method | a block that opens the builder's vocabulary (§6.10) |
+| a block that writes a context's fields to get around its verbs | the verb that is missing (§6.9) |
+| naming every context to reach outer names | `do(..)`, and let names fall through (§6.8) |
+| an operator or `__member` with a meaning the reader must look up | a named word or a method |
+| parentheses added so a line can be read | descriptive names, or a better split of the words |
+| a body that aborts by jumping out | an outcome the activity matches on |
+| locks or atomics to coordinate tasks | channels for messages, pools for buffers |
+| state shared by several tasks | one owner task; the others send it requests |
+| a task that writes its spawner's locals | a message back, or results collected in the scope body |
+| a closer that guesses when workers are done | a scope of their own: close when it ends |
+| I/O raced in `first_of` | a deadline, or a task that sends its result |
+| a blocking C call in a task | `blocking do ... end` |
+| ignoring an outcome | handle it: the match is exhaustive for a reason |
+| a magic value for absence | a sum |
+| a clock or randomness in compile-time Lua | inputs read at start-up and passed in |
+| counting what a chunk boundary can split | count what it cannot, or carry state across chunks |
+| assuming a check vanished | read the C |
+
+## 25. Review checklist
+
+* **Binding time:** what is known while compiling, and at start-up? Is it still known where it is used? Is any description interpreted at run time?
+* **Names:** do calls read as sentences? Is each context a noun for what the body holds, shared by its type and its block?
+* **Ownership:** does every type have one role, and every arrow one kind? Who owns each mutable thing?
+* **Hooks:** does each hook mean what its operation already means? Are fields that carry an invariant written only by the type's methods and hooks?
+* **Activities:** who sets up, who completes, and how does a body abort?
+* **Instructions:** does each block speak only its context's vocabulary and its enclosing activities'? Does each instruction read as a sentence without its receiver? Does a builder leave only a description or a type behind?
+* **States:** is every lifecycle a sum, with every arm handled?
+* **Outcomes:** is every actionable result a sum, and each failure the right kind (§4.2)?
+* **Concurrency:** does anything cross a task except copies and moves? Does each entity have one owner task, each scope an end, each channel a closer?
+* **Edges:** are effects opened at the outside and passed in? Is compile-time Lua deterministic?
+* **Cost:** have you read the C for the inner loops, and measured what step 0 requires? Is code size acceptable?
+* **Tests:** do compile-time asserts cover the core, `nua.load` or harnesses the exports, and the fuzzer what specializes?
+
+## 26. Status
+
+The forms and libraries in this guide are implemented in the prototype and exercised by [`examples/guide.nua`](../examples/guide.nua). Whole programs in `examples/` show them composed: [`base64.nua`](../examples/base64.nua) is one loop between two buffer activities, reading `stdin` and writing `stdout` through `read`/`write` externs; `count_lines.nua` does its I/O by completion; `strmaps.nua` is libraries over a text map. [The syntax](syntax.md) and [the architecture](architecture.md) say what is not implemented. Formatting and naming here are house conventions, not grammar.
+
+## Maxim
+
+> **Decide what is known, and when. Model the values. Own the state. Name the words. Enter the activity: open the context, speak its instructions, bind a value to remember it, and let the activity complete. Describe with builders, run with words. Specialize what is known; share nothing between tasks; read the C.**

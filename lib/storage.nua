@@ -1,0 +1,133 @@
+-- Owned collection policy is Nua; p supplies the representation header and
+-- acquires its items. An operation acquires once, works on the items, and
+-- acquires again only after a push, the one thing that moves them.
+local stacks = require "nua.stacks"
+local storage = {}
+local trap = extern("nua_trap", { CString }, Unit)
+local slice_parts = __S.slice_parts
+local none = U32 0xffffffff
+local occupied = U32 0xfffffffe
+local retired = U32 0xfffffffd
+
+-- Room for one more item at the top of the owner's data stack.
+local function extend(T, p, what)
+    local message = what .. " grew while it was not at the top of its data stack"
+    return do(owner: Ref T, length: U32, width: U64): Unit
+        local h = p.header owner
+        local count = U64 length
+        stacks.extend h.stack h.base (count * width) width message
+    end
+end
+
+function storage.store(T, Id, p)
+    local Item = p.Item
+    local api = {}
+    local grow = extend(T, p, "Store")
+    -- the slot an Id names while it is current, or null
+    local occupant = do(s: Ref T, id: Id): Ptr Item
+        local token, slot, generation = p.components id
+        local h = p.header s
+        if token ~= h.token or slot >= h.len then return null Item end
+        local items = p.items s
+        local entry = Ptr items[slot]
+        if entry.gen ~= generation or entry.next ~= occupied then return null Item end
+        return entry
+    end
+    api.has = do(s: Ref T, id: Id): Bool
+        local entry = occupant s id
+        return entry ~= null Item
+    end
+    api.locate = do(s: Ref T, id: Id): Ptr T.elem
+        local entry = occupant s id
+        if entry == null Item then trap "stale or foreign Id in Store" end
+        return Ptr entry.value
+    end
+    api.add = do(s: Ref T, value: T.elem): Id
+        local h = p.header s
+        local slot = h.free_head
+        local entry = null Item
+        if slot ~= none then
+            local items = p.items s
+            entry = Ptr items[slot]
+            h.free_head = entry.next
+        else
+            slot = h.len
+            if slot >= retired then trap "Store is full" end
+            grow(s, slot, p.width())
+            h.len = slot + 1
+            local items = p.items s
+            entry = Ptr items[slot]
+            entry.gen = 1
+        end
+        entry.next = occupied
+        entry.value = value
+        h.live = h.live + 1
+        return p.id s slot entry.gen
+    end
+    api.remove = do(s: Ref T, id: Id): Bool
+        local entry = occupant s id
+        if entry == null Item then return false end
+        local token, slot, generation = p.components id
+        local h = p.header s
+        h.live = h.live - 1
+        if generation == none then
+            entry.next = retired
+        else
+            entry.gen = generation + 1
+            entry.next = h.free_head
+            h.free_head = slot
+        end
+        return true
+    end
+    api.length = do(s: Ref T): U32 return p.header(s).live end
+    return api
+end
+
+function storage.grow(T, p)
+    local api = {}
+    local grow = extend(T, p, T.elem == U8 and "Text" or "Grow")
+    api.clear = do(g: Ref T): Unit
+        local h = p.header g
+        stacks.reset h.stack h.base
+        h.len = 0
+    end
+    if T.elem == U8 then
+        api.append = do(g: Ref T, text: Str): Unit
+            local n = text.length
+            if n == 0 then return end
+            local h = p.header g
+            local length = h.len
+            if n > none - length then trap "Text is full" end
+            -- text may be bytes of this stack, which the push can move
+            local pinned = p.pin g text
+            local bytes = U64 n
+            local top = stacks.extend(h.stack, h.base, U64 length, bytes,
+                "Text grew while it was not at the top of its data stack")
+            if pinned ~= p.maximum() then stacks.copy h.stack top pinned bytes
+            else
+                local ptr, len = slice_parts text
+                stacks.write h.stack top ptr bytes
+            end
+            h.len = length + n
+        end
+    end
+    api.push = do(g: Ref T, value: T.elem): Unit
+        local h = p.header g
+        local length = h.len
+        if length == none then trap "Grow is full" end
+        grow(g, length, p.width())
+        h.len = length + 1
+        local items = p.items g
+        items[length] = value
+    end
+    api.locate = do(g: Ref T, index: U32): Ptr T.elem
+        local h = p.header g
+        if index >= h.len then trap "Grow index out of range" end
+        local items = p.items g
+        return Ptr items[index]
+    end
+    api.items = p.items
+    api.length = do(g: Ref T): U32 return p.header(g).len end
+    return api
+end
+return storage
