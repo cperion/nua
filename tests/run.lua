@@ -106,7 +106,8 @@ end
 local shared_sources = sources(policy)
 local rt_archive = build .. '/libnua_rt_test.a'
 do
-    local ok, out = sh(('%s -c %s -o %s/nua_rt_test.o && rm -f %s && ar rcs %s %s/nua_rt_test.o')
+    -- position-independent: sanitizer harnesses link it into PIE executables
+    local ok, out = sh(('%s -fPIC -c %s -o %s/nua_rt_test.o && rm -f %s && ar rcs %s %s/nua_rt_test.o')
         :format(CC, sq(root .. '/runtime/nua_rt.c'), build, sq(rt_archive), sq(rt_archive), build))
     assert(ok, out)
 end
