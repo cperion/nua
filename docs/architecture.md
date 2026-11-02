@@ -349,8 +349,12 @@ uint32_t both(uint32_t a, uint32_t b) {
 An application without `call` is unchanged: the word's body is evaluated in place
 with whatever is known. Meaning never changes, only the shape of the C.
 
-A known view of a caller's local array (a `Str` over a `Chars`) crosses the boundary
-as a runtime address and length, since the callee cannot name the caller's local.
+A known, unscoped view of a caller's local array (a `Str` over a `Chars`) crosses
+the boundary as a runtime address and length, since the callee cannot name the
+caller's local. A scoped loan from `view_of` or `Grow:view` cannot cross that ABI:
+no lifetime contract would survive it. Explicit boundaries are rejected rather
+than silently inlined; the experimental all-shared profile excludes such sites.
+Ordinary in-place words retain the loan and can consume it.
 
 The boundary is the programmer's, and `nua size program.nua` finds it. It reports the generated C per function and, for each word that is evaluated in place at several sites, the residual statements one `call` would share, with the heaviest sites and their source lines (`maps.nua:121  x3  3,600 statements  m:put(k, v + 100)`). Words too small to repay a call are left out. A large program also prints a one-line note pointing at it.
 
@@ -435,6 +439,20 @@ A resizable value reached through a reference keeps its stack identity in its he
 Knownness is semantic information used during residualization; memory facts are verified for the residual program. They are separate responsibilities.
 
 Specialization keys contain code identity, native types and known arguments — never absolute data-stack positions, because `gs_sp` is a relative base.
+
+Scoped-loan provenance is staged information, not a pointer-field ABI extension.
+Activity tokens identify the owning native function and when the activity ends.
+Bindings, sum payloads, dynamic conversion, return joins and loop results retain
+the provenance; joins union the possible loans. Scalars and owned copies do not
+inherit it. Completing a view binds independent results before ending the token,
+so a deferred read cannot move past the owner's cleanup. `view_of`, `Grow:view`
+and StrMap key iteration share the token/completion machinery. Foreign views bind
+their pointer and length at entry. Expiration and boundary validation happen in
+the specializer; neither backend implements a second lifetime system. Scoped values
+are not static arguments for memoization or partial application, and no token
+identity is added to a specialization key. Without an interprocedural lifetime
+contract, native call arguments carrying loans and loop backedges changing loan
+origins are rejected (syntax §12.6).
 
 Unreachable code contributes nothing: a branch removed by a known condition allocates nothing, and only functions reachable from exports are emitted or counted.
 

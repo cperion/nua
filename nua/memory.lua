@@ -249,8 +249,8 @@ local function fix_index(value, what)
 end
 Mem.fix_index = fix_index
 
--- slot borrows: while an activity borrows a slot of a store, nothing may change
--- the store's structure (its slots could move)
+-- Grow loans: while an activity views resizable storage, nothing may change
+-- its structure (the elements could move). Store places use checked lookups.
 local function root(p)
     local q = rawget(p, 'parent')
     while q do p = q; q = rawget(p, 'parent') end
@@ -356,18 +356,14 @@ local function grow_methods(t)
             local ptr = storage_library(t).items(S.Ref(p))
             -- the length cannot change while the view lasts (pushing is rejected)
             local len = storage_library(t).length(S.Ref(p))
-            local token = {}
+            local token = { owner = b.fn }
             local xs = S.make_slice(st, b:bind(ptr), b:bind(len), token)
             b.slot_borrows = b.slot_borrows or {}
             table.insert(b.slot_borrows, p)
             local ok, r = pcall(body, xs)
             table.remove(b.slot_borrows)
-            token.ended = true
-            if not ok then error(r, 0) end
-            if S.is_value(r) and rawget(r, 'view') then
-                fail('a view of a Grow cannot outlive its view')
-            end
-            return r
+            if not ok then token.ended = true; error(r, 0) end
+            return S.end_view(token, r, 'a view of a Grow cannot outlive its view')
         end,
         push = function(self, v)
             local p = receiver(self, n .. ':push')

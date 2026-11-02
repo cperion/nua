@@ -73,11 +73,11 @@ local function decorate(t)
         local k, v = storage.key(table, S.dot(entry, 'key')), S.dot(entry, 'value')
         if is_str then
             local ptr, len = S.slice_parts(k)
-            local token = {}
+            local token = { owner = S.cur().fn }
             k = S.make_slice(types.Str, ptr, len, token)
             local ok, err = pcall(body, k, v)
-            token.ended = true
-            if not ok then error(err, 0) end
+            if not ok then token.ended = true; error(err, 0) end
+            S.end_view(token, nil, 'a StrMap key cannot outlive its iteration')
         else body(k, v) end
     end
     S.arity[storage.lend] = 3

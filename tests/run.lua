@@ -26,7 +26,7 @@ local check   -- reported by every phase; declared before the parallel driver us
 -- Backend and sanitizer variants repeat one program many times; they catch a
 -- different class of bug, not a different feature. Every feature keeps its
 -- single compile/run assertion below; these representatives carry the repeats.
-local SANITIZED = { staged_values = true, loop_fields = true }
+local SANITIZED = { staged_values = true, loop_fields = true, borrowed_views = true }
 local HARNESS_SAN = { runtime_scheduler = true, runtime_channel = true }
 
 local function cpus()
@@ -360,6 +360,9 @@ end
 
 local oktests, errtests = pcall(dofile, root .. '/tests/comptime_tests.lua')
 check('named tests: immediate evaluation, assertions and no residual runner', oktests, errtests)
+
+local okviews, errviews = pcall(dofile, root .. '/tests/borrowed_views.lua')
+check('scoped views: provenance, expiration and native-boundary rejection', okviews, errviews)
 
 local oka, erra = pcall(dofile, root .. '/tests/array_value.lua')
 check('immutable array contents: persistence and sparse zeros', oka, erra)

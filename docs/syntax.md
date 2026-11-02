@@ -382,7 +382,10 @@ follow:
 * **`return call f(x)` returns the call**; it is not a tail jump.
 
 `call` needs a native word. An untyped Lua function is an error, and a foreign
-function is already a call. The boundary is the programmer's; [the architecture]
+function is already a call. A scoped view from `view_of` or `Grow:view` cannot
+cross a native function boundary: its lifetime has no residual ABI contract
+(§12.6). An explicit `call` is rejected, not silently evaluated in place.
+The boundary is the programmer's; [the architecture]
 (architecture.md#57-call-a-function-boundary-at-one-site) says what it costs, what
 `nua size` reports, and where the libraries put one.
 
@@ -1180,7 +1183,7 @@ References cannot be stored in structs (and therefore not in stores). Long-lived
 
 Operations capable of invalidating borrowed storage are rejected while an incompatible borrow is live: a Grow cannot grow while a view of it is live. Borrow lifetimes are lexical.
 
-A store slot is not borrowed: it is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). Nothing holds a slot's address across a change to the store, so the store may grow or shrink while its slots are in use. The one lexical borrow left is a Grow's view (§12.4).
+A store slot is not borrowed: it is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). Nothing holds a slot's address across a change to the store, so the store may grow or shrink while its slots are in use. Scoped views retain lexical loans: a Grow's view (§12.4) and a foreign view lent with `view_of` (§12.6).
 
 ### 9.8 Managed stores and generational IDs
 
@@ -1820,6 +1823,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 | `s:sub(a, b)` | the view of `[a, b)`, checked |
 | `Slice(p, n)` | a view of `n` elements at pointer `p`: the boundary where a length is trusted |
 | `g:view() do(xs) ... end` | a view of a `Grow` (§12.4) |
+| `view_of(p, n, body)` | lend a scoped view of foreign elements (§12.6) |
 
 **A check that a branch already proved is dropped.** On each arm of a dynamic branch the compiler records what an integer comparison proves (the loop exit `if (i >= n) break;` proves `i < n` on the path that continues), over values that cannot change behind its back: constants, parameters, temporaries, versioned reads of tracked locals, and a view's length. When `i` changes, its version changes and the fact stops matching. `s[i]` and `a[i]` (§13) emit no check when such a fact proves `i < length`.
 
@@ -1876,7 +1880,7 @@ The description, the loop over it and the reader's own loop are gone; one range 
 
 ### 12.4 Views of a Grow
 
-A view of a `Grow` is an activity, the one lexical borrow left (§9.7): the body receives the elements as a slice, the `Grow` cannot grow while the view lasts (`push` is rejected, as is a materialized call receiving a reference that reaches it), and the slice cannot outlive the view, nor be stored. The view's result is the body's.
+A view of a `Grow` is an activity with a lexical loan (§9.7): the body receives the elements as a slice, the `Grow` cannot grow while the view lasts (`push` is rejected, as is a materialized call receiving a reference that reaches it), and the slice cannot outlive the view, nor be stored. It uses the same provenance and boundary checks as a foreign loan (§12.6). The view returns the body's result; scalar and owned results are bound before the loan ends, so deferred reads cannot run after the owner invalidates storage.
 
 ```lua
 return g:view() do(xs)
@@ -1887,6 +1891,57 @@ end
 ### 12.5 What is not checked
 
 A check stays when no recorded fact proves it: facts are kept per path, over values that cannot change behind the compiler's back (above), and are not carried through a `Bool` that stored a comparison (`ok = i < n; if ok then ... xs[i]`), nor across loop rounds once a variable changes. Taking a known-length sub-slice first is a way to state a bound the compiler cannot see.
+
+### 12.6 Scoped foreign views
+
+`view_of(p, n, body)` lends a read-only `Slice T` over `n` elements of a `Ptr T`
+for the body's evaluation. The pointer and length remain trusted: the wrapper
+must ensure the elements stay valid until the body completes. The compiler does
+not prevent a foreign API from freeing or invalidating them during the callback.
+The primitive neither allocates nor frees the memory. It snapshots the supplied
+pointer and length before invoking the body. Use it inside a foreign resource
+activity instead of handing the callback an unscoped `Slice(p, n)`:
+
+```lua
+local foreign_sum = do(pointer: Ptr U8, length: U32): U32
+    return view_of(pointer, length, do(bytes)
+            local text = Str.of bytes
+            return checksum text
+        end)
+end
+```
+
+This excerpt and owned-copy examples are in
+[`examples/borrowed_views.nua`](../examples/borrowed_views.nua). Its harnesses read
+copied `Chars` and `Text` after the foreign allocation has actually been freed.
+
+The scoped view and its derived values carry a loan during specialization:
+
+* Inferred bindings can alias it inside the activity. `Str.of`, subviews,
+  `dynamic`, in-place words, sum payloads and joined return paths preserve the
+  provenance. A runtime choice between two loans requires both lifetimes.
+* A scoped view cannot be assigned to native storage, including a typed local
+  declared outside the activity, or hidden in an aggregate to escape. Returning
+  this activity's loan is rejected. An outer loan may pass through an inner
+  activity without acquiring the inner activity's lifetime.
+* After the loan ends, even text length, conversion or comparison through an
+  escaped compiler alias is rejected. Copy a scalar during the activity, or copy
+  the bytes into owned `Chars(n)` or `Text`, to retain the result.
+* The residual ABI has no scoped-loan contract. Passing a scoped view (including
+  inside a sum or aggregate) to a materialized word, an indirect function call or
+  an opaque foreign call is rejected. This includes scalar-consuming callees:
+  the boundary cannot prove they do not retain the input. Use an ordinary
+  in-place word, or an owned copy. There is no automatic fallback for `call`.
+* A residual loop may carry a view with the same loan, including subviews of it.
+  Changing the loan provenance across a residual backedge is rejected rather
+  than discarding it.
+
+The raw boundary remains explicit. `Slice(p, n)`, raw pointers and raw
+representation access do not gain a loan merely because a length is present.
+Extracting a raw pointer and constructing a new slice deliberately crosses back
+into the programmer's trusted foreign-memory contract. A resource wrapper must
+establish the scoped loan around the user callback and perform invalidating work
+(step/reset/unmap/free) only after that callback completes.
 
 ## 13. Fixed-length arrays
 
@@ -2054,7 +2109,9 @@ export count
   including when an existing value makes `initial` unnecessary.
 - `remove(k)` returns whether an entry was removed. `length` is the U32 live count.
 - `each(activity)` visits an unspecified order. Fixed keys and values are snapshots;
-  a StrMap key is a read-only view valid only during that callback.
+  a StrMap key is a read-only scoped view valid only during that callback. The
+  loan's provenance, expiration and native-boundary rules are those of §12.6;
+  copy into owned storage to retain the bytes.
 
 During iteration, existing-value replacement and no-op ensure/remove are allowed.
 Actual insertion/removal traps before changing storage, including through aliases
@@ -2521,7 +2578,7 @@ In Unix everything is a file, and in Linux nearly everything is a file descripto
 | `cread("errno", I32, "<errno.h>")` | a C variable or macro, read where it is called |
 | `bytes(place)` | the storage of a place as `Ptr U8` (its lifetime dropped, as with `Ptr(place)`) |
 | `size_of(T)` | the C size of a type |
-| `view_of(p, n, body)` | a scoped read-only view, for library activities |
+| `view_of(p, n, body)` | lend a scoped read-only view, with escape and native-boundary checks (§12.6) |
 
 Declaring kernel structs by hand risks ABI mismatches (`struct epoll_event` is packed on x86-64; `struct stat` differs between architectures). A `cstruct` emits no definition of its own: the C compiler supplies the real layout, and a field like `{ "fd", I32, "data.fd" }` reaches into nested unions.
 

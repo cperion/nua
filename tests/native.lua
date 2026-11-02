@@ -27,6 +27,33 @@ check('expression factory borrowed result', borrowed.value == 41)
 borrowed.value = 17
 check('expression factory result aliases its input', record.value == 17 and factories.read_expression(record) == 18)
 
+-- Foreign loans are consumed in place; copies remain usable after source free.
+local foreign_views = nua.load(root .. '/examples/borrowed_views.nua')
+local foreign_bytes = ffi.new('uint8_t[4]', { 65, 0, 66, 67 })
+check('foreign scoped checksum', foreign_views.foreign_sum(foreign_bytes, 4) == 198)
+local foreign_length = ffi.new('uint32_t[1]', 4)
+check('foreign view snapshots its length', foreign_views.snapshot_length(foreign_bytes, foreign_length) == 4
+    and foreign_length[0] == 0)
+check('foreign branch borrowed result', foreign_views.branch_length(foreign_bytes, 4, false) == 4
+    and foreign_views.branch_length(foreign_bytes, 4, true) == 0)
+check('foreign sum payload result', foreign_views.outcome_length(foreign_bytes, 4, true) == 4
+    and foreign_views.outcome_length(foreign_bytes, 4, false) == 0)
+check('foreign loan through tail loop', foreign_views.tail_length(foreign_bytes, 4, 100) == 4)
+check('outer foreign loan through nested activity', foreign_views.nested_length(foreign_bytes, foreign_bytes, 4) == 4)
+ffi.cdef [[void *malloc(size_t size);]]
+local function foreign_buffer()
+    local p = ffi.cast('uint8_t *', ffi.C.malloc(4))
+    assert(p ~= nil, 'foreign test allocation failed')
+    ffi.copy(p, foreign_bytes, 4)
+    return p
+end
+check('fixed copy after foreign free', foreign_views.copy_fixed_release(foreign_buffer(), 4) == 198)
+check('Text copy after foreign free', foreign_views.copy_text_release(foreign_buffer(), 4) == 198)
+check('empty fixed copy after foreign free', foreign_views.copy_fixed_release(foreign_buffer(), 0) == 0)
+check('empty Text copy after foreign free', foreign_views.copy_text_release(foreign_buffer(), 0) == 0)
+local bound_view = nua.load(root .. '/tests/foreign_result_binding.nua')
+check('scalar result captured before foreign free', bound_view.foreign_byte(foreign_buffer()) == 65)
+
 -- Omitted annotations infer native places, on the same prepared IR as C.
 local inferred = nua.load(root .. '/examples/inferred_locals.nua')
 check('inferred branch true', inferred.inferred_branch(true, 10) == 29)

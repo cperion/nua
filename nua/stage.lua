@@ -650,6 +650,85 @@ local function pendable(v)
 end
 
 local h = {}
+
+-- Loan provenance belongs to staged values, never the residual ABI. A joined
+-- value may depend on several activities; ending any one invalidates that value.
+h.view_types = setmetatable({}, { __mode = 'k' })
+h.view_type = function(t)
+    local cached = h.view_types[t]
+    if cached ~= nil then return cached end
+    local yes = rawget(t, 'slice_elem') ~= nil
+    if t.kind == 'sum' then
+        for _, alt in ipairs(t.alts) do yes = yes or h.view_type(alt.type) end
+    elseif t.kind == 'array' then yes = h.view_type(t.elem)
+    elseif t.kind == 'struct' and not yes then
+        for _, field in ipairs(t.fields) do yes = yes or h.view_type(field.type) end
+    end
+    h.view_types[t] = yes
+    return yes
+end
+h.each_view = function(view, visit)
+    if not view then return end
+    if view.tokens then for token in pairs(view.tokens) do visit(token) end
+    else visit(view) end
+end
+h.merge_view = function(a, b)
+    if not a then return b end
+    if not b or a == b then return a end
+    local tokens = {}
+    h.each_view(a, function(token) tokens[token] = true end)
+    local added = false
+    h.each_view(b, function(token) if not tokens[token] then added = true; tokens[token] = true end end)
+    return added and { tokens = tokens } or a
+end
+h.value_view = function(v)
+    if not is_value(v) or not h.view_type(v.T) then return nil end
+    local view = rawget(v, 'view')
+    if v.k == 'agg' then
+        for _, field in pairs(v.f) do view = h.merge_view(view, h.value_view(field)) end
+    elseif v.k == 'sumv' then view = h.merge_view(view, h.value_view(rawget(v, 'p')))
+    elseif v.k == 'array' then
+        if v.contents.count < v.T.length then view = h.merge_view(view, h.value_view(v.contents.zero)) end
+        for _, item in pairs(v.contents.items) do view = h.merge_view(view, h.value_view(item)) end
+    end
+    return view
+end
+h.with_view = function(v, view)
+    if not view or not is_value(v) or not h.view_type(v.T) then return v end
+    view = h.merge_view(h.value_view(v), view)
+    if rawget(v, 'view') == view then return v end
+    local result = setmetatable(copy(v), V)
+    rawset(result, 'view', view)
+    return result
+end
+h.check_view = function(v)
+    local view = h.value_view(v)
+    h.each_view(view, function(token)
+        if token.ended then fail('a scoped view cannot be used after its activity ends', 4) end
+        if current and current.fn ~= token.owner then
+            fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 4)
+        end
+    end)
+    return view
+end
+h.check_view_boundary = function(v)
+    if h.check_view(v) then
+        fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 4)
+    end
+end
+S.check_view = h.check_view
+function S.end_view(token, result, message)
+    local escapes = false
+    h.each_view(h.value_view(result), function(v) if v == token then escapes = true end end)
+    if escapes then token.ended = true; fail(message, 3) end
+    -- A scalar/owned result can still contain deferred reads of the lent bytes.
+    -- Bind it before the owner may invalidate storage after this activity.
+    local ok, bound = pcall(current.bind, current, result)
+    token.ended = true
+    if not ok then error(bound, 0) end
+    return bound
+end
+
 local Matched = {} -- private, invocation-owned staging result; never residual IR
 h.reads_under = function(e, p)
     local found = false
@@ -676,8 +755,8 @@ function Builder:store(p, v)
         fail(("'%s' is a copy taken at spawn; a task cannot assign it (declare a local to change it)"):format(
             root_of(p).name), 3)
     end
-    if is_value(v) and rawget(v, 'view') then
-        fail("a view of a Grow cannot be stored; use it inside its view", 3)
+    if h.check_view(v) then
+        fail('a scoped view cannot be stored; use it inside its activity or make an owned copy', 3)
     end
     local array_root, path = array_path(p)
     if array_root then
@@ -887,11 +966,12 @@ end
 local function eager_temp(self, v)
     local t = self:new_temp(v.T)
     self:emit { op = 'let', place = t, e = v.e }
-    return dyn(v.T, read_expr(t))
+    return h.with_view(dyn(v.T, read_expr(t)), h.value_view(v))
 end
 
 function Builder:bind(v)
     if not is_value(v) then return v end
+    h.check_view(v)
     if v.k == 'dyn' and not self.fn then return v end
     if v.k == 'dyn' and size(v.e) > PENDING_LIMIT then return eager_temp(self, v) end
     if v.k == 'dyn' and not free(v.e) then
@@ -923,7 +1003,7 @@ function Builder:bind(v)
                 frame.lazy[#frame.lazy + 1] = reg
             end
         end
-        return dyn(v.T, e)
+        return h.with_view(dyn(v.T, e), h.value_view(v))
     end
     if v.k == 'agg' then
         local f = {}
@@ -959,6 +1039,7 @@ local function whole_place(v)
 end
 
 function ex(v)
+    h.check_view(v)
     if v.k == 'known' then return const(v.T, v.v) end
     if v.k == 'dyn' then return v.e end
     if v.k == 'array_ptr' then
@@ -1070,6 +1151,7 @@ local function value_of(x, t, what)
         x = cur():read(x)
     end
     if is_value(x) then
+        h.check_view(x)
         if x.k == 'ref' and (t == nil or t.kind ~= 'ref') then
             if t == nil or t == x.T.elem then return cur():read(x.place) end
         end
@@ -1362,6 +1444,7 @@ local member_ptr, member_slice
 
 local raw_member
 local function member(x, key)
+    h.check_view(x)
     local h, t, family = type_hook(x, '__member')
     if h then
         local r
@@ -1373,6 +1456,7 @@ end
 S.rawmember = function(x, key) return raw_member(x, key) end
 
 function raw_member(x, key)
+    h.check_view(x)
     local t = struct_of(x)
     local ip = rawget(t, '__index')
     if ip and (type(key) == 'number' or is_staged(key)) then return ip(x, key) end
@@ -1387,7 +1471,7 @@ function raw_member(x, key)
             if x.k == 'agg' then return x.f[key] end
             if x.k == 'known' then return x.v[key] end
             local ft = t.index[key].type
-            return dyn(ft, { op = 'field', a = x.e, name = key, T = ft })
+            return h.with_view(dyn(ft, { op = 'field', a = x.e, name = key, T = ft }), h.value_view(x))
         end
         local m = t.methods[key]
         if m then return m end
@@ -1431,6 +1515,7 @@ end
 -- "put", or any internal evaluator field name, without shadowing the API.
 function S.index(obj, key)
     if is_staged(obj) then
+        h.check_view(obj)
         local h, t = type_hook(obj, '__index')
         if h then return run_hook(t, h, obj, key) end
     end
@@ -1665,13 +1750,14 @@ function S.dynamic(x)
     if v.k == 'agg' then
         local f = {}
         for _, k in ipairs(field_order(v.T, v.f)) do f[k] = S.dynamic(v.f[k]) end
-        return agg(v.T, f)
+        return h.with_view(agg(v.T, f), h.value_view(v))
     end
     return v
 end
 
 -- the host value of a Known result (for Lua code inspecting compile-time results)
 function S.host(x)
+    h.check_view(x)
     if is_place(x) then x = cur():read(x) end
     if is_value(x) and x.k == 'known' then return fold.to_host(x.T, x.v) end
     if is_value(x) and x.k == 'array' then
@@ -1750,7 +1836,7 @@ end
 function S.infer(v, name)
     if current and (is_value(v) or is_place(v)) and v.T.kind ~= 'ref'
         and v.T.kind ~= 'unit' and v.T.kind ~= 'opaque'
-        and not rawget(v, 'view')
+        and not h.value_view(v)
         and not (is_place(v) and v.T.resizable) then
         return S.decl(v.T, v, name)
     end
@@ -2348,6 +2434,7 @@ end
 S.is_host = is_host
 
 local function static(v)
+    if h.value_view(v) then return false end
     if is_host(v) then return true end
     if not is_value(v) then return false end
     if v.k == 'known' then return true end
@@ -2485,7 +2572,7 @@ end
 -- Only ordinary, fully decomposed records participate in field-wise loop
 -- generalization. Owners, atomics, strings and scoped views retain their contracts.
 h.split_record = function(v)
-    if not (is_value(v) and v.k == 'agg') or rawget(v, 'view') then return false end
+    if not (is_value(v) and v.k == 'agg') or h.value_view(v) then return false end
     local t = v.T
     if t.kind ~= 'struct' or t.resizable or rawget(t, 'is_str') then return false end
     for _, fd in ipairs(t.fields) do
@@ -2509,9 +2596,9 @@ h.widen_value = function(v)
     if v.k == 'agg' then
         local fields = {}
         for _, k in ipairs(field_order(v.T, v.f)) do fields[k] = h.widen_value(v.f[k]) end
-        return agg(v.T, fields)
+        return h.with_view(agg(v.T, fields), h.value_view(v))
     end
-    return dyn(v.T, ex(v))
+    return h.with_view(dyn(v.T, ex(v)), h.value_view(v))
 end
 
 -- Agreement is monotone: once a leaf is dynamic it cannot become known again.
@@ -2775,6 +2862,7 @@ function run_loop_body(self, frame)
             end
         end
     end
+    for i, value in ipairs(vals) do vals[i] = h.with_view(value, h.value_view(frame.args[i])) end
     frame.lvs, frame.partial = lvs, partial
     frame.top, frame.ends = 'L' .. uid(), 'L' .. uid()
     if frame.kind == 'word' and frame.ret.kind ~= 'unit' then
@@ -2863,7 +2951,7 @@ function run_loop_body(self, frame)
         end
         self.state = out
     end
-    if frame.rvar then return dyn(frame.ret, read_expr(frame.rvar)) end
+    if frame.rvar then return h.with_view(dyn(frame.ret, read_expr(frame.rvar)), frame.view) end
     return nil
 end
 
@@ -2918,6 +3006,12 @@ end
 
 -- jump back to the top of a loop-mode frame with new arguments
 function Builder:jump_next(frame, args)
+    for i, arg in ipairs(args) do
+        local before, incoming = h.value_view(frame.args[i]), h.check_view(arg)
+        if h.merge_view(before, incoming) ~= before or h.merge_view(incoming, before) ~= incoming then
+            fail('scoped view provenance cannot change across a residual loop boundary', 3)
+        end
+    end
     local diff = changed(frame.args, args, true)
     if next(diff) then signal('restart', frame, { widen = diff, mode = 'loop' }) end
     for i, a in ipairs(args) do
@@ -3043,7 +3137,7 @@ local function shareable(w, args)
     local residual = false
     for _, a in ipairs(args) do
         if is_place(a) then return false end
-        if not is_value(a) then return false end
+        if not is_value(a) or h.value_view(a) then return false end
         local k = a.k
         if k == 'pack' or k == 'array' or k == 'array_ptr' then return false end
         if not static(a) then residual = true end
@@ -3242,7 +3336,7 @@ function Builder:finish_frame(frame)
     end
     self.block[#self.block + 1] = { op = 'label', label = frame.label }
     self.state = out
-    if frame.rvar then return dyn(frame.ret, read_expr(frame.rvar)) end
+    if frame.rvar then return h.with_view(dyn(frame.ret, read_expr(frame.rvar)), frame.view) end
     if frame.deferred then
         -- every return was a Lua number: one value is a compile-time result
         local v0 = frame.deferred[1].v
@@ -3262,6 +3356,7 @@ end
 
 -- `return v` from a word frame
 function Builder:return_value(frame, v)
+    frame.view = h.merge_view(frame.view, h.check_view(v))
     if v and is_value(v) and v.k == 'ref' then
         local r = root_of(v.place)
         if r.pk == 'local' and frame.local_owner and rawget(r, 'frame') == frame.local_owner then
@@ -3724,6 +3819,7 @@ end
 
 -- the argument expression passed to a materialized function for value v
 function Builder:call_arg(v)
+    h.check_view_boundary(v)
     if v.k == 'ref' then
         local p = v.place
         if p.pk == 'deref' then return { op = 'addr', place = p, T = v.T } end
@@ -3740,6 +3836,7 @@ end
 
 -- the call itself: the callee exists, so its arguments may cross
 function Builder:emit_call(w, fn, args)
+    for _, arg in ipairs(args) do h.check_view_boundary(arg) end
     self:bump_checked()          -- the callee may change any storage it reaches
     local cargs = {}
     for i, a in ipairs(args) do
@@ -4570,7 +4667,8 @@ local function match(s, handlers)
         local function arm(i)
             local alt = t.alts[i]
             local function run()
-                local payload = alt.type.kind ~= 'unit' and dyn(alt.type, h.payload_of(e, alt)) or nil
+                local payload = alt.type.kind ~= 'unit'
+                    and h.with_view(dyn(alt.type, h.payload_of(e, alt)), h.value_view(v)) or nil
                 S.ret(call(alt, payload))
             end
             if i == #t.alts then return run() end
@@ -4600,6 +4698,8 @@ h.land_match = function(b, producer, group)
     b:emit { op = 'label', label = group.label }
     if group.unknown or group.alt.type.kind == 'unit' then return nil end
     local first = paths[1].payload
+    local view
+    for _, site in ipairs(paths) do view = h.merge_view(view, h.value_view(site.payload)) end
     local same = static(first)
     for _, site in ipairs(paths) do
         if not static(site.payload) or arg_key(site.payload) ~= arg_key(first) then same = false end
@@ -4611,7 +4711,7 @@ h.land_match = function(b, producer, group)
     for _, site in ipairs(paths) do
         site.hole.op, site.hole.place, site.hole.e = 'store', slot, site.expression
     end
-    return dyn(group.alt.type, read_expr(slot))
+    return h.with_view(dyn(group.alt.type, read_expr(slot)), view)
 end
 
 h.finish_match = function(result, handlers)
@@ -4641,7 +4741,7 @@ h.finish_match = function(result, handlers)
                 local section = b:sub(function()
                     local payload = h.land_match(b, producer, group)
                     if group.unknown then
-                        S.ret(match(dyn(producer.ret, read_expr(producer.rvar)), handlers))
+                        S.ret(match(h.with_view(dyn(producer.ret, read_expr(producer.rvar)), producer.view), handlers))
                     else S.ret(call(group.alt, payload)) end
                 end, copy(b.state), 'dyn')
                 frame.sections[#frame.sections + 1] = section
@@ -4863,6 +4963,7 @@ end
 -- index and the length are both known (index-range), otherwise when it runs.
 
 local function slice_parts(s)
+    h.check_view(s)
     local t = struct_of(s)
     local function part(name)
         local m
@@ -4878,13 +4979,7 @@ local function slice_parts(s)
     return part('ptr'), part('len'), t
 end
 
-local function check_view(s)
-    local v = is_value(s) and rawget(s, 'view')
-    if v and v.ended then
-        fail('a view of a Grow cannot be used after its view ends', 4)
-    end
-    return v
-end
+local check_view = h.check_view
 
 -- the checked-access words: the bounds and the trap text are library policy
 local slice_checks
@@ -4957,8 +5052,8 @@ h.slice_get = function(s, key)
     if iv.T ~= types.U32 then iv = types.U32(iv) end
     bound_check(iv, len, 'index')
     local value = h.array_pointer_read(ptr, iv)
-    if value then return value end
-    return cur():read(__index(ptr, iv, ptr.T.elem))
+    if value then return h.with_view(value, h.value_view(s)) end
+    return h.with_view(cur():read(__index(ptr, iv, ptr.T.elem)), h.value_view(s))
 end
 
 h.slice_sub = function(s, a, b_)
@@ -5073,7 +5168,7 @@ function S.array_member(x, key, want_place)
         end
         if want_place then fail('cannot assign to an element of an array value; store it in a typed local first', 3) end
         local xv = value_of(x, t, 'array')
-        return dyn(t.elem, { op = 'array_index', a = ex(xv), idx = ex(iv), T = t.elem })
+        return h.with_view(dyn(t.elem, { op = 'array_index', a = ex(xv), idx = ex(iv), T = t.elem }), h.value_view(xv))
     end
     fail(("%s offers a[i], a.length and a:slice(), not '%s'"):format(t.display, tostring(key)), 3)
 end
@@ -5248,13 +5343,12 @@ end
 function S.view_of(p, n, body)
     local pv = is_place(p) and cur():read(p) or p
     if not (is_value(pv) and pv.T.kind == 'ptr') then fail('view_of(p, n, body) takes a pointer', 2) end
-    local token = {}
-    local xs = S.make_slice(types.slice(pv.T.elem), cur():bind(pv), coerce(n, types.U32, 'view length'), token)
+    local b = cur()
+    local token = { owner = b.fn }
+    local xs = S.make_slice(types.slice(pv.T.elem), b:bind(pv), b:bind(coerce(n, types.U32, 'view length')), token)
     local ok, r = pcall(body, xs)
-    token.ended = true
-    if not ok then error(r, 0) end
-    if is_value(r) and rawget(r, 'view') then fail('a view cannot outlive its activity', 2) end
-    return r
+    if not ok then token.ended = true; error(r, 0) end
+    return S.end_view(token, r, 'a view cannot outlive its activity')
 end
 
 -- atomics ----------------------------------------------------------------------------------------
