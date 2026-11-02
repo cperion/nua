@@ -94,7 +94,7 @@ function nua.prelude()
     env.cformat = S.cformat
     env.Args = S.args_type()
     env.test = S.test
-    env.check = S.check
+    env.assert = S.assert
     env.Ptr = S.Ptr
     env.Slice = S.Slice
     env.Array = S.Array
@@ -289,35 +289,6 @@ local function run(args)
     if r == false then os.exit(1) end
 end
 
--- nua test program.nua: run the program's tests, each under nua_try
-local function run_tests(rest)
-    if not rest[1] then io.stderr:write('usage: nua test program.nua|project\n'); os.exit(2) end
-    local proj = require('nua.project').resolve(rest[1])
-    local path = proj.entry
-    local ok, mod = pcall(function() return select(2, nua.compile(read(path), path, { no_c = true, paths = proj.paths })) end)
-    if not ok then io.stderr:write(tostring(mod), '\n'); os.exit(1) end
-    local tests = mod.tests or {}
-    if #tests == 0 then
-        io.write('no tests in ', path, '\n')
-        os.exit(0)
-    end
-    local mok, m = pcall(function() return require('nua.native').compile(mod) end)
-    if not mok then io.stderr:write(tostring(m), '\n'); os.exit(1) end
-    local failed = 0
-    for _, fn in ipairs(tests) do
-        local call = m[fn.export_name or fn.cname] or m[fn.cname]
-        local pok, err = pcall(call)
-        if pok then
-            io.write('ok    ', fn.test_name or fn.cname, '\n')
-        else
-            failed = failed + 1
-            io.write('FAIL  ', fn.test_name or fn.cname, '\n', tostring(err), '\n')
-        end
-    end
-    io.write(('%d tests, %d failed\n'):format(#tests, failed))
-    os.exit(failed == 0 and 0 or 1)
-end
-
 -- nua build prog.nua -o prog: an executable, linked by the host cc
 local function build_opts(rest)
     local o = { opt = 'O2' }
@@ -471,7 +442,6 @@ local function main(args)
     local function rest() local r = {}; for i = 2, #args do r[#r + 1] = args[i] end; return r end
     if sub == 'build' then return build(rest()) end
     if sub == 'check' then return check(rest()) end
-    if sub == 'test' then return run_tests(rest()) end
     if sub == 'cc' then return cc(rest()) end
     if sub == 'doctor' then return doctor() end
     if sub == 'cache' then return cache(rest()) end
@@ -517,7 +487,6 @@ local function main(args)
        luajit nua.lua build program.nua -o program [-O0..-O3] [-g]
        luajit nua.lua check program.nua
        luajit nua.lua size program.nua [--top N]
-       luajit nua.lua test program.nua
        luajit nua.lua fuzz [--tasks] [--seconds N] [--seed S] [--count N]
        luajit nua.lua cc file.c -o file.o
        luajit nua.lua doctor | version | cache clean

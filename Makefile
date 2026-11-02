@@ -171,7 +171,7 @@ test-dist: dist
 	build/dist/nua version | grep -q '^nua '
 	build/dist/nua build examples/hello.nua -o build/tmp/hello
 	build/tmp/hello | grep -q 'hello from Nua'
-	build/dist/nua test examples/tests.nua | grep -q '3 tests, 0 failed'
+	CC=/bin/false NUA_GCCJIT=/no-gccjit.so build/dist/nua check examples/tests.nua
 	build/dist/nua run examples/project alpha | grep -q 'hello, alpha'
 	build/dist/nua build examples/project -o build/tmp/proj
 	build/tmp/proj beta | grep -q 'hello, beta'

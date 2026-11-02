@@ -54,17 +54,25 @@ local function active_trail()
     return table.concat(out)
 end
 
-local function fail(msg, level)
-    msg = msg .. active_trail()
-    if S.user_source then
-        for l = 2, 60 do
-            local info = debug.getinfo(l, 'Sl')
-            if not info then break end
-            if info.source == S.user_source and info.currentline and info.currentline > 0 then
-                error(S.user_path .. ':' .. info.currentline .. ': ' .. msg, 0)
+-- Compiler errors may name the innermost required .nua module. Runtime wait
+-- sites keep the entry-program call site rather than a library wrapper's line.
+local function source_location(include_modules)
+    for level = 2, 80 do
+        local info = debug.getinfo(level, 'Sl')
+        if not info then break end
+        if info.currentline and info.currentline > 0 then
+            if info.source == S.user_source then return S.user_path, info.currentline end
+            if include_modules and info.source:match('^@.*%.nua$') then
+                return info.source:sub(2), info.currentline
             end
         end
     end
+end
+
+local function fail(msg, level)
+    msg = msg .. active_trail()
+    local path, line = source_location(true)
+    if path then error(path .. ':' .. line .. ': ' .. msg, 0) end
     error(msg, (level or 1) + 1)
 end
 S.fail = fail
@@ -3947,53 +3955,43 @@ end
 
 S.export = S.export_word
 
--- test "name" do ... end: a word with no parameters, materialized so `nua test`
--- can call it; its body runs under the runtime's trap recovery.
-local test_ids = 0
+-- A named diagnostic scope, not a residual function or a registered test.
+-- The body follows ordinary application rules: Lua code runs now, and a native
+-- word must be saturated and entirely evaluable while constructing the program.
 function S.test(name, body)
     local nm = type(name) == 'string' and name or (is_value(name) and name.k == 'known' and name.v) or nil
     if type(nm) ~= 'string' then
         fail('test "name" do ... end: the name must be text known while compiling', 2)
     end
+    if current and current.fn then
+        fail('test blocks run during program construction, not in residual code', 2)
+    end
     if body == nil then
-        -- `test "name" do ... end` reaches the macro as test("name")(function ...):
-        -- the declaration hands back what the block is applied to
         return function(block) return S.test(nm, block) end
     end
     if type(body) ~= 'function' and not (getmetatable(body) and getmetatable(body).__call) then
         fail('test "name" do ... end takes a block, got ' .. describe(body), 2)
     end
-    test_ids = test_ids + 1
-    local w = S.word { name = 'test ' .. nm, params = {}, result = types.Unit,
-                       loc = S.site('test'), body = function() body() end }
-    local fn = build_function(w, {}, 'test#' .. test_ids, nil, {})
-    fn.test_name = nm
-    fn.exported = true
-    fn.cname = fn.cname or unique(module.names, 'nua_test_' .. test_ids)
-    fn.export_name = nm
-    module.tests = module.tests or {}
-    module.tests[#module.tests + 1] = fn
-    module.exports[#module.exports + 1] = fn
-    return fn
+    if is_word(body) and #body.supplied < #body.params then
+        fail('test "name" do ... end: the body must take no arguments', 2)
+    end
+    local site = S.site('test', true)
+    local ok, err = pcall(body)
+    if not ok then error(('test %q (%s):\n%s'):format(nm, site, tostring(err)), 0) end
 end
 
--- check(cond): a test's assertion; a known false one fails while compiling, a
--- dynamic one traps where it runs, naming the site
-function S.check(cond)
-    -- a host boolean (a plain block's comparison) is decided now
-    if type(cond) == 'boolean' then
-        if not cond then fail(('check failed: %s'):format(S.site('check')), 3) end
-        return
+-- Lua assertions keep their truthiness and multiple-result contract. A native
+-- condition must be a known Bool: Lua would otherwise treat even Bool(false)
+-- as a truthy table. An unknown condition is never deferred to a runtime trap.
+function S.assert(...)
+    local cv = condition((...))
+    if not cv then return assert(...) end
+    if cv.k ~= 'known' then fail('assert condition must be known at compile time', 2) end
+    if not cv.v then
+        local message = select(2, ...)
+        fail(message == nil and 'assertion failed!' or tostring(message), 2)
     end
-    local cv = condition(cond)
-    if not cv then fail('check(cond) takes a Bool', 2) end
-    if cv.k == 'known' then
-        if not cv.v then fail(('check failed: %s'):format(S.site('check')), 3) end
-        return
-    end
-    S.if_(cond, nil, function()
-        S.trap(known(types.CString, 'check failed: ' .. S.site('check')))
-    end)
+    return ...
 end
 
 -- materialize a word to call now (the in-process backend): like an export, but
@@ -5454,14 +5452,9 @@ function S.size_function()
 end
 
 -- the user's line, for naming a wait in a deadlock report
-function S.site(what)
-    for level = 2, 80 do
-        local info = debug.getinfo(level, 'Sl')
-        if not info then break end
-        if info.source == S.user_source and info.currentline and info.currentline > 0 then
-            return (S.user_path or '?'):match('[^/]*$') .. ':' .. info.currentline .. ': ' .. what
-        end
-    end
+function S.site(what, include_modules)
+    local path, line = source_location(include_modules)
+    if path then return path:match('[^/]*$') .. ':' .. line .. ': ' .. what end
     return what
 end
 

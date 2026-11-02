@@ -104,7 +104,7 @@ sum constructor, §11), and the prelude adds:
   `cconst`, `cread`, `bytes`, `size_of`, `view_of`, `atomic_ptr`, `null`, `cformat`,
   `fence`, `trap`, `rawmember`;
 * **binding time and the host**: `host`, `dynamic`, `native`, `global`, `fnptr`,
-  `test`, `check`, `Args`;
+  `test`, `assert`, `Args`;
 * **concurrency**: `tasks`, `first_of`, `recv`, `send`, `after`, `take`, `spawn`,
   `channel`, `pool`, `blocking`, `sleep`, `ns`, `us`, `ms`, `seconds`;
 * **bitwise operations**: `band bor bxor shl shr bnot`, which Lua 5.1 has no
@@ -385,6 +385,59 @@ follow:
 function is already a call. The boundary is the programmer's; [the architecture]
 (architecture.md#57-call-a-function-boundary-at-one-site) says what it costs, what
 `nua size` reports, and where the libraries put one.
+
+### 3.10 Named compile-time tests and assertions
+
+A test is ordinary computation during program construction, with a name attached
+for diagnostics. Put it beside the word it tests:
+
+```lua
+local add = do(a: U32, b: U32): U32 = a + b
+
+test "addition" do(): Unit
+    assert(add 2 2 == 4)
+    assert(add 40 2 == 42)
+end
+```
+
+`test` takes a name known as text and a body callable without arguments. It calls
+the body immediately. A failed assertion or other error stops compilation, with
+the test name and the underlying diagnostic. Nested blocks add their names to the
+failure context. Returning a value, including `false`, does not itself assert
+anything; assertions are explicit.
+
+There is no test registry, runner, test mode or residual test entry point. Tests
+run when reached while evaluating a module, under the ordinary `require` cache
+rules (§2.1). Unloaded modules have not had their tests run. Named blocks cannot
+be deferred into residual code. `nua check program.nua` evaluates them as part of
+ordinary compilation, as do C emission, `build`, `run` and library loading.
+
+The body uses the ordinary lambda rules (§2.5). `do(): Unit` is a native word:
+comparisons, local mutation, loops and callbacks are staged, and must finish with
+no runtime work. A plain `do ... end` body is Lua, not an implicitly typed test
+language; use `host` to inspect native results there, or assert a known native
+`Bool` returned by a word. Existing compile-time restrictions still apply:
+foreign effects, runtime-only storage and unknown inputs are not made executable
+by wrapping them in a test. There is no automatic native compilation or execution
+of residual work. Host Lua is not sandboxed.
+
+`assert(condition, ...)` is Lua's assertion extended to native conditions:
+
+* Host conditions keep Lua truthiness and assertion behavior, including returning
+  all supplied arguments on success.
+* A native condition must be a known `Bool`. Known false raises an assertion
+  error; an unknown `Bool` is a compile-time error, not a residual trap. Other
+  native types are rejected as conditions. On success, the original native
+  condition and the remaining arguments are returned.
+* An optional message explains failure. Native assertion failures include the
+  source location and active specialization trail.
+
+The same assertion rules apply outside named blocks. A passing compile-time test
+checks its examples under native semantics; it does not prove behavior for all
+runtime inputs, backend correctness, task scheduling or foreign interactions.
+Those need explicit differential, native or integration checks outside this
+compile-time assertion mechanism.
+
 ## 4. Typed control flow
 
 ### 4.1 What the translation stages

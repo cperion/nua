@@ -103,6 +103,25 @@ endall spines. A `.nuafmt.lua` can set `indent_width`, `column_width`,
 codes. `make test-format` checks style, idempotence, source preservation and
 compiler-output equivalence.
 
+## Tests beside definitions
+
+Named tests execute during ordinary compilation. Failure is a compilation error;
+passing tests leave no residual test functions or runner:
+
+```lua
+local add = do(a: U32, b: U32): U32 = a + b
+
+test "addition" do(): Unit
+    assert(add 2 2 == 4)
+    assert(add 40 2 == 42)
+end
+```
+
+A typed block uses native comparisons and control flow; a plain block is Lua.
+`luajit nua.lua check examples/tests.nua` checks the
+[example](examples/tests.nua) without backend execution. See
+[the contract](docs/syntax.md#310-named-compile-time-tests-and-assertions).
+
 ## Modules
 
 ```lua

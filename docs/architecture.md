@@ -805,8 +805,8 @@ format.
 
 ### 13.2 The compilation scope
 
-A process can compile several programs, and `nua.load`, `nua test` and `native` compile
-inside a long-lived one. Caching a module's types or words globally would let a
+A process can compile several programs, and `nua.load` and `native` compile inside
+a long-lived one. Caching a module's types or words globally would let a
 later program reuse an earlier program's staging state. Clearing only `.nua` entries
 would not be enough either: a Lua wrapper can keep them alive.
 
@@ -965,7 +965,6 @@ luajit nua.lua build program.nua|project -o prog [-O0..-O3] [-g]
 luajit nua.lua check program.nua|project
 luajit nua.lua --split dir program.nua        one C file per function beside one header
 luajit nua.lua size program.nua|project [--top N] [--profile written|inline|share] [--compare]
-luajit nua.lua test program.nua|project
 luajit nua.lua fuzz [--seconds N] [--seed S] [--count N] [--keep] [--regressions]
 luajit nua.lua fuzz --storage [--count N] [--seed S] [--keep]
 luajit nua.lua fuzz --tasks [--seeds N] [--quick]
@@ -986,7 +985,7 @@ in outer (prog.nua:4)
 in inner (prog.nua:1)
 ```
 
-**`run`, `build`, `check`, `test`** accept a program file, a project directory or a
+**`run`, `build`, `check`** accept a program file, a project directory or a
 `project.lua`.
 
 * `run` compiles the program into this process: its Lua runs (calling `native` as it
@@ -997,12 +996,15 @@ in inner (prog.nua:1)
   entry point that calls the program's `main`, and links with the host `cc` and the
   runtime archive. A project's `options.opt`/`options.debug` become the default
   optimization and debug settings.
-* `check` specializes and reports errors without emitting code.
-* `test` collects `test "name" do ... end` blocks into one runner, each called under
-  `nua_try` so a failing test does not stop the others; `check(cond)` inside a test
-  traps with its line, and a condition known while compiling must hold then. The
-  exit status counts failures. Compile-time `assert`s run under `check` and `test`
-  alike.
+* `check` specializes and reports errors without emitting code. Named tests beside
+  definitions run immediately during module evaluation, under this command and
+  every other ordinary compilation path (syntax §3.10). `S.test` simply calls the
+  body under a protected Lua call and adds its name to an error; it creates no
+  native function, export or registry. Native bodies use the existing compile-time
+  evaluator, which rejects residual effects. `S.assert` inspects known native
+  booleans instead of accepting their Lua-table truthiness, and otherwise preserves
+  host Lua assertions. Unknown native conditions fail compilation rather than
+  producing runtime traps. There is no separate test command or runner.
 
 **A project** is a `project.lua` beside the program: a return table with `entry`
 (required), `paths` (extra module directories, resolved against the project), and

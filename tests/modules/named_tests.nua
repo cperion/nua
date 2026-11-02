@@ -1,0 +1,13 @@
+-- Tests beside module definitions execute once per require cache, not via a runner.
+local add = do(a: U32, b: U32): U32 = a + b
+
+test "module addition" do(): Unit
+    assert(add 2 3 == 5)
+end
+
+local runs = 0
+test "module construction" do
+    runs = runs + 1
+end
+
+return { .runs }

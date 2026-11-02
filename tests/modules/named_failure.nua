@@ -1,0 +1,3 @@
+test "failure in required module" do(): Unit
+    assert(false, "module assertion")
+end

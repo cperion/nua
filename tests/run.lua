@@ -358,6 +358,9 @@ do
     end)
 end
 
+local oktests, errtests = pcall(dofile, root .. '/tests/comptime_tests.lua')
+check('named tests: immediate evaluation, assertions and no residual runner', oktests, errtests)
+
 local oka, erra = pcall(dofile, root .. '/tests/array_value.lua')
 check('immutable array contents: persistence and sparse zeros', oka, erra)
 local okm, errm = pcall(dofile, root .. '/tests/map_types.lua')
