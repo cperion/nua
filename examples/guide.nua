@@ -9,7 +9,7 @@ local Direction = oneof { left: Unit, right: Unit }
 local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
 
 -- an outcome a caller acts on is a sum
-local Found = oneof { found: U32, missing: Unit }
+local Found = oneof { found: U64, missing: Unit }
 
 -- §5 Ownership: trees are fields, graphs are stores ------------------------------------------------
 
@@ -45,7 +45,7 @@ function Document:at_end(): Bool
 end
 
 local find_nonzero = do(xs: Slice U32): Found
-    local i: U32 = 0
+    local i: U64 = 0
     while i < xs.length do
         if xs[i] ~= 0 then
             return Found.found i
@@ -279,7 +279,7 @@ export type_greeting
 
 -- a runtime description: the same engine, as a loop
 local replay = do(document: Ref Document, commands: Ref(Grow Command)): Unit
-    local i: U32 = 0
+    local i: U64 = 0
     while i < commands.length do
         apply document commands[i]
         i = i + 1

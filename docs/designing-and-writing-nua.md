@@ -187,12 +187,12 @@ Commands as data give replay and tests a shared input, and (§17) they give spec
 Use a sum when alternatives carry different data or require distinct handling, and match it exhaustively. A predicate can return `Bool`; a named sum makes a richer protocol explicit. Do not encode absence as a magic value:
 
 ```lua
-local Found = oneof { found: U32, missing: Unit }
+local Found = oneof { found: U64, missing: Unit }
 ```
 
 ```lua
 local find_nonzero = do(xs: Slice U32): Found
-    local i: U32 = 0
+    local i: U64 = 0
     while i < xs.length do
         if xs[i] ~= 0 then
             return Found.found i
@@ -860,19 +860,19 @@ Put cost requirements on the inner loops, codecs and engines that matter, then *
 
 ```c
 uint32_t first_or(U32Slice xs, uint32_t fallback) {
-    uint32_t payload;
-    uint32_t i = 0u;
+    uint64_t payload;
+    uint64_t i = 0ull;
     for (;;) {
         if (i >= xs.len) break;
         if (xs.ptr[i] != 0u) {
             payload = i;
             goto L1;
         }
-        i = i + 1u;
+        i = i + 1ull;
     }
     return fallback;
 L1:;
-    if ((uint64_t)payload >= (uint64_t)xs.len) {
+    if (payload >= xs.len) {
         nua_trap("slice index out of range");
     }
     return xs.ptr[payload];
@@ -1049,7 +1049,7 @@ Over a description known only at run time, the same engine is a loop with a `swi
 
 ```lua
 local replay = do(document: Ref Document, commands: Ref(Grow Command)): Unit
-    local i: U32 = 0
+    local i: U64 = 0
     while i < commands.length do
         apply document commands[i]
         i = i + 1

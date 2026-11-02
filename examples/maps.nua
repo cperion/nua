@@ -72,7 +72,7 @@ local sum_keys = do(n: I64): U32
     m:put(Choice.integer n, 5)
     m:put(Choice.record { NAME = 1, wide = 2, label = Chars 8 "a" }, 9)
     local record = Choice.record { NAME = 1, wide = 2, label = Chars 8 "a" }
-    return m[Choice.none()] + m[Choice.integer n] + m[record] + m.length
+    return m[Choice.none()] + m[Choice.integer n] + m[record] + U32 m.length
 end
 export sum_keys
 

@@ -2,7 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 uint64_t map_tally(uint32_t n);
 uint64_t edit_counts(uint32_t k);
 uint32_t label_count(Str s);

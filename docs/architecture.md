@@ -1471,7 +1471,6 @@ expectations, `nua size`, the three fuzzers and the documentation checks.
 | Owners nested in containers, arrays, payloads and map values (arenas); owner globals | design memory.md §5.9, §5.10 |
 | Releasing every owner at its last use (today: exact for moves and replacement, otherwise at block end) | design memory.md §5.8 |
 | Mutual recursion through words returning different owner types, or moving an owner out of a `Ref` argument through one | design memory.md §14 |
-| `U64` lengths and indices of any unsigned type (lengths are `U32`) | design memory.md §15 D2 |
 | Work stealing; the run queue is one locked queue | syntax §20.8 |
 | Maps of maps (a map as a store payload or a map value) | syntax §15.1 |
 | `s:find` faster than the obvious algorithm | implementation note, not a contract |

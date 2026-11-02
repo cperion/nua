@@ -13,7 +13,7 @@ local Stats = struct { rows: U32, sum: I64, min: I64, max: I64 }
 -- lines after the header
 local field_stats = do(layout, rows: Slice U8): Stats
     local s = Stats { rows = 0, sum = 0, min = 0, max = 0 }
-    local i: U32 = 0
+    local i: U64 = 0
     while i < rows.length do
         -- the fields before ours: the count is known, so this unrolls
         for _ = 1, layout.index - 1 do

@@ -78,7 +78,7 @@ export run_script
 -- over a runtime program, the same interpreter is a switch in a loop: a VM
 local Program = Grow Command
 local run_program = do(e: Ref Editor, prog: Ref Program): Unit
-    local i: U32 = 0
+    local i: U64 = 0
     while i < prog.length do
         apply e prog[i]
         i = i + 1

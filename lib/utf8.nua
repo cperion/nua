@@ -6,16 +6,16 @@
 -- U+10FFFF.
 local utf8 = {}
 
-local Rune = struct { cp: U32, size: U32 }
+local Rune = struct { cp: U32, size: U64 }
 
 -- the rune starting at i: its code point and width, or U+FFFD with size 0
-local function step(s: Str, i: U32): Rune
+local function step(s: Str, i: U64): Rune
     local c: U8 = s[i]
     if c < 0x80 then
         return Rune { cp = U32 c, size = 1 }
     end
     -- a continuation byte must be 0x80..0xBF
-    local function cont(at: U32): Bool
+    local function cont(at: U64): Bool
         if at >= s.length then return false end
         local b: U8 = s[at]
         return b >= 0x80 and b <= 0xBF
@@ -54,7 +54,7 @@ utf8.step = step
 
 -- is every byte part of a well-formed sequence?
 utf8.valid = do(s: Str): Bool
-    local i: U32 = 0
+    local i: U64 = 0
     while i < s.length do
         local r = step s i
         if r.size == 0 then return false end
@@ -65,7 +65,7 @@ end
 
 -- each rune: its code point and the byte it starts at
 utf8.runes = do(s: Str, body): Unit
-    local i: U32 = 0
+    local i: U64 = 0
     while i < s.length do
         local r = step s i
         if r.size == 0 then

@@ -49,7 +49,7 @@ end
 export port_of
 
 -- where a word is, or 99
-local where = do(s: Str): U32
+local where = do(s: Str): U64
     return s:find "fox" {
         at(i) = i,
         missing() = 99,
@@ -71,7 +71,7 @@ local remember = do(name: Str, age: U32): U32
     local p = Person { name = Chars 16 name, .age }
     local back: U32 = 0
     if p.name:str():equals name then
-        back = p.name.length
+        back = U32 p.name.length
     end
     return back + p.age
 end

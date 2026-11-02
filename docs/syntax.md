@@ -1303,6 +1303,8 @@ Cycles are ordinary relationships; they create no ownership cycles. Objects are 
 
 ### 9.12 Grow arrays
 
+Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`Slice(p, n)`, `view_of(p, n, body)`, `Array(T, n)`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
+
 `Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4) and `g:clear()`. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any fixed-size type that is neither an owner nor an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots.
 
 ## 10. Activities, opening and spread
@@ -1886,7 +1888,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 
 ### 12.2 Slices
 
-`Slice T` is a read-only view: a pointer and a `U32` length. `Slice.mut T` is the same view, writable: `s[i] = v` is checked like a read; its length cannot change. A `Slice.mut` serves where a `Slice` is expected. An owner (a `Grow`, an `Array T`, an `Array(T, n)`) lends its elements to a `Slice.mut` marked at the call, `f(Ref xs)`, and to a `Slice` with no marker. The operations of both:
+`Slice T` is a read-only view: a pointer and a `U64` length. `Slice.mut T` is the same view, writable: `s[i] = v` is checked like a read; its length cannot change. A `Slice.mut` serves where a `Slice` is expected. An owner (a `Grow`, an `Array T`, an `Array(T, n)`) lends its elements to a `Slice.mut` marked at the call, `f(Ref xs)`, and to a `Slice` with no marker. The operations of both:
 
 | Form | Meaning |
 |---|---|
@@ -1933,17 +1935,17 @@ end
 
 ```c
 Packet parse(U8Slice buf) {
-    if (8ull > (uint64_t)buf.len) {
+    if (8ull > buf.len) {
         nua_trap("slice range out of bounds");
     }
-    uint32_t v = (uint32_t)buf.ptr[0u];
-    uint32_t v2 = (uint32_t)buf.ptr[1u];
-    uint32_t v3 = (uint32_t)buf.ptr[2u];
-    v3 = v3 * 256u + (uint32_t)buf.ptr[3u];
-    uint32_t v4 = (uint32_t)buf.ptr[4u];
-    v4 = v4 * 256u + (uint32_t)buf.ptr[5u];
-    v4 = v4 * 256u + (uint32_t)buf.ptr[6u];
-    v4 = v4 * 256u + (uint32_t)buf.ptr[7u];
+    uint32_t v = (uint32_t)buf.ptr[0ull];
+    uint32_t v2 = (uint32_t)buf.ptr[1ull];
+    uint32_t v3 = (uint32_t)buf.ptr[2ull];
+    v3 = v3 * 256u + (uint32_t)buf.ptr[3ull];
+    uint32_t v4 = (uint32_t)buf.ptr[4ull];
+    v4 = v4 * 256u + (uint32_t)buf.ptr[5ull];
+    v4 = v4 * 256u + (uint32_t)buf.ptr[6ull];
+    v4 = v4 * 256u + (uint32_t)buf.ptr[7ull];
     return (Packet){ .version = v, .flags = v2, .length = v3, .id = v4 };
 }
 ```
@@ -1977,10 +1979,10 @@ activity instead of handing the callback an unscoped `Slice(p, n)`:
 
 ```lua
 local foreign_sum = do(pointer: Ptr U8, length: U32): U32
-    return view_of(pointer, length, do(bytes)
-            local text = Str.of bytes
-            return checksum text
-        end)
+    return view_of(pointer, length) do(bytes)
+        local text = Str.of bytes
+        return checksum text
+    end
 end
 ```
 
@@ -2064,7 +2066,7 @@ Three types, one per role, each fitting the memory model as it is: views never o
 | Word | Gives |
 |---|---|
 | `s:equals(t)`, `s:starts_with(t)`, `s:ends_with(t)` | `Bool` |
-| `s:find(t)` | `oneof { at: U32, missing: Unit }` |
+| `s:find(t)` | `oneof { at: U64, missing: Unit }` |
 | `s:compare(t)` | `oneof { less, same, greater }` (bytes, then length) |
 | `s:trim()` | `Str` without leading and trailing spaces, tabs, CR, LF |
 | `s:split(",") do(part) ... end` | each part between one-byte separators |
@@ -2080,14 +2082,14 @@ local is_world = do(name: Str): Bool = name:equals "world"
 
 ```c
 bool is_world(Str name) {
-    if (name.len != 5u) {
+    if (name.len != 5ull) {
         return false;
     }
-    bool same = name.ptr[0u] == 119u;
-    same = same && name.ptr[1u] == 111u;
-    same = same && name.ptr[2u] == 114u;
-    same = same && name.ptr[3u] == 108u;
-    same = same && name.ptr[4u] == 100u;
+    bool same = name.ptr[0ull] == 119u;
+    same = same && name.ptr[1ull] == 111u;
+    same = same && name.ptr[2ull] == 114u;
+    same = same && name.ptr[3ull] == 108u;
+    same = same && name.ptr[4ull] == 100u;
     return same;
 }
 ```
@@ -2180,7 +2182,7 @@ export count
 - `has(k)` returns Bool. `put(k, v)` inserts or replaces and returns Unit.
 - `ensure(k, initial)` inserts only if absent. Both arguments evaluate eagerly,
   including when an existing value makes `initial` unnecessary.
-- `remove(k)` returns whether an entry was removed. `length` is the U32 live count.
+- `remove(k)` returns whether an entry was removed. `length` is the live count, a U64.
 - `each(activity)` visits an unspecified order. Fixed keys and values are snapshots;
   a StrMap key is a read-only scoped view valid only during that callback. The
   loan's provenance, expiration and native-boundary rules are those of §12.6;
@@ -2494,7 +2496,7 @@ int32_t dist(int32_t a, int32_t b) {
 
 A foreign function is an opaque effect: it is never executed at compile time, whatever its arguments. With a header, the backend includes it; without one, it emits the prototype.
 
-Structs with fixed C layouts cross the boundary directly; exported words taking `Ref T` take `T *`, and `Slice T` is a `{ T *ptr; uint32_t len; }` struct passed by value. Resizable values and stores cross only by pointer, with their header layout from `nua_rt.h`. Raw pointers (`Ptr T`, §12) are the foreign boundary, not provenance-checked references.
+Structs with fixed C layouts cross the boundary directly; exported words taking `Ref T` take `T *`, and `Slice T` is a `{ T *ptr; uint64_t len; }` struct passed by value. Owners cross only by pointer, with their header layout from `nua_rt.h`. Raw pointers (`Ptr T`, §12) are the foreign boundary, not provenance-checked references.
 
 Private records need not retain storage for every declared field. After specialization, a field with no remaining runtime read, write or observable address may be omitted from the native layout. This decision applies across all reachable instances of that type; known configuration values can differ between instances. Source-level fields and their values do not change. Exported and foreign interfaces retain the declared layout, including nested records and types reached through pointers or callbacks. C and libgccjit use the same storage decisions.
 
@@ -2618,14 +2620,14 @@ uint32_t sum_filled(uint32_t n, uint8_t byte) {
         goto L1;
     }
     memset(t, (int32_t)byte, (uint64_t)n);
-    t[0u] = 1u;
+    t[0ull] = 1u;
     total = 0u;
-    bytes = (U8Slice){ .ptr = t, .len = n };
-    uint32_t i = 0u;
+    bytes = (U8Slice){ .ptr = t, .len = (uint64_t)n };
+    uint64_t i = 0ull;
     for (;;) {
         if (i >= bytes.len) break;
         total = total + (uint32_t)bytes.ptr[i];
-        i = i + 1u;
+        i = i + 1ull;
     }
     free(t);
 L1:;
@@ -2740,7 +2742,7 @@ end
             found = 0u;
             goto L3;
         }
-        found = (uint32_t)t[0u] * 16777216u + (uint32_t)t[1u] * 65536u + (uint32_t)t[2u] * 256u + (uint32_t)t[3u];
+        found = (uint32_t)t[0ull] * 16777216u + (uint32_t)t[1ull] * 65536u + (uint32_t)t[2ull] * 256u + (uint32_t)t[3ull];
         munmap(t, 4ull);
     L3:;
 ```
@@ -3214,7 +3216,7 @@ uint64_t pooled(uint32_t count) {
                 if ((uint64_t)i >= 64ull) {
                     nua_trap("slice index out of range");
                 }
-                s = s + (uint32_t)at->data.e[i];
+                s = s + (uint32_t)at->data.e[(uint64_t)i];
                 i = i + 1u;
             }
             total = total + (uint64_t)s;

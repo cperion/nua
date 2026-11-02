@@ -79,7 +79,7 @@ local store_tokens = do(n: U32): U32
     local source = Chars(16) "hello world"
     local tokens = Store(Token) {}
     local id = tokens:add Token { text = source:str():sub(0, 5), kind = n }
-    return tokens[id].text.length + tokens[id].kind
+    return U32 tokens[id].text.length + tokens[id].kind
 end
 export store_tokens
 

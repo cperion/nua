@@ -765,8 +765,8 @@ local function index_hook(t)
     local n = cname_of(t)
     return function(x, key)
         local p = receiver(x, t.kind == 'store' and n .. '[id]' or n .. '[i]')
-        local kt = t.kind == 'store' and types.id(t.elem) or types.U32
-        local k = S.coerce(key, kt, t.kind == 'store' and 'Id' or 'index')
+        -- an index is any unsigned integer, checked as U64 (design memory.md §15 D2)
+        local k = t.kind == 'store' and S.coerce(key, types.id(t.elem), 'Id') or S.index_value(key)
         k = fix_index(k, 'capturing a storage index')
         local function resolve() return S.ex(storage_library(t).locate(S.Ref(p), k)) end
         local b = S.cur()
@@ -907,7 +907,7 @@ Mem.RtArray = checked(types.rtarray, 'Array')
 -- Array(T, n) {} with n known only at runtime: an Array T of n zeroed elements
 function Mem.array_of_length(t, n)
     local v = fresh(t)
-    rawset(v, 'length', S.coerce(n, types.U32, 'length of ' .. t.display))
+    rawset(v, 'length', S.index_value(n))
     return v
 end
 Mem.Id = checked(types.id, 'Id')

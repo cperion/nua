@@ -2,12 +2,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 bool is_world(Str name);
 uint32_t word_count(Str text);
 int64_t line_sum(Str line);
 uint32_t port_of(Str config);
-uint32_t where(Str s);
+uint64_t where(Str s);
 bool render_matches(uint32_t n, bool ok, Str expected);
 uint32_t remember(Str name, uint32_t age);
 int32_t order(Str a, Str b);
@@ -16,7 +16,7 @@ uint32_t rune_count(Str s);
 uint32_t first_rune(Str s);
 uint32_t cstring_len(Str s);
 double parse_float(Str s);
-static Str S(const char *s) { Str r; r.ptr = (uint8_t *)s; r.len = (uint32_t)strlen(s); return r; }
+static Str S(const char *s) { Str r; r.ptr = (uint8_t *)s; r.len = (uint64_t)strlen(s); return r; }
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 int main(void) {

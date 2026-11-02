@@ -289,7 +289,7 @@ local grow_in_task = do(n: U32): U32
             end
             local xs = g:all()
             local s: U32 = 0
-            local j: U32 = 0
+            local j: U64 = 0
             while j < xs.length do
                 s = s + xs[j]
                 j = j + 1

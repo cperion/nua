@@ -303,7 +303,7 @@ function map.library(T, storage, Entry, Result, string_keys)
         end
         return true
     end
-    api.length = do(m: Ref T): U32 return header(m).len end
+    api.length = do(m: Ref T): U64 return U64 header(m).len end
     -- `copy m` into a new, empty map: the table, and for text keys the arena
     -- the stored keys point into by offset
     api.copy = do(m: Ref T, from: Ref T): Unit

@@ -7,7 +7,7 @@
 
 local str = {}
 
-str.Found = oneof { at: U32, missing: Unit }
+str.Found = oneof { at: U64, missing: Unit }
 str.Order = oneof { less: Unit, same: Unit, greater: Unit }
 
 -- equal bytes; the loop runs over b, so a known b unrolls
@@ -15,7 +15,7 @@ str.equals = do(a: Str, b: Str): Bool
     if a.length ~= b.length then
         return false
     end
-    local i: U32 = 0
+    local i: U64 = 0
     while i < b.length do
         if a[i] ~= b[i] then
             return false
@@ -66,8 +66,8 @@ str.find_known = do(s: Str, t): str.Found
     if #t > s.length then
         return str.Found.missing()
     end
-    local last: U32 = s.length - #t
-    local i: U32 = 0
+    local last: U64 = s.length - #t
+    local i: U64 = 0
     while i <= last do
         local hit: Bool = true
         for k = 1, #t do
@@ -85,7 +85,7 @@ str.starts_with = do(s: Str, prefix: Str): Bool
     if prefix.length > s.length then
         return false
     end
-    local i: U32 = 0
+    local i: U64 = 0
     while i < prefix.length do
         if s[i] ~= prefix[i] then
             return false
@@ -99,8 +99,8 @@ str.ends_with = do(s: Str, suffix: Str): Bool
     if suffix.length > s.length then
         return false
     end
-    local at: U32 = s.length - suffix.length
-    local i: U32 = 0
+    local at: U64 = s.length - suffix.length
+    local i: U64 = 0
     while i < suffix.length do
         if s[at + i] ~= suffix[i] then
             return false
@@ -115,10 +115,10 @@ str.find = do(s: Str, t: Str): str.Found
     if t.length > s.length then
         return str.Found.missing()
     end
-    local last: U32 = s.length - t.length
-    local i: U32 = 0
+    local last: U64 = s.length - t.length
+    local i: U64 = 0
     while i <= last do
-        local j: U32 = 0
+        local j: U64 = 0
         while j < t.length and s[i + j] == t[j] do
             j = j + 1
         end
@@ -132,7 +132,7 @@ end
 
 -- byte order, then length
 str.compare = do(a: Str, b: Str): str.Order
-    local i: U32 = 0
+    local i: U64 = 0
     while i < a.length and i < b.length do
         if a[i] < b[i] then
             return str.Order.less()
@@ -154,8 +154,8 @@ end
 local space = do(c: U8): Bool = c == 32 or c == 9 or c == 10 or c == 13
 
 str.trim = do(s: Str): Str
-    local a: U32 = 0
-    local b: U32 = s.length
+    local a: U64 = 0
+    local b: U64 = s.length
     while a < b and space s[a] do
         a = a + 1
     end
@@ -167,8 +167,8 @@ end
 
 -- the parts between separator bytes, each given to body
 str.split = do(s: Str, sep: U8, body): Unit
-    local start: U32 = 0
-    local i: U32 = 0
+    local start: U64 = 0
+    local i: U64 = 0
     while i < s.length do
         if s[i] == sep then
             body s:sub(start, i)
@@ -181,8 +181,8 @@ end
 
 -- the lines: the parts between newlines, without a last empty one
 str.lines = do(s: Str, body): Unit
-    local start: U32 = 0
-    local i: U32 = 0
+    local start: U64 = 0
+    local i: U64 = 0
     while i < s.length do
         if s[i] == 10 then
             body s:sub(start, i)
@@ -218,7 +218,7 @@ for _, T in ipairs { U8, U16, U32, U64 } do
         end
         local max: T = bnot(T 0)
         local v: T = 0
-        local i: U32 = 0
+        local i: U64 = 0
         while i < s.length do
             local c: U8 = s[i]
             if c < 48 or c > 57 then
@@ -239,7 +239,7 @@ for _, pair in ipairs { { I8, U8 }, { I16, U16 }, { I32, U32 }, { I64, U64 } } d
     local T, U = pair[1], pair[2]
     local P = str.parsed T
     str['parse_' .. T.name] = do(s: Str): P
-        local i: U32 = 0
+        local i: U64 = 0
         local negative: Bool = false
         if s.length > 0 and (s[0] == 45 or s[0] == 43) then
             negative = s[0] == 45
@@ -284,9 +284,9 @@ local is_digit = do(c: U8): Bool = c >= 48 and c <= 57
 
 local function float_syntax(s: Str): Bool
     local n = s.length
-    local i: U32 = 0
+    local i: U64 = 0
     if i < n and (s[i] == 43 or s[i] == 45) then i = i + 1 end
-    local count: U32 = 0
+    local count: U64 = 0
     while i < n and is_digit s[i] do
         count = count + 1
         i = i + 1
@@ -302,7 +302,7 @@ local function float_syntax(s: Str): Bool
     if i < n and (s[i] == 101 or s[i] == 69) then
         i = i + 1
         if i < n and (s[i] == 43 or s[i] == 45) then i = i + 1 end
-        local exponent: U32 = 0
+        local exponent: U64 = 0
         while i < n and is_digit s[i] do
             exponent = exponent + 1
             i = i + 1
@@ -320,12 +320,9 @@ str.parse_F64 = do(s: Str): str.parsed F64
         return P.value strtod(c, null CString)
     end
 end
-str.c_length = do(bytes: Ptr U8): U32
-    local length = U32 0
-    while bytes[length] ~= 0 do
-        if length == 0xffffffff then trap "a C string longer than a Str can view" end
-        length = length + 1
-    end
+str.c_length = do(bytes: Ptr U8): U64
+    local length = U64 0
+    while bytes[length] ~= 0 do length = length + 1 end
     return length
 end
 

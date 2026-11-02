@@ -8,7 +8,7 @@ local grow_during_view = do(n: U32): U32
     g:push 9
     local xs = g:all()
     for i: U32 = 1, n do g:push i end
-    return xs[0] + xs[1] + xs.length
+    return xs[0] + xs[1] + U32 xs.length
 end
 export grow_during_view
 
@@ -19,7 +19,7 @@ local text_doubles = do(n: U32): U32
     for i: U32 = 1, n do
         out:write out:str()
     end
-    return out.length + U32 out[out.length - 1]
+    return U32 out.length + U32 out[out.length - 1]
 end
 export text_doubles
 

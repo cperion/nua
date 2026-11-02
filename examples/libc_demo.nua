@@ -37,8 +37,8 @@ local sum_filled = do(n: U32, byte: U8): U32
     with_buffer n do(..)
         fill byte
         data[0] = 1
-        local bytes = Slice(data, size)
-        local i: U32 = 0
+        local bytes = Slice(data, U64 size)
+        local i: U64 = 0
         while i < bytes.length do
             total = total + U32 bytes[i]
             i = i + 1

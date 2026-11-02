@@ -7,7 +7,7 @@
 
 typedef struct Document { uint32_t length, cursor, edits; } Document;
 typedef struct Stats { uint32_t entered, left; } Stats;
-typedef struct U32Slice { uint32_t *ptr; uint32_t len; } U32Slice;
+typedef struct U32Slice { uint32_t *ptr; uint64_t len; } U32Slice;
 
 uint32_t outline_demo(uint32_t n);
 uint32_t first_or(U32Slice xs, uint32_t fallback);

@@ -14,7 +14,7 @@ local strmap_words = do(text: Str): U32
         words:put(key, count + 1)  -- replacement is safe while the key is borrowed
         words:remove "not-present"
     end
-    return total * 100 + words.length
+    return total * 100 + U32 words.length
 end
 export strmap_words
 
@@ -26,7 +26,7 @@ local strmap_copy = do(): U32
     words:put(key:str(), 9)
     words:put("", 3)
     words:put("a\0b", 4)
-    return words["cat"] + words["bat"] + words[""] + words["a\0b"] + words.length
+    return words["cat"] + words["bat"] + words[""] + words["a\0b"] + U32 words.length
 end
 export strmap_copy
 
@@ -71,7 +71,7 @@ local strmap_mutation = do(mode: U32): U32
         if mode == 0 then words:put("b", value) end
         if mode == 1 then words:remove key end
     end
-    return words.length
+    return U32 words.length
 end
 export strmap_mutation
 
@@ -83,7 +83,7 @@ local strmap_reserved_keys = do(): U32
     end
     local total: U32 = 0
     words:each do(key, value) total = total + value end
-    return total + words.length
+    return total + U32 words.length
 end
 export strmap_reserved_keys
 
@@ -108,6 +108,6 @@ local strmap_lookup = do(key: Str): U32
     if not m:has key then return 999 end
     if not m:remove key then return 998 end
     if m:remove key then return 997 end
-    return before + m.length
+    return before + U32 m.length
 end
 export strmap_lookup

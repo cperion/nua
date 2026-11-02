@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-typedef struct U8Slice { uint8_t *ptr; uint32_t len; } U8Slice;
+typedef struct U8Slice { uint8_t *ptr; uint64_t len; } U8Slice;
 typedef struct Stats { uint32_t rows; int64_t sum, min, max; } Stats;
 Stats price_stats(U8Slice rows);
 int main(void) {

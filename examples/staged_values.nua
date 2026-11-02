@@ -4,7 +4,7 @@ local constant = Chars 4 "abc"
 local empty = Chars 4 ()
 assert(host constant.length == 3 and host empty.length == 0)
 
-local stage_filled = do(s: Str): U32
+local stage_filled = do(s: Str): U64
     local c = Chars 4 s
     return c.length
 end
@@ -208,7 +208,7 @@ local stage_partial = do(s: Str, byte: U8): U32
     local view = c:str()
     c.bytes[0] = byte
     if view.length == 0 then return 0 end
-    return U32 before.bytes[0] + U32 view[0] + c.length
+    return U32 before.bytes[0] + U32 view[0] + U32 c.length
 end
 assert(host(stage_partial("abc", U8 20)) == 120)
 export stage_partial

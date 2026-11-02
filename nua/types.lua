@@ -398,7 +398,7 @@ function T.slice(elem)
 
     if slices[elem] then return slices[elem] end
     local base = (elem.kind == 'struct' or elem.kind == 'sum') and elem.name or elem.name or 'T'
-    local t = T.struct(base .. 'Slice', { { 'ptr', T.ptr(elem) }, { 'len', T.U32 } })
+    local t = T.struct(base .. 'Slice', { { 'ptr', T.ptr(elem) }, { 'len', T.U64 } })
     t.display = 'Slice ' .. elem.display
     t.slice_elem = elem
     slices[elem] = t
@@ -414,7 +414,7 @@ function T.slice_mut(elem)
     end
     if mut_slices[elem] then return mut_slices[elem] end
     local base = elem.name or 'T'
-    local t = T.struct(base .. 'SliceMut', { { 'ptr', T.ptr(elem) }, { 'len', T.U32 } })
+    local t = T.struct(base .. 'SliceMut', { { 'ptr', T.ptr(elem) }, { 'len', T.U64 } })
     t.display = 'Slice.mut ' .. elem.display
     t.slice_elem = elem
     t.slice_mut = true
@@ -424,7 +424,7 @@ end
 
 -- text: Str is a read-only view of bytes (a slice of U8 with text words);
 -- Chars(n) is short text as a value: a length and n bytes
-T.Str = T.struct('Str', { { 'ptr', T.ptr(T.U8) }, { 'len', T.U32 } })
+T.Str = T.struct('Str', { { 'ptr', T.ptr(T.U8) }, { 'len', T.U64 } })
 T.Str.display = 'Str'
 T.Str.slice_elem = T.U8
 T.Str.is_str = true

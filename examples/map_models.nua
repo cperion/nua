@@ -38,7 +38,7 @@ function model(T, string_keys)
                 if had then count = count - 1 end
                 expected[k] = 0
             end
-            if m.length ~= count then return false end
+            if U32 m.length ~= count then return false end
             if round % 97 == 0 then
                 for j: U32 = 0, limit - 1 do
                     bytes.bytes[0] = U8 j
@@ -71,7 +71,7 @@ local map_table_alias = do(count: U32): U32
     end
     local source = m["source"]:str()
     m:put(source, Buffer "ok")  -- eighth entry grows the table after copying source
-    return m.length + m["new-key"].len
+    return U32 m.length + m["new-key"].len
 end
 export map_table_alias
 
@@ -102,6 +102,6 @@ local map_arena_alias = do(count: U32, width: U32): U32
     m:put(source, 999)  -- compact while the pending key aliases the old arena
     local copied = Buffer string.rep("x", 96)
     copied.len = width - 1
-    return m[copied:str()] + m.length
+    return m[copied:str()] + U32 m.length
 end
 export map_arena_alias

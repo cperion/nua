@@ -7,7 +7,7 @@ bool strmap_model(uint32_t rounds, uint32_t width, uint32_t limit);
 uint32_t map_table_alias(uint32_t count);
 uint32_t map_eager_ensure(void);
 uint32_t map_arena_alias(uint32_t count, uint32_t width);
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 uint64_t map_model_extent(nua_strmap *m) { return m->arena_len; }
 Str map_model_arena_alias(nua_strmap *m) {
     uint32_t i;

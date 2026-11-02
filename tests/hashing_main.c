@@ -2,7 +2,7 @@
 #include "hash_reference.h"
 #include <assert.h>
 #include <stdio.h>
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 uint64_t hash_known(void);
 uint64_t hash_stream(Str a, Str b);
 uint64_t hash_word(Str prefix, uint64_t word);

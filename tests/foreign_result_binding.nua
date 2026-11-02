@@ -8,6 +8,6 @@ local release_after = function(pointer, value)
 end
 
 local foreign_byte = do(pointer: Ptr U8): U8
-    return release_after(pointer, view_of(pointer, 1, do(bytes) return bytes[0] end))
+    return release_after(pointer, view_of(pointer, 1) do(bytes) return bytes[0] end)
 end
 export foreign_byte

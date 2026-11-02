@@ -628,6 +628,23 @@ local function expr_key(e)
         return op .. rawget(e.place, 'id') .. '#' .. tostring(e.ver)
     end
     local parts = { op, tostring(e.o or e.name or e.text or '') }
+    -- every other plain field counts too (an offset, a constant, a type): two
+    -- expressions share a key only when they compute the same value
+    local extra = {}
+    for k, v in pairs(e) do
+        if k ~= 'op' and k ~= 'o' and k ~= 'name' and k ~= 'text' and k ~= 'T' and k ~= 'a' and k ~= 'b'
+            and k ~= 'e' and k ~= 'args' and k ~= 'fields' then
+            if type(v) ~= 'table' then
+                extra[#extra + 1] = tostring(k) .. '=' .. tostring(v)
+            elseif rawget(v, 'op') then
+                extra[#extra + 1] = tostring(k) .. '=' .. expr_key(v)
+            else
+                extra[#extra + 1] = tostring(k) .. '=' .. tostring(rawget(v, 'display') or rawget(v, 'id') or v)
+            end
+        end
+    end
+    table.sort(extra)
+    for _, x in ipairs(extra) do parts[#parts + 1] = x end
     for _, k in ipairs { 'a', 'b', 'e' } do if e[k] then parts[#parts + 1] = expr_key(e[k]) end end
     for _, a in ipairs(e.args or {}) do parts[#parts + 1] = expr_key(a) end
     if e.fields then
@@ -650,6 +667,19 @@ end
 
 -- staging helpers, shared by the sections below
 local h = {}
+-- an expression that does nothing but compute: no call, no atomic, no wait
+h.EFFECTS = { call = true, calli = true, rtcall = true, atomic = true, wait = true, slot_at = true, task = true }
+h.effect_free = function(e)
+    if type(e) ~= 'table' then return true end
+    if h.EFFECTS[e.op] then return false end
+    for k, c in pairs(e) do
+        if type(c) == 'table' and k ~= 'T' and k ~= 'place' and k ~= 'fn' and k ~= 'ext'
+            and rawget(c, 'op') and not h.effect_free(c) then return false end
+    end
+    for _, a in ipairs(e.args or {}) do if not h.effect_free(a) then return false end end
+    for _, a in pairs(e.fields or {}) do if not h.effect_free(a) then return false end end
+    return true
+end
 
 -- A reference read back from memory (a field, an element, a payload, a local
 -- that became memory) is a pointer value; it denotes a place again, carrying
@@ -1974,6 +2004,14 @@ local function compare(op, a, b)
             return known(types.Bool, false)
         end
     end
+    -- an integer compared with the very same expression, evaluated once in the
+    -- same comparison and with no effect between, is known (C warns of these too)
+    if t.kind == 'int' or t.kind == 'bool' then
+        local ea, eb = ex(av), ex(bv)
+        if expr_key(ea) == expr_key(eb) and h.effect_free(ea) then
+            return known(types.Bool, op == 'eq' or op == 'le' or op == 'ge')
+        end
+    end
     return dyn(types.Bool, { op = 'cmp', o = op, a = ex(av), b = ex(bv), T = types.Bool })
 end
 
@@ -2743,6 +2781,18 @@ local function stable_key(e)
     return ok and S.expr_key(e) or nil
 end
 
+-- a constant's value as a Lua number, when it is one exactly (a 64-bit
+-- constant is a cdata; facts compare small bounds, below 2^53)
+h.const_number = function(e)
+    if type(e) ~= 'table' or e.op ~= 'const' then return nil end
+    local v = e.v
+    if type(v) == 'number' then return v end
+    if type(v) == 'cdata' then
+        local n = tonumber(v)
+        if n and n >= 0 and n <= 9007199254740992 then return n end
+    end
+    return nil
+end
 local INVERT = { lt = 'ge', ge = 'lt', gt = 'le', le = 'gt', eq = 'ne', ne = 'eq' }
 local function facts_of(e, positive, out)
     out = out or {}
@@ -2757,9 +2807,9 @@ local function facts_of(e, positive, out)
         end
         -- a lower bound by a constant: x == c, x >= c, x > c (either way round)
         local x, c, rel = nil, nil, o
-        if e.b.op == 'const' and type(e.b.v) == 'number' then x, c = e.a, e.b.v
-        elseif e.a.op == 'const' and type(e.a.v) == 'number' then
-            x, c = e.b, e.a.v
+        if h.const_number(e.b) then x, c = e.a, h.const_number(e.b)
+        elseif h.const_number(e.a) then
+            x, c = e.b, h.const_number(e.a)
             rel = ({ lt = 'gt', gt = 'lt', le = 'ge', ge = 'le', eq = 'eq', ne = 'ne' })[o]
         end
         if x then
@@ -2789,10 +2839,10 @@ function Builder:proves_less(lo, hi)
     if not kh then return false end
     local here = self.path or ''
     -- a constant below a known lower bound
-    if lo.op == 'const' and type(lo.v) == 'number' then
+    if h.const_number(lo) then
         for i = #(self.facts or {}), 1, -1 do
             local f = self.facts[i]
-            if f.min and f.hi == kh and lo.v < f.min and here:sub(1, #f.path) == f.path then return true end
+            if f.min and f.hi == kh and h.const_number(lo) < f.min and here:sub(1, #f.path) == f.path then return true end
         end
     end
     local kl = stable_key(lo)
@@ -5927,7 +5977,8 @@ local function ptr_value(x)
     return x
 end
 
--- an index operand: an unsigned integer value, U32 for a Lua number
+-- an index operand: an unsigned integer value of any width, U64 for a Lua
+-- number; checked against U64 lengths (design memory.md §15 D2)
 local function index_value(i)
     if is_place(i) then i = cur():read(i) end
     if is_value(i) then
@@ -5936,7 +5987,12 @@ local function index_value(i)
         end
         return i
     end
-    return value_of(i, types.U32, 'index')
+    return value_of(i, types.U64, 'index')
+end
+S.index_value = function(i)
+    local v = index_value(i)
+    if v.T ~= types.U64 then v = types.U64(v) end
+    return v
 end
 
 local function __index(pv, iv, elem)
@@ -6057,7 +6113,7 @@ function S.array_pointer(place, offset, builder)
         builder = cur()
     end
     return setmetatable({ T = types.ptr(place.T.elem), k = 'array_ptr', place = place,
-                          offset = cur():bind(offset or known(types.U32, 0)), builder = builder or cur() }, V)
+                          offset = cur():bind(offset or known(types.U64, 0)), builder = builder or cur() }, V)
 end
 
 h.array_pointer_read = function(ptr, index)
@@ -6094,7 +6150,7 @@ h.slice_get = function(s, key)
     check_view(s)
     local ptr, len = slice_parts(s)
     local iv = index_value(key)
-    if iv.T ~= types.U32 then iv = types.U32(iv) end
+    if iv.T ~= types.U64 then iv = types.U64(iv) end
     bound_check(iv, len, 'index')
     local value = h.array_pointer_read(ptr, iv)
     if value then return h.reref(h.with_view(value, h.value_view(s))) end
@@ -6106,7 +6162,7 @@ h.slice_place = function(s, key)
     check_view(s)
     local ptr, len = slice_parts(s)
     local iv = index_value(key)
-    if iv.T ~= types.U32 then iv = types.U32(iv) end
+    if iv.T ~= types.U64 then iv = types.U64(iv) end
     bound_check(iv, len, 'index')
     return __index(ptr, iv, ptr.T.elem)
 end
@@ -6117,8 +6173,8 @@ h.slice_sub = function(s, a, b_)
     local view = check_view(s)
     local ptr, len, t = slice_parts(s)
     local av, bv = index_value(a), index_value(b_)
-    if av.T ~= types.U32 then av = types.U32(av) end
-    if bv.T ~= types.U32 then bv = types.U32(bv) end
+    if av.T ~= types.U64 then av = types.U64(av) end
+    if bv.T ~= types.U64 then bv = types.U64(bv) end
     if av.k == 'known' and bv.k == 'known' and len.k == 'known' then
         if av.v > bv.v or bv.v > len.v then
             fail(('index-range: sub(%s, %s) is outside a slice of length %s'):format(
@@ -6167,7 +6223,7 @@ function S.Slice(x, n)
     local pv = is_staged(x) and ptr_value(x)
     if pv and pv.T.kind == 'ptr' and n ~= nil then
         local t = types.slice(pv.T.elem)
-        return make_slice(t, pv, coerce(n, types.U32, 'slice length'))
+        return make_slice(t, pv, S.index_value(n))
     end
     fail('Slice(T) is a type; Slice(p, n) views n elements at pointer p (a view of a Grow is g:all())', 2)
 end
@@ -6204,7 +6260,7 @@ end
 
 function S.array_member(x, key, want_place)
     local t = struct_of(x)
-    local n = known(types.U32, t.length)
+    local n = known(types.U64, t.length)
     if key == 'length' then return n end
     if key == 'slice' then
         return function(self)
@@ -6215,7 +6271,7 @@ function S.array_member(x, key, want_place)
     end
     if type(key) == 'number' or is_staged(key) then
         local iv = index_value(key)
-        if iv.T ~= types.U32 then iv = types.U32(iv) end
+        if iv.T ~= types.U64 then iv = types.U64(iv) end
         bound_check(iv, n, 'index', 'an array')
         local aggregate_place = (is_place(x) or x.k == 'ref')
             and (t.elem.kind == 'struct' or t.elem.kind == 'array')
@@ -6413,11 +6469,13 @@ function S.view_of(p, n, body)
     if not (is_value(pv) and pv.T.kind == 'ptr') then fail('view_of(p, n, body) takes a pointer', 2) end
     local b = cur()
     local token = S.activity_token()
-    local xs = S.make_slice(types.slice(pv.T.elem), b:bind(pv), b:bind(coerce(n, types.U32, 'view length')), token)
+    local xs = S.make_slice(types.slice(pv.T.elem), b:bind(pv), b:bind(S.index_value(n)), token)
     local ok, r = pcall(body, xs)
     if not ok then token.ended = true; error(r, 0) end
     return S.end_view(token, r, 'a view cannot outlive its activity')
 end
+-- a trailing body curries out like any activity's: view_of(p, n) do(xs) ... end
+S.arity[S.view_of] = 3
 
 -- atomics ----------------------------------------------------------------------------------------
 -- Atomic operations are effects: never folded, never pending, emitted in source
@@ -6656,9 +6714,9 @@ function S.args_type()
     if args_type then return args_type end
     local t = S.cstruct('nua_args', '"nua_rt.h"',
         { { 'count', types.U32 }, { 'argv', types.ptr(types.CString) } })
-    local strlen = S.extern('strlen', { types.CString }, types.U32, { header = '<string.h>' })
+    local strlen = S.extern('strlen', { types.CString }, types.U64, { header = '<string.h>' })
     t.properties = t.properties or {}
-    t.properties.length = function(x) return S.dot(x, 'count') end
+    t.properties.length = function(x) return types.U64(S.dot(x, 'count')) end
     S.member_tables(t)
     t.__index = function(x, key)
         local i = index_value(key)
@@ -7547,6 +7605,12 @@ function S.io_vocabulary()
         elseif is_staged(data) and rawget(struct_of(data), 'slice_elem') == types.U8 then
             local sv = is_place(data) and cur():read(data) or data
             local sp, sl = slice_parts(sv)
+            -- an operation's count is a U32 at the runtime boundary (the kernel
+            -- moves less than 2 GiB per call anyway): a longer slice traps
+            if pos[3] == nil then
+                checks().high(types.U64(sl), known(types.U64, 4294967296))
+                sl = types.U32(sl)
+            end
             ptr, n = ex(sp), pos[3] ~= nil and coerce(pos[3], types.U32, 'io.write count') or sl
         else
             local p, cap = byte_buffer(data, 'io.write')

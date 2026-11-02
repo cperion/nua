@@ -524,9 +524,9 @@ end
 -- the generated C keeps the checks nothing proves, and drops the ones a branch proved
 do
     local expectations = {
-        { 'memory_views', 'if ((uint64_t)(i + 1u - 1u) >= (uint64_t)xs.len)', true,
+        { 'memory_views', 'if ((uint64_t)i + 1ull - 1ull >= xs.len)', true,
           'an index no fact covers stays checked' },
-        { 'memory_views', 'if ((uint64_t)i >= (uint64_t)xs.len)', false,
+        { 'memory_views', 'if ((uint64_t)i >= xs.len)', false,
           'an index the branch proved is not checked' },
         { 'activities', 'at->value = at->value * 2u;\n    at->weight = at->weight + 1u;', true,
           'one checked lookup serves the whole stretch' },

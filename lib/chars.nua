@@ -10,8 +10,8 @@ function chars.from(T)
     local from = do(text: Str): T
         if text.length > capacity then trap "text longer than its Chars(n)" end
         local out = T()
-        out.len = text.length
-        local i: U32 = 0
+        out.len = U32 text.length
+        local i = U64 0
         while i < text.length do
             out.bytes[i] = text[i]
             i = i + 1

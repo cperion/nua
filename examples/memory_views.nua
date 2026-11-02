@@ -32,7 +32,7 @@ export through_pointer
 -- Slice: a checked read-only view with a length
 local sum = do(xs: Slice U8): U32
     local total: U32 = 0
-    local i: U32 = 0
+    local i: U64 = 0
     while i < xs.length do
         total = total + U32 xs[i]
         i = i + 1
@@ -42,7 +42,7 @@ end
 export sum
 
 -- Slice(p, n) makes a view at the boundary
-local sum_raw = do(p: Ptr U8, n: U32): U32 = sum Slice(p, n)
+local sum_raw = do(p: Ptr U8, n: U32): U32 = sum Slice(p, U64 n)
 export sum_raw
 
 -- a binary format described as data; one range check, then constant offsets
@@ -74,7 +74,7 @@ export parse
 -- a view of a Grow: an activity; the Grow cannot grow while it lasts
 local sum32 = do(xs: Slice U32): U32
     local total: U32 = 0
-    local i: U32 = 0
+    local i: U64 = 0
     while i < xs.length do
         total = total + xs[i]
         i = i + 1
@@ -104,7 +104,7 @@ export fill
 
 -- a fact stops holding when its value changes: the second index is checked
 local next_after = do(xs: Slice U32, i: U32): U32
-    local j = i
+    local j = U64 i
     if j < xs.length then
         local here: U32 = xs[j]
         j = j + 1

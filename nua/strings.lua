@@ -24,7 +24,7 @@ local function fail(msg, level) S.fail(msg, (level or 2) + 1) end
 
 function S.str_literal(s)
     local e = { op = 'conv', a = { op = 'const', T = types.CString, v = s }, T = u8p, str_lit = s }
-    return S.make_slice(T, S.dyn(u8p, e), S.known(U32, #s))
+    return S.make_slice(T, S.dyn(u8p, e), S.known(types.U64, #s))
 end
 
 -- the text of a Str known while compiling, or nil: a literal, or a part of one
@@ -152,7 +152,7 @@ function S.member_str(x, key)
     if type(key) == 'number' or S.is_staged(key) then
         -- a byte of known text at a known index is known
         local kt = Str.known_text(x)
-        local iv = type(key) == 'number' and S.known(U32, key) or S.value_of(key, nil, 'index')
+        local iv = type(key) == 'number' and S.known(types.U64, key) or S.value_of(key, nil, 'index')
         if kt and S.is_value(iv) and iv.k == 'known' then
             local i = tonumber(iv.v)
             if i < 0 or i >= #kt then
@@ -230,16 +230,17 @@ end
 function S.member_chars(x, key)
     local t = S.value_of(x, nil, 'Chars').T
     if key == 'length' then
-        if S.is_place(x) then return S.cur():read(S.field_place(x, 'len')) end
+        -- stored as U32 (n is at most 65536); every length is a U64
+        if S.is_place(x) then return types.U64(S.cur():read(S.field_place(x, 'len'))) end
         local value = S.value_of(x, t, 'Chars.length')
-        if value.k == 'agg' then return value.f.len end
-        return S.dyn(U32, { op = 'field', a = S.ex(value), name = 'len', T = U32 })
+        if value.k == 'agg' then return types.U64(value.f.len) end
+        return types.U64(S.dyn(U32, { op = 'field', a = S.ex(value), name = 'len', T = U32 }))
     end
     if key == 'str' then
         return function(self)
             if not S.is_place(self) then fail(t.display .. ':str() views storage: call it on a typed local or a field', 2) end
             local ptr = S.array_pointer(S.field_place(self, 'bytes'))
-            local len = S.cur():bind(S.cur():read(S.field_place(self, 'len')))
+            local len = S.cur():bind(types.U64(S.cur():read(S.field_place(self, 'len'))))
             return S.make_slice(T, ptr, len, S.owner_token(self))
         end
     end

@@ -3,10 +3,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 typedef struct U8x4 { uint8_t e[4]; } U8x4;
 typedef struct Chars4 { uint32_t len; U8x4 bytes; } Chars4;
-uint32_t stage_filled(Str s);
+uint64_t stage_filled(Str s);
 Chars4 stage_value(void);
 Chars4 stage_binary_value(void);
 bool stage_empty(void);
@@ -31,7 +31,7 @@ uint32_t stage_partial(Str s, uint8_t byte);
 uint32_t stage_split(uint8_t byte);
 uint32_t stage_task_copy(uint8_t byte);
 uint32_t stage_dead_write(uint32_t i);
-static Str S(const char *s) { Str v = { (uint8_t *)s, (uint32_t)strlen(s) }; return v; }
+static Str S(const char *s) { Str v = { (uint8_t *)s, (uint64_t)strlen(s) }; return v; }
 static void too_long(void *unused) { (void)unused; (void)stage_filled(S("abcde")); }
 static void bad_index(void *unused) { (void)unused; (void)stage_index(3); }
 static void dead_store_bounds(void *unused) { (void)unused; (void)stage_dead_write(2); }

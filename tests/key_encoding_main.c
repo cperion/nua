@@ -2,7 +2,7 @@
 #include "hash_reference.h"
 #include <assert.h>
 #include <stdio.h>
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 uint64_t semantic_key_hash(int64_t n, bool flag, Str text, bool number);
 int main(void) {
     uint8_t bytes[] = { 'a', 0, 'b' };

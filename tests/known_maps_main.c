@@ -2,7 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 uint32_t known_number(uint32_t key);
 uint32_t known_word(Str key);
 uint32_t known_checked(Str key);

@@ -126,7 +126,7 @@ void nua_gs_zero(size_t stack, size_t at, size_t bytes);
 typedef struct nua_grow {
     size_t stack;
     size_t base;
-    uint32_t len;
+    uint64_t len;
 } nua_grow;
 
 nua_store nua_store_new(size_t stack);
@@ -163,7 +163,7 @@ extern uint64_t nua_hash_key0, nua_hash_key1;
 
 /* StrMap entries begin with this complete key header, followed by a typed
  * value. Offsets survive arena movement; there are no retained byte pointers. */
-typedef struct nua_strkey { uint64_t hash; size_t offset; uint32_t len; } nua_strkey;
+typedef struct nua_strkey { uint64_t hash; size_t offset; uint64_t len; } nua_strkey;
 typedef struct nua_strmap {
     nua_map entries;
     size_t arena_stack, arena_base, arena_len, dead;

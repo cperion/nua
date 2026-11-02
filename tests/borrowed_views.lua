@@ -8,7 +8,7 @@ local prefix = [[
 local Optional = oneof { some: Str, none: Unit }
 local Box = struct { text: Optional }
 local identity = do(text: Str): Str = text
-local length = do(text: Str): U32 = text.length
+local length = do(text: Str): U64 = text.length
 local stash = do(text: Str, target: Ref Str): Unit
     target = text
 end
@@ -28,7 +28,7 @@ local function tail_view(text: Str, count: U32): Str
     if count == 0 then return text end
     return tail_view(text, count - 1)
 end
-local function tail_length(text: Str, count: U32): U32
+local function tail_length(text: Str, count: U32): U64
     if count == 0 then return text.length end
     return tail_length(text, count - 1)
 end
@@ -75,52 +75,52 @@ end
 export entry
 ]]
 local rejected = {
-    { 'direct text assignment', [[view_of(p, n, do(xs) kept = Str.of xs end)]], 'cannot be stored' },
-    { 'subview assignment', [[view_of(p, n, do(xs) kept = Str.of(xs):sub(0, n) end)]], 'cannot be stored' },
-    { 'dynamic retains provenance', [[view_of(p, n, do(xs) kept = dynamic(Str.of xs) end)]], 'cannot be stored' },
-    { 'inline branch result', [[view_of(p, n, do(xs) kept = choose(Str.of xs, flag) end)]], 'cannot be stored' },
-    { 'materialized identity', [[view_of(p, n, do(xs) kept = call identity(Str.of xs) end)]], 'cannot be stored' },
+    { 'direct text assignment', [[view_of(p, n) do(xs) kept = Str.of xs end]], 'cannot be stored' },
+    { 'subview assignment', [[view_of(p, n) do(xs) kept = Str.of(xs):sub(0, n) end]], 'cannot be stored' },
+    { 'dynamic retains provenance', [[view_of(p, n) do(xs) kept = dynamic(Str.of xs) end]], 'cannot be stored' },
+    { 'inline branch result', [[view_of(p, n) do(xs) kept = choose(Str.of xs, flag) end]], 'cannot be stored' },
+    { 'materialized identity', [[view_of(p, n) do(xs) kept = call identity(Str.of xs) end]], 'cannot be stored' },
     { 'cached materialized identity', [[
         local raw = Str.of(Slice(p, n))
         local first = call identity raw
-        view_of(p, n, do(xs) kept = call identity(Str.of xs) end)
+        view_of(p, n) do(xs) kept = call identity(Str.of xs) end
     ]], 'cannot be stored' },
-    { 'materialized output reference', [[view_of(p, n, do(xs) call stash(Str.of xs, Ref kept) end)]], 'cannot be stored in' },
+    { 'materialized output reference', [[view_of(p, n) do(xs) call stash(Str.of xs, Ref kept) end]], 'cannot be stored in' },
     { 'function pointer', [[
         local f = fnptr identity
-        view_of(p, n, do(xs) kept = f(Str.of xs) end)
+        view_of(p, n) do(xs) kept = f(Str.of xs) end
     ]], 'native function boundary' },
     { 'opaque foreign call', [[
         local echo = extern("foreign_echo", { Str }, Str)
-        view_of(p, n, do(xs) kept = echo(Str.of xs) end)
+        view_of(p, n) do(xs) kept = echo(Str.of xs) end
     ]], 'native function boundary' },
     { 'captured loan in native function', [[
-        view_of(p, n, do(xs)
+        view_of(p, n) do(xs)
             local text = Str.of xs
-            local get = do(): U32 = text.length
+            local get = do(): U64 = text.length
             local size = call get()
-        end)
+        end
     ]], 'native function boundary' },
-    { 'direct return', [[local saved = view_of(p, n, do(xs) return Str.of xs end)]], 'cannot outlive its activity' },
-    { 'sum return', [[local saved = view_of(p, n, do(xs) return Optional.some(Str.of xs) end)]], 'cannot outlive its activity' },
+    { 'direct return', [[local saved = view_of(p, n) do(xs) return Str.of xs end]], 'cannot outlive its activity' },
+    { 'sum return', [[local saved = view_of(p, n) do(xs) return Optional.some(Str.of xs) end]], 'cannot outlive its activity' },
     { 'record containing a sum return', [[
-        local saved = view_of(p, n, do(xs) return Box { text = Optional.some(Str.of xs) } end)
+        local saved = view_of(p, n) do(xs) return Box { text = Optional.some(Str.of xs) } end
     ]], 'cannot outlive its activity' },
     { 'dynamic sum result', [[
-        view_of(p, n, do(xs)
+        view_of(p, n) do(xs)
             local optional = choose_optional(Str.of xs, flag)
             kept = optional { some = do(text) return text end, none = do() return Str "" end }
-        end)
+        end
     ]], 'cannot be stored' },
     { 'immediate matched payload join', [[
-        view_of(p, n, do(xs)
+        view_of(p, n) do(xs)
             choose_some(Str.of xs, flag) {
                 some = do(text) kept = text end,
                 none = do end,
             }
-        end)
+        end
     ]], 'cannot be stored' },
-    { 'residual tail-loop result', [[view_of(p, n, do(xs) kept = tail_view(Str.of xs, n) end)]], 'cannot be stored' },
+    { 'residual tail-loop result', [[view_of(p, n) do(xs) kept = tail_view(Str.of xs, n) end]], 'cannot be stored' },
     { 'Grow text assignment', [[fill_grow(Ref kept, false)]], 'cannot be stored' },
     { 'Grow dynamic text assignment', [[fill_grow(Ref kept, true)]], 'cannot be stored' },
     { 'Grow borrow used after clear', [[
@@ -172,37 +172,37 @@ local rejected = {
     { 'known call memo cannot strip a loan', [[
         local raw = Str "abc"
         local first = identity raw
-        view_of(rawmember(raw, "ptr"), raw.length, do(xs) kept = identity(Str.of xs) end)
+        view_of(rawmember(raw, "ptr"), raw.length) do(xs) kept = identity(Str.of xs) end
     ]], 'cannot be stored' },
     { 'inner loan in a merged result', [[
-        view_of(p, n, do(outer)
-            local selected = view_of(q, n, do(inner)
+        view_of(p, n) do(outer)
+            local selected = view_of(q, n) do(inner)
                 if flag then return Str.of outer end
                 return Str.of inner
-            end)
-        end)
+            end
+        end
     ]], 'cannot outlive its activity' },
     { 'different loans across a residual backedge', [[
         local function rotate(a: Str, b: Str, count: U32): Str
             if count == 0 then return a end
             return rotate(b, a, count - 1)
         end
-        view_of(p, n, do(outer)
-            view_of(q, n, do(inner)
+        view_of(p, n) do(outer)
+            view_of(q, n) do(inner)
                 local selected = rotate(Str.of outer, Str.of inner, n)
-            end)
-        end)
+            end
+        end
     ]], 'provenance cannot change' },
 }
 for _, operation in ipairs { 'saved.length', 'saved[0]', 'saved:equals "x"',
     'saved:sub(0, 0)', 'Str.of saved', 'dynamic saved', 'rawmember(saved, "ptr")' } do
     rejected[#rejected + 1] = { 'expired text: ' .. operation,
-        'local saved = {}\nview_of(p, n, do(xs) saved.text = Str.of xs end)\nlocal used = '
+        'local saved = {}\nview_of(p, n) do(xs) saved.text = Str.of xs end\nlocal used = '
             .. operation:gsub('saved', 'saved.text'),
         'after its activity ends' }
 end
 local accepted = {
-    { 'materialized scalar consumer', [[view_of(p, n, do(xs) local size = call length(Str.of xs) end)]] },
+    { 'materialized scalar consumer', [[view_of(p, n) do(xs) local size = call length(Str.of xs) end]] },
     { 'Grow materialized call', [[
         local bytes = (Grow U8) {}
         bytes:push 65
@@ -271,33 +271,33 @@ local accepted = {
         local size = holder.length
     ]] },
     { 'inferred aliases and scalar copies', [[
-        local size: U32 = 0
-        view_of(p, n, do(xs)
+        local size: U64 = 0
+        view_of(p, n) do(xs)
             local text = Str.of xs
             local alias = identity text
             size = alias.length
-        end)
+        end
         kept = "independent"
     ]] },
     { 'owned Chars copy', [[
         local saved = Chars 32 ()
-        view_of(p, n, do(xs) saved = Chars 32 (Str.of xs) end)
+        view_of(p, n) do(xs) saved = Chars 32 (Str.of xs) end
         local size = saved.length
     ]] },
     { 'owned Text copy', [[
         local saved = Text {}
-        view_of(p, n, do(xs) saved:write(Str.of xs) end)
+        view_of(p, n) do(xs) saved:write(Str.of xs) end
         local size = saved.length
     ]] },
     { 'owned value crosses a native boundary', [[
-        local size = do(text: Chars 32): U32 = text.length
+        local size = do(text: Chars 32): U64 = text.length
         local saved = Chars 32 ()
-        view_of(p, n, do(xs) saved = Chars 32 (Str.of xs) end)
+        view_of(p, n) do(xs) saved = Chars 32 (Str.of xs) end
         local result = call size saved
     ]] },
     { 'scalar crosses a native boundary inside a loan', [[
-        local twice = do(value: U32): U32 = value * 2
-        view_of(p, n, do(xs) local result = call twice(xs.length) end)
+        local twice = do(value: U64): U64 = value * 2
+        view_of(p, n) do(xs) local result = call twice(xs.length) end
     ]] },
     { 'StrMap key copied into owned storage', [[
         local map = StrMap(U32) {}
@@ -308,29 +308,29 @@ local accepted = {
     ]] },
     { 'raw slice remains a trusted boundary', [[kept = Str.of(Slice(p, n))]] },
     { 'explicit raw pointer extraction remains trusted', [[
-        view_of(p, n, do(xs)
+        view_of(p, n) do(xs)
             local text = Str.of xs
             kept = Str.of(Slice(rawmember(text, "ptr"), text.length))
-        end)
+        end
     ]] },
-    { 'independent literal result', [[kept = view_of(p, n, do(xs) return Str "independent" end)]] },
+    { 'independent literal result', [[kept = view_of(p, n) do(xs) return Str "independent" end]] },
     { 'outer loan may pass through an inner activity', [[
-        view_of(p, n, do(outer)
-            local text = view_of(q, n, do(inner) return Str.of outer end)
+        view_of(p, n) do(outer)
+            local text = view_of(q, n) do(inner) return Str.of outer end
             local size = text.length
-        end)
+        end
     ]] },
     { 'same loan through a residual tail loop', [[
-        view_of(p, n, do(xs) local size = tail_length(Str.of xs, n) end)
+        view_of(p, n) do(xs) local size = tail_length(Str.of xs, n) end
     ]] },
     { 'scalar extracted from a sum is independent', [[
-        local size: U32 = 0
-        view_of(p, n, do(xs)
+        local size: U64 = 0
+        view_of(p, n) do(xs)
             size = choose_optional(Str.of xs, flag) {
                 some = do(text) return text.length end,
-                none = do() return U32 0 end,
+                none = do() return U64 0 end,
             }
-        end)
+        end
     ]] },
 }
 local function run(case, reject, index)

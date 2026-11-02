@@ -97,7 +97,7 @@ function Fd:mapped(n: U32, body): Bool
     if p == MAP_FAILED then
         return false
     end
-    view_of(p, n, body)
+    view_of(p, U64 n, body)
     c_munmap p (U64 n)
     return true
 end

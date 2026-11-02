@@ -18,7 +18,7 @@ local function decorate(t)
     local prefix = is_str and 'StrMap' or ('Map_' .. G.ctype(t.key):gsub('[^%w_]', '_'))
     local n = S.unique_global(prefix .. '_' .. G.ctype(t.elem):gsub('[^%w_]', '_'))
     t.ctype = function() return n end
-    local stored_key = is_str and S.struct(n .. 'Bytes', { { 'offset', types.U64 }, { 'len', types.U32 } }) or t.key
+    local stored_key = is_str and S.struct(n .. 'Bytes', { { 'offset', types.U64 }, { 'len', types.U64 } }) or t.key
     t.entry = S.struct(n .. 'Entry', { { 'hash', types.U64 }, { 'key', stored_key }, { 'value', t.elem } })
     t.lookup = S.oneof(n .. 'Lookup', { { 'found', t.elem }, { 'missing', types.Unit } })
     local layouts = Mem.layouts_module()
@@ -170,7 +170,7 @@ local function known_description(t, entries)
     local mt = getmetatable(object)
     mt.__nua_index = checked
     mt.__index = function(_, name)
-        if name == 'length' then return S.known(types.U32, count) end
+        if name == "length" then return S.known(types.U64, count) end
         if methods[name] then return methods[name] end
         if name == 'put' or name == 'ensure' or name == 'remove' then fail('known maps are immutable') end
         return checked(object, name)

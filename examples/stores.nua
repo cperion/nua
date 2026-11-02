@@ -55,7 +55,7 @@ local run = do(n: U32): U32
 
     populate_double(Ref g, n)
 
-    return g.nodes.length
+    return U32 g.nodes.length
 end
 
 export run
@@ -87,7 +87,7 @@ local digits = do(x: U32): U32
         buf:push U8(v % 10)
         v = v / 10
     end
-    return buf.length
+    return U32 buf.length
 end
 export digits
 
@@ -100,7 +100,7 @@ end
 local sum_depths = do(n: U32): U32
     local g = Graph { nodes = Store(Node) {} }
     g:add(depth n)
-    return g.nodes.length + depth n
+    return U32 g.nodes.length + depth n
 end
 export sum_depths
 

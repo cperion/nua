@@ -50,7 +50,7 @@ local inferred_storage = do(n: U32): U32
     local values = Array(U32, 2) { n, 3 }
     local text = Text {}
     text:write "abc"
-    return values[0] + values[1] + text.length
+    return values[0] + values[1] + U32 text.length
 end
 
 local inferred_mixed = do(x: U32): U32

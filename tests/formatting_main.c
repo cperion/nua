@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 typedef struct Chars20 { uint32_t len; struct { uint8_t e[20]; } bytes; } Chars20;
-typedef struct Str { uint8_t *ptr; uint32_t len; } Str;
+typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 Chars20 format_unsigned(uint64_t value);
 Chars20 format_signed(int64_t value);
 uint32_t format_known_length(void);

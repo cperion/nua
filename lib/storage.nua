@@ -6,23 +6,27 @@ local storage = {}
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
 local none = U32 0xffffffff
+local maximum = U64 0xffffffffffffffffULL
 local occupied = U32 0xfffffffe
 local retired = U32 0xfffffffd
 
 -- Room for one more item at the top of the owner's data stack.
-local function extend(T, p, what)
+local function extend(T, p, what, counts_slots)
     local message = what .. " grew while it was not at the top of its data stack"
-    return do(owner: Ref T, length: U32, width: U64): Unit
+    return do(owner: Ref T, length: U64, width: U64): Unit
         local h = p.header owner
-        local count = U64 length
-        stacks.extend h.stack h.base (count * width) width message
+        -- a Store counts slots in a U32 (its Ids name them): no product overflows
+        if not counts_slots then
+            if length > maximum / width then trap(what .. " is full") end
+        end
+        stacks.extend h.stack h.base (length * width) width message
     end
 end
 
 function storage.store(T, Id, p)
     local Item = p.Item
     local api = {}
-    local grow = extend(T, p, "Store")
+    local grow = extend(T, p, "Store", true)
     -- the slot an Id names while it is current, or null
     local occupant = do(s: Ref T, id: Id): Ptr Item
         local token, slot, generation = p.components id
@@ -53,7 +57,7 @@ function storage.store(T, Id, p)
         else
             slot = h.len
             if slot >= retired then trap "Store is full" end
-            grow(s, slot, p.width())
+            grow(s, U64 slot, p.width())
             h.len = slot + 1
             local items = p.items s
             entry = Ptr items[slot]
@@ -79,7 +83,7 @@ function storage.store(T, Id, p)
         end
         return true
     end
-    api.length = do(s: Ref T): U32 return p.header(s).live end
+    api.length = do(s: Ref T): U64 return U64 p.header(s).live end
     -- `copy s` into a new, empty store: the same slots, generations and token,
     -- so the original's Ids name the same entities in the copy
     api.copy = do(s: Ref T, from: Ref T): Unit
@@ -114,11 +118,10 @@ function storage.grow(T, p)
             if n == 0 then return end
             local h = p.header g
             local length = h.len
-            if n > none - length then trap "Text is full" end
             -- text may be bytes of this stack, even of this Text: growth leaves
             -- them where they are, and the new bytes lie above them
-            local bytes = U64 n
-            local top = stacks.extend(h.stack, h.base, U64 length, bytes,
+            local bytes = n
+            local top = stacks.extend(h.stack, h.base, length, bytes,
                 "Text grew while it was not at the top of its data stack")
             local ptr, len = slice_parts text
             stacks.write h.stack top ptr bytes
@@ -128,24 +131,24 @@ function storage.grow(T, p)
     api.push = do(g: Ref T, value: T.elem): Unit
         local h = p.header g
         local length = h.len
-        if length == none then trap "Grow is full" end
         grow(g, length, p.width())
         h.len = length + 1
         local items = p.items g
         items[length] = value
     end
-    api.locate = do(g: Ref T, index: U32): Ptr T.elem
+    api.locate = do(g: Ref T, index: U64): Ptr T.elem
         local h = p.header g
         if index >= h.len then trap "Grow index out of range" end
         local items = p.items g
         return Ptr items[index]
     end
     api.items = p.items
-    api.length = do(g: Ref T): U32 return p.header(g).len end
+    api.length = do(g: Ref T): U64 return p.header(g).len end
     -- an empty owner takes n zeroed elements (Array(T, n) {} with a runtime n)
-    api.allocate = do(g: Ref T, n: U32): Unit
+    api.allocate = do(g: Ref T, n: U64): Unit
         local h = p.header g
-        local bytes = U64 n * p.width()
+        if n > maximum / p.width() then trap "Array is too large" end
+        local bytes = n * p.width()
         if bytes ~= 0 then
             local at = stacks.extend(h.stack, h.base, U64 0, bytes,
                 "Array was not at the top of its data stack when built")
@@ -154,9 +157,9 @@ function storage.grow(T, p)
         h.len = n
     end
     -- an empty owner takes a copy of n elements (copy of a Slice)
-    api.fill_from = do(g: Ref T, items: Ptr T.elem, n: U32): Unit
+    api.fill_from = do(g: Ref T, items: Ptr T.elem, n: U64): Unit
         local h = p.header g
-        local bytes = U64 n * p.width()
+        local bytes = n * p.width()
         if bytes ~= 0 then
             local at = stacks.extend(h.stack, h.base, U64 0, bytes,
                 "copy target was not at the top of its data stack")
@@ -168,7 +171,7 @@ function storage.grow(T, p)
     api.copy = do(g: Ref T, from: Ref T): Unit
         local source = p.header from
         local h = p.header g
-        local bytes = U64 source.len * p.width()
+        local bytes = source.len * p.width()
         if bytes ~= 0 then
             local at = stacks.extend(h.stack, h.base, U64 0, bytes,
                 "Grow copy target was not at the top of its data stack")

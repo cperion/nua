@@ -8,7 +8,7 @@ layout.Store = cstruct("nua_store", h, {
         { "stack", U64 },
         { "base", U64 }, { "len", U32 }, { "live", U32 }, { "free_head", U32 }, { "token", U64 },
     })
-layout.Grow = cstruct("nua_grow", h, { { "stack", U64 }, { "base", U64 }, { "len", U32 } })
+layout.Grow = cstruct("nua_grow", h, { { "stack", U64 }, { "base", U64 }, { "len", U64 } })
 layout.Id = cstruct("nua_id", h, { { "token", U64 }, { "slot", U32 }, { "gen", U32 } })
 layout.Map = cstruct("nua_map", h, {
         { "stack", U64 },
@@ -49,7 +49,7 @@ layout.map_new = do(stack: U64, width: U64): layout.Map
 end
 layout.strmap_new = do(table_stack: U64, arena_stack: U64, width: U64): layout.StrMap
     -- nua_strkey is the full fixed prefix, including native trailing padding.
-    local Key = cstruct("nua_strkey", h, { { "hash", U64 }, { "offset", U64 }, { "len", U32 } })
+    local Key = cstruct("nua_strkey", h, { { "hash", U64 }, { "offset", U64 }, { "len", U64 } })
     if table_stack == arena_stack or width < size_of Key then trap "StrMap: invalid storage layout" end
     local entries = layout.map_new table_stack width
     local base = stacks.begin arena_stack

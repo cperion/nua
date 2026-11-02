@@ -341,7 +341,7 @@ export f
       src = [[local G = struct { order: Grow U32 }
 local f = do(g: Ref G): U32
     local o = g.order
-    return o.length
+    return U32 o.length
 end
 export f
 ]] },
@@ -385,8 +385,8 @@ export f
     local mine = Grow(U32) {}
     mine:push n
     outer:push n
-    if n == 0 then return mine.length end
-    return deep(n - 1, Ref mine) + mine.length
+    if n == 0 then return U32 mine.length end
+    return deep(n - 1, Ref mine) + U32 mine.length
 end
 local g = do(n: U32): U32
     local start = Grow(U32) {}

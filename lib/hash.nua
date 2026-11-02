@@ -62,8 +62,8 @@ local byte = do(h: Ref State, value: U8): Unit
 end
 
 hash.bytes = do(h: Ref State, text: Str): Unit
-    h.length = h.length + U64 text.length
-    local i = U32 0
+    h.length = h.length + text.length
+    local i = U64 0
     while i < text.length do
         byte h text[i]
         i = i + 1

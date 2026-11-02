@@ -4,7 +4,7 @@
 #include "nua_rt.h"
 
 typedef struct Pixel { uint8_t r, g, b; } Pixel;
-typedef struct U8Slice { uint8_t *ptr; uint32_t len; } U8Slice;
+typedef struct U8Slice { uint8_t *ptr; uint64_t len; } U8Slice;
 typedef struct Packet { uint32_t version, flags, length, id; } Packet;
 
 void brighten(Pixel *, uint32_t, uint8_t);
