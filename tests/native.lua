@@ -60,6 +60,19 @@ check('grow during view', stable.grow_during_view(1000000) == 18)
 check('text appends its own lent bytes', stable.text_doubles(16) == 131072 + 98)
 check('store grows during a view', stable.store_during_view(100000) == 100005)
 
+-- References as data: fields, payloads, elements, locals, containers, globals.
+local refs = nua.load(root .. '/tests/references.nua')
+check('reference field written through then rebound', refs.field_rebind(5) == 7102)
+check('reference field through a call', refs.field_call(10) == 16)
+check('reference local chosen at run time', refs.local_choice(true, 4) == 45 and refs.local_choice(false, 4) == 54)
+check('array of references', refs.array_refs(3) == 14)
+check('sum payload reference', refs.sum_payload(true, 1) == 6 and refs.sum_payload(false, 1) == 1)
+check('Grow of records holding references', refs.grow_refs(7) == 7)
+check('Store of tokens borrowing a source', refs.store_tokens(2) == 7)
+check('global reference to a global', refs.global_ref(41) == 42)
+check('Grow of references', refs.grow_of_refs(2) == 312)
+check('Store of references', refs.store_of_refs(4) == 12)
+
 -- Omitted annotations infer native places, on the same prepared IR as C.
 local inferred = nua.load(root .. '/examples/inferred_locals.nua')
 check('inferred branch true', inferred.inferred_branch(true, 10) == 29)

@@ -24,6 +24,7 @@ local function fail(msg) S.fail(msg, 2) end
 -- C names supplied by the backend: NodeStore, NodeId, U8Grow
 local function elem_name(t)
     if t.kind == 'struct' then return require('nua.cgen').ctype(t) end
+    if t.kind == 'ref' then return elem_name(t.elem) .. 'Ref' end
     return t.name
 end
 
@@ -139,6 +140,8 @@ function Builder:gs_close(blk)
         if reachable_end then
             o.release()
         end
+        -- its bytes are given back: borrows of it end with it
+        S.end_place(o.place, ("'" .. tostring(rawget(o.place, 'name')) .. "' ended"))
         self.gs_live[o.k] = nil
     end
     self.gs_owned[blk] = nil
@@ -180,6 +183,7 @@ end
 
 -- the place a method receiver denotes (a place, or a reference to one)
 local function receiver(x, what)
+    x = S.through(x)
     if S.is_place(x) then return x end
     if S.is_value(x) and x.k == 'ref' then return x.place end
     fail(what .. ' needs the storage itself (a place or a Ref), got a value')
@@ -211,6 +215,19 @@ local function capture(value, what)
     local tmp = b:new_temp(value.T)
     b:emit { op = 'let', place = tmp, e = S.ex(value), what = what }
     return dyn(value.T, S.read_expr(tmp))
+end
+
+-- A value entering a container: the lifetime rule checks what it borrows
+-- against the container's owner, and records it there for later reads. The
+-- container's algorithm then copies plain bytes through raw memory.
+local function owned_copy(container, value, what)
+    -- a reference stays a reference: reading it as a value would follow it
+    if not (S.is_value(value) and value.k == 'ref') then value = S.value_of(value) end
+    S.check_store_view(container, value)
+    local b = S.cur()
+    local tmp = b:new_temp(value.T)
+    b:emit { op = 'let', place = tmp, e = S.ex(value), what = what }
+    return S.dyn(value.T, S.read_expr(tmp))
 end
 
 -- An index or key fixed where it is written, so a checked place denotes the
@@ -249,51 +266,6 @@ local function fix_index(value, what)
 end
 Mem.fix_index = fix_index
 
--- Grow loans: data stacks never move, so growth keeps a view valid. While an
--- activity views resizable storage, only shrinking it (which frees the bytes
--- the view reads) is rejected. Store places use checked lookups.
-local function root(p)
-    local q = rawget(p, 'parent')
-    while q do p = q; q = rawget(p, 'parent') end
-    return p
-end
-
-local function check_shrink(p, what)
-    local b = S.cur()
-    for _, q in ipairs(b.slot_borrows or {}) do
-        if q == p or root(q).pk == 'deref' or root(p).pk == 'deref' then
-            fail(('%s while %s is borrowed (inside :view) would free what the view reads. '
-                .. 'Finish the borrow first'):format(what, q == p and ("'" .. p.name .. "'") or 'resizable storage'))
-        end
-    end
-end
-
-local function contains_store(t, seen)
-    seen = seen or {}
-    if seen[t] then return false end
-    seen[t] = true
-    if t.kind == 'store' or t.kind == 'grow' then return true end
-    if t.kind == 'ref' then return contains_store(t.elem, seen) end
-    if t.kind == 'struct' then
-        for _, f in ipairs(t.fields) do if contains_store(f.type, seen) then return true end end
-    end
-    return false
-end
-
--- a materialized call could shrink any storage passed to it by reference
-local call_materialized = Builder.call_materialized
-function Builder:call_materialized(w, args, key)
-    if self.slot_borrows and #self.slot_borrows > 0 then
-        for _, a in ipairs(args) do
-            if S.is_value(a) and a.k == 'ref' and contains_store(a.T) then
-                fail(('calling %s with a reference that reaches resizable storage while it is borrowed '
-                    .. '(inside :view): the call could shrink it'):format(w.name))
-            end
-        end
-    end
-    return call_materialized(self, w, args, key)
-end
-
 local storage_libraries, storage_module = {}, nil
 storage_library = function(t)
     if storage_module ~= S.module then storage_libraries, storage_module = {}, S.module end
@@ -323,7 +295,7 @@ local function store_methods(t)
             local p = receiver(self, n .. ':add')
             S.bump_checked()
             local val = S.coerce(v, elem, 'value added to ' .. t.display)
-            val = capture(val, 'capturing a store value')
+            val = owned_copy(p, val, 'capturing a store value')
             return storage_library(t).add(S.Ref(p), val)
         end,
         remove = function(self, i)
@@ -341,38 +313,42 @@ end
 local function grow_methods(t)
     local n = cname_of(t)
     local elem = t.elem
-    return {
-        -- an activity: the body sees the elements as a read-only slice of the
-        -- length at its start; the Grow may grow meanwhile (its bytes stay put)
-        -- but not shrink, and the slice ends with the view
-        view = function(self, body)
-            local p = receiver(self, n .. ':view')
-            if type(body) ~= 'function' and not S.is_word(body) then
-                fail(n .. ':view() needs a body: g:view() do(xs) ... end')
-            end
-            local st = types.slice(elem)
-            local pt = types.ptr(elem)
+    local grow_all
+    local methods
+    grow_all = function(self) return methods.all(self) end
+    methods = {
+        -- the elements as a read-only slice borrowing the Grow, of the length it
+        -- has now: growing keeps the slice valid (stacks never move); clearing
+        -- ends it
+        all = function(self)
+            local p = receiver(self, n .. ':all')
             local b = S.cur()
+            if not b.fn then fail(n .. ' is runtime storage: it is viewed where it runs') end
             local ptr = storage_library(t).items(S.Ref(p))
-            -- the slice keeps the length at the start of the view
             local len = storage_library(t).length(S.Ref(p))
-            local token = { owner = b.fn }
-            local xs = S.make_slice(st, b:bind(ptr), b:bind(len), token)
-            b.slot_borrows = b.slot_borrows or {}
-            table.insert(b.slot_borrows, p)
-            local ok, r = pcall(body, xs)
-            table.remove(b.slot_borrows)
-            if not ok then token.ended = true; error(r, 0) end
-            return S.end_view(token, r, 'a view of a Grow cannot outlive its view')
+            return S.make_slice(types.slice(elem), b:bind(ptr), b:bind(len), S.place_tokens(p, true))
+        end,
+        sub = function(self, a, z)
+            local xs = grow_all(self)
+            return S.member_slice(xs, 'sub')(xs, a, z)
+        end,
+        clear = function(self)
+            local p = receiver(self, n .. ':clear')
+            S.end_borrows(p, ("'" .. tostring(p.name) .. "' was cleared"))
+            S.bump_checked()
+            local b = S.cur()
+            if b.fn then b.fn.uses_rt = true end
+            storage_library(t).clear(S.Ref(p))
         end,
         push = function(self, v)
             local p = receiver(self, n .. ':push')
             S.bump_checked()
             local val = S.coerce(v, elem, 'value pushed onto ' .. t.display)
-            val = capture(val, 'capturing a Grow value')
+            val = owned_copy(p, val, 'capturing a Grow value')
             return storage_library(t).push(S.Ref(p), val)
         end,
     }
+    return methods
 end
 
 -- s[id] and g[i]: an element as a checked place. Its address is computed (and
@@ -388,8 +364,12 @@ local function index_hook(t)
         local function resolve() return S.ex(storage_library(t).locate(S.Ref(p), k)) end
         local b = S.cur()
         if b.fn then b.fn.uses_rt = true end
-        return S.checked_place(t.elem, nil, nil, true, resolve,
+        local place = S.checked_place(t.elem, nil, nil, true, resolve,
             n .. '/' .. S.expr_key(addr(p)) .. '/' .. S.expr_key(S.ex(k)))
+        -- an element is the container's contents: borrows of it, and borrows
+        -- stored in it, are checked against the container's owner
+        rawset(place, 'owner_place', p)
+        return place
     end
 end
 
@@ -440,7 +420,7 @@ local function decorate(t)
         end)
     elseif t.kind == 'grow' then
         local ms = grow_methods(t)
-        local ar = { push = 2, view = 2 }
+        local ar = { push = 2, all = 1, sub = 3, clear = 1 }
         for k, f in pairs(ms) do S.arity[f] = ar[k] end
         rawset(t, 'builtin_methods', merge_methods(t, ms))
         rawset(t, '__index', index_hook(t))
@@ -469,7 +449,7 @@ local function checked(make, what)
 end
 
 -- for nua.strings: Text is Grow U8 with text methods
-Mem.receiver, Mem.check_shrink, Mem.capture, Mem.addr = receiver, check_shrink, capture, addr
+Mem.receiver, Mem.capture, Mem.addr = receiver, capture, addr
 
 Mem.Store = checked(types.store, 'Store')
 Mem.Grow = checked(types.grow, 'Grow')

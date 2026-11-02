@@ -233,8 +233,9 @@ local f = do(x: U32): Unit
 end
 f(3)
 ]] },
-    { name = 'reference stored in a struct', expect = 'cannot be stored in aggregates',
-      src = [[local S = struct { r: Ref U32 }
+    { name = 'a reference in a channel message', expect = 'a reference points into memory someone else owns',
+      src = [[local Box = struct { r: Ref U32 }
+local C = Chan Box
 ]] },
     { name = 'a store assigned after creation', expect = 'cannot be reassigned',
       src = [[local N = struct { v: U32 }
@@ -416,9 +417,18 @@ export f
 local f = do(x: U32): S = S.dot(x)
 export f
 ]] },
-    { name = 'a reference in an alternative', expect = 'holds a reference',
+    { name = 'a reference payload returned past its target', expect = 'returns a borrow of its own local',
       src = [[local Node = struct { v: U32 }
 local Link = oneof { none: Unit, some: Ref Node }
+local make = do(): Link
+    local node = Node { v = 1 }
+    return Link.some(Ref node)
+end
+local f = do(): U32
+    local link = make()
+    return 0
+end
+export f
 ]] },
     { name = 'an empty oneof', expect = 'at least one named alternative',
       src = [[local Never = oneof { }
@@ -451,28 +461,40 @@ export f
 end
 export f
 ]] },
-    { name = 'clearing a Text while it is viewed', expect = 'would free what the view reads',
+    { name = 'a Text borrow used after clearing', expect = "a borrow of 't' is used after 't' was cleared",
       src = [[local f = do(n: U32): U32
     local t = Text {}
     t:write "abc"
-    return t:str() do(s)
-        t:clear()
-        return s.length
-    end
+    local s = t:str()
+    t:clear()
+    return s.length
 end
 export f
 ]] },
-    { name = 'a view outliving its view', expect = 'cannot outlive its view',
-      src = [[local f = do(n: U32): U32
+    { name = 'a borrow returned past its owner', expect = "returns a borrow of its own local 'g'",
+      src = [[local first = do(n: U32): Slice U32
     local g: Grow U32 = (Grow U32) {}
     g:push(n)
-    local xs = g:view() do(v) return v end
+    return g:all()
+end
+local f = do(n: U32): U32
+    local xs = first n
     return 0
 end
 export f
 ]] },
-    { name = 'a slice stored in a struct', expect = 'borrows cannot be stored',
-      src = [[local S = struct { bytes: Slice U8 }
+    { name = 'a store element borrowing a word local', expect = "cannot be stored in 'tokens'",
+      src = [[local Token = struct { text: Str }
+local fill = do(tokens: Ref (Store Token)): Unit
+    local c = Chars(8) "ab"
+    local id = tokens:add Token { text = c:str() }
+end
+local f = do(): U32
+    local tokens = Store(Token) {}
+    fill(Ref tokens)
+    return tokens.length
+end
+export f
 ]] },
     { name = 'a signed index', expect = 'must be an unsigned integer',
       src = [[local f = do(p: Ptr U8, i: I32): U8 = p[i]
@@ -685,8 +707,17 @@ export f
     { name = 'an empty array type', expect = 'n must be a positive integer known while compiling',
       src = [[local A = Array(U32, 0)
 ]] },
-    { name = 'an array of references', expect = 'Array holds fixed-size values, not Ref U32',
-      src = [[local A = Array(Ref(U32), 4)
+    { name = 'an array of references to a word local returned', expect = 'returns a borrow of its own local',
+      src = [[local A = Array(Ref(U32), 1)
+local make = do(): A
+    local v: U32 = 1
+    return A { Ref v }
+end
+local f = do(): U32
+    local refs = make()
+    return 0
+end
+export f
 ]] },
     { name = 'an array literal of the wrong length', expect = 'Array(U8, 3) { ... } lists 3 elements, got 2',
       src = [[local f = do(): U8
@@ -844,8 +875,15 @@ export f
 end
 export f
 ]] },
-    { name = 'a Str stored in a struct', expect = "field 's' is a Str, a view of someone else's bytes",
+    { name = 'a local view stored in a global record', expect = 'cannot be stored',
       src = [[local Holder = struct { s: Str }
+local held = global(Holder, {})
+local f = do(): U32
+    local c = Chars(8) "ab"
+    held.s = c:str()
+    return 0
+end
+export f
 ]] },
     { name = 'Chars overflow on the known word path', expect = 'Chars(4) holds 4 bytes; this text has 5',
       src = [[local f = do(s: Str): U32

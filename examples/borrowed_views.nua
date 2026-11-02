@@ -46,9 +46,7 @@ local copy_text_release = do(pointer: Ptr U8, length: U32): U32
             owned:write(Str.of bytes)
         end)
     release pointer
-    return owned:str() do(text)
-        return checksum text
-    end
+    return checksum owned:str()
 end
 export copy_text_release
 

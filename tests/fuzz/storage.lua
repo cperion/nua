@@ -220,7 +220,7 @@ local function make_text_program(seed)
             src[#src + 1] = '    acc = acc * 31 + U64(t.length)'
             model.acc = model.acc * 31 + model.length
         else
-            src[#src + 1] = '    t:str() do(s) acc = acc * 31 + U64(s.length) end'
+            src[#src + 1] = '    acc = acc * 31 + U64(t:str().length)'
             model.acc = model.acc * 31 + model.length
         end
         if r(10) == 1 then

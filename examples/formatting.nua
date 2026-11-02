@@ -17,8 +17,6 @@ export format_known_length
 local format_render = do(a: I64, b: U64, flag: Bool, expected: Str): Bool
     local out = Text {}
     out:write(a, ",", b, ",", flag, ",", 42, ",", U64 18446744073709551615ULL)
-    local same: Bool = false
-    out:str() do(text) same = text:equals expected end
-    return same
+    return out:str():equals expected
 end
 export format_render

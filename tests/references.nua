@@ -1,0 +1,118 @@
+-- References as data: fields, payloads, elements, locals and container elements,
+-- rebound by a reference and written through by a value (assignment by type).
+
+local Holder = struct { r: Ref U32, n: U32 }
+local bump = do(h: Ref Holder): Unit
+    h.r = h.r + h.n
+end
+
+-- a field is written through, then rebound
+local field_rebind = do(x: U32): U32
+    local a: U32 = x
+    local b: U32 = 100
+    local holder = Holder { r = Ref a, n = 2 }
+    bump(Ref holder)
+    holder.r = Ref b
+    bump(Ref holder)
+    return a * 1000 + b
+end
+export field_rebind
+
+-- the same through a function compiled on its own: the target becomes memory
+local field_call = do(x: U32): U32
+    local a: U32 = x
+    local holder = Holder { r = Ref a, n = 3 }
+    call bump(Ref holder)
+    call bump(Ref holder)
+    return a
+end
+export field_call
+
+-- a Ref local chooses its target at run time, then writes through it
+local local_choice = do(flag: Bool, x: U32): U32
+    local a: U32 = x
+    local b: U32 = x
+    local r: Ref U32 = Ref a
+    if flag then r = Ref b end
+    r = r + 1
+    return a * 10 + b
+end
+export local_choice
+
+-- an array of references, written through each
+local array_refs = do(x: U32): U32
+    local a: U32 = x
+    local b: U32 = x + 1
+    local refs = Array(Ref U32, 2) { Ref a, Ref b }
+    for i: U32 = 0, 1 do refs[i] = refs[i] * 2 end
+    return a + b
+end
+export array_refs
+
+-- a sum carrying a reference: the payload denotes the place again
+local Target = oneof { some: Ref U32, none: Unit }
+local pick = do(flag: Bool, a: Ref U32): Target
+    if flag then return Target.some a end
+    return Target.none()
+end
+local sum_payload = do(flag: Bool, x: U32): U32
+    local a: U32 = x
+    pick(flag, Ref a) { some = do(r) r = r + 5 end, none = do end }
+    return a
+end
+export sum_payload
+
+-- a Grow of records holding references, declared after their targets
+local Cell = struct { target: Ref U32 }
+local grow_refs = do(n: U32): U32
+    local a: U32 = 0
+    local cells = Grow(Cell) {}
+    for i: U32 = 1, n do cells:push Cell { target = Ref a } end
+    for i: U32 = 0, n - 1 do cells[i].target = cells[i].target + 1 end
+    return a
+end
+export grow_refs
+
+-- a Store of tokens whose text borrows a source declared before the store
+local Token = struct { text: Str, kind: U32 }
+local store_tokens = do(n: U32): U32
+    local source = Chars(16) "hello world"
+    local tokens = Store(Token) {}
+    local id = tokens:add Token { text = source:str():sub(0, 5), kind = n }
+    return tokens[id].text.length + tokens[id].kind
+end
+export store_tokens
+
+-- a global holds a reference to another global
+local counter = global(U32, {})
+local pointer = global(Ref U32, {})
+local global_ref = do(n: U32): U32
+    counter[0] = n
+    pointer[0] = Ref counter[0]
+    pointer[0] = pointer[0] + 1
+    return counter[0]
+end
+export global_ref
+
+-- containers of references: a Grow and a Store whose elements are references
+local grow_of_refs = do(x: U32): U32
+    local a: U32 = x
+    local b: U32 = x
+    local refs = Grow(Ref U32) {}
+    refs:push(Ref a)
+    refs:push(Ref b)
+    refs[1] = refs[1] + 10
+    local all = refs:all()
+    all[0] = all[0] + 1
+    return a * 100 + b
+end
+export grow_of_refs
+
+local store_of_refs = do(x: U32): U32
+    local a: U32 = x
+    local refs = Store(Ref U32) {}
+    local id = refs:add(Ref a)
+    refs[id] = refs[id] * 3
+    return a
+end
+export store_of_refs

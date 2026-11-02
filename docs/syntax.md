@@ -382,9 +382,9 @@ follow:
 * **`return call f(x)` returns the call**; it is not a tail jump.
 
 `call` needs a native word. An untyped Lua function is an error, and a foreign
-function is already a call. A scoped view from `view_of` or `Grow:view` cannot
-cross a native function boundary: its lifetime has no residual ABI contract
-(§12.6). An explicit `call` is rejected, not silently evaluated in place.
+function is already a call. Borrows cross a `call` under the callee's derived
+summary (§9.7); a foreign or indirect call receives none, since nothing describes
+what it keeps.
 The boundary is the programmer's; [the architecture]
 (architecture.md#57-call-a-function-boundary-at-one-site) says what it costs, what
 `nua size` reports, and where the libraries put one.
@@ -1160,30 +1160,102 @@ computed length, arrays sized by a parameter) belong to the design: they use
 data-stack storage with properly nested lifetimes. They are not implemented yet
 (architecture §17.2).
 
-### 9.4 Borrowed references
+### 9.4 Borrows
 
-`Ref T` borrows an addressable native place and never owns it.
+A borrow uses storage someone else owns and never owns it:
 
-### 9.5 Borrowed results
+* `Ref T` borrows one addressable place.
+* `Slice T` and `Str` view a run of elements: `g:all()` and `g:sub(a, b)` of a
+  `Grow`, `out:str()` of a `Text`, `c:str()` of a `Chars(n)`, `a:slice()` of an
+  array, and the lent view of `view_of` (§12.6).
 
-A word can return a reference derived from a reference it received:
+Both may be held in typed locals, struct fields, sum payloads, array elements and
+the elements of a `Store` or a `Grow`, under the lifetime rule (§9.5).
+
+**Assigning to a `Ref`** follows the type of the right-hand side. A `Ref` local,
+field or element is rebound by a reference and written through by a value of the
+referred type:
+
+```lua
+local Holder = struct { r: Ref U32, n: U32 }
+local holder = Holder { r = Ref a, n = 2 }
+holder.r = holder.r + holder.n    -- writes a
+holder.r = Ref b                  -- now refers to b
+```
+
+`Ref T` and `T` are different types, so the two never collide; a `Ref` parameter
+keeps its meaning (`target = text` writes through). A place holding a reference
+stands for its target wherever a place is used: `holder.r.field`, `r[i]`, `r:push v`.
+A reference becoming data (stored in a field, an element, a local that becomes
+memory) takes its target's address, so the target lives in memory from then on.
+
+The compiler records, for every borrow, the owners it depends on. The program
+never writes that down: there is no lifetime syntax.
+
+### 9.5 The lifetime rule
+
+> **A borrow must not outlive the owner it borrows from.**
+
+The rule applies wherever a borrow could escape:
+
+* **Storing.** A borrow may be stored only in a place its owners outlive: a local
+  declared after the owner or in the owner's own scope. Storing a view of a word's
+  local into the caller's storage is rejected
+  (`a borrow of 'bytes' cannot be stored in 'kept', which outlives it`).
+* **Returning.** A word may return a borrow of what it received, never of its own
+  local (`word first returns a borrow of its own local 'g', which ends with it`):
+  return the owner's contents as an owned copy instead.
+* **Branches and joins.** A value that may come from several borrows depends on
+  all of them.
+* **Use.** A borrow used after its owner ended is rejected where it is used.
 
 ```lua
 local identity = do(r: Ref U32): Ref U32 =
 r
 ```
 
-A word that returns a reference to its own local is rejected.
+A Lua string literal is a `Str` of static data and borrows nothing that ends.
+`Slice(p, n)` and raw pointers borrow nothing the compiler knows: they are the
+programmer's contract (§12.5).
 
-### 9.6 Restricted aggregates
+### 9.6 Containers, globals and tasks
 
-References cannot be stored in structs (and therefore not in stores). Long-lived relationships are represented by IDs.
+An element of a `Store` or a `Grow` is a place of the container: a borrow stored
+in it is checked against the container's owner, and a borrow of an element (`Ref
+g[i]`, `g:all()`) borrows the container's contents, which `clear` ends. A global
+outlives every owner, so it holds only borrows of static data or of other globals.
+Values crossing a task boundary (spawn copies, channel messages) hold no borrow at
+all (§20.5), and map entries hold none (§15.1). Store an owned copy (`Chars(n)`, a
+`Text`) or an `Id` instead. A long-lived relationship between entities is an `Id`
+(§9.8).
 
 ### 9.7 Invalidation
 
-Data stacks never move (§9.10), so growth invalidates nothing: a Grow or a Text may grow while a view of it is live, and the view keeps the length it began with. Operations that free borrowed storage are rejected while a borrow is live: a Text cannot be cleared while it is lent as a `Str`, and a materialized call receiving a reference that reaches viewed storage is rejected, because it could do the same. Borrow lifetimes are lexical.
+Data stacks never move (§9.10), so growing invalidates nothing: a `Grow` or a
+`Text` may grow while a borrow of it is live, and the borrow keeps the length it
+was taken with. Only freeing storage invalidates. `clear` ends every borrow of the
+owner's contents taken so far (its views, references to its elements); borrows
+taken afterwards are new. A reference to the owner itself (`Ref g`) survives:
+the owner still exists. The check is made where a
+borrow is used, so a borrow that is not used again is no obstacle:
 
-A store slot is not borrowed: it is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). Nothing holds a slot's address across a change to the store, so the store may grow or shrink while its slots are in use. Scoped views retain lexical loans: a Grow's view (§12.4) and a foreign view lent with `view_of` (§12.6).
+```lua
+local head = xs:sub(0, 3)
+xs:push 99            -- fine: head stays valid
+local first = head[0]
+xs:clear()            -- fine: head is not used again
+```
+
+Using `head` after the `clear` is rejected
+(`a borrow of 'xs' is used after 'xs' was cleared`).
+
+A function compiled on its own (`call`, recursion) is described by a summary
+derived from its body: which arguments its result borrows from, and which
+arguments it may clear. A call that may clear an owner ends that owner's borrows
+at the call; a call that only reads or appends leaves them valid. A function still
+being built, within a recursive cycle, is assumed to do both.
+
+A store slot is not borrowed: it is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). A removed slot is detected by its generation.
 
 ### 9.8 Managed stores and generational IDs
 
@@ -1384,7 +1456,7 @@ Temporary resizable state (a worklist, a change log) created in an activity take
 
 ### 10.4 Saturating chains
 
-`transaction(doc) do(draft..) ... end` is the application `transaction(doc)(body)`. On its own, `transaction(doc)` would be a partial application with a runtime argument, which §3.8 rejects. **A chain of applications on a word accumulates its arguments until the word is saturated**, as in Let; surplus arguments apply to the result. The same holds for method chains (`g:view() do(xs) ... end`) and for library functions with a declared arity. Any other Lua function applies each group in turn.
+`transaction(doc) do(draft..) ... end` is the application `transaction(doc)(body)`. On its own, `transaction(doc)` would be a partial application with a runtime argument, which §3.8 rejects. **A chain of applications on a word accumulates its arguments until the word is saturated**, as in Let; surplus arguments apply to the result. The same holds for method chains (`m:each do(k, v) ... end`) and for library functions with a declared arity. Any other Lua function applies each group in turn.
 
 In a typed body, a native-word chain concatenates its argument groups before
 applying the word. A rest requirement receives the remaining arguments from the
@@ -1822,7 +1894,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 | `s.length` | the length |
 | `s:sub(a, b)` | the view of `[a, b)`, checked |
 | `Slice(p, n)` | a view of `n` elements at pointer `p`: the boundary where a length is trusted |
-| `g:view() do(xs) ... end` | a view of a `Grow` (§12.4) |
+| `g:all()`, `g:sub(a, b)` | a view of a `Grow` (§12.4) |
 | `view_of(p, n, body)` | lend a scoped view of foreign elements (§12.6) |
 
 **A check that a branch already proved is dropped.** On each arm of a dynamic branch the compiler records what an integer comparison proves (the loop exit `if (i >= n) break;` proves `i < n` on the path that continues), over values that cannot change behind its back: constants, parameters, temporaries, versioned reads of tracked locals, and a view's length. When `i` changes, its version changes and the fact stops matching. `s[i]` and `a[i]` (§13) emit no check when such a fact proves `i < length`.
@@ -1880,12 +1952,13 @@ The description, the loop over it and the reader's own loop are gone; one range 
 
 ### 12.4 Views of a Grow
 
-A view of a `Grow` is an activity with a lexical loan (§9.7): the body receives the elements as a slice of the length the `Grow` had when the view began. The `Grow` may grow while the view lasts, since its bytes never move; a materialized call receiving a reference that reaches it is rejected, since it could free them. The slice cannot outlive the view, nor be stored. It uses the same provenance and boundary checks as a foreign loan (§12.6). The view returns the body's result; scalar and owned results are bound before the loan ends, so deferred reads cannot run after the owner invalidates storage.
+`g:all()` is a slice of a `Grow`'s elements, borrowing the `Grow` (§9.4), of the
+length it has when the slice is taken; `g:sub(a, b)` is `g:all():sub(a, b)`. The
+`Grow` may grow while the slice is used, since its bytes never move; `g:clear()`
+ends the slice (§9.7).
 
 ```lua
-return g:view() do(xs)
-    return sum32(xs)
-end
+return sum32 g:all()
 ```
 
 ### 12.5 What is not checked
@@ -1915,23 +1988,22 @@ This excerpt and owned-copy examples are in
 [`examples/borrowed_views.nua`](../examples/borrowed_views.nua). Its harnesses read
 copied `Chars` and `Text` after the foreign allocation has actually been freed.
 
-The scoped view and its derived values carry a loan during specialization:
+The scoped view is a borrow of the activity (§9.4) and follows the lifetime rule:
 
 * Inferred bindings can alias it inside the activity. `Str.of`, subviews,
   `dynamic`, in-place words, sum payloads and joined return paths preserve the
   provenance. A runtime choice between two loans requires both lifetimes.
-* A scoped view cannot be assigned to native storage, including a typed local
-  declared outside the activity, or hidden in an aggregate to escape. Returning
-  this activity's loan is rejected. An outer loan may pass through an inner
-  activity without acquiring the inner activity's lifetime.
+* A scoped view can be stored only in storage declared inside the activity; a
+  typed local declared outside it, or an aggregate that escapes, is rejected.
+  Returning this activity's loan is rejected. An outer loan may pass through an
+  inner activity without acquiring the inner activity's lifetime.
 * After the loan ends, even text length, conversion or comparison through an
   escaped compiler alias is rejected. Copy a scalar during the activity, or copy
   the bytes into owned `Chars(n)` or `Text`, to retain the result.
-* The residual ABI has no scoped-loan contract. Passing a scoped view (including
-  inside a sum or aggregate) to a materialized word, an indirect function call or
-  an opaque foreign call is rejected. This includes scalar-consuming callees:
-  the boundary cannot prove they do not retain the input. Use an ordinary
-  in-place word, or an owned copy. There is no automatic fallback for `call`.
+* A materialized word receives a scoped view under its derived summary (§9.7):
+  a scalar-consuming callee is fine, and a callee returning its argument returns
+  a value that still borrows the activity. An indirect function call or an
+  opaque foreign call receiving one is rejected: nothing describes what it keeps.
 * A residual loop may carry a view with the same loan, including subviews of it.
   Changing the loan provenance across a residual backedge is rejected rather
   than discarding it.
@@ -2027,7 +2099,7 @@ There are no bounds checks: when an arm of an `if` cannot fall through, what fol
 `Text` is `Grow U8` with text words, created in place like any `Grow`: `local out: Text = Text {}`.
 
 * `out:write(a, b, ...)` appends each value as text. Known pieces (Lua strings and numbers, known values, known `Str`) are joined while compiling into one literal; each runtime value gets the conversion its type needs: integers in decimal, `Bool` as `true`/`false`, floats as the shortest text that reads back as the same value, `Str` and `CString` as their bytes. No format string exists at run time.
-* `out:str() do(s) ... end` lends the text as a `Str`. The text may grow meanwhile (`out:write s` appends its own bytes); it cannot be cleared (like `Grow:view`).
+* `out:str()` is the text as a `Str` borrowing `out` (§9.4). The text may grow while the `Str` is used (`out:write out:str()` appends its own bytes); `out:clear()` ends it.
 * `out:clear()`, `out:push(byte)`, `out.length`, `out[i]`.
 
 Integer digit generation and Boolean formatting are ordinary Nua words in
@@ -2060,7 +2132,7 @@ A `c:str()` view records an owner, offset and the length at creation. It reads t
 
 [The staged-values example](../examples/staged_values.nua) exercises these distinctions across known, split and dynamic inputs, nested fields, joins, loops, raw address escape and task captures. A task's view addresses its own captured value, never the parent's later contents.
 
-A struct field cannot be a `Str` (`field 's' is a Str, a view of someone else's bytes; store text as Chars(n), or keep it in a Text`).
+A struct field may be a `Str`; the struct then borrows what the `Str` borrows and follows the same lifetime rule (§9.7). Globals, stores, Grow arrays, maps and channel messages cannot hold one: store text that must outlive its owner as `Chars(n)` or in a `Text`.
 
 ### 14.4 What is implemented
 
@@ -3122,7 +3194,7 @@ uint64_t pooled(uint32_t count) {
     bool open = true;
     for (;;) {
         if (!open) break;
-        if (nua_recv(nua_tk, nua_ops, ch, &got, "channels.nua:345: recv") == NUA_PENDING) nua_block(nua_tk);
+        if (nua_recv(nua_tk, nua_ops, ch, &got, "channels.nua:343: recv") == NUA_PENDING) nua_block(nua_tk);
         r = nua_tk->result;
         if (r == 1) {
             nua_slot_adopt(nua_tk, got);
@@ -3149,7 +3221,7 @@ uint64_t pooled(uint32_t count) {
             nua_slot_release(nua_tk, r2.as.value);
         }
     }
-    if (nua_scope_end(nua_tk, nua_ops, scope, "channels.nua:332: the end of a tasks scope") == NUA_PENDING) nua_block(nua_tk);
+    if (nua_scope_end(nua_tk, nua_ops, scope, "channels.nua:330: the end of a tasks scope") == NUA_PENDING) nua_block(nua_tk);
     return total;
 }
 ```

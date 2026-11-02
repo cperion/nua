@@ -197,6 +197,17 @@ a borrow could escape:
 
 A Lua string literal is a `Str` of static data and borrows nothing that ends.
 
+**Assigning to a `Ref`** (decided 2026-11-02) follows the type of the right-hand
+side. A `Ref` local, a `Ref` field or a `Ref` element is rebound by a `Ref` value
+(`r = Ref y`) and written through by a value of the referred type (`r = 5`). `Ref T`
+and `T` are different types, so the two never collide, and a `Ref` parameter keeps
+its meaning (`target = text` writes through).
+
+**Containers** (decided 2026-11-02): `Store` and `Grow` elements may hold borrows.
+They are places like any other, checked against the container's owner by the
+storing rule. A global may hold a borrow only of static data or of another
+global, since it outlives every owner.
+
 ### 6.3 Invalidation
 
 Growth never moves elements, so **growing does not invalidate borrows**. Only

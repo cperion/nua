@@ -94,9 +94,10 @@ end
 
 function T.store(elem)
     check_type(elem, 'Store')
-    if elem.kind ~= 'struct' and elem.kind ~= 'sum' and not T.is_scalar(elem) then
+    if elem.kind ~= 'struct' and elem.kind ~= 'sum' and elem.kind ~= 'ref' and not T.is_scalar(elem) then
         error('Store holds fixed-size values, not ' .. elem.display, 2)
     end
+
     return memoized('store', elem, function()
         return { kind = 'store', elem = elem, display = 'Store ' .. elem.display,
                  resizable = true }
@@ -112,9 +113,10 @@ end
 
 function T.grow(elem)
     check_type(elem, 'Grow')
-    if not (T.is_scalar(elem) or elem.kind == 'struct' or elem.kind == 'sum') then
+    if not (T.is_scalar(elem) or elem.kind == 'struct' or elem.kind == 'sum' or elem.kind == 'ref') then
         error('Grow holds fixed-size values, not ' .. elem.display, 2)
     end
+
     return memoized('grow', elem, function()
         return { kind = 'grow', elem = elem, display = 'Grow ' .. elem.display,
                  resizable = true }
@@ -153,15 +155,6 @@ function T.struct(name, fields)
         if ftype.kind == 'opaque' then
             error(("struct %s: field '%s' is the opaque type %s; hold it as Ptr %s"):format(name, fname,
                 ftype.display, ftype.display), 2)
-        end
-        if rawget(ftype, 'is_str') then
-            error(("struct %s: field '%s' is a Str, a view of someone else's bytes; store text as "
-                .. "Chars(n), or keep it in a Text"):format(name, fname), 2)
-        end
-        if ftype.kind == 'ref' or rawget(ftype, 'slice_elem') then
-            error(("struct %s: field '%s' is a %s; borrows cannot be stored in "
-                .. "aggregates (use an Id, or a Ptr at a foreign boundary)"):format(name, fname,
-                ftype.kind == 'ref' and 'reference' or 'slice'), 2)
         end
         if resizable then
             error(("struct %s: the resizable field '%s' must be the last field"):format(name, resizable), 2)
@@ -237,8 +230,8 @@ function T.array(elem, n)
             elem.display, tostring(n)), 2)
     end
     local k = elem.kind
-    if not (k == 'int' or k == 'float' or k == 'bool' or k == 'struct' or k == 'sum' or k == 'array' or k == 'chan')
-        or elem.resizable or rawget(elem, 'slice_elem') then
+    if not (k == 'int' or k == 'float' or k == 'bool' or k == 'struct' or k == 'sum' or k == 'array' or k == 'chan'
+            or k == 'ref') or elem.resizable then
         error(('Array holds fixed-size values, not %s'):format(elem.display), 2)
     end
     arrays[elem] = arrays[elem] or {}
@@ -254,6 +247,24 @@ end
 -- channels -------------------------------------------------------------------------------------
 -- Chan T: a handle to a channel. What crosses a channel is a copy, so T holds
 -- no reference to anyone's memory: no Ref, Ptr, Slice, CString, Id or Atomic.
+
+-- whether values of t borrow someone else's storage: a view, or an aggregate
+-- holding one. Such values follow the lifetime rule; storage that outlives
+-- every owner (globals, containers, messages) cannot hold them.
+local borrow_cache = setmetatable({}, { __mode = 'k' })
+function T.holds_borrow(t)
+    local cached = borrow_cache[t]
+    if cached ~= nil then return cached end
+    local yes = rawget(t, 'slice_elem') ~= nil or t.kind == 'ref'
+    if not yes and t.kind == 'struct' then
+        for _, f in ipairs(t.fields or {}) do yes = yes or T.holds_borrow(f.type) end
+    elseif t.kind == 'array' then yes = T.holds_borrow(t.elem)
+    elseif t.kind == 'sum' then
+        for _, a in ipairs(t.alts) do yes = yes or T.holds_borrow(a.type) end
+    end
+    borrow_cache[t] = yes
+    return yes
+end
 
 -- why t cannot cross between tasks, or nil when it can
 function T.unsendable(t)
@@ -363,9 +374,10 @@ T.Group = new { kind = 'group', display = 'tasks scope', name = 'Group', cname =
 local slices = {}
 function T.slice(elem)
     if not T.is_type(elem) then error('Slice expects a type, got ' .. tostring(elem), 2) end
-    if elem.kind == 'unit' or elem.kind == 'ref' or elem.resizable then
+    if elem.kind == 'unit' or elem.resizable then
         error('Slice holds fixed-size values, not ' .. elem.display, 2)
     end
+
     if slices[elem] then return slices[elem] end
     local base = (elem.kind == 'struct' or elem.kind == 'sum') and elem.name or elem.name or 'T'
     local t = T.struct(base .. 'Slice', { { 'ptr', T.ptr(elem) }, { 'len', T.U32 } })
@@ -412,10 +424,6 @@ function T.sum(name, alts)
         seen[an] = true
         if not T.is_type(at) then
             error(("oneof: alternative '%s' needs a type, got %s"):format(an, tostring(at)), 2)
-        end
-        if at.kind == 'ref' then
-            error(("oneof: alternative '%s' holds a reference; references cannot be stored in "
-                .. "aggregates (use an Id)"):format(an), 2)
         end
         if at.resizable then
             error(("oneof: alternative '%s' is resizable storage; payloads are fixed-size"):format(an), 2)

@@ -287,14 +287,12 @@ local grow_in_task = do(n: U32): U32
                 g:push i
                 i = i + 1
             end
-            local s: U32 = g:view() do(xs)
-                local t: U32 = 0
-                local j: U32 = 0
-                while j < xs.length do
-                    t = t + xs[j]
-                    j = j + 1
-                end
-                return t
+            local xs = g:all()
+            local s: U32 = 0
+            local j: U32 = 0
+            while j < xs.length do
+                s = s + xs[j]
+                j = j + 1
             end
             out:send s
         end

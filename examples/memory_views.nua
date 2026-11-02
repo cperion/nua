@@ -88,9 +88,7 @@ local squares = do(n: U32): U32
         g:push(i * i)
         i = i + 1
     end
-    return g:view() do(xs)
-        return sum32 xs
-    end
+    return sum32 g:all()
 end
 export squares
 

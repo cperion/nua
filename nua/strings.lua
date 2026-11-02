@@ -136,10 +136,8 @@ function methods.cstring(self, body)
     api.append(S.Ref(p), s)
     api.push(S.Ref(p), S.known(U8, 0))
     S.bump_checked()
-    return S.mcall(text, 'view', function(xs)
-        local ptr = S.slice_parts(xs)
-        return body(S.dyn(types.CString, { op = 'conv', a = S.ex(ptr), T = types.CString }))
-    end)
+    local ptr = S.slice_parts(S.mcall(text, 'all'))
+    return body(S.dyn(types.CString, { op = 'conv', a = S.ex(ptr), T = types.CString }))
 end
 
 local arities = { equals = 2, starts_with = 2, ends_with = 2, find = 2, compare = 2, trim = 1, split = 3,
@@ -242,7 +240,7 @@ function S.member_chars(x, key)
             if not S.is_place(self) then fail(t.display .. ':str() views storage: call it on a typed local or a field', 2) end
             local ptr = S.array_pointer(S.field_place(self, 'bytes'))
             local len = S.cur():bind(S.cur():read(S.field_place(self, 'len')))
-            return S.make_slice(T, ptr, len)
+            return S.make_slice(T, ptr, len, S.owner_token(self))
         end
     end
     return nil
@@ -395,23 +393,23 @@ end
 
 text_methods.clear = function(self)
     local p = Mem.receiver(self, 'Text:clear')
-    Mem.check_shrink(p, 'clearing a Text')
+    S.end_borrows(p, ("'" .. tostring(p.name) .. "' was cleared"))
     S.bump_checked()
     local b = S.cur()
     if b.fn then b.fn.uses_rt = true end
     Mem.storage_library(Text).clear(S.Ref(p))
 end
 
--- t:str() do(s) ... end: the text as a Str; it may grow meanwhile, not shrink
-text_methods.str = function(self, body)
-    return text_methods.view(self, function(xs)
-        local ptr, len = S.slice_parts(xs)
-        return body(S.make_slice(T, ptr, len, rawget(xs, 'view')))
-    end)
+-- t:str(): the text as a Str borrowing t, of the length t has now. The text may
+-- grow while the Str is used; clearing it ends the Str.
+text_methods.str = function(self)
+    local xs = text_methods.all(self)
+    local ptr, len = S.slice_parts(xs)
+    return S.make_slice(T, ptr, len, rawget(xs, 'view'))
 end
 S.arity[text_methods.write] = nil
 S.arity[text_methods.clear] = 1
-S.arity[text_methods.str] = 2
+S.arity[text_methods.str] = 1
 
 -- names for programs
 function Str.prelude(env)

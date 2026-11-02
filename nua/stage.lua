@@ -499,7 +499,7 @@ function Builder:new_local(t, name)
     local fn = self.fn
     local frame = self.frames[#self.frames]
     local p = new_place { pk = 'local', T = t, name = name or 'v', id = uid(),
-                          frame = frame and frame.local_owner, owner = self.fn }
+                          frame = frame and frame.local_owner, owner = self.fn, block = self.block }
     if fn then fn.locals[#fn.locals + 1] = p end
     for _, l in ipairs(leaves(p)) do self.state[l] = { uninit = true } end
     return p
@@ -564,7 +564,8 @@ function Builder:resolve_checked(p)
         rawset(t, 'hint', 'at')
         self:emit { op = 'let', place = t, e = copy_expr(call), what = 'a checked lookup' }
         e = { epoch = self.cepoch or 0, path = here,
-              root = new_place { pk = 'deref', T = r.T, name = r.name, ptr = read_expr(t), id = uid() } }
+              root = new_place { pk = 'deref', T = r.T, name = r.name, ptr = read_expr(t), id = uid(),
+                                 owner_place = rawget(r, 'owner_place') } }
         self.ccache[c.key] = e
     end
     local names, q = {}, p
@@ -605,6 +606,28 @@ function S.checked_place(t, call, name, cache, resolve, key)
     return p
 end
 
+-- staging helpers, shared by the sections below
+local h = {}
+
+-- A reference read back from memory (a field, an element, a payload, a local
+-- that became memory) is a pointer value; it denotes a place again, carrying
+-- what the stored reference borrowed.
+-- a place holding a reference stands for the place it refers to wherever a
+-- place is used (members, indexing, method receivers); Goose's `&` of a
+-- location holding a reference likewise yields the stored reference
+h.through = function(x)
+    if is_place(x) and x.T.kind == 'ref' and current then return current:read(x) end
+    return x
+end
+S.through = function(x) return h.through(x) end
+h.reref = function(v)
+    if not (is_value(v) and v.k == 'dyn' and v.T.kind == 'ref') then return v end
+    local target = new_place { pk = 'deref', T = v.T.elem, name = 'ref', ptr = v.e, id = uid() }
+    local carried = rawget(v, 'view')
+    if carried then rawset(target, 'carried_view', carried) end
+    return ref(target)
+end
+
 function Builder:read(p)
     if checked_root(p) then p = self:resolve_checked(p) end
     if foreign_place(self, p) then return S.capture_read(self, p) end
@@ -632,41 +655,27 @@ function Builder:read(p)
         if not en or en.uninit then
             fail(("'%s' is read before it is written"):format(p.name), 3)
         end
-        if en.mat then return dyn(p.T, read_expr(p, en.ver)) end
+        if en.mat then return h.reref(h.with_view(dyn(p.T, read_expr(p, en.ver)), h.place_view(p))) end
         return en.val
     end
     self:flush_pending(p)
-    return dyn(p.T, read_expr(p))
+    return h.reref(h.with_view(dyn(p.T, read_expr(p)), h.place_view(p)))
 end
 
 local PENDING_LIMIT = 24
 
 local function pendable(v)
-    if v.k == 'known' or v.k == 'array_ptr' then return true end
+    if v.k == 'known' or v.k == 'array_ptr' or v.k == 'ref' then return true end
     if v.k == 'array' then return is_known(v) end
     if v.k == 'sumv' then local q = rawget(v, 'p'); return q == nil or pendable(q) end
     if v.k == 'dyn' then return free(v.e) and size(v.e) <= PENDING_LIMIT end
     return false
 end
 
-local h = {}
-
 -- Loan provenance belongs to staged values, never the residual ABI. A joined
 -- value may depend on several activities; ending any one invalidates that value.
-h.view_types = setmetatable({}, { __mode = 'k' })
-h.view_type = function(t)
-    local cached = h.view_types[t]
-    if cached ~= nil then return cached end
-    local yes = rawget(t, 'slice_elem') ~= nil
-    if t.kind == 'sum' then
-        for _, alt in ipairs(t.alts) do yes = yes or h.view_type(alt.type) end
-    elseif t.kind == 'array' then yes = h.view_type(t.elem)
-    elseif t.kind == 'struct' and not yes then
-        for _, field in ipairs(t.fields) do yes = yes or h.view_type(field.type) end
-    end
-    h.view_types[t] = yes
-    return yes
-end
+-- the types whose values borrow: views, references, aggregates holding either
+h.view_type = function(t) return types.holds_borrow(t) end
 h.each_view = function(view, visit)
     if not view then return end
     if view.tokens then for token in pairs(view.tokens) do visit(token) end
@@ -684,6 +693,23 @@ end
 h.value_view = function(v)
     if not is_value(v) or not h.view_type(v.T) then return nil end
     local view = rawget(v, 'view')
+    if v.k == 'ref' then
+        -- a task reaching a reference of the code that spawns it shares memory:
+        -- say so, as a capture would, before any lifetime question arises
+        local root = root_of(v.place)
+        local owner = rawget(root, 'param_fn') or rawget(root, 'owner')
+        if current and current.fn and current.fn.capture and owner and owner ~= current.fn then
+            fail(("a task shares no memory: the outside value '%s' is a %s, and %s; send values, "
+                .. "or pass them to spawn"):format(tostring(rawget(root, 'name')), v.T.display,
+                types.unsendable(v.T)), 4)
+        end
+        -- a reference borrows what its place's owner was when it was taken: a
+        -- later clear must still find this reference's tokens
+        if not rawget(v, 'ref_tokens') then
+            rawset(v, 'ref_tokens', h.place_tokens(v.place, false) or false)
+        end
+        return h.merge_view(view, rawget(v, 'ref_tokens') or nil)
+    end
     if v.k == 'agg' then
         for _, field in pairs(v.f) do view = h.merge_view(view, h.value_view(field)) end
     elseif v.k == 'sumv' then view = h.merge_view(view, h.value_view(rawget(v, 'p')))
@@ -701,16 +727,215 @@ h.with_view = function(v, view)
     rawset(result, 'view', view)
     return result
 end
-h.check_view = function(v)
-    local view = h.value_view(v)
+-- Roots. A borrow carries tokens naming what it depends on:
+--   activity  a lending activity (view_of, a map key during each): ends with it
+--   owner     a native place it borrows. Each owner has a whole token (a Ref
+--             to it, a view of a fixed array) that ends with its frame or
+--             block, and a contents token (a view of a Grow's or Text's
+--             elements) that also ends when the owner frees what it lent
+--             (clear); a later contents borrow takes a fresh token
+--   param     inside a materialized function, the caller's owners reached
+--             through argument `index`: they outlive every local of the function
+-- One rule covers all three: a borrow must not outlive what it borrows.
+h.token_ended = function(token)
+    if token.kind == 'owner' or token.kind == 'param' then
+        return ('a borrow of %s is used after %s'):format(token.what, token.why or (token.what .. ' ended'))
+    end
+    return 'a scoped view cannot be used after its activity ends'
+end
+h.check_tokens = function(view)
     h.each_view(view, function(token)
-        if token.ended then fail('a scoped view cannot be used after its activity ends', 4) end
+        if token.ended then fail(h.token_ended(token), 5) end
+        if token.whole and token.whole.ended then fail(h.token_ended(token.whole), 5) end
         if current and current.fn ~= token.owner then
-            fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 4)
+            fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 5)
         end
     end)
     return view
 end
+h.check_view = function(v)
+    return h.check_tokens(h.value_view(v))
+end
+h.place_name = function(root) return "'" .. tostring(rawget(root, 'name')) .. "'" end
+-- the whole token of the owner a place belongs to, or nil for storage the
+-- compiler does not own (raw pointers, globals): those stay the programmer's
+-- contract, and a global outlives every owner
+h.owner_token = function(place)
+    local root = root_of(place)
+    -- a loop round's copy of a variable stands for the variable
+    local origin = rawget(root, 'round_of')
+    if origin then return h.owner_token(origin) end
+    local token = rawget(root, 'borrow_token')
+    if token then return token end
+    local b = current
+    if root.pk == 'deref' then
+        local index = rawget(root, 'param_index')
+        if not index then return nil end
+        token = { kind = 'param', owner = rawget(root, 'param_fn'), index = index, what = h.place_name(root) }
+    elseif b and b.fn and rawget(root, 'owner') and rawget(root, 'owner') ~= b.fn then
+        -- another function's local read here is this function's copy (a task's
+        -- capture): it lives as long as this function, like an argument
+        b.capture_tokens = b.capture_tokens or setmetatable({}, { __mode = 'k' })
+        token = b.capture_tokens[root]
+        if not token then
+            token = { kind = 'param', owner = b.fn, what = h.place_name(root) }
+            b.capture_tokens[root] = token
+        end
+        return token
+    elseif root.pk == 'local' or root.pk == 'temp' or root.pk == 'lv' or root.pk == 'rvar' then
+        token = { kind = 'owner', owner = rawget(root, 'owner'), serial = rawget(root, 'id'),
+                  frame = rawget(root, 'frame'), block = rawget(root, 'block'), place = root,
+                  what = h.place_name(root) }
+        if b and token.frame then
+            b.frame_tokens = b.frame_tokens or setmetatable({}, { __mode = 'k' })
+            local list = b.frame_tokens[token.frame]
+            if not list then list = {}; b.frame_tokens[token.frame] = list end
+            list[#list + 1] = token
+        end
+    else
+        return nil
+    end
+    rawset(root, 'borrow_token', token)
+    return token
+end
+-- the contents token of an owner: it ends with the whole token, or earlier
+-- when the owner frees its contents
+h.contents_token = function(place)
+    local root = root_of(place)
+    local origin = rawget(root, 'round_of')
+    if origin then return h.contents_token(origin) end
+    local token = rawget(root, 'contents_token')
+    if token then return token end
+    local whole = h.owner_token(root)
+    if not whole then return nil end
+    token = {}
+    for k, v in pairs(whole) do token[k] = v end
+    token.contents, token.whole = true, whole
+    if whole.kind == 'param' and whole.index then
+        local b = current
+        if b and b.fn then
+            b.fn.param_borrows = b.fn.param_borrows or {}
+            table.insert(b.fn.param_borrows, token)
+        end
+    end
+    rawset(root, 'contents_token', token)
+    return token
+end
+-- what a borrow of a place depends on: the place's owner (whole, or its
+-- contents), what a reconstructed reference carried, or a container's contents
+h.place_tokens = function(place, contents)
+    local root = root_of(place)
+    local carried = rawget(root, 'carried_view')
+    local container = rawget(root, 'owner_place')
+    if container then return h.merge_view(carried, h.place_tokens(container, true)) end
+    if carried then return carried end
+    if contents then return h.contents_token(root) end
+    return h.owner_token(root)
+end
+-- the borrows a value read from a place may carry: those stored into it, or,
+-- when unknown, the place's own lifetime, which every stored borrow outlives
+h.place_view = function(place)
+    local root = root_of(place)
+    local container = rawget(root, 'owner_place')
+    if container then
+        local croot = root_of(container)
+        return rawget(croot, 'stored_view') or h.place_tokens(container, true)
+    end
+    local stored = rawget(root, 'stored_view')
+    if stored then return stored end
+    if root.pk == 'deref' then
+        if rawget(root, 'param_index') then return h.owner_token(root) end
+        return rawget(root, 'carried_view')
+    end
+    return nil
+end
+h.end_token = function(b, token, holder, field, why)
+    if not token or token.ended then return end
+    token.ended, token.why = true, why
+    b.shrink_log = b.shrink_log or {}
+    b.shrink_log[#b.shrink_log + 1] = { token = token, root = holder, field = field }
+    if holder then rawset(holder, field, nil) end
+end
+-- An owner frees its contents (clear): contents borrows taken so far end, with
+-- the reason; borrows taken afterwards are new. Ending is checked where a
+-- borrow is used, so a borrow not used again is no error: liveness.
+h.end_owner = function(b, place, why)
+    local root = root_of(place)
+    if root.pk == 'deref' and rawget(root, 'param_index') then
+        -- through an argument: the caller learns it from the summary, and any
+        -- argument's borrows here may alias what was freed
+        if b.fn then
+            b.fn.shrinks = b.fn.shrinks or {}
+            b.fn.shrinks[rawget(root, 'param_index')] = true
+            for _, token in ipairs(b.fn.param_borrows or {}) do h.end_token(b, token, nil, nil, why) end
+        end
+        h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
+        return
+    end
+    local carried = rawget(root, 'carried_view')
+    if carried then
+        h.each_view(carried, function(token)
+            if token.place then
+                h.end_token(b, rawget(token.place, 'contents_token'), token.place, 'contents_token', why)
+            end
+        end)
+        return
+    end
+    h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
+end
+S.end_borrows = function(place, why) h.end_owner(cur(), place, why) end
+-- an owner's storage is given back (its block ended): every borrow of it ends
+S.end_place = function(place, why)
+    local b, root = cur(), root_of(place)
+    h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
+    h.end_token(b, rawget(root, 'borrow_token'), root, 'borrow_token', why)
+end
+S.owner_token = function(place) return h.owner_token(place) end
+S.place_tokens = function(place, contents) return h.place_tokens(place, contents) end
+S.place_view = function(place) return h.place_view(place) end
+-- a lending activity's token: places declared after it are inside it
+S.activity_token = function() return { owner = cur().fn, serial = uid() } end
+-- A word's locals end with it: so do the borrows of them.
+h.end_frame_tokens = function(b, frame)
+    local list = b.frame_tokens and frame.local_owner and b.frame_tokens[frame.local_owner]
+    if not list then return end
+    for _, token in ipairs(list) do
+        if not token.ended then token.ended = true end
+    end
+    b.frame_tokens[frame.local_owner] = nil
+end
+-- the place a borrow is stored in must not outlive anything it borrows
+h.INTERNAL = { ['local'] = true, temp = true, lv = true, rvar = true }
+h.check_store_view = function(b, p, v)
+    local view = h.check_view(v)
+    if not view then return end
+    local root = root_of(p)
+    local container = rawget(root, 'owner_place')
+    if container then root = root_of(container) end
+    local where = rawget(root, 'name') and h.place_name(root) or 'that storage'
+    h.each_view(view, function(token)
+        if root.pk == 'global' then
+            fail(('%s cannot be stored in the global %s, which outlives every owner'):format(
+                token.what and ('a borrow of ' .. token.what) or 'a scoped view', where), 4)
+        end
+        local inside = h.INTERNAL[root.pk] and rawget(root, 'owner') == b.fn
+        if inside and token.kind == 'param' then return end
+        if inside and token.serial and (rawget(root, 'id') or 0) > token.serial then return end
+        if inside and token.kind == 'owner' and token.place ~= root
+            and rawget(root, 'frame') == token.frame and rawget(root, 'block') == token.block then
+            return    -- declared in the same scope: they end together
+        end
+        if token.kind == 'param' then
+            fail(('a borrow of the caller\'s %s cannot be stored in %s: a function compiled on its own '
+                .. 'cannot tell which outlives the other'):format(token.what, where), 4)
+        end
+        local of = token.kind == 'owner' and ('a borrow of ' .. token.what) or 'a scoped view'
+        fail(('%s cannot be stored in %s, which outlives it; copy it into owned storage '
+            .. '(Chars, Text) or keep an index'):format(of, where), 4)
+    end)
+    rawset(root, 'stored_view', h.merge_view(rawget(root, 'stored_view'), view))
+end
+S.check_store_view = function(p, v) return h.check_store_view(cur(), p, v) end
 h.check_view_boundary = function(v)
     if h.check_view(v) then
         fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 4)
@@ -755,9 +980,7 @@ function Builder:store(p, v)
         fail(("'%s' is a copy taken at spawn; a task cannot assign it (declare a local to change it)"):format(
             root_of(p).name), 3)
     end
-    if h.check_view(v) then
-        fail('a scoped view cannot be stored; use it inside its activity or make an owned copy', 3)
-    end
+    h.check_store_view(self, p, v)
     local array_root, path = array_path(p)
     if array_root then
         if self.dead then return end
@@ -1070,7 +1293,27 @@ function ex(v)
         for _, fd in ipairs(v.T.fields) do f[fd.name] = ex(v.f[fd.name]) end
         return { op = 'agg', T = v.T, fields = f }
     end
-    if v.k == 'ref' then return { op = 'addr', place = v.place, T = v.T } end
+    if v.k == 'ref' then
+        -- a reference becoming data (a field, an element, a stored local): its
+        -- target's address is taken, so the target lives in memory from here.
+        -- A loop round's copy is not the variable: the loop adopts the variable
+        -- itself and runs the round again.
+        local origin = rawget(root_of(v.place), 'round_of')
+        if current and origin then
+            for i = #current.frames, 1, -1 do
+                local f = current.frames[i]
+                if f.kind == 'loop' and f.desc and f.desc.adopt then
+                    for _, sl in ipairs(f.desc.slots) do
+                        if sl.place == origin and not sl.adopted then
+                            h.signal('restart', f, { adopt = origin, mode = 'loop' })
+                        end
+                    end
+                end
+            end
+        end
+        if current and v.place.pk ~= 'deref' then current:escape(v.place) end
+        return { op = 'addr', place = v.place, T = v.T }
+    end
     if v.k == 'sumv' then
         local q = rawget(v, 'p')
         return { op = 'sum', T = v.T, alt = v.tag, e = q ~= nil and ex(q) or nil }
@@ -1173,6 +1416,10 @@ end
 -- coerce for binding into a requirement / storage of type t
 local function coerce(x, t, what)
     if t.kind == 'ref' then
+        -- a place holding a reference, or a pointer value read back, is the
+        -- reference it holds
+        if is_place(x) and x.T.kind == 'ref' then x = cur():read(x) end
+        x = h.reref(x)
         if is_place(x) then
             if x.T ~= t.elem then
                 fail(('%s: expected a reference to %s, got a %s place'):format(what, t.elem.display, x.T.display), 3)
@@ -1444,6 +1691,7 @@ local member_ptr, member_slice
 
 local raw_member
 local function member(x, key)
+    x = h.through(x)
     h.check_view(x)
     local h, t, family = type_hook(x, '__member')
     if h then
@@ -1471,7 +1719,7 @@ function raw_member(x, key)
             if x.k == 'agg' then return x.f[key] end
             if x.k == 'known' then return x.v[key] end
             local ft = t.index[key].type
-            return h.with_view(dyn(ft, { op = 'field', a = x.e, name = key, T = ft }), h.value_view(x))
+            return h.reref(h.with_view(dyn(ft, { op = 'field', a = x.e, name = key, T = ft }), h.value_view(x)))
         end
         local m = t.methods[key]
         if m then return m end
@@ -1514,6 +1762,7 @@ end
 -- Brackets are distinct from member selection: a StrMap key may be "length",
 -- "put", or any internal evaluator field name, without shadowing the API.
 function S.index(obj, key)
+    obj = h.through(obj)
     if is_staged(obj) then
         h.check_view(obj)
         local h, t = type_hook(obj, '__index')
@@ -1577,6 +1826,7 @@ V.__newindex = function(x, key, v)
 end
 
 function S.setindex(obj, key, v, bracket)
+    obj = h.through(obj)
     if is_staged(obj) then
         local t = struct_of(obj)
         local hn = bracket and type_hook(obj, '__newindex')
@@ -1607,6 +1857,12 @@ function S.setindex(obj, key, v, bracket)
             return
         end
         if rawget(t, 'slice_elem') then
+            -- a reference element is read from the slice and written through:
+            -- the slice is unchanged, its element's target is not
+            if t.slice_elem.kind == 'ref' and not S.is_reference(v) and (type(key) == 'number' or is_staged(key)) then
+                S.set(S.slice_element(obj, key).place, v)
+                return
+            end
             fail('not-a-place: a slice is a read-only view; write through a Ptr or the storage itself', 2)
         end
     end
@@ -1733,6 +1989,7 @@ function S.Ref(x)
     if is_staged(x) and x.T.kind == 'ptr' then
         fail('Ref(p) rejects a pointer: an unchecked address cannot become a checked borrow', 2)
     end
+    if is_place(x) and x.T.kind == 'ref' then return cur():read(x) end
     if is_place(x) then return ref(x) end
     if is_value(x) and x.k == 'ref' then return x end
     fail('Ref(...) needs a type or an addressable place, got ' .. describe(x), 2)
@@ -1779,7 +2036,7 @@ end
 function S.decl(t, init, name)
     local b = cur()
     if not is_type(t) then fail(("local '%s': annotation is not a type (%s)"):format(name or '?', describe(t)), 2) end
-    if t.kind == 'unit' or t.kind == 'ref' or t.kind == 'opaque' then
+    if t.kind == 'unit' or t.kind == 'opaque' then
         fail(("local '%s': a typed local cannot have type %s"):format(name or '?', t.display), 2)
     end
     local p = b:new_local(t, name)
@@ -1813,11 +2070,24 @@ function S.decl(t, init, name)
     return p
 end
 
+-- whether x is a reference (a Ref value, or a place holding one)
+h.is_reference = function(x)
+    return (is_value(x) or is_place(x)) and x.T.kind == 'ref'
+end
+S.is_reference = h.is_reference
+S.slice_element = function(s, key) return h.slice_get(s, key) end
+
 function S.set(p, v)
     local b = cur()
     if not is_place(p) then fail('assignment target is not a native place', 2) end
     if p.T.resizable and p.T.kind ~= 'struct' then
         fail(("'%s' is resizable storage; it cannot be reassigned"):format(p.name), 2)
+    end
+    if p.T.kind == 'ref' then
+        -- Assignment follows the right-hand side's type: a reference rebinds,
+        -- a value of the referred type writes through.
+        if not h.is_reference(v) then return S.set(b:read(p).place, v) end
+        if is_place(v) then v = b:read(v) end
     end
     b:store(p, coerce(v, p.T, ("assignment to '%s'"):format(p.name)))
 end
@@ -1831,12 +2101,13 @@ function S.open_bind(v)
 end
 
 -- Infer storage only for native values that can inhabit a local. References
--- retain write-through semantics; borrowed views and existing resizable places
--- remain aliases, never implicitly stored or copied.
+-- retain write-through semantics, and plain views (Slice, Str) and existing
+-- resizable places remain aliases. An aggregate holding a borrow is stored
+-- like any value: the lifetime rule checks it.
 function S.infer(v, name)
     if current and (is_value(v) or is_place(v)) and v.T.kind ~= 'ref'
         and v.T.kind ~= 'unit' and v.T.kind ~= 'opaque'
-        and not h.value_view(v)
+        and not (rawget(v.T, 'slice_elem') and h.value_view(v))
         and not (is_place(v) and v.T.resizable) then
         return S.decl(v.T, v, name)
     end
@@ -1868,19 +2139,19 @@ function S.bind(v)
 end
 
 -- a host binding declared outside k staged regions is being rebound
--- a reference denotes its place: assigning to a name that holds one writes the
--- target; references are never re-pointed
+-- a reference denotes its place: assigning a value to a name that holds one
+-- writes the target; assigning another reference rebinds the name
 local function write_through(r, v)
     S.set(r.place, v)
 end
 
 function S.assign_param(cur_v, v, name)
-    if is_value(cur_v) and cur_v.k == 'ref' then return write_through(cur_v, v) end
+    if is_value(cur_v) and cur_v.k == 'ref' and not h.is_reference(v) then return write_through(cur_v, v) end
     fail(("'%s' is a parameter; parameters are immutable (copy it into a typed local)"):format(name), 2)
 end
 
 function S.assign_name(cur_v, v, k)
-    if is_value(cur_v) and cur_v.k == 'ref' then
+    if is_value(cur_v) and cur_v.k == 'ref' and not h.is_reference(v) then
         write_through(cur_v, v)
         return cur_v
     end
@@ -2023,6 +2294,21 @@ function Builder:join(paths, base)
         end
         end
         ::continue::
+    end
+    -- Materializing a joined reference takes its target's address, which can
+    -- make a place joined above memory: its pending values are stored on every
+    -- path, as for a place that was memory before the join.
+    for _, place in ipairs(sorted_places(base)) do
+        local en = out[place]
+        if en and not en.mat and not en.uninit and not tracked(place) then
+            for _, p in ipairs(live) do
+                local pe = p.state[place]
+                if pe and not pe.mat and not pe.uninit then
+                    self:materialize(place, p.block, p.state)
+                end
+            end
+            out[place] = nil
+        end
     end
     return out
 end
@@ -2261,7 +2547,7 @@ function Builder:snapshot()
     return { block = self.block, n = #self.block, state = copy(self.state), dead = self.dead,
              gs_live = self.gs_live and copy(self.gs_live), owned_n = owned and #owned or 0,
              escapes = #self.escapes, emissions = #self.emissions,
-             locals = self.fn and #self.fn.locals }
+             locals = self.fn and #self.fn.locals, shrinks = self.shrink_log and #self.shrink_log or 0 }
 end
 
 function Builder:rollback(snap)
@@ -2286,6 +2572,14 @@ function Builder:rollback(snap)
         rawset(self.escapes[k], 'escaped', nil)
         self.escapes[k] = nil
     end
+    -- a discarded round's clears never happened: their borrows live again
+    local log = self.shrink_log
+    for k = #(log or {}), (snap.shrinks or 0) + 1, -1 do
+        local entry = log[k]
+        entry.token.ended, entry.token.why = nil, nil
+        if entry.root then rawset(entry.root, entry.field, entry.token) end
+        log[k] = nil
+    end
 end
 
 local function signal(kind, frame, fields)
@@ -2293,6 +2587,7 @@ local function signal(kind, frame, fields)
     fields.nua_signal, fields.frame = kind, frame
     error(fields, 0)
 end
+h.signal = signal
 
 -- structural equality of residual expressions
 local function same_e(x, y)
@@ -2745,11 +3040,13 @@ function Builder:run_frame(desc, args, opts)
                 self:rollback(frame.snap)
                 return self:call_materialized(desc.word, args, frame.key)
             end
+            h.end_frame_tokens(self, frame)
             return res
         end
         local sig = type(res) == 'table' and res.nua_signal and res.frame == frame and res
         if not sig then error(res, 0) end
         if sig.nua_signal == 'tail' then
+            h.end_frame_tokens(self, frame)
             -- a known round: the next one continues in place
             rounds = rounds + 1
             args = sig.args
@@ -3137,7 +3434,7 @@ local function shareable(w, args)
     local residual = false
     for _, a in ipairs(args) do
         if is_place(a) then return false end
-        if not is_value(a) or h.value_view(a) then return false end
+        if not is_value(a) or (a.k ~= 'ref' and h.value_view(a)) then return false end
         local k = a.k
         if k == 'pack' or k == 'array' or k == 'array_ptr' then return false end
         if not static(a) then residual = true end
@@ -3356,7 +3653,6 @@ end
 
 -- `return v` from a word frame
 function Builder:return_value(frame, v)
-    frame.view = h.merge_view(frame.view, h.check_view(v))
     if v and is_value(v) and v.k == 'ref' then
         local r = root_of(v.place)
         if r.pk == 'local' and frame.local_owner and rawget(r, 'frame') == frame.local_owner then
@@ -3364,6 +3660,28 @@ function Builder:return_value(frame, v)
                 frame_name(frame), r.name), 3)
         end
     end
+    local view = h.check_view(v)
+    h.each_view(view, function(token)
+        if token.kind == 'owner' and frame.local_owner and token.frame == frame.local_owner then
+            fail(("%s %s returns a borrow of its own local %s, which ends with it; return the owner "
+                .. "itself or an owned copy"):format(frame.kind == 'word' and 'word' or 'callback',
+                frame_name(frame), token.what), 3)
+        end
+        if frame.mode == 'root' then
+            -- a materialized function returns borrows of its arguments only:
+            -- the caller's result depends on those arguments (its summary)
+            if token.kind == 'param' and token.owner == self.fn and token.index then
+                self.fn.result_params = self.fn.result_params or {}
+                local kinds = self.fn.result_params[token.index] or {}
+                kinds[token.contents and 'contents' or 'whole'] = true
+                self.fn.result_params[token.index] = kinds
+            else
+                fail(("word %s returns a borrow of %s, which ends with it"):format(frame_name(frame),
+                    token.what or 'a scoped view'), 3)
+            end
+        end
+    end)
+    frame.view = h.merge_view(frame.view, view)
     if frame.mode == 'root' then
         self:emit { op = 'ret', e = v and ex(v) or nil, T = frame.ret }
         self.dead = true
@@ -3613,6 +3931,7 @@ function S.loop(params, args, body, opts)
                 round[j] = sl.place
             elseif sl.idx then
                 local l = b:new_local(sl.place.T, all_params[sl.idx].name)
+                rawset(l, 'round_of', sl.place)
                 b:store(l, a[sl.idx])
                 round[j] = l
             else
@@ -3817,9 +4136,11 @@ h.new_fn = function(name, w, key)
              locals = {}, body = {}, status = 'building' }
 end
 
--- the argument expression passed to a materialized function for value v
+-- the argument expression passed to a foreign or indirect function for value
+-- v: nothing describes what it keeps, so no view crosses; a reference crosses
+-- as an address, as it always has at the foreign boundary
 function Builder:call_arg(v)
-    h.check_view_boundary(v)
+    if not (is_value(v) and v.k == 'ref') then h.check_view_boundary(v) end
     if v.k == 'ref' then
         local p = v.place
         if p.pk == 'deref' then return { op = 'addr', place = p, T = v.T } end
@@ -3834,23 +4155,63 @@ function Builder:call_materialized(w, args, key)
     return self:emit_call(w, exported or module.by_key[key] or build_function(w, args, key), args)
 end
 
--- the call itself: the callee exists, so its arguments may cross
+-- What an argument lends a materialized call: its own borrows, or for a Ref,
+-- the owner it refers to.
+h.argument_view = function(a, kinds)
+    if is_value(a) and a.k == 'ref' then
+        local view = nil
+        if not kinds or kinds.whole then view = h.value_view(a) end
+        if kinds and kinds.contents then view = h.merge_view(view, h.place_tokens(a.place, true)) end
+        return h.check_tokens(view)
+    end
+    return h.check_view(a)
+end
+
+-- the call itself: the callee exists, so its arguments may cross. Borrows cross
+-- under the callee's summary: which arguments its result borrows from, and
+-- which arguments it may free (clear). A callee still being built (recursion)
+-- is assumed to do both with every argument.
 function Builder:emit_call(w, fn, args)
-    for _, arg in ipairs(args) do h.check_view_boundary(arg) end
+    local done = fn.status == 'done'
+    local result_view
+    for i, a in ipairs(args) do
+        local kinds = done and fn.result_params and fn.result_params[i]
+        local view = h.argument_view(a, (not done) and { whole = true, contents = true } or kinds)
+        if view and (not done or kinds) then
+            result_view = h.merge_view(result_view, view)
+        end
+    end
     self:bump_checked()          -- the callee may change any storage it reaches
     local cargs = {}
     for i, a in ipairs(args) do
-        if fn.dynamic_pos[i] then cargs[#cargs + 1] = self:call_arg(a) end
+        if fn.dynamic_pos[i] then
+            if a.k == 'ref' then
+                local p = a.place
+                if p.pk ~= 'deref' then self:escape(p) end
+                cargs[#cargs + 1] = { op = 'addr', place = p, T = a.T }
+            else
+                cargs[#cargs + 1] = ex(a)
+            end
+        end
     end
     local call = { op = 'call', fn = fn, args = cargs, T = w.ret,
                    gs_off = self.gs_offset and self:gs_offset() or 0 }
+    local result
     if w.ret.kind == 'unit' then
         self:emit { op = 'expr', e = call, what = 'a call to ' .. w.name }
-        return nil
+    else
+        local t = self:new_temp(w.ret)
+        self:emit { op = 'let', place = t, e = call, what = 'a call to ' .. w.name }
+        result = h.reref(h.with_view(dyn(w.ret, read_expr(t)), result_view))
     end
-    local t = self:new_temp(w.ret)
-    self:emit { op = 'let', place = t, e = call, what = 'a call to ' .. w.name }
-    return dyn(w.ret, read_expr(t))
+    -- the callee may have freed what an argument owns: borrows of it end here
+    for i, a in ipairs(args) do
+        if is_value(a) and a.k == 'ref' and a.T.elem.resizable
+            and (not done or (fn.shrinks and fn.shrinks[i])) then
+            h.end_owner(self, a.place, ('the call to %s, which may clear it'):format(w.name))
+        end
+    end
+    return result
 end
 
 -- construct the residual C function for a specialization key
@@ -3886,12 +4247,21 @@ function build_function(w, args, key, cname, opts)
                 local cp = { name = pname, T = a.T }
                 fn.params[#fn.params + 1] = cp
                 local target = new_place { pk = 'deref', T = a.T.elem, name = p.name,
-                    ptr = { op = 'param', name = pname, T = a.T, fn = fn }, id = uid() }
+                    ptr = { op = 'param', name = pname, T = a.T, fn = fn }, id = uid(),
+                    param_index = i, param_fn = fn }
                 vals[i] = ref(target)
             else
                 local cp = { name = pname, T = a.T }
                 fn.params[#fn.params + 1] = cp
                 vals[i] = dyn(a.T, { op = 'param', name = pname, T = a.T, fn = fn })
+                if h.view_type(a.T) then
+                    -- what the argument borrows, seen from inside: the caller's
+                    -- owners, which outlive every local of this function
+                    local token = { kind = 'param', owner = fn, index = i, what = "'" .. tostring(p.name) .. "'" }
+                    fn.param_borrows = fn.param_borrows or {}
+                    table.insert(fn.param_borrows, token)
+                    vals[i] = h.with_view(vals[i], token)
+                end
             end
         end
     end
@@ -4668,7 +5038,7 @@ local function match(s, handlers)
             local alt = t.alts[i]
             local function run()
                 local payload = alt.type.kind ~= 'unit'
-                    and h.with_view(dyn(alt.type, h.payload_of(e, alt)), h.value_view(v)) or nil
+                    and h.reref(h.with_view(dyn(alt.type, h.payload_of(e, alt)), h.value_view(v))) or nil
                 S.ret(call(alt, payload))
             end
             if i == #t.alts then return run() end
@@ -4711,7 +5081,7 @@ h.land_match = function(b, producer, group)
     for _, site in ipairs(paths) do
         site.hole.op, site.hole.place, site.hole.e = 'store', slot, site.expression
     end
-    return h.with_view(dyn(group.alt.type, read_expr(slot)), view)
+    return h.reref(h.with_view(dyn(group.alt.type, read_expr(slot)), view))
 end
 
 h.finish_match = function(result, handlers)
@@ -4825,8 +5195,7 @@ end
 
 function S.global(t, opts)
     if not is_type(t) then fail('global(T, opts) takes a type, got ' .. describe(t), 2) end
-    if t.resizable or t.kind == 'unit' or t.kind == 'opaque' or t.kind == 'ref' or t.kind == 'chan'
-        or rawget(t, 'slice_elem') then
+    if t.resizable or t.kind == 'unit' or t.kind == 'opaque' or t.kind == 'chan' then
         fail('global: a ' .. t.display .. ' cannot be static storage', 2)
     end
     opts = opts or {}
@@ -5052,8 +5421,8 @@ h.slice_get = function(s, key)
     if iv.T ~= types.U32 then iv = types.U32(iv) end
     bound_check(iv, len, 'index')
     local value = h.array_pointer_read(ptr, iv)
-    if value then return h.with_view(value, h.value_view(s)) end
-    return h.with_view(cur():read(__index(ptr, iv, ptr.T.elem)), h.value_view(s))
+    if value then return h.reref(h.with_view(value, h.value_view(s))) end
+    return h.reref(h.with_view(cur():read(__index(ptr, iv, ptr.T.elem)), h.value_view(s)))
 end
 
 h.slice_sub = function(s, a, b_)
@@ -5112,7 +5481,7 @@ function S.Slice(x, n)
         local t = types.slice(pv.T.elem)
         return make_slice(t, pv, coerce(n, types.U32, 'slice length'))
     end
-    fail('Slice(T) is a type; Slice(p, n) views n elements at pointer p (a view of a Grow is g:view() do(xs) ... end)', 2)
+    fail('Slice(T) is a type; Slice(p, n) views n elements at pointer p (a view of a Grow is g:all())', 2)
 end
 S.make_slice = make_slice
 S.slice_parts, S.member_slice, S.bound_check = slice_parts, member_slice, bound_check
@@ -5145,7 +5514,7 @@ function S.array_member(x, key, want_place)
         return function(self)
             local place = is_place(self) and self or self.k == 'ref' and self.place
             if not place then fail('a:slice() needs the array itself (a typed local, a field), not a copy', 2) end
-            return make_slice(types.slice(t.elem), S.array_pointer(place), n)
+            return make_slice(types.slice(t.elem), S.array_pointer(place), n, h.owner_token(place))
         end
     end
     if type(key) == 'number' or is_staged(key) then
@@ -5168,7 +5537,8 @@ function S.array_member(x, key, want_place)
         end
         if want_place then fail('cannot assign to an element of an array value; store it in a typed local first', 3) end
         local xv = value_of(x, t, 'array')
-        return h.with_view(dyn(t.elem, { op = 'array_index', a = ex(xv), idx = ex(iv), T = t.elem }), h.value_view(xv))
+        return h.reref(h.with_view(dyn(t.elem, { op = 'array_index', a = ex(xv), idx = ex(iv), T = t.elem }),
+            h.value_view(xv)))
     end
     fail(("%s offers a[i], a.length and a:slice(), not '%s'"):format(t.display, tostring(key)), 3)
 end
@@ -5219,15 +5589,17 @@ function S.Array(elem, n)
             if #x ~= t.length then
                 fail(('%s { ... } lists %d elements, got %d'):format(t.display, t.length, #x), 3)
             end
-            local fields, items, all_known = {}, {}, true
+            local fields, items, all_known, view = {}, {}, true, nil
             for i = 1, t.length do
                 local value = coerce(x[i], t.elem, ('element %d of %s'):format(i, t.display))
                 items[i - 1] = value
                 all_known = all_known and is_known(value)
+                view = h.merge_view(view, h.value_view(value))
                 fields[i - 1] = ex(value)
             end
             if all_known then return array_value(t, Arrays.new(t, zero_value(t.elem), items)) end
-            return dyn(t, { op = 'array', fields = fields, T = t })
+            -- the array borrows what its elements borrow
+            return h.with_view(dyn(t, { op = 'array', fields = fields, T = t }), view)
         end)
     end
     return t
@@ -5344,7 +5716,7 @@ function S.view_of(p, n, body)
     local pv = is_place(p) and cur():read(p) or p
     if not (is_value(pv) and pv.T.kind == 'ptr') then fail('view_of(p, n, body) takes a pointer', 2) end
     local b = cur()
-    local token = { owner = b.fn }
+    local token = S.activity_token()
     local xs = S.make_slice(types.slice(pv.T.elem), b:bind(pv), b:bind(coerce(n, types.U32, 'view length')), token)
     local ok, r = pcall(body, xs)
     if not ok then token.ended = true; error(r, 0) end

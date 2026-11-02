@@ -1,15 +1,14 @@
--- Data stacks never move: growth during a view leaves the viewed bytes valid.
+-- Data stacks never move: growth while a borrow is live leaves its bytes valid.
 
--- the view keeps the length at its start and reads its first element after
--- n pushes have grown the Grow far past every earlier capacity
+-- the borrow keeps the length it was taken with and reads its first elements
+-- after n pushes have grown the Grow far past every earlier capacity
 local grow_during_view = do(n: U32): U32
     local g = Grow(U32) {}
     g:push 7
     g:push 9
-    return g:view() do(xs)
-        for i: U32 = 1, n do g:push i end
-        return xs[0] + xs[1] + xs.length
-    end
+    local xs = g:all()
+    for i: U32 = 1, n do g:push i end
+    return xs[0] + xs[1] + xs.length
 end
 export grow_during_view
 
@@ -18,22 +17,21 @@ local text_doubles = do(n: U32): U32
     local out = Text {}
     out:write "ab"
     for i: U32 = 1, n do
-        out:str() do(s) out:write s end
+        out:write out:str()
     end
     return out.length + U32 out[out.length - 1]
 end
 export text_doubles
 
--- a Store grows while a Grow on another stack is viewed
+-- a Store grows while a Grow on another stack is borrowed
 local store_during_view = do(n: U32): U32
     local Node = struct { value: U32 }
     local nodes = Store(Node) {}
     local g = Grow(U32) {}
     g:push 5
-    return g:view() do(xs)
-        local last = nodes:add Node { value = 0 }
-        for i: U32 = 1, n do last = nodes:add Node { value = i } end
-        return xs[0] + nodes[last].value
-    end
+    local xs = g:all()
+    local last = nodes:add Node { value = 0 }
+    for i: U32 = 1, n do last = nodes:add Node { value = i } end
+    return xs[0] + nodes[last].value
 end
 export store_during_view

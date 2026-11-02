@@ -61,11 +61,7 @@ export where
 local render_matches = do(n: U32, ok: Bool, expected: Str): Bool
     local out = Text {}
     out:write("n = ", n, ", ok = ", ok, ", unit = ", 1.5)
-    local same: Bool = false
-    out:str() do(s)
-        same = s:equals expected
-    end
-    return same
+    return out:str():equals expected
 end
 export render_matches
 

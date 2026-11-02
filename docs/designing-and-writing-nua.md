@@ -297,7 +297,7 @@ end
 
 An activity is a design role made of ordinary parts: a word that sets up a context, runs a body that opens it, and owns completion. The callback is evaluated in place, so there is no runtime closure or callback dispatch. The context's storage and the work done through it remain when needed; private known state may fold away.
 
-**The activity is the centre of this design method.** Look for bounded responsibilities: a working copy and its commit, a file and its close, a borrow of growing storage (`g:view() do(xs)`), a guarded iteration (`m:each do(k, v)`), a `tasks` scope and its join, a `blocking` call. Inside an activity you speak **instructions**: calls written without a receiver, which the opened context resolves (§6.3). The same construct, run while compiling on a vocabulary, is a **builder** (§6.10). Design the activities, and the program's shape follows.
+**The activity is the centre of this design method.** Look for bounded responsibilities: a working copy and its commit, a file and its close, a guarded iteration (`m:each do(k, v)`), a `tasks` scope and its join, a `blocking` call. Inside an activity you speak **instructions**: calls written without a receiver, which the opened context resolves (§6.3). The same construct, run while compiling on a vocabulary, is a **builder** (§6.10). Design the activities, and the program's shape follows.
 
 ### 6.1 Finding activities
 

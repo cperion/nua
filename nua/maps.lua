@@ -73,7 +73,7 @@ local function decorate(t)
         local k, v = storage.key(table, S.dot(entry, 'key')), S.dot(entry, 'value')
         if is_str then
             local ptr, len = S.slice_parts(k)
-            local token = { owner = S.cur().fn }
+            local token = S.activity_token()
             k = S.make_slice(types.Str, ptr, len, token)
             local ok, err = pcall(body, k, v)
             if not ok then token.ended = true; error(err, 0) end
