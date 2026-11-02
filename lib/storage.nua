@@ -1,6 +1,6 @@
 -- Owned collection policy is Nua; p supplies the representation header and
--- acquires its items. An operation acquires once, works on the items, and
--- acquires again only after a push, the one thing that moves them.
+-- acquires its items. Data stacks never move, so an acquisition stays valid
+-- across pushes; it is repeated only to see the new length.
 local stacks = require "nua.stacks"
 local storage = {}
 local trap = extern("nua_trap", { CString }, Unit)
@@ -98,16 +98,13 @@ function storage.grow(T, p)
             local h = p.header g
             local length = h.len
             if n > none - length then trap "Text is full" end
-            -- text may be bytes of this stack, which the push can move
-            local pinned = p.pin g text
+            -- text may be bytes of this stack, even of this Text: growth leaves
+            -- them where they are, and the new bytes lie above them
             local bytes = U64 n
             local top = stacks.extend(h.stack, h.base, U64 length, bytes,
                 "Text grew while it was not at the top of its data stack")
-            if pinned ~= p.maximum() then stacks.copy h.stack top pinned bytes
-            else
-                local ptr, len = slice_parts text
-                stacks.write h.stack top ptr bytes
-            end
+            local ptr, len = slice_parts text
+            stacks.write h.stack top ptr bytes
             h.len = length + n
         end
     end

@@ -38,8 +38,9 @@ claim-before-transfer, successful-path adoption, capture-next-before-wake and
 atomic memory orders are preserved. Protocol words can explicitly lock, unlock
 and wake; leaf queue/heap/transfer words rely on their caller's transaction.
 
-C retains `nua_trap` and `nua_try` (`setjmp`/`longjmp` return twice) and `nua_gs_pin`
-(Nua has no pointer subtraction), in [nua_rt.c](nua_rt.c). io_uring additionally
+C retains `nua_trap` and `nua_try` (`setjmp`/`longjmp` return twice) and
+`nua_reserve`/`nua_unreserve`, which map the address space of data stacks (`mmap`
+signals failure with `MAP_FAILED`, an address Nua cannot compare), in [nua_rt.c](nua_rt.c). io_uring additionally
 retains Linux setup/mmap and integer-address kernel ABI marshalling in
 [nua_io_uring.c](nua_io_uring.c). The language deliberately offers no integer-pointer
 conversion. Nothing else in the runtime is C: locks, parking, wake-ups, clock reads,

@@ -249,19 +249,20 @@ local function fix_index(value, what)
 end
 Mem.fix_index = fix_index
 
--- Grow loans: while an activity views resizable storage, nothing may change
--- its structure (the elements could move). Store places use checked lookups.
+-- Grow loans: data stacks never move, so growth keeps a view valid. While an
+-- activity views resizable storage, only shrinking it (which frees the bytes
+-- the view reads) is rejected. Store places use checked lookups.
 local function root(p)
     local q = rawget(p, 'parent')
     while q do p = q; q = rawget(p, 'parent') end
     return p
 end
 
-local function check_structural(p, what)
+local function check_shrink(p, what)
     local b = S.cur()
     for _, q in ipairs(b.slot_borrows or {}) do
         if q == p or root(q).pk == 'deref' or root(p).pk == 'deref' then
-            fail(('%s while %s is borrowed (inside :view); its storage could move. '
+            fail(('%s while %s is borrowed (inside :view) would free what the view reads. '
                 .. 'Finish the borrow first'):format(what, q == p and ("'" .. p.name .. "'") or 'resizable storage'))
         end
     end
@@ -279,14 +280,14 @@ local function contains_store(t, seen)
     return false
 end
 
--- a materialized call could reach any store passed to it by reference
+-- a materialized call could shrink any storage passed to it by reference
 local call_materialized = Builder.call_materialized
 function Builder:call_materialized(w, args, key)
     if self.slot_borrows and #self.slot_borrows > 0 then
         for _, a in ipairs(args) do
             if S.is_value(a) and a.k == 'ref' and contains_store(a.T) then
                 fail(('calling %s with a reference that reaches resizable storage while it is borrowed '
-                    .. '(inside :view)'):format(w.name))
+                    .. '(inside :view): the call could shrink it'):format(w.name))
             end
         end
     end
@@ -320,7 +321,6 @@ local function store_methods(t)
     return {
         add = function(self, v)
             local p = receiver(self, n .. ':add')
-            check_structural(p, 'adding to a store')
             S.bump_checked()
             local val = S.coerce(v, elem, 'value added to ' .. t.display)
             val = capture(val, 'capturing a store value')
@@ -328,7 +328,6 @@ local function store_methods(t)
         end,
         remove = function(self, i)
             local p = receiver(self, n .. ':remove')
-            check_structural(p, 'removing from a store')
             S.bump_checked()
             return storage_library(t).remove(S.Ref(p), S.coerce(i, id, 'Id to remove'))
         end,
@@ -343,8 +342,9 @@ local function grow_methods(t)
     local n = cname_of(t)
     local elem = t.elem
     return {
-        -- an activity: the body sees the elements as a read-only slice, and the
-        -- Grow cannot grow meanwhile; the slice ends with the view
+        -- an activity: the body sees the elements as a read-only slice of the
+        -- length at its start; the Grow may grow meanwhile (its bytes stay put)
+        -- but not shrink, and the slice ends with the view
         view = function(self, body)
             local p = receiver(self, n .. ':view')
             if type(body) ~= 'function' and not S.is_word(body) then
@@ -354,7 +354,7 @@ local function grow_methods(t)
             local pt = types.ptr(elem)
             local b = S.cur()
             local ptr = storage_library(t).items(S.Ref(p))
-            -- the length cannot change while the view lasts (pushing is rejected)
+            -- the slice keeps the length at the start of the view
             local len = storage_library(t).length(S.Ref(p))
             local token = { owner = b.fn }
             local xs = S.make_slice(st, b:bind(ptr), b:bind(len), token)
@@ -367,7 +367,6 @@ local function grow_methods(t)
         end,
         push = function(self, v)
             local p = receiver(self, n .. ':push')
-            check_structural(p, 'pushing onto a Grow')
             S.bump_checked()
             local val = S.coerce(v, elem, 'value pushed onto ' .. t.display)
             val = capture(val, 'capturing a Grow value')
@@ -378,7 +377,7 @@ end
 
 -- s[id] and g[i]: an element as a checked place. Its address is computed (and
 -- checked: the Id is current, the index in range) when used, and reused for the
--- same index until something could move the storage, which is found again then
+-- same index until something could change the storage, which is found again then
 local function index_hook(t)
     local n = cname_of(t)
     return function(x, key)
@@ -470,7 +469,7 @@ local function checked(make, what)
 end
 
 -- for nua.strings: Text is Grow U8 with text methods
-Mem.receiver, Mem.check_structural, Mem.capture, Mem.addr = receiver, check_structural, capture, addr
+Mem.receiver, Mem.check_shrink, Mem.capture, Mem.addr = receiver, check_shrink, capture, addr
 
 Mem.Store = checked(types.store, 'Store')
 Mem.Grow = checked(types.grow, 'Grow')

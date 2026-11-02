@@ -1181,7 +1181,7 @@ References cannot be stored in structs (and therefore not in stores). Long-lived
 
 ### 9.7 Invalidation
 
-Operations capable of invalidating borrowed storage are rejected while an incompatible borrow is live: a Grow cannot grow while a view of it is live. Borrow lifetimes are lexical.
+Data stacks never move (§9.10), so growth invalidates nothing: a Grow or a Text may grow while a view of it is live, and the view keeps the length it began with. Operations that free borrowed storage are rejected while a borrow is live: a Text cannot be cleared while it is lent as a `Str`, and a materialized call receiving a reference that reaches viewed storage is rejected, because it could do the same. Borrow lifetimes are lexical.
 
 A store slot is not borrowed: it is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). Nothing holds a slot's address across a change to the store, so the store may grow or shrink while its slots are in use. Scoped views retain lexical loans: a Grow's view (§12.4) and a foreign view lent with `view_of` (§12.6).
 
@@ -1214,7 +1214,7 @@ An ID is a store token, a slot index and a generation. A checked lookup verifies
 
 ### 9.10 Store ownership
 
-A store's slots live on its data stack; its header (stack index, base offset, counters, token) lives in its place. Slots are addressed by offset, so growth may move the stack's buffer safely.
+A store's slots live on its data stack; its header (stack index, base offset, counters, token) lives in its place. A data stack is address space reserved once and committed as it is touched, so it never moves: growth bumps its top after one comparison against the reservation, and exceeding the reservation traps. The reservation is 64 GiB per stack for a thread and 1 GiB per stack for a task by default (`NUA_THREAD_STACK_BYTES`, `NUA_TASK_STACK_BYTES` when building the runtime); there are no guard pages.
 
 ### 9.11 Cyclic graphs
 
@@ -1483,7 +1483,7 @@ Every use is checked, as a slice checks its index, but uses that nothing separat
 * a call into a function compiled on its own, or into C;
 * the start of a residual loop's round, the end of the loop, and the join after a branch.
 
-Then the next use looks again. The C compiler cannot do this merging itself, because a store to an element may alias the store's header as far as it can tell. The lookup itself is inline: a few loads and compares, with the failure and the growth of the stack set out of line. Because no address outlives the stretch it was found in, a store may grow (its data stack can move) between two uses of the same slot. This replaces both a borrow checker for §9.7 and the borrow-by-scope activity of earlier versions.
+Then the next use looks again. The C compiler cannot do this merging itself, because a store to an element may alias the store's header as far as it can tell. The lookup itself is inline: a few loads and compares, with the failure and the growth of the stack set out of line. Looking again is what makes an `Id` safe after a removal: the generation is checked at every use, so a stale `Id` never reaches a recycled slot. This replaces both a borrow checker for §9.7 and the borrow-by-scope activity of earlier versions.
 
 ### 10.7 Keyed spread
 
@@ -1880,7 +1880,7 @@ The description, the loop over it and the reader's own loop are gone; one range 
 
 ### 12.4 Views of a Grow
 
-A view of a `Grow` is an activity with a lexical loan (§9.7): the body receives the elements as a slice, the `Grow` cannot grow while the view lasts (`push` is rejected, as is a materialized call receiving a reference that reaches it), and the slice cannot outlive the view, nor be stored. It uses the same provenance and boundary checks as a foreign loan (§12.6). The view returns the body's result; scalar and owned results are bound before the loan ends, so deferred reads cannot run after the owner invalidates storage.
+A view of a `Grow` is an activity with a lexical loan (§9.7): the body receives the elements as a slice of the length the `Grow` had when the view began. The `Grow` may grow while the view lasts, since its bytes never move; a materialized call receiving a reference that reaches it is rejected, since it could free them. The slice cannot outlive the view, nor be stored. It uses the same provenance and boundary checks as a foreign loan (§12.6). The view returns the body's result; scalar and owned results are bound before the loan ends, so deferred reads cannot run after the owner invalidates storage.
 
 ```lua
 return g:view() do(xs)
@@ -2027,7 +2027,7 @@ There are no bounds checks: when an arm of an `if` cannot fall through, what fol
 `Text` is `Grow U8` with text words, created in place like any `Grow`: `local out: Text = Text {}`.
 
 * `out:write(a, b, ...)` appends each value as text. Known pieces (Lua strings and numbers, known values, known `Str`) are joined while compiling into one literal; each runtime value gets the conversion its type needs: integers in decimal, `Bool` as `true`/`false`, floats as the shortest text that reads back as the same value, `Str` and `CString` as their bytes. No format string exists at run time.
-* `out:str() do(s) ... end` lends the text as a `Str`, while it cannot grow (like `Grow:view`).
+* `out:str() do(s) ... end` lends the text as a `Str`. The text may grow meanwhile (`out:write s` appends its own bytes); it cannot be cleared (like `Grow:view`).
 * `out:clear()`, `out:push(byte)`, `out.length`, `out[i]`.
 
 Integer digit generation and Boolean formatting are ordinary Nua words in

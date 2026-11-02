@@ -19,7 +19,6 @@ layout.StrMap = cstruct("nua_strmap", h, {
         { "arena_stack", U64 }, { "arena_base", U64 }, { "arena_len", U64 }, { "dead", U64 },
     })
 local token = extern("nua_next_token", {}, U64, { header = h })
-local pin = extern("nua_gs_pin", { U64, Ptr U8, U64 }, U64, { header = h })
 local trap = extern("nua_trap", { CString }, Unit, { header = h })
 local maximum = U64 0xffffffffffffffffULL
 local Void = opaque "void"
@@ -73,7 +72,7 @@ layout.iter_new = do(stack: U64, map: Ptr layout.Map): layout.Grow
     return guard
 end
 -- A representation supplies its header and acquires its items: one stack
--- resolution and one range check, valid until the next push onto the stack.
+-- resolution and one range check, valid while the owner lives (stacks never move).
 function layout.storage(T, R, Elem, Slot, view, make_id, components)
     local is_store = Slot ~= nil
     local Item = Slot or Elem
@@ -95,10 +94,6 @@ function layout.storage(T, R, Elem, Slot, view, make_id, components)
         return make_id { token = view(self).token, slot = index, .gen }
     end
     p.components = components
-    p.pin = do(self: Ref T, text: Str): U64
-        local ptr, len = slice_parts text
-        return pin view(self).stack ptr (U64 len)
-    end
     p.maximum = do(): U64 = maximum
     return p
 end
@@ -146,10 +141,6 @@ function layout.maps(T, Entry, view)
         return stored
     end
     p.maximum = do(): U64 = maximum
-    p.pin = do(self: Ref T, text: Str): U64
-        local ptr, len = slice_parts text
-        return pin view(self).arena_stack ptr (U64 len)
-    end
     return p
 end
 local function project(value, path)

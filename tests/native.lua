@@ -54,6 +54,12 @@ check('empty Text copy after foreign free', foreign_views.copy_text_release(fore
 local bound_view = nua.load(root .. '/tests/foreign_result_binding.nua')
 check('scalar result captured before foreign free', bound_view.foreign_byte(foreign_buffer()) == 65)
 
+-- Data stacks never move: views stay valid while their owner grows.
+local stable = nua.load(root .. '/tests/stable_stacks.nua')
+check('grow during view', stable.grow_during_view(1000000) == 18)
+check('text appends its own lent bytes', stable.text_doubles(16) == 131072 + 98)
+check('store grows during a view', stable.store_during_view(100000) == 100005)
+
 -- Omitted annotations infer native places, on the same prepared IR as C.
 local inferred = nua.load(root .. '/examples/inferred_locals.nua')
 check('inferred branch true', inferred.inferred_branch(true, 10) == 29)

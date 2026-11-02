@@ -327,7 +327,6 @@ S.arity[S.parse_float_known] = 1
 -- t:write(a, b, ...): each value as text, known pieces joined while compiling
 text_methods.write = function(self, ...)
     local p = Mem.receiver(self, 'Text:write')
-    Mem.check_structural(p, 'writing to a Text')
     local b = S.cur()
     if not b.fn then fail('a Text is runtime storage: it is written where it runs', 2) end
     b.fn.uses_rt = true
@@ -396,14 +395,14 @@ end
 
 text_methods.clear = function(self)
     local p = Mem.receiver(self, 'Text:clear')
-    Mem.check_structural(p, 'clearing a Text')
+    Mem.check_shrink(p, 'clearing a Text')
     S.bump_checked()
     local b = S.cur()
     if b.fn then b.fn.uses_rt = true end
     Mem.storage_library(Text).clear(S.Ref(p))
 end
 
--- t:str() do(s) ... end: the text as a Str, while it cannot change
+-- t:str() do(s) ... end: the text as a Str; it may grow meanwhile, not shrink
 text_methods.str = function(self, body)
     return text_methods.view(self, function(xs)
         local ptr, len = S.slice_parts(xs)

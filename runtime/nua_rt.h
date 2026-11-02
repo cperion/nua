@@ -10,7 +10,11 @@
  * uses gs_sp + k for its k-th live resizable local, so callees never share a
  * stack with a caller's live growing values. Exported functions start at 0.
  *
- * Contents are addressed by offset, never by pointer: growth may move a buffer.
+ * A stack never moves: it is a range of address space reserved once and
+ * committed by the system as it is touched. Growth bumps the top after one
+ * comparison against the reservation; an address into a stack stays valid until
+ * the top is reset below it. There are no guard pages (each would cost a kernel
+ * mapping per stack).
  */
 #ifndef NUA_RT_H
 #define NUA_RT_H
@@ -33,7 +37,8 @@
 typedef struct nua_stack {
     unsigned char *data;
     size_t top;
-    size_t cap;
+    size_t cap;         /* the bytes reserved for this stack: top never passes it */
+    size_t region;      /* nonzero on the first stack of a reservation: its size */
     /* An iteration guard owns its own data stack. Resetting that stack
      * releases the borrow, including returns and residual loop exits. */
     uint32_t *map_counter;
@@ -97,9 +102,22 @@ typedef struct nua_id {
 #define NUA_OCCUPIED (UINT32_MAX - 1)
 #define NUA_RETIRED (UINT32_MAX - 2)
 
-/* General movable-stack byte access and relocation primitives. */
+/* Reserving address space for data stacks: the platform mechanism. Placement,
+ * growth and limits are Nua (lib/stacks.nua). */
+#ifndef NUA_THREAD_STACK_BYTES
+#define NUA_THREAD_STACK_BYTES ((size_t)64 << 30)
+#endif
+#ifndef NUA_TASK_STACK_BYTES
+#define NUA_TASK_STACK_BYTES ((size_t)1 << 30)
+#endif
+/* the reservation per stack, for a task's stacks or a thread's own */
+size_t nua_stack_bytes(bool task);
+/* bytes of address space, committed as touched; NULL if none is available */
+uint8_t *nua_reserve(size_t bytes);
+void nua_unreserve(uint8_t *p, size_t bytes);
+
+/* Data-stack byte access. */
 uint8_t *nua_gs_bytes(size_t stack, size_t at, size_t bytes);
-size_t nua_gs_pin(size_t stack, const uint8_t *p, size_t bytes);
 void nua_gs_copy(size_t stack, size_t dst, size_t src, size_t bytes);
 void nua_gs_write(size_t stack, size_t dst, const uint8_t *src, size_t bytes);
 void nua_gs_zero(size_t stack, size_t at, size_t bytes);

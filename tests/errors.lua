@@ -451,13 +451,13 @@ export f
 end
 export f
 ]] },
-    { name = 'pushing onto a Grow while it is viewed', expect = 'is borrowed',
+    { name = 'clearing a Text while it is viewed', expect = 'would free what the view reads',
       src = [[local f = do(n: U32): U32
-    local g: Grow U32 = (Grow U32) {}
-    g:push(n)
-    return g:view() do(xs)
-        g:push(1)
-        return xs.length
+    local t = Text {}
+    t:write "abc"
+    return t:str() do(s)
+        t:clear()
+        return s.length
     end
 end
 export f
