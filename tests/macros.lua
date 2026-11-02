@@ -45,6 +45,37 @@ local answer = do() = 42
 assert(answer() == 42)
 print('forms ok')
 ]]), 0, 'forms ok')
+check('nested application in copied argument groups', cli .. ' -lmacro.let -e ' .. q([[
+local identity = do(x) = x
+local Box = do(fields) = fields
+local Ref = do(x) = x
+local item = 42
+local result = identity Box { value = Ref item, nested = { Ref item } }
+assert(result.value == 42 and result.nested[1] == 42)
+assert(identity Box(Ref item) == 42)
+local slots = { 42 }
+local index = 1
+assert(identity slots[Ref index] == 42)
+local text = identity Box { value = "Ref__let_apply" }
+assert(text.value == "Ref__let_apply")
+print('copied groups ok')
+]]), 0, 'copied groups ok')
+check('native words inside expression factories', lua .. ' ' .. q(root .. '/nua.lua')
+    .. ' ' .. fixture('expression_native.nua'), 0, 'read_expression', 'Ref__let_apply')
+do
+    local file = assert(io.open(fixtures .. 'expression_native.nua'))
+    local source = file:read '*a'; file:close()
+    local nua = require 'nua'
+    local translated = nua.translate(source, fixtures .. 'expression_native.nua')
+    assert(not translated:find('__let_apply', 1, true), translated)
+    local code = nua.compile(source, fixtures .. 'expression_native.nua')
+    local expression = code:match('uint32_t read_expression%b()%s*(%b{})')
+    local block = code:match('uint32_t read_block%b()%s*(%b{})')
+    local parenthesized = code:match('uint32_t read_parenthesized%b()%s*(%b{})')
+    assert(expression and expression == block and expression == parenthesized, code)
+    passed = passed + 1
+    print('ok    macro: expression and block factories emit identical bodies')
+end
 check('exact hexadecimal integer suffixes in bare calls', cli .. ' -lmacro.let -e ' .. q([[
 local identity = do(x) = x
 local u = identity 0xffffffffffffffffULL

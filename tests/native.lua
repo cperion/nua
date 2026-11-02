@@ -16,6 +16,17 @@ local function check(name, ok, detail)
     if not ok then fails = fails + 1; print('FAIL  native: ' .. name .. (detail and ('\n' .. tostring(detail)) or '')) end
 end
 
+-- Curried expression factories preserve native parameter and result types.
+local factories = nua.load(root .. '/tests/macros/fixtures/expression_native.nua')
+local record = factories.types.Record { value = 41 }
+check('expression factory native call', factories.read_expression(record) == 42)
+check('block factory native call', factories.read_block(record) == 42)
+check('parenthesized factory native call', factories.read_parenthesized(record) == 42)
+local borrowed = factories.borrow_expression(record)
+check('expression factory borrowed result', borrowed.value == 41)
+borrowed.value = 17
+check('expression factory result aliases its input', record.value == 17 and factories.read_expression(record) == 18)
+
 -- Omitted annotations infer native places, on the same prepared IR as C.
 local inferred = nua.load(root .. '/examples/inferred_locals.nua')
 check('inferred branch true', inferred.inferred_branch(true, 10) == 29)

@@ -201,13 +201,21 @@ local STATEMENT_WORDS = { ['then'] = true, ['else'] = true, ['end'] = true, ['re
 
 -- reading forward -------------------------------------------------------------------------
 
+-- Application marks are inserted immediately after the preceding token, before
+-- its original whitespace. When collected tokens become text and are lexed again,
+-- keep the mark separate: `Ref` + APPLY must not become `Ref__let_apply`.
+local function token_text(t, v)
+    if t == 'iden' and v == APPLY then return ' ' .. v end
+    return v
+end
+
 -- read a balanced group after its opener was read; `keep` collects the text
 local function balanced (get, open, close, keep)
     local depth = 1
     repeat
         local t, v = get()
         if not t then M.error("'" .. open .. "' is not closed") end
-        if keep then keep[#keep + 1] = v end
+        if keep then keep[#keep + 1] = token_text(t, v) end
         if t == open then depth = depth + 1 elseif t == close then depth = depth - 1 end
     until depth == 0
 end
@@ -228,40 +236,41 @@ local function group (get, keep)
     repeat
         local t, v = get()
         if not t then M.error 'a bracket is not closed' end
-        if keep then keep[#keep + 1] = v end
+        if keep then keep[#keep + 1] = token_text(t, v) end
         if t == '(' then depth = depth + 1 elseif t == ')' then depth = depth - 1 end
     until depth == 0
 end
 
--- read a type: Name ('.' Name)* ['(' ... ')'] [':' type], or a bracketed signature
--- ['(' ... ')' ':' type]. Returns the token after it. `keep` collects the text.
+-- Collect a type's names, postfix groups and application chain, including known
+-- arguments (Chars 64) and signatures (Fn(...) : T). Returns the token after it.
+-- This only locates the body; Nua's typed parser owns the annotation's meaning.
 local function read_type (get, keep)
     local function take (t, v, skipped)
-        if keep then keep[#keep + 1] = skipped; keep[#keep + 1] = v end
+        if keep then keep[#keep + 1] = skipped; keep[#keep + 1] = token_text(t, v) end
     end
     local t, v, skipped = significant(get)
     take(t, v, skipped)
     if t == '(' then
         group(get, keep)
-    elseif t == 'iden' then
-        t, v, skipped = significant(get)
-        while t == '.' do
-            take(t, v, skipped)
-            t, v, skipped = significant(get); take(t, v, skipped)
-            t, v, skipped = significant(get)
-        end
-        if t ~= '(' then
-            if t == ':' then take(t, v, skipped); return read_type(get, keep) end
-            return t, v, skipped
-        end
-        take(t, v, skipped)
-        group(get, keep)
-    else
+    elseif t ~= 'iden' and t ~= 'number' and t ~= 'string'
+        and not (t == 'keyword' and (v == 'true' or v == 'false')) then
         M.error("a type cannot start with '" .. tostring(v) .. "'")
     end
-    t, v, skipped = significant(get)
-    if t == ':' then take(t, v, skipped); return read_type(get, keep) end
-    return t, v, skipped
+    while true do
+        t, v, skipped = significant(get)
+        if t == '.' then
+            take(t, v, skipped)
+            t, v, skipped = significant(get); take(t, v, skipped)
+        elseif t == '(' then
+            take(t, v, skipped)
+            group(get, keep)
+        elseif t == ':' or (t == 'iden' and v == APPLY) then
+            take(t, v, skipped)
+            return read_type(get, keep)
+        else
+            return t, v, skipped
+        end
+    end
 end
 
 -- `( params )` after the '(' was read. Returns the Lua names and the opened one.
@@ -334,10 +343,8 @@ local function expression (get)
 
         if t == '(' and ended and skipped:find '\n' then
             put ' ('; put(skipped)                       -- keep the call's '(' on its line
-        elseif v == APPLY then
-            put(skipped); put(' '); put(v)              -- the mark has no space of its own
         else
-            put(skipped); put(v)
+            put(skipped); put(token_text(t, v))
         end
 
         if is_do(t, v) then
