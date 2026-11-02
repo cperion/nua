@@ -96,7 +96,7 @@ function nua.prelude()
     env.test = S.test
     env.assert = S.assert
     env.Ptr = S.Ptr
-    env.Slice = S.Slice
+    env.Slice = S.SliceNS
     env.Array = S.Array
     env.null = S.null
     env.dynamic = S.dynamic

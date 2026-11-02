@@ -145,6 +145,7 @@ S.unique_global = function(base) return unique(module.names, base) end
 local function known(t, v) return setmetatable({ T = t, k = 'known', v = v }, V) end
 local function dyn(t, e) return setmetatable({ T = t, k = 'dyn', e = e }, V) end
 local function agg(t, f) return setmetatable({ T = t, k = 'agg', f = f }, V) end
+S.agg = agg
 local function ref(place) return setmetatable({ T = types.ref(place.T), k = 'ref', place = place }, V) end
 -- a sum value whose tag is known; its payload has any binding time (nil for Unit)
 local function sumv(t, tag, p) return setmetatable({ T = t, k = 'sumv', tag = tag, p = p }, V) end
@@ -434,6 +435,47 @@ local function field_place(p, name)
     return c
 end
 S.field_place = field_place
+S.root_of = root_of
+
+-- Moved owners (design memory.md §5.4). A move marks its source on the path
+-- that made it; the mark is a state entry of a private marker place, so it
+-- follows branches, joins and rollbacks like any other path fact. A marker is
+-- never storage: its entry is always `mat`, and joins handle it themselves.
+S.move_marker = function(p)
+    local m = rawget(p, 'move_marker')
+    if not m then
+        m = new_place { pk = 'moved', T = types.Bool, name = (rawget(p, 'name') or 'owner') .. '#moved',
+                        id = uid(), source = p }
+        rawset(p, 'move_marker', m)
+    end
+    return m
+end
+function S.mark_moved(src, dst, releases)
+    local b = current
+    local m = S.move_marker(src)
+    rawset(m, 'releases', releases)
+    b.state[m] = { mat = true, moved = rawget(dst, 'name') or 'another place' }
+end
+function S.clear_moved(p)
+    local m = rawget(p, 'move_marker')
+    if m and current.state[m] then current.state[m] = nil end
+end
+-- An owner, or a place inside one, is used: it must not have been moved on
+-- this path. A destination being given a new owner may itself have been moved.
+function S.check_usable(p, as_destination)
+    local b = current
+    if not b then return end
+    local q = p
+    while q do
+        local m = rawget(q, 'move_marker')
+        local en = m and b.state[m]
+        if en and en.moved and not (as_destination and q == p) then
+            S.fail(("'%s' was moved into '%s'; it cannot be used after the move (use '%s', "
+                .. "or copy it before moving)"):format(tostring(q.name), en.moved, en.moved), 3)
+        end
+        q = rawget(q, 'parent')
+    end
+end
 
 -- A fixed-index projection can be evaluated against an immutable array value.
 -- Keep the actual C place too, for the point where storage becomes observable.
@@ -629,6 +671,7 @@ h.reref = function(v)
 end
 
 function Builder:read(p)
+    if root_of(p).T.resizable then S.check_usable(p) end
     if checked_root(p) then p = self:resolve_checked(p) end
     if foreign_place(self, p) then return S.capture_read(self, p) end
     local array_root, path = array_path(p)
@@ -823,10 +866,21 @@ h.contents_token = function(place)
 end
 -- what a borrow of a place depends on: the place's owner (whole, or its
 -- contents), what a reconstructed reference carried, or a container's contents
+-- the nearest container a place lies in (a container element, a payload of a
+-- sum place), walking up from the place itself
+h.container_of = function(place)
+    local q = place
+    while q do
+        local c = rawget(q, 'owner_place')
+        if c then return c end
+        q = rawget(q, 'parent')
+    end
+    return nil
+end
 h.place_tokens = function(place, contents)
     local root = root_of(place)
     local carried = rawget(root, 'carried_view')
-    local container = rawget(root, 'owner_place')
+    local container = h.container_of(place)
     if container then return h.merge_view(carried, h.place_tokens(container, true)) end
     if carried then return carried end
     if contents then return h.contents_token(root) end
@@ -836,7 +890,7 @@ end
 -- when unknown, the place's own lifetime, which every stored borrow outlives
 h.place_view = function(place)
     local root = root_of(place)
-    local container = rawget(root, 'owner_place')
+    local container = h.container_of(place)
     if container then
         local croot = root_of(container)
         return rawget(croot, 'stored_view') or h.place_tokens(container, true)
@@ -867,6 +921,9 @@ h.end_owner = function(b, place, why)
         if b.fn then
             b.fn.shrinks = b.fn.shrinks or {}
             b.fn.shrinks[rawget(root, 'param_index')] = true
+            -- shrinking resizes too: the recursion check treats it as growth
+            b.fn.grow_sites = b.fn.grow_sites or {}
+            table.insert(b.fn.grow_sites, { param = rawget(root, 'param_index'), holding = h.holds_owners(b) })
             for _, token in ipairs(b.fn.param_borrows or {}) do h.end_token(b, token, nil, nil, why) end
         end
         h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
@@ -884,11 +941,255 @@ h.end_owner = function(b, place, why)
     h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
 end
 S.end_borrows = function(place, why) h.end_owner(cur(), place, why) end
+-- the field names leading from a place's root to it
+function S.field_path(p)
+    local names = {}
+    while rawget(p, 'parent') do
+        table.insert(names, 1, rawget(p, 'fname'))
+        p = rawget(p, 'parent')
+    end
+    return table.concat(names, '.')
+end
+h.place_at = function(p, path)
+    for name in path:gmatch('[^%.]+') do p = field_place(p, name) end
+    return p
+end
+-- a materialized word moves the owner at `path` out of its Ref argument i
+function S.note_move_out(fn, index, path)
+    fn.moves_out = fn.moves_out or {}
+    fn.moves_out[index] = fn.moves_out[index] or {}
+    fn.moves_out[index][path] = true
+end
+-- has this path moved the place, or a place it lies in?
+h.moved_in = function(state, p)
+    local q = p
+    while q do
+        local m = rawget(q, 'move_marker')
+        if m and state[m] and state[m].moved then return true end
+        q = rawget(q, 'parent')
+    end
+    return false
+end
+-- A materialized word returns an owner: each of its stacks must be the
+-- result stack of the same position, or a parameter's (returned in place). An
+-- owner built elsewhere is built again on its result stack: the word is
+-- rebuilt with that allocation placed there. Owners above it on the result
+-- stacks end now; those below it (results it consumed) stay until the
+-- outermost caller rewinds the stack.
+h.place_result = function(b, place)
+    local fn = b.fn
+    local positions = {}
+    for _, leaf in ipairs(S.owner_leaves(place)) do
+        for _, slot in ipairs(b:slots_of(leaf.place)) do positions[#positions + 1] = slot end
+    end
+    local need, returned, top = {}, {}, {}
+    for _, slot in ipairs(positions) do
+        returned[slot] = true
+        if slot.res then
+            top[slot.res] = math.max(top[slot.res] or 0, slot.serial)
+        elseif slot.param then
+            fn.returns_param = fn.returns_param or {}
+            fn.returns_param[slot.param] = true
+        elseif slot.ordinal then
+            local span = b.alloc_spans and b.alloc_spans[slot.ordinal]
+            need[slot.ordinal] = math.max((need[slot.ordinal] or 0) + 1, span or 0)
+        else
+            fail(('%s returns an owner whose storage it cannot place on its result stack'):format(
+                fn.word and fn.word.name or '?'), 4)
+        end
+    end
+    if next(need) then
+        -- each allocation still to place gets result stacks of its own
+        local allocs, m = {}, 0
+        for k2, v in pairs(fn.result_allocs or {}) do allocs[k2] = v; m = math.max(m, v.last + 1) end
+        local ords = {}
+        for o in pairs(need) do ords[#ords + 1] = o end
+        table.sort(ords)
+        for _, o in ipairs(ords) do
+            allocs[o] = { first = m, last = m + need[o] - 1 }
+            m = m + need[o]
+        end
+        error({ nua_signal = 'rebuild_results', fn = fn, result_allocs = allocs }, 0)
+    end
+    -- result-stack owners placed after the returned ones lie above them, on
+    -- whichever stacks they share: they end now, newest first
+    local newest = 0
+    for slot in pairs(returned) do if slot.res then newest = math.max(newest, slot.serial) end end
+    local above = {}
+    for slot in pairs(b.gs_res_slots or {}) do
+        if not returned[slot] and slot.serial > newest then above[#above + 1] = slot end
+    end
+    table.sort(above, function(x, y) return x.serial > y.serial end)
+    for _, slot in ipairs(above) do
+        if not b.dead then slot.release() end
+        b.transfer_log = b.transfer_log or {}
+        table.insert(b.transfer_log, { slot = slot, place = slot.place, block = slot.block, dropped = true })
+        b:drop_slot(slot)
+    end
+end
+
+-- Where a materialized call's owner result is built (design memory.md §9):
+--   inside a recursion, on this word's own result stacks: every level's result
+--     lands there, a deeper one above a shallower one;
+--   when this word returns that very result, on its own result stacks too;
+--   otherwise on stacks reserved here past the live ones, released back to
+--     where they stood before the call, which also reclaims what the callee
+--     left below its result.
+-- Returns where each of the result's stacks lies, for adopting it.
+h.result_destination = function(b, w, fn, done, call, args)
+    local n = S.owner_stack_count(w.ret)
+    local m = done and (fn.result_stacks or 0) or 0
+    local ordinal, j0 = b:next_allocation()
+    local placement, res = {}, nil
+    if not done then
+        -- inside the recursion: the callee is this word (or one returning the
+        -- same), whose result stacks are this word's own. Where the result
+        -- lies is known only from its header: this word's result stacks, or an
+        -- argument's stack; whichever it is, it stays this word's to return.
+        if not (b.fn and b.fn.ret == w.ret and b.fn.result_stacks) then
+            fail(('%s returns a %s through a recursion with a word returning something else; this is '
+                .. 'not supported yet'):format(w.name, w.ret.display), 4)
+        end
+        res = { op = 'param', name = 'gs_res', T = types.U64 }
+        for j = 0, n - 1 do placement[j + 1] = { res = 'any', ordinal = ordinal } end
+        call.res_passthrough = true
+    elseif j0 then
+        -- this word returns this very result: the callee's result stacks are
+        -- some of this word's own, from j0
+        res = S.ex(S.result_stack_value(j0))
+        b.alloc_spans = b.alloc_spans or {}
+        b.alloc_spans[ordinal] = math.max(n, m)
+        for j = 0, n - 1 do placement[j + 1] = { res = 'any', ordinal = ordinal } end
+    else
+        -- reserve the callee's result stacks past the live ones: the result
+        -- lies on one of them, or on the stack of an argument it returns
+        local k0 = b:gs_offset()
+        res = S.ex(S.result_stack_value(nil, k0))
+        b.alloc_spans = b.alloc_spans or {}
+        b.alloc_spans[ordinal] = math.max(n, m)
+        local reserved, header = {}, false
+        for k = k0, k0 + m - 1 do reserved[#reserved + 1] = k end
+        for i, a in ipairs(args) do
+            if is_place(a) and fn.returns_param and fn.returns_param[i] then
+                header = true
+                for _, slot in ipairs(b:slots_of(a)) do
+                    if slot.k then reserved[#reserved + 1] = slot.k end
+                end
+            end
+        end
+        -- releasing rewinds each reserved result stack to where it stood
+        -- before the call (the result and what the callee left below it);
+        -- a result that may be an argument's is released by its header
+        local rewinders = {}
+        if not header then for k = k0, k0 + m - 1 do rewinders[#rewinders + 1] = S.stack_rewinder(k) end end
+        for p = 1, n do
+            local at = { ordinal = ordinal }
+            if p == 1 then
+                at.reserved = reserved
+                if not header then at.free = function() for _, r in ipairs(rewinders) do r() end end end
+            elseif not header then
+                at.free = function() end
+            end
+            placement[p] = at
+        end
+        call.gs_off = k0 + m
+    end
+    table.insert(call.args, 1, res)
+    return placement
+end
+
+-- A root exit: its path state decides, once the word's moves are known, which
+-- Ref parameters' owners it still holds and must release
+h.note_root_exit = function(b, stmt)
+    local fn = b.fn
+    if not (fn and fn.ref_owner_params) then return end
+    fn.root_exits = fn.root_exits or {}
+    table.insert(fn.root_exits, { block = b.block, stmt = stmt, state = copy(b.state) })
+end
+h.finish_ref_moves = function(b, fn)
+    if not fn.moves_out then return end
+    -- a recursive site that assumed this word moves nothing must be built again
+    for i, paths in pairs(fn.moves_out) do
+        for path in pairs(paths) do
+            local known = fn.moves_known and fn.moves_known[i] and fn.moves_known[i][path]
+            if not known and fn.assumed_no_move and fn.assumed_no_move[i] then
+                error({ nua_signal = 'rebuild_moves', fn = fn }, 0)
+            end
+        end
+    end
+    for _, exit in ipairs(fn.root_exits or {}) do
+        local releases = {}
+        local held = {}
+        for i, paths in pairs(fn.moves_out) do
+            local base = fn.ref_owner_params and fn.ref_owner_params[i]
+            for path in pairs(paths) do
+                local place = base and h.place_at(base, path)
+                if place and not h.moved_in(exit.state, place) then held[#held + 1] = place end
+            end
+        end
+        table.sort(held, function(x, y) return x.id < y.id end)
+        for _, place in ipairs(held) do
+            do
+                local saved_block, saved_state, saved_dead = b.block, b.state, b.dead
+                local blk = {}
+                b.block, b.state, b.dead = blk, {}, false
+                local ok, err = pcall(S.release_place, place)
+                b.block, b.state, b.dead = saved_block, saved_state, saved_dead
+                if not ok then error(err, 0) end
+                for _, st in ipairs(blk) do releases[#releases + 1] = st end
+            end
+        end
+        if #releases > 0 then
+            local at = #exit.block + 1
+            if exit.stmt then
+                for k, st in ipairs(exit.block) do if st == exit.stmt then at = k break end end
+            end
+            for k = #releases, 1, -1 do table.insert(exit.block, at, releases[k]) end
+        end
+    end
+end
+-- does this function hold an owner on its own data stacks right now?
+h.holds_owners = function(b)
+    for _, slot in pairs(b.gs_live or {}) do if slot then return true end end
+    return false
+end
+-- An owner grows. Reached through a parameter of a materialized function, the
+-- growth goes in the function's summary, with whether the function held
+-- owners of its own then: inside a recursion, those may lie above the grown
+-- owner on its stack (design memory.md §9).
+S.note_growth = function(place)
+    local b = cur()
+    local root = root_of(place)
+    -- on a result stack only the newest owner can grow: an older one has a
+    -- deeper result, or another candidate result, above it
+    if b and b.gs_res_slots then
+        for slot in pairs(b.gs_res_slots) do
+            if slot.place == place then
+                for other in pairs(b.gs_res_slots) do
+                    local shared = other.res == slot.res or other.res == 'any' or slot.res == 'any'
+                    if other ~= slot and shared and other.serial > slot.serial then
+                        fail(("'%s' grows while '%s' lies above it on the result stack of %s; build the "
+                            .. "result after the owners it is made from, or grow it before them"):format(
+                            tostring(place.name), tostring(other.place.name),
+                            b.fn.word and b.fn.word.name or '?'), 3)
+                    end
+                end
+            end
+        end
+    end
+    if not (b and b.fn and root.pk == 'deref' and rawget(root, 'param_index')) then return end
+    b.fn.grow_sites = b.fn.grow_sites or {}
+    table.insert(b.fn.grow_sites, { param = rawget(root, 'param_index'), holding = h.holds_owners(b),
+                                    where = b.fn.word and b.fn.word.loc })
+end
 -- an owner's storage is given back (its block ended): every borrow of it ends
 S.end_place = function(place, why)
     local b, root = cur(), root_of(place)
     h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
-    h.end_token(b, rawget(root, 'borrow_token'), root, 'borrow_token', why)
+    -- an owner field ending (replaced, moved away) leaves the struct itself
+    if root == place or root.pk ~= 'local' then
+        h.end_token(b, rawget(root, 'borrow_token'), root, 'borrow_token', why)
+    end
 end
 S.owner_token = function(place) return h.owner_token(place) end
 S.place_tokens = function(place, contents) return h.place_tokens(place, contents) end
@@ -975,6 +1276,14 @@ h.reads_under = function(e, p)
 end
 
 function Builder:store(p, v)
+    if p.T.kind == 'sum' and rawget(root_of(p), 'contents_token') then
+        -- a new variant: borrows of the old payload end
+        h.end_owner(self, p, ("'" .. tostring(p.name) .. "' was given another variant"))
+    end
+    if p.T.resizable and is_place(v) then
+        -- a named owner moves (an owner struct field by field)
+        return self:move_owner(p, v)
+    end
     if checked_root(p) then p = self:resolve_checked(p) end
     if foreign_place(self, p) then
         fail(("'%s' is a copy taken at spawn; a task cannot assign it (declare a local to change it)"):format(
@@ -1413,6 +1722,37 @@ local function value_of(x, t, what)
     return known(t, v)
 end
 
+-- Owners lend their elements where a view is expected (design memory.md §5.6):
+-- an owner where a Slice T or a Str is expected is borrowed read-only with no
+-- marker; `Ref g` where a Slice.mut T is expected lends them for writing; a
+-- Slice.mut also serves where a Slice T is expected.
+h.lend_view = function(x, t, what)
+    local marked = is_value(x) and x.k == 'ref'
+    local q = h.through(x)
+    if is_value(q) and q.k == 'ref' then q = q.place end
+    local mut = rawget(t, 'slice_mut')
+    if is_value(x) and rawget(x.T, 'slice_mut') and x.T.slice_elem == t.slice_elem and not mut then
+        local ptr, len = S.slice_parts(x)
+        return S.make_slice(t, ptr, len, h.value_view(x))
+    end
+    if not is_place(q) then return nil end
+    local qt = q.T
+    local elem = qt.kind == 'array' and qt.elem or ((qt.kind == 'grow' or qt.kind == 'rtarray') and qt.elem)
+    if not elem or elem ~= t.slice_elem then return nil end
+    if mut and not marked then
+        fail(('%s: a Slice.mut lends %s for writing; mark it at the call: Ref %s'):format(
+            what, tostring(rawget(q, 'name') or 'the owner'), tostring(rawget(q, 'name') or 'x')), 4)
+    end
+    local view
+    if qt.kind == 'array' then
+        view = S.array_member(q, 'slice')(q)
+    else
+        view = qt.builtin_methods.all(q)
+    end
+    local ptr, len = S.slice_parts(view)
+    return S.make_slice(t, ptr, len, h.value_view(view))
+end
+
 -- coerce for binding into a requirement / storage of type t
 local function coerce(x, t, what)
     if t.kind == 'ref' then
@@ -1440,10 +1780,23 @@ local function coerce(x, t, what)
         -- an atomic is initialized from a value of its element type
         return value_of(x, t.elem, what)
     end
+    if rawget(t, 'slice_elem') then
+        local view = h.lend_view(x, t, what)
+        if view then return view end
+    end
     if t.resizable then
-        -- only a constructor, building the storage in place
+        -- an owner: a constructor builds it in place, a named owner moves
         if is_value(x) and (x.k == 'fresh' or x.k == 'agg') and x.T == t then return x end
-        fail(('%s: a %s moves only by reference; pass Ref(...)'):format(what, t.display), 3)
+        x = h.through(x)
+        if is_value(x) and x.k == 'ref' and x.T.elem == t then
+            fail(('%s: a %s owns its storage; a Ref borrows it. Pass the owner itself to move it, '
+                .. 'or copy it'):format(what, t.display), 3)
+        end
+        if is_place(x) and x.T == t then return x end
+        -- a header arriving from a materialized word: adopted where it lands
+        if is_value(x) and x.k == 'dyn' and x.T == t then return x end
+        fail(('%s: expected a %s (a constructor, an owner to move, or a copy), got %s'):format(
+            what, t.display, describe(x)), 3)
     end
     return value_of(x, t, what)
 end
@@ -1863,7 +2216,12 @@ function S.setindex(obj, key, v, bracket)
                 S.set(S.slice_element(obj, key).place, v)
                 return
             end
-            fail('not-a-place: a slice is a read-only view; write through a Ptr or the storage itself', 2)
+            if rawget(t, 'slice_mut') and (type(key) == 'number' or is_staged(key)) then
+                S.set(S.slice_place(obj, key), v)
+                return
+            end
+            fail('not-a-place: a Slice is a read-only view; write through a Slice.mut, a Ptr or the storage '
+                .. 'itself', 2)
         end
     end
     if is_place(obj) or (is_value(obj) and obj.k == 'ref') then
@@ -1930,15 +2288,17 @@ Type.__call = function(t, x)
         if type(x) ~= 'table' or is_staged(x) then
             fail(('%s { ... } expects a table of fields'):format(t.display), 2)
         end
-        local f, all = {}, true
+        local f = {}
         for _, fd in ipairs(t.fields) do
             local fv = x[fd.name]
-            if fv == nil then fail(("%s { ... }: field '%s' is missing"):format(t.display, fd.name), 2) end
-            if fd.type.kind == 'store' or fd.type.kind == 'grow' then
-                f[fd.name] = coerce(fv, fd.type, ("field '%s'"):format(fd.name))
-            else
-                f[fd.name] = coerce(fv, fd.type, ("field '%s'"):format(fd.name))
+            if fv == nil then
+                -- an owner struct's omitted fields start empty (owners) or zeroed
+                if not t.resizable then
+                    fail(("%s { ... }: field '%s' is missing"):format(t.display, fd.name), 2)
+                end
+                fv = fd.type.resizable and fd.type {} or S.zero_value(fd.type)
             end
+            f[fd.name] = coerce(fv, fd.type, ("field '%s'"):format(fd.name))
         end
         for k in pairs(x) do
             if not t.index[k] then fail(("%s has no field '%s'"):format(t.display, tostring(k)), 2) end
@@ -2041,8 +2401,8 @@ function S.decl(t, init, name)
     end
     local p = b:new_local(t, name)
     if init == nil and t.resizable then
-        fail(("local '%s': a %s is created where it is declared: local %s: %s = ..."):format(
-            name or '?', t.display, name or 'x', t.display), 2)
+        -- an owner declared without a value starts empty
+        init = t {}
     end
     if init == nil and t.kind == 'array' then init = t() end     -- arrays start zeroed
     local unreachable = b.dead
@@ -2080,8 +2440,11 @@ S.slice_element = function(s, key) return h.slice_get(s, key) end
 function S.set(p, v)
     local b = cur()
     if not is_place(p) then fail('assignment target is not a native place', 2) end
-    if p.T.resizable and p.T.kind ~= 'struct' then
-        fail(("'%s' is resizable storage; it cannot be reassigned"):format(p.name), 2)
+    if p.T.resizable then
+        -- a new owner replaces the old one, which ends here (§5.8)
+        local value = coerce(v, p.T, ("assignment to '%s'"):format(p.name))
+        if p.T.kind == 'struct' then return b:store(p, value) end
+        return b:init_resizable(p, value)
     end
     if p.T.kind == 'ref' then
         -- Assignment follows the right-hand side's type: a reference rebinds,
@@ -2107,8 +2470,14 @@ end
 function S.infer(v, name)
     if current and (is_value(v) or is_place(v)) and v.T.kind ~= 'ref'
         and v.T.kind ~= 'unit' and v.T.kind ~= 'opaque'
-        and not (rawget(v.T, 'slice_elem') and h.value_view(v))
-        and not (is_place(v) and v.T.resizable) then
+        and not (rawget(v.T, 'slice_elem') and h.value_view(v)) then
+        -- an owner place moves into the new local; a word's owner result is
+        -- already a place of this block, so it simply takes the name
+        if is_place(v) and v.T.resizable and rawget(v, 'owner_result_of') then
+            rawset(v, 'owner_result_of', nil)
+            if name then rawset(v, 'name', name) end
+            return v
+        end
         return S.decl(v.T, v, name)
     end
     return S.bind(v)
@@ -2260,7 +2629,27 @@ function Builder:join(paths, base)
     if #live == 0 then self.dead = true; return base end
     if #live == 1 then return live[1].state end
     local out = {}
+    -- A move on some paths only: the owner's life ends on the others, where it
+    -- is released before the join. After the join it counts as moved.
+    local markers = {}
+    for _, p in ipairs(live) do
+        for place in pairs(p.state) do if place.pk == 'moved' then markers[place] = true end end
+    end
+    for _, place in ipairs(sorted_places(markers)) do
+        do
+            local moved, others = nil, {}
+            for _, p in ipairs(live) do
+                local en = p.state[place]
+                if en and en.moved then moved = en else others[#others + 1] = p end
+            end
+            if moved then
+                for _, p in ipairs(others) do self:release_moved_on(place, p) end
+                out[place] = moved
+            end
+        end
+    end
     for _, place in ipairs(sorted_places(base)) do
+        if place.pk == 'moved' then goto continue end
         if not tracked(place) then
             -- it became memory on some path: every path stores its pending value
             for _, p in ipairs(live) do
@@ -2311,6 +2700,20 @@ function Builder:join(paths, base)
         end
     end
     return out
+end
+
+-- release, on one path, an owner another path moved away
+function Builder:release_moved_on(marker, path)
+    local block, state, dead = self.block, self.state, self.dead
+    self.block, self.state, self.dead = path.block or self.block, path.state, false
+    local ok, err = pcall(function()
+        for _, r in ipairs(rawget(marker, 'releases') or {}) do r.free(r.place) end
+    end)
+    self.block, self.state, self.dead = block, state, dead
+    if not ok then error(err, 0) end
+    -- the borrows of it may be used after the join on either path: they end
+    S.end_place(rawget(marker, 'source'), ("'" .. tostring(rawget(marker, 'source').name)
+        .. "' was moved on another path"))
 end
 
 -- range facts: on each arm of a dynamic branch, what its integer condition
@@ -2545,9 +2948,11 @@ end
 function Builder:snapshot()
     local owned = self.gs_owned and self.gs_owned[self.block]
     return { block = self.block, n = #self.block, state = copy(self.state), dead = self.dead,
-             gs_live = self.gs_live and copy(self.gs_live), owned_n = owned and #owned or 0,
+             gs_live = self.gs_live and copy(self.gs_live), owned = owned and copy(owned),
+             gs_extra = self.gs_extra and copy(self.gs_extra),
              escapes = #self.escapes, emissions = #self.emissions,
-             locals = self.fn and #self.fn.locals, shrinks = self.shrink_log and #self.shrink_log or 0 }
+             locals = self.fn and #self.fn.locals, shrinks = self.shrink_log and #self.shrink_log or 0,
+             transfers = self.transfer_log and #self.transfer_log or 0 }
 end
 
 function Builder:rollback(snap)
@@ -2566,8 +2971,14 @@ function Builder:rollback(snap)
     self.state = copy(snap.state)
     self.dead = snap.dead
     if self.gs_live then self.gs_live = snap.gs_live and copy(snap.gs_live) or {} end
+    if self.gs_extra then self.gs_extra = snap.gs_extra and copy(snap.gs_extra) or {} end
+    -- a discarded round's moves never happened: their slots go back first
+    if self.undo_transfers then self:undo_transfers(snap.transfers or 0) end
     local owned = self.gs_owned and self.gs_owned[snap.block]
-    if owned then for k = #owned, snap.owned_n + 1, -1 do owned[k] = nil end end
+    if owned then
+        for k = #owned, 1, -1 do owned[k] = nil end
+        for k, slot in ipairs(snap.owned or {}) do owned[k] = slot end
+    end
     for k = #self.escapes, snap.escapes + 1, -1 do
         rawset(self.escapes[k], 'escaped', nil)
         self.escapes[k] = nil
@@ -2673,19 +3084,11 @@ function S.word(spec)
             fail(("word %s: parameter '%s' is the opaque type %s; take a Ptr %s"):format(spec.name or '?',
                 p[1], p[2].display, p[2].display), 2)
         end
-        if p[2].resizable then
-            fail(("word %s: parameter '%s' is a %s; resizable values are passed as Ref %s"):format(
-                spec.name or '?', p[1], p[2].display, p[2].display), 2)
-        end
         params[i] = { name = p[1], T = p[2] }
         ::next_param::
     end
     if not is_type(spec.result) then
         fail(('word %s: result annotation is not a type (%s)'):format(spec.name or '?', describe(spec.result)), 2)
-    end
-    if spec.result.resizable then
-        fail(('word %s: a %s cannot be returned; create it in the caller and pass a Ref'):format(
-            spec.name or '?', spec.result.display), 2)
     end
     local body = spec.body
     if spec.rest then
@@ -2699,6 +3102,20 @@ function S.word(spec)
         end
         if np == 0 then
             body = function(...) return inner(S.pack({ ... })) end
+        end
+    end
+    -- an owner-typed parameter owns its argument (design memory.md §5.6): the
+    -- word's own local receives it, moved or built in place, and ends with it
+    local owned = {}
+    for i, p in ipairs(params) do if p.T and p.T.resizable then owned[#owned + 1] = i end end
+    if #owned > 0 then
+        local inner = body
+        body = function(...)
+            local all, n = { ... }, select('#', ...)
+            for _, i in ipairs(owned) do
+                all[i] = S.decl(params[i].T, all[i], params[i].name)
+            end
+            return inner(unpack(all, 1, n))
         end
     end
     return setmetatable({
@@ -2747,6 +3164,8 @@ end
 
 local function arg_key(v)
     if is_host(v) then return h.host_key(v) end
+    -- an owner moved into a word: dynamic, like any runtime value
+    if is_place(v) then return '?' .. v.T.display end
     if v.k == 'sumv' and is_known(v) then
         local q = rawget(v, 'p')
         return v.T.display .. '.' .. v.tag .. '(' .. (q ~= nil and arg_key(q) or '') .. ')'
@@ -2850,7 +3269,9 @@ end
 
 -- the shape of a specialization key: knownness and types, not known values
 h.arg_shape = function(v)
-    -- a place passed on to a handler is read like any other argument
+    -- an owner moved into a word is a runtime value; any other place passed
+    -- on to a handler is read like any other argument
+    if is_place(v) and v.T.resizable then return '?' .. v.T.display end
     if is_place(v) then v = cur():read(v) end
     if is_host(v) then return 'H' end
     if static(v) then return 'K' .. v.T.display end
@@ -2992,13 +3413,15 @@ local build_function
 -- resizable values created since a frame's round began give their space back
 -- before a jump
 function Builder:release_since(frame)
-    local mark = frame.gs_mark or {}
-    local ks = {}
-    for k in pairs(self.gs_live or {}) do if not mark[k] then ks[#ks + 1] = k end end
-    table.sort(ks, function(a, b) return a > b end)
-    for _, k in ipairs(ks) do
-        local owned = self.gs_live[k]
-        owned.release()
+    local held = {}
+    for _, slot in pairs(frame.gs_mark or {}) do held[slot] = true end
+    for slot in pairs(frame.extra_mark or {}) do held[slot] = true end
+    local slots = self.all_slots and self:all_slots() or {}
+    for i = #slots, 1, -1 do
+        local slot = slots[i]
+        -- an owner moved to a place outside the frame (its result) lives on
+        local outside = frame.first_id and (root_of(slot.place).id or 0) < frame.first_id
+        if not held[slot] and not outside then slot.release() end
     end
 end
 
@@ -3017,6 +3440,11 @@ function Builder:run_frame(desc, args, opts)
     local mode = opts.mode or 'inline'
     local widen, escapes = {}, {}
     local rounds = 0
+    -- a word returning an owner builds it in a place of the caller (design
+    -- memory.md §5.3): its returns move into it, and the caller's block owns it
+    local owner_result = self.fn and desc.ret and desc.ret.resizable and mode ~= 'comptime'
+        and self:new_local(desc.ret, 'result') or nil
+    if owner_result then rawset(owner_result, 'owner_result_of', desc.word or true) end
     while true do
         local frame = {
             kind = desc.kind, mode = mode, word = desc.word, desc = desc, args = args,
@@ -3024,10 +3452,12 @@ function Builder:run_frame(desc, args, opts)
             ret = desc.ret, base_block = self.block, sites = {}, rounds = rounds,
             tail_parent = opts.tail_parent, widen = widen, escape_list = escapes,
             infer = desc.infer, match = mode == 'inline' and opts.match or nil,
+            first_id = uid(), owner_result = owner_result,
         }
         frame.snap = self:snapshot()
         frame.iter_n, frame.iter_state = #self.block, copy(self.state)
         frame.gs_mark = copy(self.gs_live or {})
+        frame.extra_mark = copy(self.gs_extra or {})
         local ok, res
         if mode == 'loop' then
             ok, res = pcall(self.run_loop, self, frame)
@@ -3041,6 +3471,7 @@ function Builder:run_frame(desc, args, opts)
                 return self:call_materialized(desc.word, args, frame.key)
             end
             h.end_frame_tokens(self, frame)
+            if owner_result then return owner_result end
             return res
         end
         local sig = type(res) == 'table' and res.nua_signal and res.frame == frame and res
@@ -3162,7 +3593,7 @@ function run_loop_body(self, frame)
     for i, value in ipairs(vals) do vals[i] = h.with_view(value, h.value_view(frame.args[i])) end
     frame.lvs, frame.partial = lvs, partial
     frame.top, frame.ends = 'L' .. uid(), 'L' .. uid()
-    if frame.kind == 'word' and frame.ret.kind ~= 'unit' then
+    if frame.kind == 'word' and frame.ret.kind ~= 'unit' and not frame.owner_result then
         frame.rvar = self:new_var(frame.ret, 'rvar', 'r')
     end
     local s0 = self.state
@@ -3207,6 +3638,7 @@ function run_loop_body(self, frame)
     local blk = self:sub(function()
         frame.base_block = self.block
         frame.gs_mark = copy(self.gs_live or {})
+        frame.extra_mark = copy(self.gs_extra or {})
         ok, err = pcall(desc.body, unpack(vals, 1, #frame.args))
         if ok and not self.dead then
             -- falling off the end leaves the loop / returns Unit
@@ -3455,7 +3887,7 @@ function Builder:share_or_in_place(w, args, key)
     if not failed then failed = {}; module.share_failed = failed end
     if failed[key] then return false end
     local ok, err = pcall(function()
-        return module.by_key[key] or module.export_by_key[key] or build_function(w, args, key)
+        return module.by_key[key] or module.export_by_key[key] or h.build_with_moves(w, args, key)
     end)
     local fn = ok and (module.by_key[key] or module.export_by_key[key] or nil) or nil
     local fits = fn ~= nil
@@ -3653,6 +4085,12 @@ end
 
 -- `return v` from a word frame
 function Builder:return_value(frame, v)
+    if frame.owner_result then
+        -- the result is built in the caller's place: a returned owner moves
+        -- there, a constructor creates it there; no value travels
+        if v ~= nil and not self.dead then self:init_resizable(frame.owner_result, v) end
+        v = nil
+    end
     if v and is_value(v) and v.k == 'ref' then
         local r = root_of(v.place)
         if r.pk == 'local' and frame.local_owner and rawget(r, 'frame') == frame.local_owner then
@@ -3682,8 +4120,45 @@ function Builder:return_value(frame, v)
         end
     end)
     frame.view = h.merge_view(frame.view, view)
+    if frame.mode == 'root' and frame.ret.resizable then
+        -- a materialized word returns an owner's header; the stacks it sits on
+        -- are left as they are when the function gives its others back
+        local place = v
+        if not is_place(place) then
+            place = self:new_local(frame.ret, 'result')
+            self:store(place, v)
+        end
+        for _, l in ipairs(leaves(place)) do
+            if tracked(l) then self:materialize(l) end
+        end
+        -- what this exit gives up holds on this path only: the others still
+        -- hold it after the return, so its bookkeeping is taken back then
+        local mark = self.transfer_log and #self.transfer_log or 0
+        h.place_result(self, place)
+        self:hand_off(place)
+        local result = self:new_temp(frame.ret)
+        self:emit { op = 'let', place = result, e = read_expr(place), what = 'an owner result' }
+        self:release_extras()
+        local stmt = { op = 'ret', e = read_expr(result), T = frame.ret }
+        h.note_root_exit(self, stmt)
+        self:emit(stmt)
+        self:undo_transfers(mark)
+        self.dead = true
+        return
+    end
     if frame.mode == 'root' then
-        self:emit { op = 'ret', e = v and ex(v) or nil, T = frame.ret }
+        if self.gs_extra and next(self.gs_extra) then
+            -- the value is computed before adopted owners are given back
+            if v ~= nil then
+                local t = self:new_temp(frame.ret)
+                self:emit { op = 'let', place = t, e = ex(v), what = 'a result' }
+                v = dyn(frame.ret, read_expr(t))
+            end
+            self:release_extras()
+        end
+        local stmt = { op = 'ret', e = v and ex(v) or nil, T = frame.ret }
+        h.note_root_exit(self, stmt)
+        self:emit(stmt)
         self.dead = true
         return
     end
@@ -3727,7 +4202,7 @@ function Builder:return_value(frame, v)
     if frame.infer and frame.ret and frame.ret.kind ~= 'unit' and v ~= nil then
         v = coerce(v, frame.ret, 'return value of ' .. frame_name(frame))
     end
-    if frame.ret and frame.ret.kind ~= 'unit' and not frame.rvar then
+    if frame.ret and frame.ret.kind ~= 'unit' and not frame.rvar and not frame.owner_result then
         frame.rvar = self:new_var(frame.ret, 'rvar', 'r')
         -- the deferred Lua numbers now have a type
         for _, d in ipairs(frame.deferred or {}) do
@@ -4152,7 +4627,37 @@ end
 
 function Builder:call_materialized(w, args, key)
     local exported = module.export_by_key[key]
-    return self:emit_call(w, exported or module.by_key[key] or build_function(w, args, key), args)
+    return self:emit_call(w, exported or module.by_key[key] or h.build_with_moves(w, args, key), args)
+end
+-- build a function; if a recursive site assumed it moves nothing out of a Ref
+-- argument and it does, build it again knowing its moves
+h.build_with_moves = function(w, args, key, cname, opts)
+    local ok, fn = pcall(build_function, w, args, key, cname, opts)
+    if ok then return fn end
+    local sig = fn
+    if type(sig) ~= 'table' or (sig.nua_signal ~= 'rebuild_moves' and sig.nua_signal ~= 'rebuild_results') then
+        error(sig, 0)
+    end
+    local old = sig.fn
+    module.by_key[key] = nil
+    for k = #module.functions, 1, -1 do
+        if module.functions[k] == old then table.remove(module.functions, k) break end
+    end
+    for _, other in ipairs(module.functions) do
+        for _, site in ipairs(other.owner_sites or {}) do
+            if site.callee == old then
+                fail(('%s moves an owner out of a Ref argument through a recursion with other words; '
+                    .. 'this is not supported yet'):format(w.name), 4)
+            end
+        end
+    end
+    local o = {}
+    for k2, v in pairs(opts or {}) do o[k2] = v end
+    o.moves_known = old.moves_out or old.moves_known
+    o.result_allocs = sig.result_allocs or old.result_allocs
+    o.rebuilds = (o.rebuilds or 0) + 1
+    if o.rebuilds > 8 then fail(('%s: placing its owner results does not settle'):format(w.name), 4) end
+    return h.build_with_moves(w, args, key, cname, o)
 end
 
 -- What an argument lends a materialized call: its own borrows, or for a Ref,
@@ -4174,17 +4679,55 @@ end
 function Builder:emit_call(w, fn, args)
     local done = fn.status == 'done'
     local result_view
+    -- an owner argument passes to the callee whole: a constructor is built
+    -- here first, then its header crosses and the callee releases it
+    args = { unpack(args, 1, #args) }
     for i, a in ipairs(args) do
+        if is_value(a) and (a.k == 'fresh' or (a.k == 'agg' and a.T.resizable)) then
+            local t = self:new_local(a.T, 'arg')
+            self:store(t, a)
+            args[i] = t
+        end
+    end
+    for i, a in ipairs(args) do
+        if is_place(a) then goto next_arg end
         local kinds = done and fn.result_params and fn.result_params[i]
         local view = h.argument_view(a, (not done) and { whole = true, contents = true } or kinds)
         if view and (not done or kinds) then
             result_view = h.merge_view(result_view, view)
         end
+        ::next_arg::
     end
     self:bump_checked()          -- the callee may change any storage it reaches
+    -- what each Ref to an owner refers to, for the recursion check: an owner
+    -- of this function, or one passed on from a parameter
+    if self.fn then
+        for i, a in ipairs(args) do
+            if is_value(a) and a.k == 'ref' and a.T.elem.resizable then
+                local root = root_of(a.place)
+                local site = { callee = fn, arg = i, holding = h.holds_owners(self) }
+                if root.pk == 'deref' and rawget(root, 'param_index') then
+                    site.kind, site.param = 'pass', rawget(root, 'param_index')
+                elseif root.pk == 'local' then
+                    site.kind = 'own'
+                end
+                if site.kind then
+                    self.fn.owner_sites = self.fn.owner_sites or {}
+                    table.insert(self.fn.owner_sites, site)
+                end
+            end
+        end
+    end
     local cargs = {}
     for i, a in ipairs(args) do
-        if fn.dynamic_pos[i] then
+        if fn.dynamic_pos[i] and is_place(a) then
+            for _, l in ipairs(leaves(a)) do
+                if tracked(l) then self:materialize(l) end
+            end
+            cargs[#cargs + 1] = read_expr(a)
+            local releases = self:hand_off(a)
+            S.mark_moved(a, { name = 'the call to ' .. w.name }, releases)
+        elseif fn.dynamic_pos[i] then
             if a.k == 'ref' then
                 local p = a.place
                 if p.pk ~= 'deref' then self:escape(p) end
@@ -4196,13 +4739,50 @@ function Builder:emit_call(w, fn, args)
     end
     local call = { op = 'call', fn = fn, args = cargs, T = w.ret,
                    gs_off = self.gs_offset and self:gs_offset() or 0 }
+    local placement
+    if w.ret.resizable then placement = h.result_destination(self, w, fn, done, call, args) end
     local result
     if w.ret.kind == 'unit' then
         self:emit { op = 'expr', e = call, what = 'a call to ' .. w.name }
+    elseif w.ret.resizable then
+        -- an owner result: its header comes back by value; it lies where this
+        -- call put its destination
+        local t = self:new_temp(w.ret)
+        self:emit { op = 'let', place = t, e = call, what = 'a call to ' .. w.name }
+        result = self:new_local(w.ret, 'result')
+        self:adopt_owner(result, dyn(w.ret, read_expr(t)), placement)
+        rawset(result, 'owner_result_of', w)
     else
         local t = self:new_temp(w.ret)
         self:emit { op = 'let', place = t, e = call, what = 'a call to ' .. w.name }
         result = h.reref(h.with_view(dyn(w.ret, read_expr(t)), result_view))
+    end
+    -- the callee may move an owner out of a Ref argument (its summary): that
+    -- place counts as moved here; a callee still being built is assumed not
+    -- to, and is built again if it turns out to
+    for i, a in ipairs(args) do
+        if is_value(a) and a.k == 'ref' and a.T.elem.resizable then
+            local moves = done and fn.moves_out or (not done and fn.moves_known)
+            if not done then
+                fn.assumed_no_move = fn.assumed_no_move or {}
+                fn.assumed_no_move[i] = true
+            end
+            local paths = {}
+            for path in pairs(moves and moves[i] or {}) do paths[#paths + 1] = path end
+            table.sort(paths)
+            for _, path in ipairs(paths) do
+                local place = h.place_at(a.place, path)
+                local root = root_of(place)
+                local releases
+                if root.pk == 'deref' and rawget(root, 'param_index') and rawget(root, 'param_fn') == self.fn then
+                    S.note_move_out(self.fn, rawget(root, 'param_index'), S.field_path(place))
+                    releases = S.place_releases(place)
+                else
+                    releases = self:hand_off(place)
+                end
+                S.mark_moved(place, { name = 'the call to ' .. w.name }, releases)
+            end
+        end
     end
     -- the callee may have freed what an argument owns: borrows of it end here
     for i, a in ipairs(args) do
@@ -4217,6 +4797,8 @@ end
 -- construct the residual C function for a specialization key
 function build_function(w, args, key, cname, opts)
     local fn = h.new_fn(w.name, w, key)
+    fn.moves_known = opts and opts.moves_known
+    fn.result_allocs = opts and opts.result_allocs
     fn.task = opts and opts.task
     fn.capture = opts and opts.capture
     fn.cname = cname and unique(module.names, cname) or unique(module.names, w.name)
@@ -4243,13 +4825,21 @@ function build_function(w, args, key, cname, opts)
             end
             local pname = unique(names, base)
             fn.param_of[i] = pname
-            if a.k == 'ref' then
+            if is_place(a) or (is_value(a) and a.k == 'fresh') then
+                -- an owner: its header arrives by value, and the body adopts it
+                fn.params[#fn.params + 1] = { name = pname, T = a.T }
+                vals[i] = dyn(a.T, { op = 'param', name = pname, T = a.T, fn = fn })
+            elseif a.k == 'ref' then
                 local cp = { name = pname, T = a.T }
                 fn.params[#fn.params + 1] = cp
                 local target = new_place { pk = 'deref', T = a.T.elem, name = p.name,
                     ptr = { op = 'param', name = pname, T = a.T, fn = fn }, id = uid(),
                     param_index = i, param_fn = fn }
                 vals[i] = ref(target)
+                if a.T.elem.resizable then
+                    fn.ref_owner_params = fn.ref_owner_params or {}
+                    fn.ref_owner_params[i] = target
+                end
             else
                 local cp = { name = pname, T = a.T }
                 fn.params[#fn.params + 1] = cp
@@ -4266,6 +4856,15 @@ function build_function(w, args, key, cname, opts)
         end
     end
     fn.param_names = names
+    if w.ret.resizable then
+        -- the caller gives the result its destination (design memory.md §9):
+        -- result stacks gs_res, gs_res + 1, ...: each owner allocation the word
+        -- may return has its own, so candidate results never stack on each other
+        local m = 0
+        for _, j in pairs(fn.result_allocs or {}) do m = math.max(m, j.last + 1) end
+        fn.result_stacks = m
+        table.insert(fn.params, 1, { name = 'gs_res', T = types.U64 })
+    end
 
     push_builder(b)
     local frame = { kind = 'word', mode = 'root', word = w, key = key, ret = w.ret, base_block = fn.body,
@@ -4277,6 +4876,18 @@ function build_function(w, args, key, cname, opts)
     local profile = S.size_profile
     if profile then profile:push(S.size_module(w.loc)) end
     local ok, err = pcall(w.body, unpack(vals, 1, #args))
+    if ok and not b.dead and b.release_extras then
+        -- falling off the end is an exit too
+        local ok2, err2 = pcall(b.release_extras, b)
+        if not ok2 then ok, err = false, err2 end
+        if ok then h.note_root_exit(b, nil) end
+    end
+    if ok then
+        -- exits on paths that did not move a Ref parameter's owner, in a word
+        -- that moves it out on another path, release it there
+        local ok2, err2 = pcall(h.finish_ref_moves, b, fn)
+        if not ok2 then ok, err = false, err2 end
+    end
     pop_frame(b)
     pop_builder()
     if profile then profile:pop() end
@@ -4292,6 +4903,11 @@ function build_function(w, args, key, cname, opts)
                 w.ret.display), 2)
         end
         fn.body[#fn.body + 1] = { op = 'ret' }
+    end
+    if fn.moves_out and fn.exported then
+        -- a foreign caller cannot learn that its owner moved away
+        fail(('export %s moves an owner out of a Ref argument; a C caller could not know it moved, so '
+            .. 'an exported word copies it instead'):format(fn.cname), 2)
     end
     if fn.capture then S.capture_leaves(fn) end
     S.check_isolated(fn)
@@ -4341,12 +4957,20 @@ end
 function S.runtime_exports(on) module.lazy_mode = on and true or nil end
 
 local function export_args(w, cname)
+    if w.ret.resizable then
+        fail(("export %s: it returns a %s; C cannot take over an owner, so an exported word returns "
+            .. "values, or fills an owner passed as Ref"):format(cname, w.ret.display), 2)
+    end
     local args = {}
     for i, p in ipairs(w.params) do
         if w.supplied[i] then
             args[i] = w.supplied[i]
         elseif p.static then
             fail(("export %s: compile-time parameter '%s' must be supplied first"):format(cname, p.name), 2)
+        elseif p.T.resizable then
+            -- C has no owners: storage it can see is lent (Ref, Slice) or raw
+            fail(("export %s: parameter '%s' is a %s; C cannot hand over an owner, so an exported word "
+                .. "takes it as Ref %s or a Slice"):format(cname, p.name, p.T.display, p.T.display), 2)
         elseif p.T.kind == 'ref' then
             args[i] = setmetatable({ T = p.T, k = 'ref', place = { pk = 'deref' } }, V)
         else
@@ -4391,12 +5015,20 @@ function S.export_word(w, cname)
         module.lazy[cname] = w
         return
     end
+    if w.ret.resizable then
+        fail(("export %s: it returns a %s; C cannot take over an owner, so an exported word returns "
+            .. "values, or fills an owner passed as Ref"):format(cname, w.ret.display), 2)
+    end
     local args = {}
     for i, p in ipairs(w.params) do
         if w.supplied[i] then
             args[i] = w.supplied[i]
         elseif p.static then
             fail(("export %s: compile-time parameter '%s' must be supplied first"):format(cname, p.name), 2)
+        elseif p.T.resizable then
+            -- C has no owners: storage it can see is lent (Ref, Slice) or raw
+            fail(("export %s: parameter '%s' is a %s; C cannot hand over an owner, so an exported word "
+                .. "takes it as Ref %s or a Slice"):format(cname, p.name, p.T.display, p.T.display), 2)
         elseif p.T.kind == 'ref' then
             args[i] = setmetatable({ T = p.T, k = 'ref', place = { pk = 'deref' } }, V)
         else
@@ -4466,12 +5098,18 @@ end
 local natives = 0
 function S.native_word(w)
     if not is_word(w) then fail(('native: not a native word (%s)'):format(describe(w)), 3) end
+    if w.ret.resizable then
+        fail(("native: %s returns a %s; the host cannot take over an owner"):format(w.name, w.ret.display), 3)
+    end
     local args = {}
     for i, p in ipairs(w.params) do
         if w.supplied[i] then
             args[i] = w.supplied[i]
         elseif p.static then
             fail(("native: compile-time parameter '%s' must be supplied first"):format(p.name), 3)
+        elseif p.T.resizable then
+            fail(("native: parameter '%s' is a %s; the host cannot hand over an owner"):format(
+                p.name, p.T.display), 3)
         elseif p.T.kind == 'ref' then
             args[i] = setmetatable({ T = p.T, k = 'ref', place = { pk = 'deref' } }, V)
         else
@@ -5009,25 +5647,59 @@ h.match_handlers = function(t, handlers)
             fail(("matching a %s: alternative '%s' has no handler"):format(t.display, alt.name), 3)
         end
     end
-    local function call(alt, payload)
+    local function call(alt, payload, place)
         local h = handlers[alt.name]
         local mt = getmetatable(h)
         if type(h) ~= 'function' and not (mt and mt.__call) then
             fail(("the handler for '%s' is not callable"):format(alt.name), 4)
         end
         if alt.type.kind == 'unit' then return h() end
+        -- a handler declaring `Ref P` borrows the payload of the sum place
+        -- being matched (design memory.md §4); any other receives a copy
+        if place and S.handler_wants_ref(h, alt) then return h(ref(S.payload_place(place, alt))) end
         return h(payload)
     end
     return call
 end
 
+-- does a handler declare its payload parameter as a reference to it?
+function S.handler_wants_ref(handler, alt)
+    if not is_word(handler) then return false end
+    local p = handler.params[#handler.supplied + 1]
+    return p and p.T and p.T.kind == 'ref' and p.T.elem == alt.type or false
+end
+-- the payload of one alternative, as a place of the sum place: a borrow of it
+-- borrows the sum's contents, which replacing the variant ends
+function S.payload_place(p, alt)
+    local ch = rawget(p, 'children')
+    if not ch then ch = {}; rawset(p, 'children', ch) end
+    local key = 'as.' .. alt.name
+    local c = ch[key]
+    if not c then
+        c = new_place { pk = 'field', T = alt.type, parent = p, fname = key,
+                        name = p.name .. '.' .. alt.name, id = uid() }
+        rawset(c, 'owner_place', p)
+        ch[key] = c
+    end
+    return c
+end
+
 local function match(s, handlers)
-    if is_place(s) then s = cur():read(s) end
+    local place
+    if is_place(s) then
+        -- a payload borrowed in place needs the sum in memory
+        local t = s.T
+        for _, alt in ipairs(t.alts) do
+            if type(handlers) == 'table' and S.handler_wants_ref(handlers[alt.name], alt) then place = s end
+        end
+        if place then cur():escape(place) end
+        s = cur():read(s)
+    end
     local t = s.T
     local call = h.match_handlers(t, handlers)
     if s.k == 'sumv' then
         -- a known tag: only the selected handler runs
-        return call(t.index[rawget(s, 'tag')], rawget(s, 'p'))
+        return call(t.index[rawget(s, 'tag')], rawget(s, 'p'), place)
     end
     -- a runtime tag: a test per alternative, the payload projected in its arm
     local b = cur()
@@ -5039,7 +5711,7 @@ local function match(s, handlers)
             local function run()
                 local payload = alt.type.kind ~= 'unit'
                     and h.reref(h.with_view(dyn(alt.type, h.payload_of(e, alt)), h.value_view(v))) or nil
-                S.ret(call(alt, payload))
+                S.ret(call(alt, payload, place))
             end
             if i == #t.alts then return run() end
             S.if_(dyn(types.Bool, { op = 'cmp', o = 'eq', a = h.tag_of(e), T = types.Bool,
@@ -5145,7 +5817,7 @@ function S.fnptr(w)
         end
     end
     local key = spec_key(w, args)
-    local fn = module.export_by_key[key] or module.by_key[key] or build_function(w, args, key)
+    local fn = module.export_by_key[key] or module.by_key[key] or h.build_with_moves(w, args, key)
     fn.addr_taken = true
     local ft = types.fn(ptypes, w.ret)
     return dyn(ft, { op = 'fnaddr', fn = fn, T = ft })
@@ -5176,6 +5848,8 @@ end
 
 V.__call = function(x, ...)
     if x.T.kind == 'sum' then return match(x, ...) end
+    -- matching through a reference matches the place it refers to
+    if x.k == 'ref' and x.T.elem.kind == 'sum' then return match(x.place, ...) end
     if x.T.kind == 'fn' then return call_fn(x, ...) end
     fail(('a %s value is not callable'):format(x.T.display), 2)
 end
@@ -5195,7 +5869,9 @@ end
 
 function S.global(t, opts)
     if not is_type(t) then fail('global(T, opts) takes a type, got ' .. describe(t), 2) end
-    if t.resizable or t.kind == 'unit' or t.kind == 'opaque' or t.kind == 'chan' then
+    -- handles are generational, so a stale Chan or Pool in a global traps at
+    -- its next use and never reaches freed memory (design memory.md §15 D3)
+    if t.resizable or t.kind == 'unit' or t.kind == 'opaque' then
         fail('global: a ' .. t.display .. ' cannot be static storage', 2)
     end
     opts = opts or {}
@@ -5425,6 +6101,18 @@ h.slice_get = function(s, key)
     return h.reref(h.with_view(cur():read(__index(ptr, iv, ptr.T.elem)), h.value_view(s)))
 end
 
+-- an element of a Slice.mut as a place, checked against the length
+h.slice_place = function(s, key)
+    check_view(s)
+    local ptr, len = slice_parts(s)
+    local iv = index_value(key)
+    if iv.T ~= types.U32 then iv = types.U32(iv) end
+    bound_check(iv, len, 'index')
+    return __index(ptr, iv, ptr.T.elem)
+end
+
+S.slice_place = function(s, key) return h.slice_place(s, key) end
+
 h.slice_sub = function(s, a, b_)
     local view = check_view(s)
     local ptr, len, t = slice_parts(s)
@@ -5485,6 +6173,14 @@ function S.Slice(x, n)
 end
 S.make_slice = make_slice
 S.slice_parts, S.member_slice, S.bound_check = slice_parts, member_slice, bound_check
+-- Slice.mut T, the writable view; `Slice` itself stays callable as before
+function S.SliceMut(x)
+    if not is_type(x) then fail('Slice.mut T is a type: Slice.mut U8', 2) end
+    local ok, t = pcall(types.slice_mut, x)
+    if not ok then fail((tostring(t):gsub('^[^:]+:%d+: ', '')), 2) end
+    return t
+end
+S.SliceNS = setmetatable({ mut = S.SliceMut }, { __call = function(_, x, n) return S.Slice(x, n) end })
 
 -- fixed-length arrays ------------------------------------------------------------------------------
 -- a[i] is checked like a slice's (at compile time when the index is known),

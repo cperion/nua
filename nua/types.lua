@@ -92,9 +92,18 @@ function T.ptr(elem)
     end)
 end
 
+-- An element of an array or a container, or a map value: any fixed-size type
+-- that is neither an owner nor an atomic (design memory.md §5.11). Atomics are
+-- never copied, and elements move by copy; owners nested in containers are
+-- milestone 5 (arenas).
+function T.element(elem)
+    local k = elem.kind
+    return not (k == 'unit' or k == 'opaque' or k == 'atomic' or k == 'group' or elem.resizable)
+end
+
 function T.store(elem)
     check_type(elem, 'Store')
-    if elem.kind ~= 'struct' and elem.kind ~= 'sum' and elem.kind ~= 'ref' and not T.is_scalar(elem) then
+    if not T.element(elem) then
         error('Store holds fixed-size values, not ' .. elem.display, 2)
     end
 
@@ -113,7 +122,7 @@ end
 
 function T.grow(elem)
     check_type(elem, 'Grow')
-    if not (T.is_scalar(elem) or elem.kind == 'struct' or elem.kind == 'sum' or elem.kind == 'ref') then
+    if not T.element(elem) then
         error('Grow holds fixed-size values, not ' .. elem.display, 2)
     end
 
@@ -123,8 +132,22 @@ function T.grow(elem)
     end)
 end
 
+-- Array T: an owner of elements whose count is fixed when it is built, at
+-- runtime (design memory.md §5.1); Array(T, n) with a known n is a value
+function T.rtarray(elem)
+    check_type(elem, 'Array')
+    if not T.element(elem) then
+        error('Array holds fixed-size values, not ' .. elem.display, 2)
+    end
+    return memoized('rtarray', elem, function()
+        return { kind = 'rtarray', elem = elem, display = 'Array ' .. elem.display,
+                 resizable = true }
+    end)
+end
+
 -- structs -----------------------------------------------------------------------------
--- Fields are ordered. At most one resizable field, and it must be last (Goose).
+-- Fields are ordered. A struct holding owner fields, any number of them in any
+-- order, is itself an owner (design memory.md §5.2).
 
 function T.struct(name, fields)
     local t = new { kind = 'struct', name = name, display = name, fields = {},
@@ -155,9 +178,6 @@ function T.struct(name, fields)
         if ftype.kind == 'opaque' then
             error(("struct %s: field '%s' is the opaque type %s; hold it as Ptr %s"):format(name, fname,
                 ftype.display, ftype.display), 2)
-        end
-        if resizable then
-            error(("struct %s: the resizable field '%s' must be the last field"):format(name, resizable), 2)
         end
         if ftype.resizable or (ftype.kind == 'struct' and ftype.resizable) then
             resizable = fname
@@ -229,9 +249,7 @@ function T.array(elem, n)
         error(('Array(%s, n): n must be a positive integer known while compiling, got %s'):format(
             elem.display, tostring(n)), 2)
     end
-    local k = elem.kind
-    if not (k == 'int' or k == 'float' or k == 'bool' or k == 'struct' or k == 'sum' or k == 'array' or k == 'chan'
-            or k == 'ref') or elem.resizable then
+    if not T.element(elem) then
         error(('Array holds fixed-size values, not %s'):format(elem.display), 2)
     end
     arrays[elem] = arrays[elem] or {}
@@ -384,6 +402,23 @@ function T.slice(elem)
     t.display = 'Slice ' .. elem.display
     t.slice_elem = elem
     slices[elem] = t
+    return t
+end
+
+-- Slice.mut T: a run of elements, writable; its length cannot change
+local mut_slices = {}
+function T.slice_mut(elem)
+    if not T.is_type(elem) then error('Slice.mut expects a type, got ' .. tostring(elem), 2) end
+    if elem.kind == 'unit' or elem.resizable then
+        error('Slice.mut holds fixed-size values, not ' .. elem.display, 2)
+    end
+    if mut_slices[elem] then return mut_slices[elem] end
+    local base = elem.name or 'T'
+    local t = T.struct(base .. 'SliceMut', { { 'ptr', T.ptr(elem) }, { 'len', T.U32 } })
+    t.display = 'Slice.mut ' .. elem.display
+    t.slice_elem = elem
+    t.slice_mut = true
+    mut_slices[elem] = t
     return t
 end
 

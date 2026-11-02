@@ -1322,12 +1322,71 @@ local function plan_stacks(fns)
         end
         return false
     end
+    -- Frames of one recursion share its stack indices (design memory.md §9):
+    -- each level's owners begin above the previous level's on the same stacks,
+    -- so the number of stacks stays fixed and depth is bounded by bytes.
     for _, fn in ipairs(fns) do
         for _, c in ipairs(calls[fn]) do
-            if need[c.fn] and (c.gs_off or 0) > 0 and reaches(c.fn, fn) then
-                error(('%s: recursion through %s keeps %d data stack(s) live on every round; '
-                    .. 'unbounded data stacks are rejected (end the resizable values before the call)'):format(
-                    fn.word.loc or fn.cname, c.fn.cname, c.gs_off), 0)
+            if reaches(c.fn, fn) then
+                if c.fn.ret and c.fn.ret.resizable and not c.res_passthrough then
+                    -- every level of a recursion builds its result on the same result
+                    -- stacks; a call that reserved its own would stack them per level
+                    error(('%s: %s returns a %s through a recursion with words that place its result '
+                        .. 'elsewhere; this is not supported yet'):format(fn.word.loc or fn.cname, c.fn.cname,
+                        c.fn.ret.display), 0)
+                end
+                if need[c.fn] then c.gs_off = 0 end
+            end
+        end
+    end
+    -- The one rejected case: a frame resizing an owner that an outer level of
+    -- the same recursion created, while a frame between them holds an owner
+    -- of its own, which may lie above it on its stack.
+    local in_cycle = {}
+    for _, fn in ipairs(fns) do in_cycle[fn] = reaches(fn, fn) or nil end
+    local resizes, holding = {}, {}
+    for _, fn in ipairs(fns) do
+        resizes[fn], holding[fn] = {}, {}
+        for _, site in ipairs(fn.grow_sites or {}) do
+            resizes[fn][site.param] = true
+            if site.holding then holding[fn][site.param] = true end
+        end
+    end
+    local changed2 = true
+    while changed2 do
+        changed2 = false
+        for _, fn in ipairs(fns) do
+            for _, site in ipairs(fn.owner_sites or {}) do
+                if site.kind == 'pass' and resizes[site.callee] and resizes[site.callee][site.arg] then
+                    if not resizes[fn][site.param] then resizes[fn][site.param] = true; changed2 = true end
+                    local held = site.holding or holding[site.callee][site.arg]
+                    if held and not holding[fn][site.param] then holding[fn][site.param] = true; changed2 = true end
+                end
+            end
+        end
+    end
+    -- parameters that may refer to an owner created inside the recursion
+    local fed = {}
+    for _, fn in ipairs(fns) do fed[fn] = {} end
+    local changed3 = true
+    while changed3 do
+        changed3 = false
+        for _, fn in ipairs(fns) do
+            for _, site in ipairs(fn.owner_sites or {}) do
+                local callee = site.callee
+                if in_cycle[callee] and in_cycle[fn] and reaches(callee, fn) and fed[callee] then
+                    local inner = site.kind == 'own' or (site.kind == 'pass' and fed[fn][site.param])
+                    if inner and not fed[callee][site.arg] then fed[callee][site.arg] = true; changed3 = true end
+                end
+            end
+        end
+    end
+    for _, fn in ipairs(fns) do
+        for i in pairs(fed[fn]) do
+            if holding[fn][i] then
+                error(('%s: %s resizes an owner created by an outer level of its own recursion while a level '
+                    .. 'holds an owner above it on the same data stack; create the growing owner outside the '
+                    .. 'recursion and pass it down'):format(fn.word.loc or fn.cname, fn.cname), 0)
             end
         end
     end

@@ -73,6 +73,34 @@ check('global reference to a global', refs.global_ref(41) == 42)
 check('Grow of references', refs.grow_of_refs(2) == 312)
 check('Store of references', refs.store_of_refs(4) == 12)
 
+-- Owners: several owner fields, moves, returns, owner parameters, copies,
+-- runtime-length arrays, views, payload borrows and recursion (memory.md §5).
+local owners = nua.load(root .. '/tests/owners.nua')
+check('owner struct with two owner fields', owners.two_fields(3) == 70303)
+check('nested owner structs through Ref and call', owners.nested(2) == 202020804)
+check('owner returned into the caller', owners.returned(3) == 1405)
+check('owner returned from either path', owners.picked(true, 5) == 51 and owners.picked(false, 5) == 112)
+check('named owners move into a struct', owners.build(4) == 443)
+check('owner parameter consumes its argument', owners.consume(3) == 7)
+check('assigning an owner replaces the old one', owners.replace(3) == 22)
+check('a move on one path releases on the other', owners.partial(true, 4) == 15 and owners.partial(false, 4) == 5)
+check('owner returned across call', owners.call_returned(3) == 1405)
+check('owner chosen at run time across call', owners.call_picked(true, 5) == 10052
+    and owners.call_picked(false, 5) == 10113)
+check('owner parameter across call', owners.call_consume(3) == 7)
+check('owner passed through and returned across call, in a loop', owners.call_through(3) == 20020)
+check('copy of Grow, owner struct, StrMap and text', owners.copies(3) == 234521465)
+check('Array T of runtime length, and copy of a slice', owners.arrays(5) == 1000509)
+check('owners lend Slice and Slice.mut', owners.views(4) == 6000020)
+check('handler borrows the payload of a sum place', owners.payloads(4) == 57)
+check('recursion while owners are live', owners.walked(5) == 6)
+check('owner from outside a recursion grows at every level', owners.gathered(4) == 10010)
+check('owner moved out through a Ref parameter', owners.ref_moves(4, true) == 412
+    and owners.ref_moves(4, false) == 402)
+check('owner moved out through a recursion', owners.recursive_move(3) == 3)
+check('recursive word returning an owner it grew', owners.counted(4) == 4010)
+check('recursive results combined, reclaimed by the caller', owners.tree(3) == 2024)
+
 -- Omitted annotations infer native places, on the same prepared IR as C.
 local inferred = nua.load(root .. '/examples/inferred_locals.nua')
 check('inferred branch true', inferred.inferred_branch(true, 10) == 29)

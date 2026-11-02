@@ -29,9 +29,10 @@ local function decorate(t)
         local table_stack = b:gs_alloc(p, is_str and { 'entries.stack', 'entries.base' } or nil)
         local arena_stack = is_str and b:gs_alloc(p, { 'arena_stack', 'arena_base' }) or table_stack
         rawset(p, 'gs_k', table_stack)
-        local function index(k) return S.dyn(types.U64, { op = 'stack_index', offset = k, T = types.U64 }) end
+        local function index(k) return Mem.stack_index(k) end
         storage.init(S.Ref(p), index(table_stack), index(arena_stack))
     end
+    t.release_fields = is_str and { { 'entries.stack', 'entries.base' }, { 'arena_stack', 'arena_base' } } or nil
     t.construct = function(x)
         if type(x) ~= 'table' or S.is_staged(x) or next(x) then fail(t.display .. ' {} takes no fields') end
         return setmetatable({ T = t, k = 'fresh' }, S.V)
@@ -51,6 +52,10 @@ local function decorate(t)
     end
     storage = layouts.maps(t, t.entry, function(x) return Mem.view(receiver(x), t.representation) end)
     local function library() return require('nua.map').library(t, storage, t.entry, t.lookup, is_str) end
+    -- `copy m`: the new map receives m's table and keys
+    t.copy_storage = function(p, source)
+        library().copy(S.Ref(p), S.Ref(source))
+    end
     local ms = {}
     for _, method in ipairs { 'has', 'find', 'remove' } do
         ms[method] = function(self, k)
@@ -61,6 +66,7 @@ local function decorate(t)
     for _, method in ipairs { 'put', 'ensure' } do
         ms[method] = function(self, k, value)
             local p, kv = receiver(self), capture_key(key(k))
+            S.note_growth(p)
             -- Eager by-value capture, including ensure's unused replacement.
             local v = Mem.capture(S.coerce(value, t.elem, 'Map value'), 'capturing a map value')
             S.bump_checked()
@@ -89,7 +95,7 @@ local function decorate(t)
             local guard = b:new_local(Mem.Grow(types.U8), 'map_iter')
             local stack = b:gs_alloc(guard)
             storage.iter(S.Ref(p), Mem.view(guard, layouts.Grow),
-                S.dyn(types.U64, { op = 'stack_index', offset = stack, T = types.U64 }))
+                Mem.stack_index(stack))
             require('nua.map').each(t, storage, body)(S.Ref(p))
         end, state, 'known')
         for _, statement in ipairs(block) do b.block[#b.block + 1] = statement end

@@ -28,8 +28,10 @@ assert(not T.map_key(Hidden) and not T.map_value(Hidden))
 assert(not T.map_value(T.array(Borrowed, 2)))
 local Owner = T.struct('MapTypeOwner', { { 'n', T.U32 }, { 'entries', T.strmap(Value) } })
 assert(Owner.resizable and not T.map_value(Owner))
-rejects(function() T.struct('MapTypeBadOrder', { { 'entries', T.map(Key, Value) }, { 'n', T.U32 } }) end,
-    'must be the last field')
+-- owner fields may come in any order, any number of them (design memory.md §5.2)
+local AnyOrder = T.struct('MapTypeAnyOrder', { { 'entries', T.map(Key, Value) }, { 'n', T.U32 },
+    { 'more', T.strmap(Value) } })
+assert(AnyOrder.resizable)
 -- Repeated module loads may reuse display names, not native type identity.
 local A = T.struct('MapPayloadAgain', { { 'n', T.U32 } })
 local B = T.struct('MapPayloadAgain', { { 'n', T.U32 } })

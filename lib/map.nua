@@ -304,6 +304,32 @@ function map.library(T, storage, Entry, Result, string_keys)
         return true
     end
     api.length = do(m: Ref T): U32 return header(m).len end
+    -- `copy m` into a new, empty map: the table, and for text keys the arena
+    -- the stored keys point into by offset
+    api.copy = do(m: Ref T, from: Ref T): Unit
+        local source = header from
+        local h = header m
+        if source.cap ~= 0 then
+            local bytes = byte_count source.cap
+            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+                "Map copy target was not at the top of its data stack")
+            stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
+        end
+        h.len = source.len
+        h.cap = source.cap
+        if string_keys then
+            local a = storage.strmap m
+            local b = storage.strmap from
+            local n = b.arena_len
+            if n ~= 0 then
+                local at = stacks.extend(a.arena_stack, a.arena_base, U64 0, n,
+                    "StrMap copy target was not at the top of its data stack")
+                stacks.move (stacks.region a.arena_stack at n) (stacks.region b.arena_stack b.arena_base n) n
+            end
+            a.arena_len = n
+            a.dead = b.dead
+        end
+    end
     libraries[T] = api
     return api
 end

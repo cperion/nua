@@ -316,7 +316,7 @@ Nothing else is shared: each call site gets the residual code of its own argumen
 
 - Effect and memory summaries are needed only at boundaries: an inlined application needs none, because the caller's abstract state flows through the callee's body.
 - At a materialized call, a reference to a tracked local escapes: the local is written to storage and untracked from then on.
-- The data-stack recursion bound (§7) is checked only on cycles of materialized functions. A tail jump gives back the data stacks of the round it leaves.
+- Recursion shares stack indices (§7) only on cycles of materialized functions. A tail jump gives back the data stacks of the round it leaves.
 
 ### 5.7 `call`: what a function boundary costs
 
@@ -430,9 +430,15 @@ Exports are entry points: they take no base parameter and start at stack 0.
 
 Every function that allocates on data stacks records the tops of its stacks on entry and restores them before every return (the result is computed first), so early exits give space back too. Block-end releases give space back inside loops.
 
-**Recursive cycles that would keep data stacks live across a recursive call are rejected**: a call inside a cycle of materialized functions must not move the base. A recursive word may use data stacks, provided none of its resizable values is live at the recursive call.
+**A recursion shares its stack indices.** A call inside a cycle of materialized functions passes its own base unchanged, so each level's owners begin above the previous level's on the same stacks, the number of stacks stays fixed and depth is bounded by bytes. Unwinding gives them back in order. `plan_stacks` rejects the one unsafe case after every function is built: a parameter that may refer to an owner created inside the cycle (fed, through the cycle's call sites, by a `Ref` to a level's own owner) is resized while some level between holds an owner of its own (`grow_sites`, `owner_sites` with whether the function held owners then).
 
-A resizable value reached through a reference keeps its stack identity in its header, so it can grow through the reference.
+An owner reached through a reference keeps its stack identity in its header, so it can grow, move and be released through any place that holds the header.
+
+**Owner slots.** Each owner place holds slots: one per stack (two for a `StrMap`), released through the place's header. A slot is on one of the function's own indices (`gs_live`), adopted from a header that arrived by value (an owner parameter; `gs_extra`), or on a result stack (`gs_res_slots`). A move copies the header into the destination and transfers the slots (logged, so a rollback takes it back); the source gets a move mark in the path state, which joins treat path by path: a path that did not move it releases it before the join. A materialized function releases its adopted slots on every exit, since its epilogue resets only its own indices.
+
+**Owner results.** A word evaluated in place builds its owner result in a place of the caller's block, into which its returns move. A materialized word returning an owner takes a `gs_res` parameter: its result stacks. Allocations are numbered; when a return finds the returned owner on another stack, the function is built again with that allocation placed on result stack `j` of its own (`fn.result_allocs`), so candidate results never stack on each other. A non-recursive caller reserves the callee's result stacks past its live indices and releases the result by rewinding them to their tops before the call. A recursive call passes `gs_res` through, so every level's results share the result stacks; a returning level releases the result-stack owners placed after its result, and leaves those below it (results it consumed) for the outermost caller's rewind. On a result stack only the newest owner may grow.
+
+**Moving out through a `Ref` parameter.** A materialized word that moves an owner out of a `Ref` argument records it in `moves_out` (argument and field path). Its exits on paths that did not move it release the owner; the caller marks that place moved after the call. A recursive site that assumed the callee moves nothing makes the callee be built again once it is known to.
 
 ## 8. Memory-aware specialization and ordering
 
@@ -1462,7 +1468,10 @@ expectations, `nua size`, the three fuzzers and the documentation checks.
 
 | Not implemented | Where the design says so |
 |---|---|
-| Variable-size values: a value whose size is fixed at construction but not known while compiling (an array sized by a parameter) | syntax §9.3 and syntax §22 |
+| Owners nested in containers, arrays, payloads and map values (arenas); owner globals | design memory.md §5.9, §5.10 |
+| Releasing every owner at its last use (today: exact for moves and replacement, otherwise at block end) | design memory.md §5.8 |
+| Mutual recursion through words returning different owner types, or moving an owner out of a `Ref` argument through one | design memory.md §14 |
+| `U64` lengths and indices of any unsigned type (lengths are `U32`) | design memory.md §15 D2 |
 | Work stealing; the run queue is one locked queue | syntax §20.8 |
 | Maps of maps (a map as a store payload or a map value) | syntax §15.1 |
 | `s:find` faster than the obvious algorithm | implementation note, not a contract |

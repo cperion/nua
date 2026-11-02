@@ -88,10 +88,10 @@ export f
 end
 export f
 ]] },
-    { name = 'inferred resizable storage cannot be reassigned', expect = 'cannot be reassigned',
+    { name = 'an owner used after it moved', expect = "'text' was moved into 'other'",
       src = [[local f = do(): U32
     local text = Text {}
-    text = Text {}
+    local other = text
     return text.length
 end
 export f
@@ -120,19 +120,24 @@ local f = do(): U32
 end
 local n = host(f())
 ]] },
-    { name = 'a map reassigned', expect = 'cannot be reassigned',
-      src = [[local M = Map(U32, U32)
-local f = do(): U32
-    local m: M = M {}
-    m = M {}
-    return m.length
+    { name = 'a borrow of a replaced owner', expect = "'g' was replaced",
+      src = [[local f = do(): U32
+    local g = Grow(U32) {}
+    g:push 1
+    local r: Ref U32 = Ref g[0]
+    g = Grow(U32) {}
+    return r
 end
 export f
 ]] },
-    { name = 'a map passed by value', expect = 'passed as Ref',
+    { name = 'a Ref passed where an owner is expected', expect = 'owns its storage; a Ref borrows it',
       src = [[local M = Map(U32, U32)
 local f = do(m: M): U32 = m.length
-export f
+local g = do(): U32
+    local m = M {}
+    return f(Ref m)
+end
+export g
 ]] },
     { name = 'signed overflow at compile time', line = 1, expect = 'signed overflow',
       src = [[local f = do(a: I32): I32 = a * 2
@@ -237,61 +242,156 @@ f(3)
       src = [[local Box = struct { r: Ref U32 }
 local C = Chan Box
 ]] },
-    { name = 'a store assigned after creation', expect = 'cannot be reassigned',
+    { name = 'an owner moved on one path is moved after the join', expect = "'s' was moved",
       src = [[local N = struct { v: U32 }
+local G = struct { nodes: Store N }
 local f = do(x: U32): U32
     local s: Store N = Store(N) {}
-    s = Store(N) {}
-    return x
+    local g = G {}
+    if x > 3 then g.nodes = s end
+    return s.length
 end
 export f
 ]] },
-    { name = 'a store passed by value', expect = 'passed as Ref',
-      src = [[local N = struct { v: U32 }
-local f = do(s: Store N): U32 = 1
-]] },
-    { name = 'a store returned', expect = 'cannot be returned',
+    { name = 'a word returning a store returns a store', expect = 'expected a Store N',
       src = [[local N = struct { v: U32 }
 local f = do(x: U32): Store N = x
-]] },
-    { name = 'a struct holding a store passed by value', expect = 'resizable values are passed as Ref',
-      src = [[local N = struct { v: U32 }
-local G = struct { nodes: Store N }
-local take = do(g: G): U32 = 1
-]] },
-    { name = 'a store copied', expect = 'moves only by reference',
-      src = [[local N = struct { v: U32 }
-local G = struct { nodes: Store N }
-local f = do(x: U32): U32
-    local g: G = G { nodes = Store(N) {} }
-    local h: G = g
-    return x
+local g = do(x: U32): U32
+    local s = f x
+    return s.length
 end
-export f
+export g
 ]] },
-    { name = 'a store declared without being created', expect = 'created where it is declared',
-      src = [[local N = struct { v: U32 }
-local f = do(x: U32): U32
-    local s: Store N
-    return x
-end
-export f
-]] },
-    { name = 'a resizable field that is not last', expect = 'must be the last field',
+    { name = 'a struct field of a moved owner struct', expect = "'g' was moved into 'h'",
       src = [[local N = struct { v: U32 }
 local G = struct { nodes: Store N, count: U32 }
-]] },
-    { name = 'recursion that accumulates data stacks', expect = 'unbounded data stacks are rejected',
-      src = [[local N = struct { v: U32 }
-local function walk(n: U32): U32
-    local s: Store N = Store(N) {}
-    s:add(N { v = n })
-    if n == 0 then
-        return s.length
-    end
-    return walk(n - 1) + s.length
+local f = do(x: U32): U32
+    local g = G {}
+    local h: G = g
+    return g.count
 end
-local g = do(n: U32): U32 = walk(n)
+export f
+]] },
+    { name = 'an exported word cannot take an owner', expect = 'C cannot hand over an owner',
+      src = [[local f = do(xs: Grow U32): U32 = xs.length
+export f
+]] },
+    { name = 'an exported word cannot return an owner', expect = 'C cannot take over an owner',
+      src = [[local f = do(n: U32): Grow U32
+    local xs = Grow(U32) {}
+    xs:push n
+    return xs
+end
+export f
+]] },
+    { name = 'a payload borrow used after the variant changed', expect = 'was given another variant',
+      src = [[local Running = struct { ticks: U32 }
+local State = oneof { running: Running, stopped: U32 }
+local f = do(n: U32): U32
+    local state = State.running { ticks = n }
+    local dummy: U32 = 0
+    local held: Ref U32 = Ref dummy
+    state {
+        running = do(r: Ref Running): Unit
+            held = Ref r.ticks
+        end,
+        stopped = do(c) end,
+    }
+    state = State.stopped 1
+    return held
+end
+export f
+]] },
+    { name = 'a Slice.mut argument is marked with Ref', expect = 'mark it at the call: Ref xs',
+      src = [[local zero = do(s: Slice.mut U32): Unit
+    for i: U32 = 0, s.length - 1 do s[i] = 0 end
+end
+local f = do(n: U32): U32
+    local xs = Grow(U32) {}
+    xs:push n
+    zero xs
+    return xs[0]
+end
+export f
+]] },
+    { name = 'a read-only Slice is not written', expect = 'a Slice is a read-only view',
+      src = [[local f = do(n: U32): U32
+    local xs = Grow(U32) {}
+    xs:push n
+    local s = xs:all()
+    s[0] = 1
+    return xs[0]
+end
+export f
+]] },
+    { name = 'moving out through a Ref whose target is chosen at run time', expect = 'not known while compiling',
+      src = [[local G = struct { order: Grow U32 }
+local H = struct { r: Ref G }
+local f = do(flag: Bool): U32
+    local a = G {}
+    local b = G {}
+    local holder = H { r = Ref a }
+    if flag then holder.r = Ref b end
+    local taken = holder.r.order
+    return taken.length
+end
+export f
+]] },
+    { name = 'an exported word moving out of a Ref argument', expect = 'a C caller could not know it moved',
+      src = [[local G = struct { order: Grow U32 }
+local f = do(g: Ref G): U32
+    local o = g.order
+    return o.length
+end
+export f
+]] },
+    { name = 'a recursive result grows below a deeper result', expect = 'lies above it on the result stack',
+      src = [[local function build(n: U32): Grow U32
+    local out = Grow(U32) {}
+    if n == 0 then return out end
+    local inner = build(n - 1)
+    out:push inner.length
+    return out
+end
+local f = do(n: U32): U32
+    local xs = build n
+    return xs.length
+end
+export f
+]] },
+    { name = 'an owner moved twice', expect = "'s' was moved into 'a'",
+      src = [[local N = struct { v: U32 }
+local f = do(x: U32): U32
+    local s = Store(N) {}
+    local a = s
+    local b = s
+    return x
+end
+export f
+]] },
+    { name = 'an owner struct moved after one of its fields moved', expect = "'g.nodes' was moved",
+      src = [[local N = struct { v: U32 }
+local G = struct { count: U32, nodes: Store N }
+local f = do(x: U32): U32
+    local g = G {}
+    local n = g.nodes
+    local h = g
+    return x
+end
+export f
+]] },
+    { name = 'a recursion resizing an outer level owner while holding one', expect = 'resizes an owner created by an outer level',
+      src = [[local function deep(n: U32, outer: Ref (Grow U32)): U32
+    local mine = Grow(U32) {}
+    mine:push n
+    outer:push n
+    if n == 0 then return mine.length end
+    return deep(n - 1, Ref mine) + mine.length
+end
+local g = do(n: U32): U32
+    local start = Grow(U32) {}
+    return deep(n, Ref start)
+end
 export g
 ]] },
     { name = 'returning a reference to a local', expect = 'returns a reference to its own local',

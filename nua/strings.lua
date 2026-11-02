@@ -325,6 +325,7 @@ S.arity[S.parse_float_known] = 1
 -- t:write(a, b, ...): each value as text, known pieces joined while compiling
 text_methods.write = function(self, ...)
     local p = Mem.receiver(self, 'Text:write')
+    S.note_growth(p)
     local b = S.cur()
     if not b.fn then fail('a Text is runtime storage: it is written where it runs', 2) end
     b.fn.uses_rt = true

@@ -1139,26 +1139,26 @@ References and IDs never own memory. There is no `Rc`, tracing GC or implicit he
 
 ### 9.1 Fixed-size values
 
-Scalars, structs without resizable fields, references and IDs are fixed-size. They live in registers or the C stack.
+Scalars, structs without owner fields, references and IDs are fixed-size. They live in registers or the C stack.
 
-### 9.2 Resizable values
+### 9.2 Owners
 
-`Store T` and `Grow T` are resizable: they grow after construction. A struct may contain one resizable field, and it must be the last.
+`Grow T`, `Array T`, `Store T`, `Map(K, V)`, `StrMap V` and `Text` are owners: they have storage of their own on a data stack. A struct holding owner fields, any number of them and in any order, is an owner too.
 
-The storage class of a resizable value:
-
-- **Created in place.** It is constructed where it lives — `local s: Store Node = Store(Node) {}`, or a struct field initializer `Graph { nodes = Store(Node) {} }` — and nowhere else. Declaring one without creating it is an error.
-- **One data stack each.** Creation takes the lowest free data-stack index of the function. A resizable value occupies the top of its stack, and no other live growing value shares it.
-- **Released when its block ends.** At the end of the residual block that created it, its stack's top returns to where the value began, and the index becomes free.
-- **Moved only by reference.** It cannot be assigned, returned, read as a value, copied into another place, or passed by value; a struct containing one follows the same rules. Words take it as `Ref T`.
-- **Runtime only.** Creating one at compile time is an error.
+- **Created in place.** An owner is constructed where it lives: `local xs = Grow(U32) {}`, a field of an owner struct, or the place a word's owner result is built in. Declared without a value, it starts empty: `local s: Store Node`. An owner struct's omitted owner fields start empty and its omitted value fields start zeroed: `Graph {}`, `Graph { name = Chars(32) "roads" }`.
+- **One data stack each.** Creation takes the lowest free data-stack index of the function. An owner occupies the top of its stack, and no other live owner of the function shares it. A recursion is the exception that keeps the number of stacks fixed: its levels share stack indices, each level's owners above the previous level's (§9.10).
+- **Moved at its last use.** Using a named owner as a value moves it: assigning it, passing it to an owner-typed parameter, returning it, or giving it to a field (`Graph { .nodes, .edges }`). Nothing is copied: its storage stays where it is, and the destination takes over releasing it. A later use is rejected: `'nodes' was moved into 'g.nodes'`. A move on some paths only is exact: the paths that do not move it release it before they join.
+- **Moved out through a `Ref` parameter.** A word may move an owner out of a `Ref` argument: in place, the caller's place is moved; compiled on its own (`call`, recursion), its summary says which part of which argument it moves, and the caller's place counts as moved after the call. An exported word may not. Through a `Ref` whose target is not known while compiling (a field, an element, a local chosen at run time), moving out is rejected.
+- **Replaced by assignment.** Assigning a new owner to an owner place ends the old one there: its storage returns, and borrows of it end (`'g' was replaced`).
+- **Copied only by `copy`.** `copy x` builds a duplicate in its destination: owner structs deeply (owner fields copied, value fields as values), a `Store` with the same token (its `Id`s name the same entities in the copy). `copy` of a `Str` builds a `Text`, of a `Slice T` an `Array T`; `copy` of a value is the value.
+- **Passed.** A parameter of an owner type owns its argument: a constructor or call result built in place, a moved owner, or a copy. `Ref T` lends the owner for reading and writing, including growth. Where a `Slice T` or a `Str` is expected, an owner lends its elements read-only with no marker (`total xs`); a `Slice.mut T` takes them for writing, marked at the call: `scale(Ref xs, 2)`.
+- **Returned like a value.** A word returning an owner builds it where the caller keeps it: `local xs = squares 10`. Evaluated in place, its returns move into the caller's place. Compiled on its own, it receives its destination: result stacks reserved by the caller, one for each owner allocation the word may return (§9.10).
+- **Released when its life ends.** At the latest when the residual block that holds it ends; exactly where a move on another path or a replacement ends it. Its stack's top returns to where it began.
+- **Runtime only.** Creating one at compile time is an error. C cannot hand over or take over an owner: an exported word takes `Ref T` or a `Slice`.
 
 ### 9.3 Variable-size values
 
-Values whose size is fixed at construction but unknown at compile time (strings of
-computed length, arrays sized by a parameter) belong to the design: they use
-data-stack storage with properly nested lifetimes. They are not implemented yet
-(architecture §17.2).
+`Array(T, n)` with `n` known while compiling is a value (§13). With `n` known only when the program runs, `Array(T, n) {}` builds the owner `Array T`: `n` zeroed elements, a length fixed when built, indexed and borrowed like a `Grow` (`a[i]`, `a.length`, `a:all()`, `a:sub(i, j)`), with no `push` and no `clear`. `copy` of a `Slice T` builds one.
 
 ### 9.4 Borrows
 
@@ -1303,7 +1303,7 @@ Cycles are ordinary relationships; they create no ownership cycles. Objects are 
 
 ### 9.12 Grow arrays
 
-`Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use) and `g.length`.
+`Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4) and `g:clear()`. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any fixed-size type that is neither an owner nor an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots.
 
 ## 10. Activities, opening and spread
 
@@ -1665,7 +1665,7 @@ typedef struct Shape {
 
 ### 11.2 Matching
 
-Matching is keyed application of a sum value, with one handler per alternative. Each handler receives that alternative's payload:
+Matching is keyed application of a sum value, with one handler per alternative. Each handler receives that alternative's payload, as a copy, or, when the matched sum is a place and the handler declares its parameter `Ref`, as a borrow of the payload in place (`running = do(r: Ref Running): Unit ... end`). Giving the sum another variant ends such a borrow:
 
 ```lua
 local area = do(s: Shape): U32 = s {
@@ -1886,7 +1886,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 
 ### 12.2 Slices
 
-`Slice T` is a read-only view: a pointer and a `U32` length. Its operations:
+`Slice T` is a read-only view: a pointer and a `U32` length. `Slice.mut T` is the same view, writable: `s[i] = v` is checked like a read; its length cannot change. A `Slice.mut` serves where a `Slice` is expected. An owner (a `Grow`, an `Array T`, an `Array(T, n)`) lends its elements to a `Slice.mut` marked at the call, `f(Ref xs)`, and to a `Slice` with no marker. The operations of both:
 
 | Form | Meaning |
 |---|---|
@@ -2143,10 +2143,11 @@ Everything above, on both backends (`examples/strings.nua`, `tests/strings_main.
 ### 15.1 Owned mutable storage
 
 `Map(K, V)` owns fixed-size entries on one Goose data stack. `StrMap(V)` owns
-entries and copied arbitrary byte keys on two stacks. Create either in place with
-`{}` and pass it by `Ref`; it cannot be copied, returned by value, or captured by
-another task. A task may own its own map. A map can be the last and sole resizable
-field of a struct. Scope exit and trap recovery release its owned stacks.
+entries and copied arbitrary byte keys on two stacks. Either is an owner (§9.2):
+created in place with `{}`, moved, returned, copied with `copy`, passed by `Ref`,
+and never captured by another task. A task may own its own map. A struct may hold
+maps among any number of owner fields. Scope exit and trap recovery release its
+owned stacks.
 
 Keys of `Map` are integers (including Duration), Bool, Id, Chars, or recursive
 structs and sums of these. General arrays, floating keys, pointers and borrowed
@@ -2264,12 +2265,11 @@ descriptions have no mutable compile-time heap.
 
 ### 15.5 Design rationale
 
-A map is a resizable value like `Store` and `Grow`, so the decisions that shaped it
+A map is an owner like `Store` and `Grow`, so the decisions that shaped it
 were mostly decisions about the Goose model it already had: one data stack for a
 `Map` and two for a `StrMap` (entries, and an arena of copied key bytes), created in
-place, moved only by `Ref`, released at the end of the owning block, never copied,
-returned or captured by a task. Making a map the last and sole resizable field of a
-struct needed no new rule, only the existing ownership accounting; maps of maps need
+place, released at the end of the owning block, never captured by a task. Holding
+maps in a struct needed no new rule, only the existing ownership accounting; maps of maps need
 a representation decision that is still open, because a store slot holds fixed-size
 payloads and an `Id` does not settle where the nested storage lives.
 
@@ -3454,7 +3454,7 @@ uint32_t bump(uint32_t n) {
 | `exported` | external linkage: another unit, or a header, can name it |
 | `imported`, `header` | defined elsewhere and declared by `header`, which the program includes |
 
-A global cannot be Unit, opaque, a reference, a channel, resizable storage or a view. Both backends emit it from the same IR (`gccjit` creates an internal, exported or imported global, with the TLS model for `thread_local`). An imported and an exported global of one name are one object.
+A global cannot be Unit, opaque, a reference, an owner or a view. It may be a channel or a pool: handles are generational, so a stale one traps at its next use and never reaches freed memory. Both backends emit it from the same IR (`gccjit` creates an internal, exported or imported global, with the TLS model for `thread_local`). An imported and an exported global of one name are one object.
 
 Tasks cannot write ordinary globals through compiler-visible addresses. The rule follows aliases, aggregate-held pointers, parameters, returns, known function pointers and blocking bodies. Direct reads and calls proved to read only are permitted. Actual atomic operations, thread-local storage and `global(T, { shared = true })` are exceptions. Declaring an Atomic global does not permit non-atomic writes through a cast.
 
@@ -3505,8 +3505,9 @@ The core language does not provide:
 - A runtime object model for generic types, or dynamic method dispatch by default.
 - Shared mutable memory between tasks, and the lock and ownership type disciplines that would police it (tasks communicate over channels and move pool slots, §20).
 
-Planned and not implemented: variable-size values (§9.3). Pointer arithmetic beyond
-`p[i]` is excluded by design (§12).
+Planned and not implemented: owners nested in containers, payloads and map values,
+and owner globals ([the memory design](design/memory.md) §5.9, §5.10). Pointer
+arithmetic beyond `p[i]` is excluded by design (§12).
 
 ## 23. The defining contracts
 

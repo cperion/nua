@@ -1,0 +1,388 @@
+-- Owners: owner structs with several owner fields, defaults, moves, returns,
+-- copies, runtime-length arrays and owner parameters (design memory.md §5).
+
+local Node = struct { weight: U32 }
+local Graph = struct {
+    nodes: Store Node,
+    label: U32,
+    order: Grow U32,
+}
+
+-- several owner fields in any order; omitted fields start empty or zeroed
+local two_fields = do(n: U32): U32
+    local g = Graph {}
+    for i: U32 = 1, n do
+        g.nodes:add Node { weight = i }
+        local v = i * 10
+        g.order:push v
+    end
+    g.label = 7
+    return g.nodes.length + g.order.length * 100 + g.label * 10000
+end
+export two_fields
+
+-- an owner struct inside an owner struct, with text and maps, passed by Ref
+local Index = struct { words: StrMap U32, names: Text, counts: Map(U32, U32) }
+local World = struct { graph: Graph, index: Index, ticks: U32 }
+local fill = do(w: Ref World, n: U32): Unit
+    for i: U32 = 1, n do
+        w.graph.nodes:add Node { weight = i }
+        w.index.counts:put(i, i * 2)
+        w.index.names:write "ab"
+    end
+    w.index.words:put("x", n)
+    w.ticks = w.ticks + 1
+end
+local nested = do(n: U32): U32
+    local w = World {}
+    fill(Ref w, n)
+    call fill(Ref w, n)
+    return w.graph.nodes.length + w.index.names.length * 100 + w.index.counts.length * 10000
+        + w.ticks * 1000000 + w.index.words["x"] * 100000000
+end
+export nested
+
+-- an owner is returned like a value: built in the caller's place
+local squares = do(n: U32): Grow U64
+    local out = Grow(U64) {}
+    for i: U32 = 1, n do
+        local w = U64 i
+        out:push(w * w)
+    end
+    return out
+end
+local sum = do(xs: Ref (Grow U64)): U64
+    local total = U64 0
+    for i: U32 = 0, xs.length - 1 do total = total + xs[i] end
+    return total
+end
+local returned = do(n: U32): U64
+    local xs = squares n
+    local ys: Grow U64 = squares 2
+    return sum(Ref xs) * 100 + sum(Ref ys)
+end
+export returned
+
+-- returns of different owners on different paths
+local pick = do(flag: Bool, n: U32): Grow U64
+    local a = Grow(U64) {}
+    local b = Grow(U64) {}
+    a:push(U64 n)
+    b:push(U64 n * 2)
+    b:push(U64 1)
+    if flag then return a end
+    return b
+end
+local picked = do(flag: Bool, n: U32): U64
+    local xs = pick(flag, n)
+    return sum(Ref xs) * 10 + U64 xs.length
+end
+export picked
+
+-- named owners move into a struct and into an owner parameter
+local build = do(n: U32): U32
+    local nodes = Store(Node) {}
+    local order = Grow(U32) {}
+    for i: U32 = 1, n do
+        nodes:add Node { weight = i }
+        order:push i
+    end
+    local g = Graph { .nodes, .order, label = 3 }
+    return g.nodes.length * 100 + g.order.length * 10 + g.label
+end
+export build
+local count = do(xs: Grow U64): U32
+    return xs.length
+end
+local consume = do(n: U32): U32
+    local xs = squares n
+    local m = count xs
+    return m + count(squares 4)
+end
+export consume
+
+-- assigning an owner replaces the old one
+local replace = do(n: U32): U32
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do xs:push i end
+    xs = Grow(U32) {}
+    xs:push 7
+    local ys = Grow(U32) {}
+    ys:push 1
+    ys:push 2
+    xs = ys
+    return xs.length * 10 + xs[1]
+end
+export replace
+
+-- a move on one path only: released on the other
+local partial = do(flag: Bool, n: U32): U32
+    local xs = Grow(U32) {}
+    xs:push n
+    local g = Graph {}
+    if flag then g.order = xs end
+    local more = Grow(U32) {}
+    more:push 5
+    return g.order.length * 10 + more[0]
+end
+export partial
+
+-- the same across function boundaries compiled on their own
+local call_returned = do(n: U32): U64
+    local xs = call squares n
+    local ys = call squares 2
+    return sum(Ref xs) * 100 + sum(Ref ys)
+end
+export call_returned
+local call_picked = do(flag: Bool, n: U32): U64
+    local xs = call pick(flag, n)
+    xs:push(U64 1000)
+    return sum(Ref xs) * 10 + U64 xs.length
+end
+export call_picked
+local call_consume = do(n: U32): U32
+    local xs = squares n
+    local m = call count xs
+    return m + call count(squares 4)
+end
+export call_consume
+local grow_more = do(xs: Grow U64, n: U32): Grow U64
+    for i: U32 = 1, n do xs:push(U64 i) end
+    return xs
+end
+local call_through = do(n: U32): U64
+    local xs = call squares n
+    local ys = call grow_more(xs, 3)
+    local total = U64 0
+    for round: U32 = 1, 3 do
+        local zs = call squares round
+        total = total + sum(Ref zs)
+    end
+    return sum(Ref ys) * 1000 + total
+end
+export call_through
+
+-- copy x: the visible duplicate, deep for owner structs
+local copies = do(n: U32): U32
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do xs:push i end
+    local ys = copy xs
+    ys:push 100
+    xs[0] = 50
+    local g = Graph { label = 4 }
+    g.nodes:add Node { weight = 9 }
+    g.order:push 6
+    local h = copy g
+    h.order:push 7
+    h.label = 5
+    local words = StrMap(U32) {}
+    words:put("cat", 3)
+    words:put("dog", 4)
+    local other = copy words
+    other:put("emu", 5)
+    local t = copy "abc"
+    t:write "de"
+    return xs[0] + ys[0] * 10 + ys.length * 100 + g.order.length * 1000 + h.order.length * 10000
+        + h.label * 100000 + g.label * 1000000 + other.length * 10000000 + words.length * 100000000
+        + t.length
+end
+export copies
+
+-- Array T: an owner whose length is fixed when it is built, at runtime
+local fill = do(xs: Ref (Array U32)): Unit
+    for i: U32 = 0, xs.length - 1 do xs[i] = i * 3 end
+end
+local arrays = do(n: U32): U32
+    local xs = Array(U32, n) {}
+    local zeroed = xs[n - 1]
+    fill(Ref xs)
+    local view = xs:sub(1, 3)
+    local copied = copy view
+    xs[1] = 100
+    local total = U32 0
+    for i: U32 = 0, copied.length - 1 do total = total + copied[i] end
+    return zeroed * 1000 + xs.length * 100 + total + xs[1] * 10000
+end
+export arrays
+
+-- views: an owner lends its elements to a Slice without a marker, and to a
+-- Slice.mut with Ref
+local total_of = do(xs: Slice U32): U32
+    local t = U32 0
+    for i: U32 = 0, xs.length - 1 do t = t + xs[i] end
+    return t
+end
+local scale = do(xs: Slice.mut U32, k: U32): Unit
+    for i: U32 = 0, xs.length - 1 do xs[i] = xs[i] * k end
+end
+local views = do(n: U32): U32
+    local g = Grow(U32) {}
+    for i: U32 = 1, n do g:push i end
+    local a = Array(U32, n) {}
+    scale(Ref g, 2)
+    scale(Ref a, 5)
+    local fixed = Array(U32, 3) { 1, 2, 3 }
+    scale(Ref fixed, 10)
+    return total_of g + total_of a * 1000 + total_of fixed * 100000
+end
+export views
+
+-- a handler declaring Ref borrows the payload of the sum place
+local Running = struct { ticks: U32, limit: U32 }
+local State = oneof { running: Running, stopped: U32 }
+local tick = do(state: Ref State): Unit
+    state {
+        running = do(r: Ref Running): Unit
+            r.ticks = r.ticks + 1
+        end,
+        stopped = do(code) end,
+    }
+end
+local payloads = do(n: U32): U32
+    local state = State.running { ticks = 0, limit = n }
+    for i: U32 = 1, n do tick(Ref state) end
+    call tick(Ref state)
+    local seen = U32 0
+    state {
+        running = do(r: Ref Running): Unit
+            seen = r.ticks
+        end,
+        stopped = do(code) seen = code end,
+    }
+    state = State.stopped 7
+    tick(Ref state)
+    local after = U32 0
+    state { running = do(r) after = r.ticks end, stopped = do(code) after = code end }
+    return seen * 10 + after
+end
+export payloads
+
+-- recursion while owners are live: each level's owners sit above the
+-- previous level's on the same stacks
+local N = struct { v: U32 }
+local function walk(n: U32): U32
+    local s: Store N = Store(N) {}
+    s:add(N { v = n })
+    if n == 0 then
+        return s.length
+    end
+    return walk(n - 1) + s.length
+end
+local walked = do(n: U32): U32 = walk n
+export walked
+-- the accumulator pattern: an owner from outside the recursion grows at
+-- every level, while each level holds its own
+local function gather(n: U32, acc: Ref (Grow U32)): U32
+    local mine = Grow(U32) {}
+    mine:push n
+    mine:push n
+    acc:push n
+    if n == 0 then return mine.length end
+    return gather(n - 1, acc) + mine.length
+end
+local gathered = do(n: U32): U32
+    local acc = Grow(U32) {}
+    local levels = gather(n, Ref acc)
+    local total = U32 0
+    for i: U32 = 0, acc.length - 1 do total = total + acc[i] end
+    return levels * 1000 + total
+end
+export gathered
+
+-- moving an owner out through a Ref parameter: the caller's place counts as
+-- moved after the call; paths that do not move it release it in the callee
+local take_order = do(g: Ref Graph, flag: Bool): U32
+    if flag then
+        local order = g.order
+        return order.length
+    end
+    return 0
+end
+local ref_moves = do(n: U32, flag: Bool): U32
+    local g = Graph {}
+    for i: U32 = 1, n do g.order:push i end
+    local inline = take_order(Ref g, true)
+    g.order = Grow(U32) {}
+    g.order:push 1
+    local compiled = call take_order(Ref g, flag)
+    g.order = Grow(U32) {}
+    g.order:push 1
+    g.order:push 2
+    return inline * 100 + compiled * 10 + g.order.length
+end
+export ref_moves
+local function drain(n: U32, g: Ref Graph): U32
+    if n == 0 then
+        local order = g.order
+        return order.length
+    end
+    g.order:push n
+    return drain(n - 1, g)
+end
+local recursive_move = do(n: U32): U32
+    local g = Graph {}
+    local m = drain(n, Ref g)
+    g.order = Grow(U32) {}
+    return m
+end
+export recursive_move
+
+-- recursive words returning owners: every level builds its result on the
+-- recursion's result stacks; a level may grow the result it got from below
+local function counting(n: U32): Grow U32
+    if n == 0 then
+        local out = Grow(U32) {}
+        return out
+    end
+    local rest = counting(n - 1)
+    rest:push n
+    return rest
+end
+local counted = do(n: U32): U32
+    local xs = counting n
+    local total = U32 0
+    for i: U32 = 0, xs.length - 1 do total = total + xs[i] end
+    return xs.length * 1000 + total
+end
+export counted
+-- a tree's leaves, built from two recursive results; what each level consumed
+-- stays below its result until the outermost caller releases it
+local function leaves_of(n: U32): Grow U32
+    if n == 0 then
+        local leaf = Grow(U32) {}
+        leaf:push 1
+        return leaf
+    end
+    local left = leaves_of(n - 1)
+    local right = leaves_of(n - 1)
+    local out = Grow(U32) {}
+    for i: U32 = 0, left.length - 1 do out:push(left[i] + 1) end
+    for i: U32 = 0, right.length - 1 do out:push(right[i]) end
+    return out
+end
+local tree = do(n: U32): U32
+    local total = U32 0
+    for round: U32 = 1, 3 do
+        local xs = leaves_of n
+        total = total + xs.length
+        if round == 3 then
+            for i: U32 = 0, xs.length - 1 do total = total + xs[i] * 100 end
+        end
+    end
+    return total
+end
+export tree
+
+return {
+    counted = counted, tree = tree,
+    ref_moves = ref_moves, recursive_move = recursive_move,
+    walked = walked, gathered = gathered,
+    payloads = payloads,
+    views = views,
+    arrays = arrays,
+    copies = copies,
+    call_returned = call_returned, call_picked = call_picked, call_consume = call_consume,
+    call_through = call_through,
+    two_fields = two_fields, nested = nested, returned = returned, picked = picked,
+    build = build, consume = consume, replace = replace, partial = partial,
+}

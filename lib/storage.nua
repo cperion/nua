@@ -80,12 +80,29 @@ function storage.store(T, Id, p)
         return true
     end
     api.length = do(s: Ref T): U32 return p.header(s).live end
+    -- `copy s` into a new, empty store: the same slots, generations and token,
+    -- so the original's Ids name the same entities in the copy
+    api.copy = do(s: Ref T, from: Ref T): Unit
+        local source = p.header from
+        local h = p.header s
+        local bytes = U64 source.len * p.width()
+        if bytes ~= 0 then
+            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+                "Store copy target was not at the top of its data stack")
+            stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
+        end
+        h.len = source.len
+        h.live = source.live
+        h.free_head = source.free_head
+        h.token = source.token
+    end
     return api
 end
 
 function storage.grow(T, p)
     local api = {}
-    local grow = extend(T, p, T.elem == U8 and "Text" or "Grow")
+    local what = T.kind == "rtarray" and "Array" or (T.elem == U8 and "Text" or "Grow")
+    local grow = extend(T, p, what)
     api.clear = do(g: Ref T): Unit
         local h = p.header g
         stacks.reset h.stack h.base
@@ -125,6 +142,40 @@ function storage.grow(T, p)
     end
     api.items = p.items
     api.length = do(g: Ref T): U32 return p.header(g).len end
+    -- an empty owner takes n zeroed elements (Array(T, n) {} with a runtime n)
+    api.allocate = do(g: Ref T, n: U32): Unit
+        local h = p.header g
+        local bytes = U64 n * p.width()
+        if bytes ~= 0 then
+            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+                "Array was not at the top of its data stack when built")
+            stacks.zero h.stack at bytes
+        end
+        h.len = n
+    end
+    -- an empty owner takes a copy of n elements (copy of a Slice)
+    api.fill_from = do(g: Ref T, items: Ptr T.elem, n: U32): Unit
+        local h = p.header g
+        local bytes = U64 n * p.width()
+        if bytes ~= 0 then
+            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+                "copy target was not at the top of its data stack")
+            stacks.write h.stack at (Ptr U8 items) bytes
+        end
+        h.len = n
+    end
+    -- `copy g` into a new, empty Grow
+    api.copy = do(g: Ref T, from: Ref T): Unit
+        local source = p.header from
+        local h = p.header g
+        local bytes = U64 source.len * p.width()
+        if bytes ~= 0 then
+            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+                "Grow copy target was not at the top of its data stack")
+            stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
+        end
+        h.len = source.len
+    end
     return api
 end
 return storage

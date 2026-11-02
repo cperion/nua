@@ -20,6 +20,7 @@ local dyn, known = S.dyn, S.known
 local storage_library
 
 local function fail(msg) S.fail(msg, 2) end
+local function fresh(t) return setmetatable({ T = t, k = 'fresh' }, S.V) end
 
 -- C names supplied by the backend: NodeStore, NodeId, U8Grow
 local function elem_name(t)
@@ -32,6 +33,7 @@ local function cname_of(t)
     if t.kind == 'store' then return elem_name(t.elem) .. 'Store' end
     if t.kind == 'id' then return elem_name(t.elem) .. 'Id' end
     if t.kind == 'grow' then return elem_name(t.elem) .. 'Grow' end
+    if t.kind == 'rtarray' then return elem_name(t.elem) .. 'Array' end
     if rawget(t, 'ctype') then return t.ctype() end
 end
 Mem.cname_of = cname_of
@@ -84,7 +86,8 @@ local function layout_of(t)
     local r = cache[t]
     if r then return r end
     local layouts = layouts_module()
-    r = { layout = t.kind == 'store' and layouts.Store or t.kind == 'grow' and layouts.Grow or layouts.Id }
+    r = { layout = t.kind == 'store' and layouts.Store
+        or (t.kind == 'grow' or t.kind == 'rtarray') and layouts.Grow or layouts.Id }
     if t.kind == 'store' then
         r.slot = S.struct(cname_of(t) .. 'Slot', { { 'gen', types.U32 }, { 'next', types.U32 }, { 'value', t.elem } })
     end
@@ -102,24 +105,291 @@ local function gs_expr(k) return k == 0 and 'gs_sp' or ('gs_sp + ' .. k) end
 
 -- data-stack indices ------------------------------------------------------------------------
 
+local serials = 0
+-- An owned slot: one data stack held by an owner place. The place's header
+-- says which stack and where the owner began, so releasing reads the header:
+-- a moved owner is released through whichever place holds it now.
+local function releaser_for(t, fields)
+    local representation = layout_of(t).layout
+    fields = fields or { 'stack', 'base' }
+    local cleanup = require('nua.storage_layout').releaser(representation, fields[1], fields[2])
+    return function(place) cleanup(Mem.view(place, representation)) end
+end
+Mem.releaser_for = releaser_for
+
+-- the residual block whose end releases an owner held by place p: the block
+-- its root local was declared in
+local function owning_block(b, p)
+    local root = S.root_of(p)
+    return rawget(root, 'block') or b.block
+end
+
+function Builder:gs_owned_list(blk)
+    self.gs_owned = self.gs_owned or {}
+    local owned = self.gs_owned[blk]
+    if not owned then owned = {}; self.gs_owned[blk] = owned end
+    return owned
+end
+
+-- The stack index an allocation lands on, as a value: one of this function's
+-- own stacks (gs_sp + k), or its result stack j (gs_res + j)
+function Mem.stack_index(k)
+    if type(k) == 'table' then
+        local res = { op = 'param', name = 'gs_res', T = types.U64 }
+        if k.res == 0 then return dyn(types.U64, res) end
+        return dyn(types.U64, { op = 'bin', o = 'add', a = res, b = { op = 'const', v = k.res, T = types.U64 },
+                                T = types.U64 })
+    end
+    return dyn(types.U64, { op = 'stack_index', offset = k, T = types.U64 })
+end
+
+-- Allocations are counted, so a rebuild can place the same one elsewhere: an
+-- owner a materialized word returns is built on its result stack
+-- (design memory.md §9: the callee receives its destination).
+function Builder:next_allocation()
+    self.alloc_count = (self.alloc_count or 0) + 1
+    local at = self.fn and self.fn.result_allocs and self.fn.result_allocs[self.alloc_count]
+    return self.alloc_count, at and at.first
+end
+
+function Builder:register_slot(slot)
+    serials = serials + 1
+    slot.serial, slot.adopted = serials, slot.adopted or {}
+    slot.block = slot.block or owning_block(self, slot.place)
+    slot.release = function() slot.free(slot.place) end
+    for _, k in ipairs(slot.reserved or {}) do
+        -- indices kept unused while this owner lives (where its bytes may be)
+        self.gs_live = self.gs_live or {}
+        self.gs_live[k] = slot
+        self.fn.gs_count = math.max(self.fn.gs_count or 0, k + 1)
+    end
+    if slot.k then
+        self.gs_live = self.gs_live or {}
+        self.gs_live[slot.k] = slot
+        self.fn.gs_count = math.max(self.fn.gs_count or 0, slot.k + 1)
+    elseif slot.res then
+        self.gs_res_slots = self.gs_res_slots or {}
+        self.gs_res_slots[slot] = true
+    else
+        self.gs_extra = self.gs_extra or {}
+        self.gs_extra[slot] = true
+    end
+    local owned = self:gs_owned_list(slot.block)
+    owned[#owned + 1] = slot
+    return slot
+end
+
 function Builder:gs_alloc(p, release)
     if not self.fn then
         fail('a ' .. p.T.display .. ' is runtime storage; it cannot be created at compile time')
     end
+    local ordinal, j = self:next_allocation()
+    local free = releaser_for(p.T, release)
+    if j then
+        self:register_slot { place = p, res = j, ordinal = ordinal, free = free }
+        return { res = j }
+    end
     self.gs_live = self.gs_live or {}
     local k = 0
     while self.gs_live[k] do k = k + 1 end
-    local representation = layout_of(p.T).layout
-    local fields = release or { 'stack', 'base' }
-    local cleanup = require('nua.storage_layout').releaser(representation, fields[1], fields[2])
-    local owned_slot = { place = p, k = k, release = function() cleanup(Mem.view(p, representation)) end }
-    self.gs_live[k] = owned_slot
-    self.gs_owned = self.gs_owned or {}
-    local owned = self.gs_owned[self.block]
-    if not owned then owned = {}; self.gs_owned[self.block] = owned end
-    owned[#owned + 1] = owned_slot
-    self.fn.gs_count = math.max(self.fn.gs_count or 0, k + 1)
+    self:register_slot { place = p, k = k, ordinal = ordinal, free = free }
     return k
+end
+
+-- every slot this builder holds: those on its own stack indices, and those
+-- adopted from a header (a parameter, a materialized call's result)
+function Builder:all_slots()
+    local out, seen = {}, {}
+    for _, slot in pairs(self.gs_live or {}) do
+        if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
+    end
+    for slot in pairs(self.gs_extra or {}) do
+        if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
+    end
+    for slot in pairs(self.gs_res_slots or {}) do
+        if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
+    end
+    table.sort(out, function(a, b) return a.serial < b.serial end)
+    return out
+end
+
+-- the slots an owner place holds now (a StrMap holds two)
+function Builder:slots_of(p)
+    local out = {}
+    for _, slot in ipairs(self:all_slots()) do
+        if slot.place == p then out[#out + 1] = slot end
+    end
+    return out
+end
+
+-- a slot stops being held: its indices are free again
+function Builder:drop_slot(slot)
+    if slot.k then self.gs_live[slot.k] = nil end
+    for _, k in ipairs(slot.reserved or {}) do
+        if self.gs_live[k] == slot then self.gs_live[k] = nil end
+    end
+    if self.gs_extra then self.gs_extra[slot] = nil end
+    if self.gs_res_slots then self.gs_res_slots[slot] = nil end
+    local owned = self.gs_owned and self.gs_owned[slot.block]
+    if owned then
+        for i = #owned, 1, -1 do if owned[i] == slot then table.remove(owned, i) break end end
+    end
+end
+
+-- the stack fields of an owner type's header, as (stack, base) pairs
+function Mem.release_fields(t)
+    return rawget(t, 'release_fields') or { { 'stack', 'base' } }
+end
+
+-- the owners inside a place: itself, or an owner struct's owner fields, with
+-- their field paths from the place
+function Mem.owner_leaves(p, out, path)
+    out, path = out or {}, path or {}
+    if p.T.kind == 'struct' then
+        for _, f in ipairs(p.T.fields) do
+            if f.type.resizable then
+                local sub = { unpack(path) }
+                sub[#sub + 1] = f.name
+                Mem.owner_leaves(S.field_place(p, f.name), out, sub)
+            end
+        end
+    else
+        out[#out + 1] = { place = p, path = path }
+    end
+    return out
+end
+
+-- An owner that arrives as a header value: a materialized word's parameter,
+-- or the result of a materialized call. The place adopts its stacks without
+-- allocating; `reserve` lists stack indices of this function that stay
+-- unused while it lives (where a callee may have put the result).
+function Builder:adopt_owner(p, v, placement)
+    S.check_usable(p, true)
+    self:release_owner(p, ("'" .. tostring(p.name) .. "' was replaced"))
+    S.clear_moved(p)
+    placement = placement or {}
+    local position = 0
+    local function adopt(q, e)
+        if q.T.kind == 'struct' then
+            for _, f in ipairs(q.T.fields) do
+                local fe = { op = 'field', a = e, name = f.name, T = f.type }
+                if f.type.resizable then adopt(S.field_place(q, f.name), fe)
+                else self:store(S.field_place(q, f.name), dyn(f.type, fe)) end
+            end
+            return
+        end
+        if not self.dead then self:emit { op = 'store', place = q, e = e, what = 'adopting an owner' } end
+        for _, fields in ipairs(Mem.release_fields(q.T)) do
+            position = position + 1
+            local at = placement[position] or {}
+            self:register_slot { place = q, free = at.free or releaser_for(q.T, fields), k = at.k, res = at.res,
+                                 ordinal = at.ordinal, param = at.param, reserved = at.reserved }
+        end
+    end
+    adopt(p, S.ex(v))
+end
+
+-- how many stacks an owner of type t occupies (an owner struct: all of its
+-- owners'), in the order its header lists them
+function Mem.stack_count(t)
+    local n = 0
+    local function count(u)
+        if u.kind == 'struct' then
+            for _, f in ipairs(u.fields) do if f.type.resizable then count(f.type) end end
+        else
+            n = n + #Mem.release_fields(u)
+        end
+    end
+    count(t)
+    return n
+end
+S.owner_stack_count = Mem.stack_count
+
+-- A materialized function returns: the owners it adopted (owner parameters,
+-- owner results of its calls) live on stacks that are not its own, so its
+-- epilogue does not give them back; they are released here, on every exit.
+function Builder:release_extras()
+    local slots = {}
+    for slot in pairs(self.gs_extra or {}) do slots[#slots + 1] = slot end
+    table.sort(slots, function(a, b) return a.serial > b.serial end)
+    for _, slot in ipairs(slots) do
+        if not self.dead then slot.release() end
+    end
+end
+
+-- An owner leaves this builder's hands whole (moved into a materialized call,
+-- or returned from one): its slots are dropped unreleased, since whoever
+-- receives it releases it. Returns what would release it on a path that does
+-- not let it go.
+function Builder:hand_off(p)
+    local releases = {}
+    for _, leaf in ipairs(Mem.owner_leaves(p)) do
+        S.check_usable(leaf.place)
+        local slots = self:slots_of(leaf.place)
+        if #slots == 0 then
+            fail(("'%s' is a %s this word does not own (it is reached through a reference); "
+                .. "move only owners you hold, or copy it"):format(tostring(leaf.place.name), leaf.place.T.display))
+        end
+        for _, slot in ipairs(slots) do
+            releases[#releases + 1] = { place = leaf.place, free = slot.free }
+            self.transfer_log = self.transfer_log or {}
+            table.insert(self.transfer_log, { slot = slot, place = slot.place, block = slot.block, dropped = true })
+            self:drop_slot(slot)
+        end
+    end
+    return releases
+end
+
+-- hand a slot to another place: it is released when that place's block ends.
+-- Logged, so a discarded speculative round can take the transfer back.
+function Builder:transfer_slot(slot, dst)
+    local to = owning_block(self, dst)
+    self.transfer_log = self.transfer_log or {}
+    table.insert(self.transfer_log, { slot = slot, place = slot.place, block = slot.block })
+    local from = self.gs_owned and self.gs_owned[slot.block]
+    if from then
+        for i = #from, 1, -1 do if from[i] == slot then table.remove(from, i) break end end
+    end
+    table.insert(slot.adopted, slot.place)
+    slot.place, slot.block = dst, to
+    local owned = self:gs_owned_list(to)
+    owned[#owned + 1] = slot
+end
+
+function Builder:undo_transfers(n)
+    local log = self.transfer_log
+    for i = #(log or {}), n + 1, -1 do
+        local e = log[i]
+        local slot = e.slot
+        if e.dropped then
+            -- a handed-off slot is held again
+            if slot.k then self.gs_live[slot.k] = slot
+            elseif slot.res then self.gs_res_slots = self.gs_res_slots or {}; self.gs_res_slots[slot] = true
+            else self.gs_extra = self.gs_extra or {}; self.gs_extra[slot] = true end
+        else
+            local now = self.gs_owned and self.gs_owned[slot.block]
+            if now then
+                for j = #now, 1, -1 do if now[j] == slot then table.remove(now, j) break end end
+            end
+            table.remove(slot.adopted)
+            slot.place, slot.block = e.place, e.block
+        end
+        local owned = self:gs_owned_list(e.block)
+        owned[#owned + 1] = slot
+        log[i] = nil
+    end
+end
+
+-- An owner's life ends here (it is replaced, or it is not moved on a path
+-- where another path moved it): its stacks return to where it began, and
+-- every borrow of it ends.
+function Builder:release_owner(p, why)
+    for _, slot in ipairs(self:slots_of(p)) do
+        if not self.dead then slot.release() end
+        self:drop_slot(slot)
+        for _, q in ipairs(slot.adopted) do S.end_place(q, why) end
+    end
+    S.end_place(p, why)
 end
 
 -- the offset a callee's base takes at this point: past every live index
@@ -140,9 +410,17 @@ function Builder:gs_close(blk)
         if reachable_end then
             o.release()
         end
-        -- its bytes are given back: borrows of it end with it
-        S.end_place(o.place, ("'" .. tostring(rawget(o.place, 'name')) .. "' ended"))
-        self.gs_live[o.k] = nil
+        -- its bytes are given back: borrows of it end with it, including
+        -- borrows taken through the places it was moved from
+        local why = "'" .. tostring(rawget(o.place, 'name')) .. "' ended"
+        S.end_place(o.place, why)
+        for _, q in ipairs(o.adopted or {}) do S.end_place(q, why) end
+        if o.k then self.gs_live[o.k] = nil end
+        for _, k in ipairs(o.reserved or {}) do
+            if self.gs_live[k] == o then self.gs_live[k] = nil end
+        end
+        if self.gs_extra then self.gs_extra[o] = nil end
+        if self.gs_res_slots then self.gs_res_slots[o] = nil end
     end
     self.gs_owned[blk] = nil
 end
@@ -160,19 +438,143 @@ end
 
 -- creating resizable values in place --------------------------------------------------------
 
-local function fresh(t) return setmetatable({ T = t, k = 'fresh' }, S.V) end
 
+-- An owner place receives an owner: a fresh one is created in place; a named
+-- one moves (design memory.md §5.4). An owner it held before ends here.
 function Builder:init_resizable(p, v)
+    if S.is_place(v) and v.T == p.T then return self:move_owner(p, v) end
+    if S.is_value(v) and v.k == 'dyn' and v.T == p.T then
+        -- an owner parameter: its stacks are the caller's; the slots remember
+        -- which parameter, so returning it is known to leave it where it is
+        local e = S.ex(v)
+        local placement
+        if e.op == 'param' and self.fn and self.fn.param_of then
+            for i, name in pairs(self.fn.param_of) do
+                if name == e.name then
+                    placement = {}
+                    for n = 1, Mem.stack_count(p.T) do placement[n] = { param = i } end
+                end
+            end
+        end
+        return self:adopt_owner(p, v, placement)
+    end
     if not (S.is_value(v) and v.k == 'fresh' and v.T == p.T) then
-        fail(("'%s' is a %s: it is created in place, as %s {}"):format(p.name, p.T.display, p.T.display))
+        fail(("'%s' is a %s: it is created in place (%s {}), moved from another %s, or copied"):format(
+            p.name, p.T.display, p.T.display, p.T.display))
     end
-    if rawget(p, 'gs_k') then
-        fail(("'%s' is a %s; it cannot be assigned again"):format(p.name, p.T.display))
+    S.check_usable(p, true)
+    self:release_owner(p, ("'" .. tostring(p.name) .. "' was replaced"))
+    S.clear_moved(p)
+    local source, text = rawget(v, 'copy_of'), rawget(v, 'copy_text')
+    local count, items = rawget(v, 'length'), rawget(v, 'copy_slice')
+    if rawget(p.T, 'init_storage') then
+        p.T.init_storage(self, p)
+        if source then p.T.copy_storage(p, source) end
+        return
     end
-    if rawget(p.T, 'init_storage') then return p.T.init_storage(self, p) end
     local k = self:gs_alloc(p)
-    rawset(p, 'gs_k', k)
-    storage_library(p.T).layout.init(S.Ref(p), dyn(types.U64, { op = 'stack_index', offset = k, T = types.U64 }))
+    storage_library(p.T).layout.init(S.Ref(p), Mem.stack_index(k))
+    -- `copy x`: the new owner receives x's contents (design memory.md §5.5)
+    if source then storage_library(p.T).copy(S.Ref(p), S.Ref(source)) end
+    if text then storage_library(p.T).append(S.Ref(p), text) end
+    if count then storage_library(p.T).allocate(S.Ref(p), count) end
+    if items then
+        local ptr, len = S.slice_parts(items)
+        storage_library(p.T).fill_from(S.Ref(p), ptr, len)
+    end
+end
+
+-- `copy x`: the visible O(n) duplicate of an owner, built in its destination.
+-- An owner struct copies its owners deeply and its values as values; a Str
+-- copies into a Text; a value is already a copy of itself.
+function Mem.copy(x)
+    local b = S.cur()
+    -- a Lua string is a Str of static data
+    if type(x) == 'string' then x = S.str_literal(x) end
+    x = S.through(x)
+    if S.is_value(x) and x.k == 'ref' then x = x.place end
+    if S.is_place(x) and x.T.resizable then
+        S.check_usable(x)
+        if x.T.kind == 'struct' then
+            local f = {}
+            for _, fd in ipairs(x.T.fields) do
+                local q = S.field_place(x, fd.name)
+                f[fd.name] = fd.type.resizable and Mem.copy(q) or b:read(q)
+            end
+            return S.agg(x.T, f)
+        end
+        local v = fresh(x.T)
+        rawset(v, 'copy_of', x)
+        return v
+    end
+    if S.is_place(x) then x = b:read(x) end
+    if S.is_value(x) and rawget(x.T, 'is_str') then
+        local v = fresh(require('nua.strings').Text)
+        rawset(v, 'copy_text', x)
+        return v
+    end
+    if S.is_value(x) and rawget(x.T, 'slice_elem') then
+        local v = fresh(Mem.RtArray(rawget(x.T, 'slice_elem')))
+        rawset(v, 'copy_slice', x)
+        return v
+    end
+    if S.is_value(x) then return x end
+    fail('copy needs a native value, an owner or a borrow, got ' .. S.describe(x))
+end
+
+-- Move an owner: its header is copied into the destination, which takes over
+-- its stacks; the source can no longer be used. Nothing it owns is copied.
+function Builder:move_owner(dst, src)
+    src = S.through(src)
+    if S.is_value(src) and src.k == 'ref' then src = src.place end
+    if src == dst then return end
+    S.check_usable(src)
+    S.check_usable(dst, true)
+    local releases = {}
+    local function move(d, q)
+        if d.T.kind == 'struct' then
+            for _, f in ipairs(d.T.fields) do
+                local dd, qq = S.field_place(d, f.name), S.field_place(q, f.name)
+                if f.type.resizable then move(dd, qq) else self:store(dd, self:read(qq)) end
+            end
+            return
+        end
+        S.check_usable(q)
+        local slots = self:slots_of(q)
+        if #slots == 0 then
+            local root = S.root_of(q)
+            if root.pk == 'deref' and rawget(root, 'param_index') and rawget(root, 'param_fn') == self.fn then
+                -- out of a Ref parameter: the caller's place counts as moved after
+                -- the call (the summary says so); paths that do not move it here
+                -- release it on their way out
+                local index = rawget(root, 'param_index')
+                S.note_move_out(self.fn, index, S.field_path(q))
+                for _, fields in ipairs(Mem.release_fields(q.T)) do
+                    releases[#releases + 1] = { place = q, free = releaser_for(q.T, fields) }
+                end
+                self:adopt_owner(d, dyn(d.T, S.read_expr(q)))
+                return
+            end
+            if root.pk == 'deref' then
+                fail(("'%s' is reached through a Ref whose target is not known while compiling, so it "
+                    .. "cannot be moved out (the place it leaves would not be known); copy it, or pass the "
+                    .. "owner itself"):format(tostring(q.name)))
+            end
+            fail(("'%s' is a %s this word does not own; move only owners you hold, or copy it"):format(
+                tostring(q.name), q.T.display))
+        end
+        self:release_owner(d, ("'" .. tostring(d.name) .. "' was replaced"))
+        if not self.dead then
+            self:emit { op = 'store', place = d, e = S.read_expr(q), what = 'moving an owner' }
+        end
+        for _, slot in ipairs(slots) do
+            releases[#releases + 1] = { place = q, free = slot.free }
+            self:transfer_slot(slot, d)
+        end
+    end
+    move(dst, src)
+    S.clear_moved(dst)
+    S.mark_moved(src, dst, releases)
 end
 
 function S.init_resizable(p, v)
@@ -184,8 +586,11 @@ end
 -- the place a method receiver denotes (a place, or a reference to one)
 local function receiver(x, what)
     x = S.through(x)
-    if S.is_place(x) then return x end
-    if S.is_value(x) and x.k == 'ref' then return x.place end
+    if S.is_value(x) and x.k == 'ref' then x = x.place end
+    if S.is_place(x) then
+        if x.T.resizable then S.check_usable(x) end
+        return x
+    end
     fail(what .. ' needs the storage itself (a place or a Ref), got a value')
 end
 
@@ -293,6 +698,7 @@ local function store_methods(t)
     return {
         add = function(self, v)
             local p = receiver(self, n .. ':add')
+            S.note_growth(p)
             S.bump_checked()
             local val = S.coerce(v, elem, 'value added to ' .. t.display)
             val = owned_copy(p, val, 'capturing a store value')
@@ -342,6 +748,7 @@ local function grow_methods(t)
         end,
         push = function(self, v)
             local p = receiver(self, n .. ':push')
+            S.note_growth(p)
             S.bump_checked()
             local val = S.coerce(v, elem, 'value pushed onto ' .. t.display)
             val = owned_copy(p, val, 'capturing a Grow value')
@@ -418,6 +825,19 @@ local function decorate(t)
             end
             return fresh(t)
         end)
+    elseif t.kind == 'rtarray' then
+        -- the elements of an Array T are borrowed like a Grow's; its length is
+        -- fixed, so it has no push and no clear
+        local all = grow_methods(t)
+        local ms = { all = all.all, sub = all.sub }
+        S.arity[ms.all], S.arity[ms.sub] = 1, 3
+        rawset(t, 'builtin_methods', merge_methods(t, ms))
+        rawset(t, '__index', index_hook(t))
+        rawset(t, 'properties', merge_properties(t, { length = length }))
+        S.member_tables(t)
+        rawset(t, 'construct', function(x)
+            fail(t.display .. ' is built with its length: Array(' .. t.elem.display .. ', n) {}')
+        end)
     elseif t.kind == 'grow' then
         local ms = grow_methods(t)
         local ar = { push = 2, all = 1, sub = 3, clear = 1 }
@@ -448,11 +868,48 @@ local function checked(make, what)
     end
 end
 
+S.owner_leaves = Mem.owner_leaves
+-- the index of result stack j (gs_res + j), or of this function's own stack k
+function S.result_stack_value(j, k)
+    if j then return Mem.stack_index({ res = j }) end
+    return Mem.stack_index(k)
+end
+-- releasing a call's result rewinds its reserved stack to where it stood
+-- before the call: the result, and what the callee left below it
+function S.stack_rewinder(k)
+    local stacks = require('nua.stacks')
+    local start = capture(stacks.top(Mem.stack_index(k)), 'the top before a call')
+    return function()
+        stacks.reset(Mem.stack_index(k), start)
+    end
+end
+-- what releases an owner place's stacks, through its header
+function S.place_releases(p)
+    local out = {}
+    for _, leaf in ipairs(Mem.owner_leaves(p)) do
+        for _, fields in ipairs(Mem.release_fields(leaf.place.T)) do
+            out[#out + 1] = { place = leaf.place, free = releaser_for(leaf.place.T, fields) }
+        end
+    end
+    return out
+end
+function S.release_place(p)
+    for _, r in ipairs(S.place_releases(p)) do r.free(r.place) end
+end
+
 -- for nua.strings: Text is Grow U8 with text methods
 Mem.receiver, Mem.capture, Mem.addr = receiver, capture, addr
 
 Mem.Store = checked(types.store, 'Store')
 Mem.Grow = checked(types.grow, 'Grow')
+Mem.RtArray = checked(types.rtarray, 'Array')
+
+-- Array(T, n) {} with n known only at runtime: an Array T of n zeroed elements
+function Mem.array_of_length(t, n)
+    local v = fresh(t)
+    rawset(v, 'length', S.coerce(n, types.U32, 'length of ' .. t.display))
+    return v
+end
 Mem.Id = checked(types.id, 'Id')
 
 -- Private representation projection for library words over opaque handles.
@@ -469,6 +926,24 @@ end
 
 function Mem.prelude(env)
     env.Store, env.Grow, env.Id = Mem.Store, Mem.Grow, Mem.Id
+    env.copy = Mem.copy
+    env.Array = function(elem, n)
+        if n == nil then return Mem.RtArray(elem) end
+        if S.is_staged(n) and not S.is_known(S.value_of(n)) then
+            -- a runtime length: the constructor of an Array T owner
+            local t = Mem.RtArray(elem)
+            return setmetatable({}, { __call = function(_, x)
+                if type(x) ~= 'table' or S.is_staged(x) or next(x) ~= nil then
+                    fail(('Array(%s, n) {} with n known only at runtime starts zeroed; it takes no '
+                        .. 'elements'):format(elem.display))
+                end
+                return Mem.array_of_length(t, n)
+            end })
+        end
+        if S.is_staged(n) then n = tonumber(S.value_of(n).v) end
+        return S.Array(elem, n)
+    end
+    S.arity[Mem.copy] = 1
 end
 
 return Mem

@@ -395,7 +395,7 @@ This one commits a working copy at the end. Its contract is its own: write throu
 
 * the body's `return` leaves the body, not the activity;
 * cleanup and commit are the activity's code, not a side effect of opening;
-* access to activity-owned temporary storage cannot escape its lifetime; ordinary copyable results may leave, and a reference derived from received storage follows that storage's lifetime. Resizable values are not returned by value.
+* access to activity-owned temporary storage cannot escape its lifetime; ordinary copyable results may leave, and a reference derived from received storage follows that storage's lifetime. An owner is returned like a value: it is built where the caller keeps it.
 
 There is no callback call or runtime closure. The working copy does remain here: the C contains a local draft, its updates and the field copies back to the document. This is the cost of the chosen completion policy, not activity dispatch:
 
