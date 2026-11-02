@@ -373,7 +373,93 @@ local tree = do(n: U32): U32
 end
 export tree
 
+-- mutual recursion between words returning different owner types: one
+-- result region for the recursion, each word at its own offset
+local text_of
+local function counts(n: U32): Grow U32
+    if n == 0 then
+        local out = Grow(U32) {}
+        return out
+    end
+    local t = text_of(n - 1)
+    local out = Grow(U32) {}
+    out:push(U32 t.length)
+    return out
+end
+text_of = do(n: U32): Text
+    local xs = counts n
+    local out = Text {}
+    out:write("n", n, ":", U32 xs.length)
+    return out
+end
+local mutual = do(n: U32): U32
+    local t = text_of n
+    return U32 t.length
+end
+export mutual
+-- moving an owner out of a Ref argument through a mutual recursion
+local drain_b
+local function drain_a(n: U32, g: Ref Graph): U32
+    if n == 0 then
+        local order = g.order
+        return U32 order.length
+    end
+    g.order:push n
+    return drain_b(n - 1, g)
+end
+drain_b = do(n: U32, g: Ref Graph): U32 = drain_a(n, g)
+local mutual_move = do(n: U32): U32
+    local g = Graph {}
+    local m = drain_b(n, Ref g)
+    g.order = Grow(U32) {}
+    return m
+end
+export mutual_move
+
+-- the same with both words compiled on their own: a real cycle of functions
+local text_of2
+local function counts2(n: U32): Grow U32
+    if n == 0 then
+        local out = Grow(U32) {}
+        return out
+    end
+    local t = call text_of2(n - 1)
+    local out = Grow(U32) {}
+    out:push(U32 t.length)
+    return out
+end
+text_of2 = do(n: U32): Text
+    local xs = call counts2 n
+    local out = Text {}
+    out:write("n", n, ":", U32 xs.length)
+    return out
+end
+local mutual_calls = do(n: U32): U32
+    local t = call text_of2 n
+    return U32 t.length
+end
+export mutual_calls
+local drain_d
+local function drain_c(n: U32, g: Ref Graph): U32
+    if n == 0 then
+        local order = g.order
+        return U32 order.length
+    end
+    g.order:push n
+    return call drain_d(n - 1, g)
+end
+drain_d = do(n: U32, g: Ref Graph): U32 = call drain_c(n, g)
+local mutual_move_calls = do(n: U32): U32
+    local g = Graph {}
+    local m = call drain_d(n, Ref g)
+    g.order = Grow(U32) {}
+    return m
+end
+export mutual_move_calls
+
 return {
+    mutual_calls = mutual_calls, mutual_move_calls = mutual_move_calls,
+    mutual = mutual, mutual_move = mutual_move,
     counted = counted, tree = tree,
     ref_moves = ref_moves, recursive_move = recursive_move,
     walked = walked, gathered = gathered,

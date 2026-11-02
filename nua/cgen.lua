@@ -739,6 +739,11 @@ function Fn:expr(e, need)
         return e.cconst
     elseif op == 'stack_index' then
         return e.offset == 0 and 'gs_sp' or paren('gs_sp + ' .. e.offset, PREC.add, need)
+    elseif op == 'res_index' then
+        -- result stack j of e.fn, at its offset in its recursion's region
+        local n = (e.fn.res_offset or 0) + e.j
+        local base = self.task_mode and 'f->gs_res' or 'gs_res'
+        return n == 0 and base or paren(base .. ' + ' .. n .. 'ull', PREC.add, need)
     elseif op == 'conv' then
         return paren('(' .. ctype(e.T) .. ')' .. self:expr(e.a, PREC.unary), PREC.unary, need)
     elseif op == 'field' then
@@ -1339,6 +1344,13 @@ local function plan_stacks(fns)
             end
         end
     end
+    -- Result regions: each function's result stacks sit at its offset in its
+    -- recursion's region (design memory.md §15 D11)
+    for _, fn in ipairs(fns) do
+        if fn.has_res then
+            fn.res_offset = S.result_region(fn).offset[fn] or 0
+        end
+    end
     -- The one rejected case: a frame resizing an owner that an outer level of
     -- the same recursion created, while a frame between them holds an owner
     -- of its own, which may lie above it on its stack.
@@ -1490,6 +1502,7 @@ local function emit_function(fn, out)
     local used = {}
     walk_block(fn.body, nil, function(e)
         if e.op == 'param' then used[e.name] = true end
+        if e.op == 'res_index' then used.gs_res = true end
         if e.op == 'setparam' then used[e.name] = true end
     end)
     walk_block(fn.body, function(st) if st.op == 'setparam' then used[st.name] = true end end)
@@ -1647,7 +1660,7 @@ local function collect_structs(fns)
     local function visit(t)
         if not t or seen[t] then return end
         if t.kind == 'ref' or t.kind == 'ptr' or t.kind == 'id' or t.kind == 'store'
-            or t.kind == 'grow' or t.kind == 'map' or t.kind == 'strmap' then
+            or t.kind == 'grow' or t.kind == 'rtarray' or t.kind == 'map' or t.kind == 'strmap' then
             if t.kind ~= 'ref' and t.kind ~= 'ptr' then
                 seen[t] = true
                 local native = t.native_layout and t.native_layout() or t.representation

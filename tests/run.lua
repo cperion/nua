@@ -170,6 +170,18 @@ do
     done()
 end
 
+-- the programs the in-process backend runs: their C must hold up too
+do
+    local cmds, labels = {}, {}
+    for _, name in ipairs { 'owners', 'references', 'stable_stacks' } do
+        local c = build .. '/nua_test_' .. name .. '.c'
+        cmds[#cmds + 1] = ('%s -o %s %s && %s -c %s -o %s.o'):format(NUA, c, sq(root .. '/tests/' .. name .. '.nua'),
+            CC, c, c)
+        labels[#labels + 1] = 'tests/' .. name .. '.nua: strict C'
+    end
+    par(cmds, labels)
+end
+
 -- Link and run each harness against the C backend.
 local ran, mains = {}, {}
 do

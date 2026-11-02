@@ -135,10 +135,10 @@ end
 -- own stacks (gs_sp + k), or its result stack j (gs_res + j)
 function Mem.stack_index(k)
     if type(k) == 'table' then
-        local res = { op = 'param', name = 'gs_res', T = types.U64 }
-        if k.res == 0 then return dyn(types.U64, res) end
-        return dyn(types.U64, { op = 'bin', o = 'add', a = res, b = { op = 'const', v = k.res, T = types.U64 },
-                                T = types.U64 })
+        -- result stack j of this function: gs_res + its offset in its
+        -- recursion's region + j; the backends read the offset once stacks
+        -- are planned
+        return dyn(types.U64, { op = 'res_index', fn = S.cur().fn, j = k.res, T = types.U64 })
     end
     return dyn(types.U64, { op = 'stack_index', offset = k, T = types.U64 })
 end
@@ -152,21 +152,35 @@ function Builder:next_allocation()
     return self.alloc_count, at and at.first
 end
 
+-- Slots. A slot is one data stack held by an owner place: one of this
+-- function's own indices (k), a result stack (res), or storage adopted from a
+-- header (an owner parameter: neither). Slot records are never handed from
+-- place to place: a move gives the destination a slot of its own over the same
+-- storage, and the source's move mark, which follows paths, branches and joins
+-- like any path fact, says the source no longer releases it. An index stays
+-- claimed while any slot over it lives.
+function Builder:claim(k)
+    self.gs_live = self.gs_live or {}
+    self.gs_claims = self.gs_claims or {}
+    self.gs_claims[k] = (self.gs_claims[k] or 0) + 1
+    self.gs_live[k] = true
+    self.fn.gs_count = math.max(self.fn.gs_count or 0, k + 1)
+end
+function Builder:unclaim(k)
+    local n = (self.gs_claims and self.gs_claims[k] or 1) - 1
+    self.gs_claims[k] = n > 0 and n or nil
+    if n <= 0 then self.gs_live[k] = nil end
+end
+S.slot_serial = function() return serials end
+
 function Builder:register_slot(slot)
-    serials = serials + 1
-    slot.serial, slot.adopted = serials, slot.adopted or {}
+    if not slot.serial then serials = serials + 1; slot.serial = serials end
+    slot.aliases = slot.aliases or {}
     slot.block = slot.block or owning_block(self, slot.place)
     slot.release = function() slot.free(slot.place) end
-    for _, k in ipairs(slot.reserved or {}) do
-        -- indices kept unused while this owner lives (where its bytes may be)
-        self.gs_live = self.gs_live or {}
-        self.gs_live[k] = slot
-        self.fn.gs_count = math.max(self.fn.gs_count or 0, k + 1)
-    end
+    for _, k in ipairs(slot.reserved or {}) do self:claim(k) end
     if slot.k then
-        self.gs_live = self.gs_live or {}
-        self.gs_live[slot.k] = slot
-        self.fn.gs_count = math.max(self.fn.gs_count or 0, slot.k + 1)
+        self:claim(slot.k)
     elseif slot.res then
         self.gs_res_slots = self.gs_res_slots or {}
         self.gs_res_slots[slot] = true
@@ -176,6 +190,11 @@ function Builder:register_slot(slot)
     end
     local owned = self:gs_owned_list(slot.block)
     owned[#owned + 1] = slot
+    -- on this path the place now holds this storage
+    S.mark_held(slot.place)
+    -- a discarded speculative round forgets the slots it made
+    self.registered = self.registered or {}
+    self.registered[#self.registered + 1] = slot
     return slot
 end
 
@@ -186,53 +205,83 @@ function Builder:gs_alloc(p, release)
     local ordinal, j = self:next_allocation()
     local free = releaser_for(p.T, release)
     if j then
-        self:register_slot { place = p, res = j, ordinal = ordinal, free = free }
+        self:register_slot { place = p, res = j, ordinal = ordinal, free = free, fields = release }
         return { res = j }
     end
     self.gs_live = self.gs_live or {}
     local k = 0
     while self.gs_live[k] do k = k + 1 end
-    self:register_slot { place = p, k = k, ordinal = ordinal, free = free }
+    self:register_slot { place = p, k = k, ordinal = ordinal, free = free, fields = release }
     return k
 end
 
--- every slot this builder holds: those on its own stack indices, and those
--- adopted from a header (a parameter, a materialized call's result)
+-- every slot this builder holds
 function Builder:all_slots()
     local out, seen = {}, {}
-    for _, slot in pairs(self.gs_live or {}) do
-        if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
-    end
     for slot in pairs(self.gs_extra or {}) do
         if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
     end
     for slot in pairs(self.gs_res_slots or {}) do
         if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
     end
+    for _, list in pairs(self.gs_owned or {}) do
+        for _, slot in ipairs(list) do
+            if not seen[slot] then seen[slot] = true; out[#out + 1] = slot end
+        end
+    end
     table.sort(out, function(a, b) return a.serial < b.serial end)
     return out
 end
 
--- the slots an owner place holds now (a StrMap holds two)
+-- does this path still hold the place's storage (received, not moved on)?
+local function moved_here(b, p)
+    return S.moved_on_path(b.state, p) or not S.held_on_path(b.state, p)
+end
+
+-- The slots over an owner place's storage on this path, one per stack of
+-- its header: the newest for each (a replacement made a newer one).
 function Builder:slots_of(p)
-    local out = {}
+    local by_fields, order = {}, {}
     for _, slot in ipairs(self:all_slots()) do
-        if slot.place == p then out[#out + 1] = slot end
+        if slot.place == p then
+            local key = slot.fields and table.concat(slot.fields, '/') or 'stack/base'
+            if not by_fields[key] then order[#order + 1] = key end
+            by_fields[key] = slot
+        end
     end
+    local out = {}
+    for _, key in ipairs(order) do out[#out + 1] = by_fields[key] end
+    table.sort(out, function(a, b) return a.serial < b.serial end)
     return out
 end
 
--- a slot stops being held: its indices are free again
+-- a slot's place ends: its claims go, and it is forgotten
 function Builder:drop_slot(slot)
-    if slot.k then self.gs_live[slot.k] = nil end
-    for _, k in ipairs(slot.reserved or {}) do
-        if self.gs_live[k] == slot then self.gs_live[k] = nil end
-    end
+    if slot.k then self:unclaim(slot.k) end
+    for _, k in ipairs(slot.reserved or {}) do self:unclaim(k) end
     if self.gs_extra then self.gs_extra[slot] = nil end
     if self.gs_res_slots then self.gs_res_slots[slot] = nil end
     local owned = self.gs_owned and self.gs_owned[slot.block]
     if owned then
         for i = #owned, 1, -1 do if owned[i] == slot then table.remove(owned, i) break end end
+    end
+end
+
+-- emit the releases of these slots whose places this path still holds, newest
+-- first, one per stack of a place
+function Builder:release_slots(slots, why)
+    table.sort(slots, function(a, b) return a.serial > b.serial end)
+    local done = {}
+    for _, slot in ipairs(slots) do
+        if not moved_here(self, slot.place) then
+            local key = tostring(rawget(slot.place, 'id')) .. ':' .. (slot.fields and table.concat(slot.fields, '/') or '')
+            if not done[key] and not self.dead then slot.release() end
+            done[key] = true
+            if why then
+                S.end_place(slot.place, why)
+                for _, q in ipairs(slot.aliases) do S.end_place(q, why) end
+            end
+        end
     end
 end
 
@@ -283,7 +332,8 @@ function Builder:adopt_owner(p, v, placement)
             position = position + 1
             local at = placement[position] or {}
             self:register_slot { place = q, free = at.free or releaser_for(q.T, fields), k = at.k, res = at.res,
-                                 ordinal = at.ordinal, param = at.param, reserved = at.reserved }
+                                 ordinal = at.ordinal, param = at.param, reserved = at.reserved,
+                                 fields = fields[1] ~= 'stack' and fields or nil }
         end
     end
     adopt(p, S.ex(v))
@@ -305,22 +355,19 @@ function Mem.stack_count(t)
 end
 S.owner_stack_count = Mem.stack_count
 
--- A materialized function returns: the owners it adopted (owner parameters,
--- owner results of its calls) live on stacks that are not its own, so its
--- epilogue does not give them back; they are released here, on every exit.
+-- A materialized function returns: the owners it adopted (owner parameters)
+-- live on stacks that are not its own, so its epilogue does not give them
+-- back; they are released here, on every exit this path still holds them.
 function Builder:release_extras()
     local slots = {}
     for slot in pairs(self.gs_extra or {}) do slots[#slots + 1] = slot end
-    table.sort(slots, function(a, b) return a.serial > b.serial end)
-    for _, slot in ipairs(slots) do
-        if not self.dead then slot.release() end
-    end
+    self:release_slots(slots)
 end
 
 -- An owner leaves this builder's hands whole (moved into a materialized call,
--- or returned from one): its slots are dropped unreleased, since whoever
--- receives it releases it. Returns what would release it on a path that does
--- not let it go.
+-- or returned): whoever receives it releases it. Its slots stay until its
+-- place ends, so their indices stay claimed; the caller marks it moved.
+-- Returns what would release it on a path that does not let it go.
 function Builder:hand_off(p)
     local releases = {}
     for _, leaf in ipairs(Mem.owner_leaves(p)) do
@@ -330,65 +377,15 @@ function Builder:hand_off(p)
             fail(("'%s' is a %s this word does not own (it is reached through a reference); "
                 .. "move only owners you hold, or copy it"):format(tostring(leaf.place.name), leaf.place.T.display))
         end
-        for _, slot in ipairs(slots) do
-            releases[#releases + 1] = { place = leaf.place, free = slot.free }
-            self.transfer_log = self.transfer_log or {}
-            table.insert(self.transfer_log, { slot = slot, place = slot.place, block = slot.block, dropped = true })
-            self:drop_slot(slot)
-        end
+        for _, slot in ipairs(slots) do releases[#releases + 1] = { place = leaf.place, free = slot.free } end
     end
     return releases
 end
 
--- hand a slot to another place: it is released when that place's block ends.
--- Logged, so a discarded speculative round can take the transfer back.
-function Builder:transfer_slot(slot, dst)
-    local to = owning_block(self, dst)
-    self.transfer_log = self.transfer_log or {}
-    table.insert(self.transfer_log, { slot = slot, place = slot.place, block = slot.block })
-    local from = self.gs_owned and self.gs_owned[slot.block]
-    if from then
-        for i = #from, 1, -1 do if from[i] == slot then table.remove(from, i) break end end
-    end
-    table.insert(slot.adopted, slot.place)
-    slot.place, slot.block = dst, to
-    local owned = self:gs_owned_list(to)
-    owned[#owned + 1] = slot
-end
-
-function Builder:undo_transfers(n)
-    local log = self.transfer_log
-    for i = #(log or {}), n + 1, -1 do
-        local e = log[i]
-        local slot = e.slot
-        if e.dropped then
-            -- a handed-off slot is held again
-            if slot.k then self.gs_live[slot.k] = slot
-            elseif slot.res then self.gs_res_slots = self.gs_res_slots or {}; self.gs_res_slots[slot] = true
-            else self.gs_extra = self.gs_extra or {}; self.gs_extra[slot] = true end
-        else
-            local now = self.gs_owned and self.gs_owned[slot.block]
-            if now then
-                for j = #now, 1, -1 do if now[j] == slot then table.remove(now, j) break end end
-            end
-            table.remove(slot.adopted)
-            slot.place, slot.block = e.place, e.block
-        end
-        local owned = self:gs_owned_list(e.block)
-        owned[#owned + 1] = slot
-        log[i] = nil
-    end
-end
-
--- An owner's life ends here (it is replaced, or it is not moved on a path
--- where another path moved it): its stacks return to where it began, and
--- every borrow of it ends.
+-- An owner's life ends here (it is replaced): its storage returns to where it
+-- began, and every borrow of it ends. Its slots stay until its place ends.
 function Builder:release_owner(p, why)
-    for _, slot in ipairs(self:slots_of(p)) do
-        if not self.dead then slot.release() end
-        self:drop_slot(slot)
-        for _, q in ipairs(slot.adopted) do S.end_place(q, why) end
-    end
+    self:release_slots(self:slots_of(p), why)
     S.end_place(p, why)
 end
 
@@ -399,28 +396,25 @@ function Builder:gs_offset()
     return top + 1
 end
 
--- a residual block ends: its resizable values give their space back
+-- a residual block ends: the owners it holds give their storage back, unless
+-- this path moved them on
 function Builder:gs_close(blk)
     local owned = self.gs_owned and self.gs_owned[blk]
     if not owned then return end
     local last = blk[#blk]
     local reachable_end = not (last and (last.op == 'ret' or last.op == 'goto' or last.op == 'break'))
-    for i = #owned, 1, -1 do
-        local o = owned[i]
-        if reachable_end then
-            o.release()
+    local slots = {}
+    for i = #owned, 1, -1 do slots[#slots + 1] = owned[i] end
+    if reachable_end then
+        self:release_slots(slots, nil)
+    end
+    for _, o in ipairs(slots) do
+        if not moved_here(self, o.place) then
+            local why = "'" .. tostring(rawget(o.place, 'name')) .. "' ended"
+            S.end_place(o.place, why)
+            for _, q in ipairs(o.aliases or {}) do S.end_place(q, why) end
         end
-        -- its bytes are given back: borrows of it end with it, including
-        -- borrows taken through the places it was moved from
-        local why = "'" .. tostring(rawget(o.place, 'name')) .. "' ended"
-        S.end_place(o.place, why)
-        for _, q in ipairs(o.adopted or {}) do S.end_place(q, why) end
-        if o.k then self.gs_live[o.k] = nil end
-        for _, k in ipairs(o.reserved or {}) do
-            if self.gs_live[k] == o then self.gs_live[k] = nil end
-        end
-        if self.gs_extra then self.gs_extra[o] = nil end
-        if self.gs_res_slots then self.gs_res_slots[o] = nil end
+        self:drop_slot(o)
     end
     self.gs_owned[blk] = nil
 end
@@ -567,9 +561,16 @@ function Builder:move_owner(dst, src)
         if not self.dead then
             self:emit { op = 'store', place = d, e = S.read_expr(q), what = 'moving an owner' }
         end
+        -- the destination gets slots of its own over the same storage; q's
+        -- move mark keeps q from releasing it on this path
         for _, slot in ipairs(slots) do
             releases[#releases + 1] = { place = q, free = slot.free }
-            self:transfer_slot(slot, d)
+            local aliases = { q }
+            for _, a in ipairs(slot.aliases or {}) do aliases[#aliases + 1] = a end
+            self:register_slot { place = d, k = slot.k, res = slot.res, reserved = slot.reserved,
+                                 ordinal = slot.ordinal, param = slot.param, fields = slot.fields,
+                                 free = releaser_for(d.T, slot.fields), serial = slot.serial,
+                                 aliases = aliases }
         end
     end
     move(dst, src)

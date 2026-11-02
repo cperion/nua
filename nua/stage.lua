@@ -460,6 +460,21 @@ function S.clear_moved(p)
     local m = rawget(p, 'move_marker')
     if m and current.state[m] then current.state[m] = nil end
 end
+-- An owner place holds storage on this path: set when it receives an owner
+-- (created, moved in, adopted). Joins keep it only when every path holds it.
+function S.mark_held(p)
+    local m = rawget(p, 'held_marker')
+    if not m then
+        m = new_place { pk = 'moved', T = types.Bool, name = (rawget(p, 'name') or 'owner') .. '#held',
+                        id = uid(), source = p, held = true }
+        rawset(p, 'held_marker', m)
+    end
+    if current then current.state[m] = { mat = true, held = true } end
+end
+function S.held_on_path(state, p)
+    local m = rawget(p, 'held_marker')
+    return m and state[m] and state[m].held or false
+end
 -- An owner, or a place inside one, is used: it must not have been moved on
 -- this path. A destination being given a new owner may itself have been moved.
 function S.check_usable(p, as_destination)
@@ -991,6 +1006,7 @@ function S.note_move_out(fn, index, path)
     fn.moves_out[index][path] = true
 end
 -- has this path moved the place, or a place it lies in?
+S.moved_on_path = function(state, p) return h.moved_in(state, p) end
 h.moved_in = function(state, p)
     local q = p
     while q do
@@ -1050,12 +1066,60 @@ h.place_result = function(b, place)
         if not returned[slot] and slot.serial > newest then above[#above + 1] = slot end
     end
     table.sort(above, function(x, y) return x.serial > y.serial end)
-    for _, slot in ipairs(above) do
-        if not b.dead then slot.release() end
-        b.transfer_log = b.transfer_log or {}
-        table.insert(b.transfer_log, { slot = slot, place = slot.place, block = slot.block, dropped = true })
-        b:drop_slot(slot)
+    b:release_slots(above)
+end
+
+-- The result region (design memory.md §15 D11). A function returning an
+-- owner, and every function of a recursion that passes results down, takes
+-- the region as its gs_res parameter. A recursion's functions share one
+-- region, each at its own offset; calls emitted before a function got the
+-- parameter are given the argument then.
+h.give_result_region = function(fn)
+    if fn.has_res then return end
+    if fn.exported then
+        fail(('export %s takes part in a recursion that returns owners; C cannot give it a result '
+            .. 'region, so the recursion is called from a word of its own'):format(fn.cname or '?'), 4)
     end
+    fn.has_res = true
+    table.insert(fn.params, 1, { name = 'gs_res', T = types.U64 })
+    for _, call in ipairs(fn.call_nodes or {}) do
+        if not call.res_given then
+            -- an earlier call into it: from inside its recursion, which passes
+            -- the region through (so its caller takes one too)
+            call.res_given = true
+            call.res_passthrough = true
+            table.insert(call.args, 1, { op = 'param', name = 'gs_res', T = types.U64 })
+            if call.caller then h.give_result_region(call.caller) end
+        end
+    end
+end
+-- a function reaches another through the calls it makes
+h.reaches = function(a, target, seen)
+    if a == target then return true end
+    seen = seen or {}
+    if seen[a] then return false end
+    seen[a] = true
+    for callee in pairs(a.callees or {}) do
+        if h.reaches(callee, target, seen) then return true end
+    end
+    return false
+end
+-- the functions of fn's recursion that take the region, in a fixed order,
+-- with each one's offset and the region's size
+S.result_region = function(fn)
+    local members = {}
+    for i, other in ipairs(module.functions) do
+        if other.has_res and (other == fn or (h.reaches(fn, other) and h.reaches(other, fn))) then
+            members[#members + 1] = { fn = other, index = i }
+        end
+    end
+    table.sort(members, function(x, y) return x.index < y.index end)
+    local offset, size, at = {}, 0, 0
+    for _, m in ipairs(members) do
+        offset[m.fn] = size
+        size = size + (m.fn.result_stacks or 0)
+    end
+    return { offset = offset, size = size }
 end
 
 -- Where a materialized call's owner result is built (design memory.md §9):
@@ -1067,36 +1131,37 @@ end
 --     left below its result.
 -- Returns where each of the result's stacks lies, for adopting it.
 h.result_destination = function(b, w, fn, done, call, args)
-    local n = S.owner_stack_count(w.ret)
-    local m = done and (fn.result_stacks or 0) or 0
-    local ordinal, j0 = b:next_allocation()
+    local n = w.ret.resizable and S.owner_stack_count(w.ret) or 0
+    local ordinal, j0
+    if w.ret.resizable then ordinal, j0 = b:next_allocation() end
     local placement, res = {}, nil
-    if not done then
-        -- inside the recursion: the callee is this word (or one returning the
-        -- same), whose result stacks are this word's own. Where the result
-        -- lies is known only from its header: this word's result stacks, or an
-        -- argument's stack; whichever it is, it stays this word's to return.
-        if not (b.fn and b.fn.ret == w.ret and b.fn.result_stacks) then
-            fail(('%s returns a %s through a recursion with a word returning something else; this is '
-                .. 'not supported yet'):format(w.name, w.ret.display), 4)
-        end
+    local inside = (not done) or (b.fn and h.reaches(fn, b.fn))
+    if inside then
+        -- inside the recursion: every level passes the region down, so a
+        -- deeper result lands above the shallower ones on the same stacks
+        h.give_result_region(b.fn)
         res = { op = 'param', name = 'gs_res', T = types.U64 }
         for j = 0, n - 1 do placement[j + 1] = { res = 'any', ordinal = ordinal } end
         call.res_passthrough = true
     elseif j0 then
-        -- this word returns this very result: the callee's result stacks are
-        -- some of this word's own, from j0
+        -- this word returns this very result: the callee's region is part of
+        -- this word's own, from j0
+        local region = S.result_region(fn)
         res = S.ex(S.result_stack_value(j0))
         b.alloc_spans = b.alloc_spans or {}
-        b.alloc_spans[ordinal] = math.max(n, m)
+        b.alloc_spans[ordinal] = math.max(n, region.size)
         for j = 0, n - 1 do placement[j + 1] = { res = 'any', ordinal = ordinal } end
     else
-        -- reserve the callee's result stacks past the live ones: the result
-        -- lies on one of them, or on the stack of an argument it returns
+        -- reserve the callee's region past the live stacks: the result lies in
+        -- it, or on the stack of an argument it returns
+        local region = S.result_region(fn)
+        local m = region.size
         local k0 = b:gs_offset()
         res = S.ex(S.result_stack_value(nil, k0))
-        b.alloc_spans = b.alloc_spans or {}
-        b.alloc_spans[ordinal] = math.max(n, m)
+        if ordinal then
+            b.alloc_spans = b.alloc_spans or {}
+            b.alloc_spans[ordinal] = math.max(n, m)
+        end
         local reserved, header = {}, false
         for k = k0, k0 + m - 1 do reserved[#reserved + 1] = k end
         for i, a in ipairs(args) do
@@ -1107,11 +1172,15 @@ h.result_destination = function(b, w, fn, done, call, args)
                 end
             end
         end
-        -- releasing rewinds each reserved result stack to where it stood
-        -- before the call (the result and what the callee left below it);
-        -- a result that may be an argument's is released by its header
+        -- releasing rewinds each stack of the region to where it stood before
+        -- the call (the result and what the callee left below it); a result
+        -- that may be an argument's is released by its header
         local rewinders = {}
         if not header then for k = k0, k0 + m - 1 do rewinders[#rewinders + 1] = S.stack_rewinder(k) end end
+        if n == 0 then
+            -- no owner result: what the recursion left in the region goes now
+            call.after_call = rewinders
+        end
         for p = 1, n do
             local at = { ordinal = ordinal }
             if p == 1 then
@@ -1124,6 +1193,7 @@ h.result_destination = function(b, w, fn, done, call, args)
         end
         call.gs_off = k0 + m
     end
+    call.res_given = true
     table.insert(call.args, 1, res)
     return placement
 end
@@ -1138,14 +1208,32 @@ h.note_root_exit = function(b, stmt)
 end
 h.finish_ref_moves = function(b, fn)
     if not fn.moves_out then return end
-    -- a recursive site that assumed this word moves nothing must be built again
+    -- a recursive site that assumed this word moves nothing must be built
+    -- again: the outermost function of the recursion now being built starts
+    -- over, knowing every word's moves (design memory.md §15 D11)
+    local known_all = module.moves_known or {}
+    module.moves_known = known_all
+    local mine = known_all[fn.key] or {}
+    local news = false
     for i, paths in pairs(fn.moves_out) do
         for path in pairs(paths) do
-            local known = fn.moves_known and fn.moves_known[i] and fn.moves_known[i][path]
-            if not known and fn.assumed_no_move and fn.assumed_no_move[i] then
-                error({ nua_signal = 'rebuild_moves', fn = fn }, 0)
+            if not (mine[i] and mine[i][path]) then
+                mine[i] = mine[i] or {}
+                mine[i][path] = true
+                if fn.assumed_no_move and fn.assumed_no_move[i] then news = true end
             end
         end
+    end
+    known_all[fn.key] = mine
+    if news then
+        local target = fn
+        for _, entry in ipairs(module.building or {}) do
+            if entry.fn == fn or (h.reaches(entry.fn, fn) and h.reaches(fn, entry.fn)) then
+                target = entry.fn
+                break
+            end
+        end
+        error({ nua_signal = 'rebuild_moves', fn = target }, 0)
     end
     for _, exit in ipairs(fn.root_exits or {}) do
         local releases = {}
@@ -2675,6 +2763,15 @@ function Builder:join(paths, base)
     end
     for _, place in ipairs(sorted_places(markers)) do
         do
+            if rawget(place, 'held') then
+                local all = true
+                for _, p in ipairs(live) do
+                    local en = p.state[place]
+                    if not (en and en.held) then all = false end
+                end
+                if all then out[place] = live[1].state[place] end
+                goto next_marker
+            end
             local moved, others = nil, {}
             for _, p in ipairs(live) do
                 local en = p.state[place]
@@ -2684,6 +2781,7 @@ function Builder:join(paths, base)
                 for _, p in ipairs(others) do self:release_moved_on(place, p) end
                 out[place] = moved
             end
+            ::next_marker::
         end
     end
     for _, place in ipairs(sorted_places(base)) do
@@ -3002,7 +3100,9 @@ function Builder:snapshot()
              gs_extra = self.gs_extra and copy(self.gs_extra),
              escapes = #self.escapes, emissions = #self.emissions,
              locals = self.fn and #self.fn.locals, shrinks = self.shrink_log and #self.shrink_log or 0,
-             transfers = self.transfer_log and #self.transfer_log or 0 }
+             registered = self.registered and #self.registered or 0,
+             claims = self.gs_claims and copy(self.gs_claims),
+             gs_res = self.gs_res_slots and copy(self.gs_res_slots) }
 end
 
 function Builder:rollback(snap)
@@ -3022,8 +3122,18 @@ function Builder:rollback(snap)
     self.dead = snap.dead
     if self.gs_live then self.gs_live = snap.gs_live and copy(snap.gs_live) or {} end
     if self.gs_extra then self.gs_extra = snap.gs_extra and copy(snap.gs_extra) or {} end
-    -- a discarded round's moves never happened: their slots go back first
-    if self.undo_transfers then self:undo_transfers(snap.transfers or 0) end
+    -- a discarded round's slots are forgotten
+    local reg = self.registered
+    for k = #(reg or {}), (snap.registered or 0) + 1, -1 do
+        local slot = reg[k]
+        local list = self.gs_owned and self.gs_owned[slot.block]
+        if list then
+            for i = #list, 1, -1 do if list[i] == slot then table.remove(list, i) break end end
+        end
+        reg[k] = nil
+    end
+    if self.gs_claims then self.gs_claims = snap.claims and copy(snap.claims) or {} end
+    if self.gs_res_slots then self.gs_res_slots = snap.gs_res and copy(snap.gs_res) or {} end
     local owned = self.gs_owned and self.gs_owned[snap.block]
     if owned then
         for k = #owned, 1, -1 do owned[k] = nil end
@@ -3463,16 +3573,15 @@ local build_function
 -- resizable values created since a frame's round began give their space back
 -- before a jump
 function Builder:release_since(frame)
-    local held = {}
-    for _, slot in pairs(frame.gs_mark or {}) do held[slot] = true end
-    for slot in pairs(frame.extra_mark or {}) do held[slot] = true end
-    local slots = self.all_slots and self:all_slots() or {}
-    for i = #slots, 1, -1 do
-        local slot = slots[i]
+    if not self.all_slots then return end
+    local mark = frame.serial_mark or 0
+    local since = {}
+    for _, slot in ipairs(self:all_slots()) do
         -- an owner moved to a place outside the frame (its result) lives on
         local outside = frame.first_id and (root_of(slot.place).id or 0) < frame.first_id
-        if not held[slot] and not outside then slot.release() end
+        if slot.serial > mark and not outside then since[#since + 1] = slot end
     end
+    self:release_slots(since)
 end
 
 -- run a word or loop frame to completion, trampolining known tail rounds and
@@ -3507,7 +3616,7 @@ function Builder:run_frame(desc, args, opts)
         frame.snap = self:snapshot()
         frame.iter_n, frame.iter_state = #self.block, copy(self.state)
         frame.gs_mark = copy(self.gs_live or {})
-        frame.extra_mark = copy(self.gs_extra or {})
+        frame.serial_mark = S.slot_serial and S.slot_serial() or 0
         local ok, res
         if mode == 'loop' then
             ok, res = pcall(self.run_loop, self, frame)
@@ -3688,7 +3797,7 @@ function run_loop_body(self, frame)
     local blk = self:sub(function()
         frame.base_block = self.block
         frame.gs_mark = copy(self.gs_live or {})
-        frame.extra_mark = copy(self.gs_extra or {})
+        frame.serial_mark = S.slot_serial and S.slot_serial() or 0
         ok, err = pcall(desc.body, unpack(vals, 1, #frame.args))
         if ok and not self.dead then
             -- falling off the end leaves the loop / returns Unit
@@ -4181,18 +4290,15 @@ function Builder:return_value(frame, v)
         for _, l in ipairs(leaves(place)) do
             if tracked(l) then self:materialize(l) end
         end
-        -- what this exit gives up holds on this path only: the others still
-        -- hold it after the return, so its bookkeeping is taken back then
-        local mark = self.transfer_log and #self.transfer_log or 0
         h.place_result(self, place)
-        self:hand_off(place)
+        -- the returned owner leaves on this path: nothing here releases it
+        S.mark_moved(place, { name = 'the result' }, self:hand_off(place))
         local result = self:new_temp(frame.ret)
         self:emit { op = 'let', place = result, e = read_expr(place), what = 'an owner result' }
         self:release_extras()
         local stmt = { op = 'ret', e = read_expr(result), T = frame.ret }
         h.note_root_exit(self, stmt)
         self:emit(stmt)
-        self:undo_transfers(mark)
         self.dead = true
         return
     end
@@ -4682,31 +4788,33 @@ end
 -- build a function; if a recursive site assumed it moves nothing out of a Ref
 -- argument and it does, build it again knowing its moves
 h.build_with_moves = function(w, args, key, cname, opts)
+    local start = #module.functions
     local ok, fn = pcall(build_function, w, args, key, cname, opts)
     if ok then return fn end
     local sig = fn
     if type(sig) ~= 'table' or (sig.nua_signal ~= 'rebuild_moves' and sig.nua_signal ~= 'rebuild_results') then
         error(sig, 0)
     end
-    local old = sig.fn
-    module.by_key[key] = nil
-    for k = #module.functions, 1, -1 do
-        if module.functions[k] == old then table.remove(module.functions, k) break end
+    -- the function to build again is this one only if the signal names it;
+    -- otherwise an outer level of the recursion starts over
+    local mine = module.functions[start + 1]
+    if sig.fn ~= mine then
+        if not mine then error(sig, 0) end
+        error(sig, 0)
     end
-    for _, other in ipairs(module.functions) do
-        for _, site in ipairs(other.owner_sites or {}) do
-            if site.callee == old then
-                fail(('%s moves an owner out of a Ref argument through a recursion with other words; '
-                    .. 'this is not supported yet'):format(w.name), 4)
-            end
-        end
+    -- everything built inside it is built again too
+    for k = #module.functions, start + 1, -1 do
+        local f = module.functions[k]
+        if module.by_key[f.key] == f then module.by_key[f.key] = nil end
+        if module.export_by_key[f.key] == f then module.export_by_key[f.key] = nil end
+        module.functions[k] = nil
     end
     local o = {}
     for k2, v in pairs(opts or {}) do o[k2] = v end
-    o.moves_known = old.moves_out or old.moves_known
-    o.result_allocs = sig.result_allocs or old.result_allocs
+    o.result_allocs = sig.result_allocs or (sig.nua_signal == 'rebuild_results' and mine.result_allocs)
+        or o.result_allocs
     o.rebuilds = (o.rebuilds or 0) + 1
-    if o.rebuilds > 8 then fail(('%s: placing its owner results does not settle'):format(w.name), 4) end
+    if o.rebuilds > 16 then fail(('%s: placing its owner results does not settle'):format(w.name), 4) end
     return h.build_with_moves(w, args, key, cname, o)
 end
 
@@ -4789,10 +4897,30 @@ function Builder:emit_call(w, fn, args)
     end
     local call = { op = 'call', fn = fn, args = cargs, T = w.ret,
                    gs_off = self.gs_offset and self:gs_offset() or 0 }
+    -- the call graph, for recursions: who calls whom, and where
+    if self.fn then
+        self.fn.callees = self.fn.callees or {}
+        self.fn.callees[fn] = true
+        call.caller = self.fn
+    end
+    fn.call_nodes = fn.call_nodes or {}
+    table.insert(fn.call_nodes, call)
     local placement
-    if w.ret.resizable then placement = h.result_destination(self, w, fn, done, call, args) end
+    if w.ret.resizable or fn.has_res then placement = h.result_destination(self, w, fn, done, call, args) end
     local result
-    if w.ret.kind == 'unit' then
+    if call.after_call then
+        -- the value comes out first; then the region is rewound
+        local after = call.after_call
+        call.after_call = nil
+        if w.ret.kind == 'unit' then
+            self:emit { op = 'expr', e = call, what = 'a call to ' .. w.name }
+        else
+            local t = self:new_temp(w.ret)
+            self:emit { op = 'let', place = t, e = call, what = 'a call to ' .. w.name }
+            result = h.reref(h.with_view(dyn(w.ret, read_expr(t)), result_view))
+        end
+        for _, r in ipairs(after) do r() end
+    elseif w.ret.kind == 'unit' then
         self:emit { op = 'expr', e = call, what = 'a call to ' .. w.name }
     elseif w.ret.resizable then
         -- an owner result: its header comes back by value; it lies where this
@@ -4812,7 +4940,7 @@ function Builder:emit_call(w, fn, args)
     -- to, and is built again if it turns out to
     for i, a in ipairs(args) do
         if is_value(a) and a.k == 'ref' and a.T.elem.resizable then
-            local moves = done and fn.moves_out or (not done and fn.moves_known)
+            local moves = done and fn.moves_out or (not done and module.moves_known and module.moves_known[fn.key])
             if not done then
                 fn.assumed_no_move = fn.assumed_no_move or {}
                 fn.assumed_no_move[i] = true
@@ -4847,8 +4975,10 @@ end
 -- construct the residual C function for a specialization key
 function build_function(w, args, key, cname, opts)
     local fn = h.new_fn(w.name, w, key)
-    fn.moves_known = opts and opts.moves_known
     fn.result_allocs = opts and opts.result_allocs
+    -- the functions being built, outermost first, and where each began
+    module.building = module.building or {}
+    table.insert(module.building, { fn = fn, start = #module.functions })
     fn.task = opts and opts.task
     fn.capture = opts and opts.capture
     fn.cname = cname and unique(module.names, cname) or unique(module.names, w.name)
@@ -4913,7 +5043,7 @@ function build_function(w, args, key, cname, opts)
         local m = 0
         for _, j in pairs(fn.result_allocs or {}) do m = math.max(m, j.last + 1) end
         fn.result_stacks = m
-        table.insert(fn.params, 1, { name = 'gs_res', T = types.U64 })
+        h.give_result_region(fn)
     end
 
     push_builder(b)
@@ -4941,6 +5071,9 @@ function build_function(w, args, key, cname, opts)
     pop_frame(b)
     pop_builder()
     if profile then profile:pop() end
+    for k = #module.building, 1, -1 do
+        if module.building[k].fn == fn then table.remove(module.building, k) break end
+    end
     if not ok then error(err, 0) end
     if fn.top_label then
         -- tail self-calls jump to the top: the body is a loop
@@ -5051,7 +5184,7 @@ function S.resolve_runtime(cname)
         module.lazy_fns[cname] = same
         return same
     end
-    fn = build_function(w, args, key .. '@' .. cname, cname)
+    fn = h.build_with_moves(w, args, key .. '@' .. cname, cname)
     fn.export_name = cname
     module.export_by_key[key] = fn
     module.lazy_fns[cname] = fn
@@ -5092,9 +5225,9 @@ function S.export_word(w, cname)
         fn.exported = true
         fn.cname = unique(module.names, cname)
     elseif fn then
-        fn = build_function(w, args, key .. '@' .. cname, cname)
+        fn = h.build_with_moves(w, args, key .. '@' .. cname, cname)
     else
-        fn = build_function(w, args, key, cname)
+        fn = h.build_with_moves(w, args, key, cname)
     end
     fn.export_name = fn.export_name or cname
     module.export_by_key[key] = fn
@@ -5167,7 +5300,7 @@ function S.native_word(w)
         end
     end
     natives = natives + 1
-    local fn = build_function(w, args, spec_key(w, args) .. '@native' .. natives, 'native_' .. natives)
+    local fn = h.build_with_moves(w, args, spec_key(w, args) .. '@native' .. natives, 'native_' .. natives)
     fn.exported = true
     return fn
 end

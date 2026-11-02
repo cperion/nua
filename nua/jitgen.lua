@@ -337,6 +337,12 @@ function Fn:expr(e)
     elseif op == 'stack_index' then
         if e.offset == 0 then return self:gs_sp() end
         return ctx:binop('+', self:gs_sp(), ctx:int_const(C.SIZE, e.offset))
+    elseif op == 'res_index' then
+        -- result stack j of e.fn, at its offset in its recursion's region
+        local n = (e.fn.res_offset or 0) + e.j
+        local base = self:param_lv('gs_res')
+        if n == 0 then return base end
+        return ctx:binop('+', base, self:const(types.U64, n))
     elseif op == 'conv' then
         return ctx:conv(self:expr(e.a), u:ct(e.T))
     elseif op == 'field' then

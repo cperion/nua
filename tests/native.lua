@@ -100,6 +100,9 @@ check('owner moved out through a Ref parameter', owners.ref_moves(4, true) == 41
 check('owner moved out through a recursion', owners.recursive_move(3) == 3)
 check('recursive word returning an owner it grew', owners.counted(4) == 4010)
 check('recursive results combined, reclaimed by the caller', owners.tree(3) == 2024)
+check('mutual recursion with different owner results', owners.mutual(3) == 4 and owners.mutual_calls(3) == 4)
+check('owner moved out through a mutual recursion', owners.mutual_move(3) == 3
+    and owners.mutual_move_calls(3) == 3)
 
 -- Omitted annotations infer native places, on the same prepared IR as C.
 local inferred = nua.load(root .. '/examples/inferred_locals.nua')

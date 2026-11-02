@@ -17,7 +17,10 @@ local function extend(T, p, what, counts_slots)
         local h = p.header owner
         -- a Store counts slots in a U32 (its Ids name them): no product overflows
         if not counts_slots then
-            if length > maximum / width then trap(what .. " is full") end
+            -- the byte count must not wrap (a division check: a widened U32
+            -- length would make a comparison with the maximum a tautology)
+            local bytes = length * width
+            if bytes / width ~= length then trap(what .. " is full") end
         end
         stacks.extend h.stack h.base (length * width) width message
     end
@@ -147,8 +150,8 @@ function storage.grow(T, p)
     -- an empty owner takes n zeroed elements (Array(T, n) {} with a runtime n)
     api.allocate = do(g: Ref T, n: U64): Unit
         local h = p.header g
-        if n > maximum / p.width() then trap "Array is too large" end
         local bytes = n * p.width()
+        if bytes / p.width() ~= n then trap "Array is too large" end
         if bytes ~= 0 then
             local at = stacks.extend(h.stack, h.base, U64 0, bytes,
                 "Array was not at the top of its data stack when built")
