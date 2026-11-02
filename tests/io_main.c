@@ -1,5 +1,7 @@
 /* Harness for examples/io.nua: run with whichever backend is linked in. */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "nua_rt.h"
@@ -18,7 +20,11 @@ int main(void) {
     uint32_t i, want = 0;
     CHECK(pipe_roundtrip() == 12);
     for (i = 0; i < 100; i++) want += (uint8_t)(i * 7);
-    CHECK(file_roundtrip("/tmp/nua_io_test.bin") == want);
+    /* the backends' runs are parallel: each process has its own file */
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/nua_io_test.%ld.bin", (long)getpid());
+    CHECK(file_roundtrip(path) == want);
+    remove(path);
     CHECK(timeout_then_data() == 31);           /* timed out (1), then 3 bytes (30) */
     CHECK(echo(1) == 1);
     CHECK(echo(20) == 20);
