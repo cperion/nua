@@ -2045,7 +2045,7 @@ uint32_t fixed(void) {
 * Fully known array contents are immutable aggregate values in the evaluator. A typed local keeps its whole pending value; known-index reads and known writes can fold. Copies keep independent snapshots, including nested arrays and structs. Compact zero contents do not require one compiler cell per element.
 * A dynamic write or a read requiring runtime indexing materializes the array conservatively; the implementation does not maintain a partly known element map afterward. Different branch results materialize on their respective paths, and loops widen as other tracked values do. Equal known contents may stay known.
 * `a:slice()` is a live read-only view of the owner, not a snapshot of its contents. It can read known elements without creating an address. Once a raw address or foreign boundary requires memory, pending values are written and affected knowledge is invalidated. Explicit `Ptr(...)` remains the runtime boundary of §12.1; this is not a compile-time heap.
-* Elements are fixed-size: scalars, structs, sums, arrays and channels; never references or slices. An array is sendable when its elements are.
+* Elements are fixed-size: scalars, structs, sums, arrays, channels, references and views. An array holding a borrow follows the lifetime rule as a whole (§9.5). An array is sendable when its elements are.
 
 ## 14. Text
 
@@ -2132,7 +2132,7 @@ A `c:str()` view records an owner, offset and the length at creation. It reads t
 
 [The staged-values example](../examples/staged_values.nua) exercises these distinctions across known, split and dynamic inputs, nested fields, joins, loops, raw address escape and task captures. A task's view addresses its own captured value, never the parent's later contents.
 
-A struct field may be a `Str`; the struct then borrows what the `Str` borrows and follows the same lifetime rule (§9.7). Globals, stores, Grow arrays, maps and channel messages cannot hold one: store text that must outlive its owner as `Chars(n)` or in a `Text`.
+A struct field may be a `Str`; the struct then borrows what the `Str` borrows and follows the same lifetime rule (§9.7). A store or Grow element may hold one, checked against the container's owner (§9.6). Globals hold only a `Str` of static data or of another global; maps and channel messages hold none. Store text that must outlive its owner as `Chars(n)` or in a `Text`.
 
 ### 14.4 What is implemented
 
