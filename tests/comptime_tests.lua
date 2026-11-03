@@ -71,7 +71,8 @@ local function without_includes(text) return text:gsub('#include[^\n]*\n', '') e
 check('successful tests leave no residual code', without_includes(code) == without_includes(empty), code)
 check('no residual test functions or exports', #mod.functions == 0 and #mod.exports == 0)
 check('no test registry or residual statements', mod.tests == nil and stage.emitted() == 0)
-check('old check binding removed', nua.prelude().check == nil and stage.check == nil)
+-- the prelude loads the library's owner types, so it is built inside a compilation
+check('old check binding removed', pcall(compile, 'assert(__ENV.check == nil)') and stage.check == nil)
 
 local with_tests, exported = compile(source .. '\nexport add\n')
 local baseline = compile('local add = do(a: U32, b: U32): U32 = a + b\nexport add\n')

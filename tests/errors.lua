@@ -110,6 +110,10 @@ export f
       src = [[local M = Map(F64, U32)]] },
     { name = 'nested mutable maps', expect = 'Map value must be fixed-size owned data',
       src = [[local M = Map(U32, Map(U32, U32))]] },
+    { name = 'owners as text-keyed map values', expect = 'Map(Str, V) value must be fixed-size owned data',
+      src = [[local M = Map(Str, Grow U32)]] },
+    { name = 'owners as borrowing map values', expect = 'Map.borrowing value must be fixed-size data',
+      src = [[local M = Map.borrowing(Str, Grow U32)]] },
     { name = 'a map created while compiling', expect = 'runtime storage',
       src = [[local M = Map(U32, U32)
 local f = do(): U32

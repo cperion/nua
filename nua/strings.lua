@@ -1,13 +1,13 @@
 -- nua.strings: text.
 --
 --   Str        a read-only view of bytes (a Slice U8 with text words)
---   Text       Grow U8 with text words: owned text, built in place
---   Chars(n)   short text as a value: a length and n bytes
+--
+-- Text (Grow U8 with text words) and Chars(n) (short text as a value) are library types:
+-- lib/text.nua.
 --
 -- A Str literal is known while compiling, and so are its bytes: the text
 -- words (lib/str.nua, written in Nua) run while compiling over known text and
--- unroll over known parts. Text:write is formatted while specializing: known
--- pieces become one literal, each runtime value the conversion its type needs.
+-- unroll over known parts.
 
 local S = require 'nua.stage'
 local types = require 'nua.types'
@@ -129,7 +129,7 @@ function methods.cstring(self, body)
     end
     -- runtime text: copy it to a Text on the data stack, NUL-terminate, lend the
     -- bytes to body. Appending and pushing are the storage words.
-    local TextType = Str.Text
+    local TextType = Mem.owners.Grow(U8)
     local text = S.decl(TextType, TextType({}), 'cstring_text')
     local p = S.resolve_checked(text)
     local api = Mem.storage_library(TextType)
@@ -199,59 +199,6 @@ function Str.of(x)
 end
 rawset(T, 'of', Str.of)
 
--- Chars(n) ---------------------------------------------------------------------------------------
-
-function Str.Chars(n)
-    local ok, t = pcall(types.chars, n)
-    if not ok then fail((tostring(t):gsub('^[^:]+:%d+: ', '')), 2) end
-    if not rawget(t, 'construct_text') then
-        rawset(t, 'construct_text', true)
-        rawset(t, '__member', S.member_chars)
-        -- Chars(n) "text" or Chars(n)(s): filled from text; Chars(n)() is empty
-        rawset(t, 'construct', function(x)
-            if x == nil or (type(x) == 'table' and not S.is_staged(x) and next(x) == nil) then
-                return S.zero_value(t)
-            end
-            local s = as_str(x, t.display)
-            local kt = Str.known_text(s)
-            if kt and #kt > n then
-                fail(('%s holds %d bytes; this text has %d'):format(t.display, n, #kt), 3)
-            end
-            if not kt and not S.cur().fn then
-                fail(t.display .. ' from unknown text needs runtime storage', 3)
-            end
-            return require('nua.chars').from(t)(s)
-        end)
-    end
-    return t
-end
-
--- c:str() views the text; c.length is its length
-function S.member_chars(x, key)
-    local t = S.value_of(x, nil, 'Chars').T
-    if key == 'length' then
-        -- stored as U32 (n is at most 65536); every length is a U64
-        if S.is_place(x) then return types.U64(S.cur():read(S.field_place(x, 'len'))) end
-        local value = S.value_of(x, t, 'Chars.length')
-        if value.k == 'agg' then return types.U64(value.f.len) end
-        return types.U64(S.dyn(U32, { op = 'field', a = S.ex(value), name = 'len', T = U32 }))
-    end
-    if key == 'str' then
-        return function(self)
-            if not S.is_place(self) then fail(t.display .. ':str() views storage: call it on a typed local or a field', 2) end
-            local ptr = S.array_pointer(S.field_place(self, 'bytes'))
-            local len = S.cur():bind(types.U64(S.cur():read(S.field_place(self, 'len'))))
-            return S.make_slice(T, ptr, len, S.owner_token(self))
-        end
-    end
-    return nil
-end
-
--- Text: Grow U8 with text words --------------------------------------------------------------------
-
-local Text = Mem.Grow(U8)
-Str.Text = Text
-
 -- A float known while compiling folds to its shortest round-tripping text. The
 -- decimal conversion itself is the Nua word in lib/format.nua; only the fold is
 -- here, because it must happen while compiling.
@@ -270,18 +217,6 @@ function S.float_text(value)
     end
 end
 S.arity[S.float_text] = 1
-
-local function show(v)
-    if v.T.kind == 'cstr' then return v.v end
-end
-
-local text_methods = rawget(Text, 'builtin_methods')
-local function append_text(p, text)
-    if not S.is_known(text) then
-        text = Mem.capture(text, 'capturing text metadata')
-    end
-    return Mem.storage_library(Text).append(S.Ref(p), text)
-end
 
 -- Decimal text known while compiling parses with Lua's number reader; the
 -- grammar is the library's (no hex, no inf/nan), and the runtime path is
@@ -323,99 +258,9 @@ function S.parse_float_known(v)
 end
 S.arity[S.parse_float_known] = 1
 
--- t:write(a, b, ...): each value as text, known pieces joined while compiling
-text_methods.write = function(self, ...)
-    local p = Mem.receiver(self, 'Text:write')
-    S.note_growth(p)
-    local b = S.cur()
-    if not b.fn then fail('a Text is runtime storage: it is written where it runs', 2) end
-    b.fn.uses_rt = true
-    local pending = {}
-    local function flush()
-        if #pending == 0 then return end
-        local s = table.concat(pending)
-        pending = {}
-        local lit = S.str_literal(s)
-        S.bump_checked()
-        append_text(p, lit)
-    end
-    local n = select('#', ...)
-    for i = 1, n do
-        local x = select(i, ...)
-        -- Host literals enter the same Nua formatting words as typed operands.
-        -- Preserve floating negative zero rather than coercing it to integer 0.
-        if type(x) == 'boolean' then x = S.known(types.Bool, x)
-        elseif type(x) == 'number' and x == math.floor(x) and math.abs(x) < 2 ^ 53
-            and not (x == 0 and 1 / x == -math.huge) then x = types.I64(x)
-        elseif type(x) == 'number' then x = types.F64(x) end
-        if type(x) == 'string' then
-            pending[#pending + 1] = x
-        elseif type(x) == 'number' then
-            pending[#pending + 1] = show(S.known(types.F64, x))
-        else
-            local v = S.value_of(x, nil, 'write')
-            if v.T.kind == 'int' or v.T.kind == 'bool' then
-                local format = require('nua.format')
-                if v.T.kind == 'bool' then v = format.boolean(v)
-                else
-                    local result = v.T.signed and format.i64(types.I64(v)) or format.u64(types.U64(v))
-                    local digits = S.decl(result.T, result, 'formatted')
-                    v = S.mcall(digits, 'str')
-                end
-            end
-            local kt = v.T == T and Str.known_text(v)
-            if kt then
-                pending[#pending + 1] = kt
-            elseif v.T.kind == 'float' then
-                flush()
-                local result = require('nua.format').f64(types.F64(v))
-                local digits = S.decl(result.T, result, 'formatted_float')
-                S.bump_checked()
-                append_text(p, S.mcall(digits, 'str'))
-            elseif v.k == 'known' and show(v) then
-                pending[#pending + 1] = show(v)
-            else
-                flush()
-                S.bump_checked()
-                local tk = v.T.kind
-                if v.T == T then
-                    append_text(p, v)
-
-                elseif tk == 'cstr' then
-                    local s = Str.of(v)
-                    append_text(p, s)
-                else
-                    fail(('write: cannot write a %s as text (numbers, Bool, Str, CString)'):format(v.T.display), 2)
-                end
-            end
-        end
-    end
-    flush()
-end
-
-text_methods.clear = function(self)
-    local p = Mem.receiver(self, 'Text:clear')
-    local b = S.cur()
-    if b.fn then b.fn.uses_rt = true end
-    Mem.storage_library(Text).clear(S.Ref(p))
-end
-
--- t:str(): the text as a Str borrowing t, of the length t has now. The text may
--- grow while the Str is used; clearing it ends the Str.
-text_methods.str = function(self)
-    local xs = text_methods.all(self)
-    local ptr, len = S.slice_parts(xs)
-    return S.make_slice(T, ptr, len, rawget(xs, 'view'))
-end
-S.arity[text_methods.write] = nil
-S.arity[text_methods.clear] = 1
-S.arity[text_methods.str] = 1
-
 -- names for programs
 function Str.prelude(env)
     env.Str = T
-    env.Text = Text
-    env.Chars = Str.Chars
 end
 
 return Str

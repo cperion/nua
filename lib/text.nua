@@ -1,0 +1,83 @@
+-- The text library types: `Chars n` (short text as a value) and the words of `Text`, which is
+-- `Grow U8`. A Text is built in place; known pieces written to it join while specializing and
+-- each runtime value becomes the conversion its type needs (lib/format.nua). `Str` stays a
+-- compiler type (nua.strings): literals and knownness depend on it.
+local S = require "nua.stage"
+local types = require "nua.types"
+local Mem = require "nua.memory"
+local strings = require "nua.strings"
+local text = {}
+local T = types.Str
+local U8, U32 = types.U8, types.U32
+local as_str = strings.as_str
+
+local function fail(msg, level) S.fail(msg, (level or 2) + 1) end
+
+-- Chars(n) ---------------------------------------------------------------------------------------
+
+-- c:str() views the text; c.length is its length
+local function member_chars(x, key)
+    local t = S.value_of(x, nil, 'Chars').T
+    if key == 'length' then
+        -- stored as U32 (n is at most 65536); every length is a U64
+        if S.is_place(x) then return types.U64(S.cur():read(S.field_place(x, 'len'))) end
+        local value = S.value_of(x, t, 'Chars.length')
+        if value.k == 'agg' then return types.U64(value.f.len) end
+        return types.U64(S.dyn(U32, { op = 'field', a = S.ex(value), name = 'len', T = U32 }))
+    end
+    if key == 'str' then
+        return function(self)
+            if not S.is_place(self) then fail(t.display .. ':str() views storage: call it on a typed local or a field', 2) end
+            local ptr = S.array_pointer(S.field_place(self, 'bytes'))
+            local len = S.cur():bind(types.U64(S.cur():read(S.field_place(self, 'len'))))
+            return S.make_slice(T, ptr, len, S.owner_token(self))
+        end
+    end
+    return nil
+end
+
+
+function text.Chars(n)
+    local ok, t = pcall(types.chars, n)
+    if not ok then fail((tostring(t):gsub('^[^:]+:%d+: ', '')), 2) end
+    if not rawget(t, 'construct_text') then
+        rawset(t, 'construct_text', true)
+        rawset(t, '__member', member_chars)
+        -- Chars(n) "text" or Chars(n)(s): filled from text; Chars(n)() is empty
+        rawset(t, 'construct', function(x)
+            if x == nil or (type(x) == 'table' and not S.is_staged(x) and next(x) == nil) then
+                return S.zero_value(t)
+            end
+            local s = as_str(x, t.display)
+            local kt = strings.known_text(s)
+            if kt and #kt > n then
+                fail(('%s holds %d bytes; this text has %d'):format(t.display, n, #kt), 3)
+            end
+            if not kt and not S.cur().fn then
+                fail(t.display .. ' from unknown text needs runtime storage', 3)
+            end
+            return require('nua.chars').from(t)(s)
+        end)
+    end
+    return t
+end
+
+
+-- Text ---------------------------------------------------------------------------------------------
+
+-- The words a Text offers beyond Grow's are library words (g:write, g:str in lib/storage.nua);
+-- this only states that a Text is written where it runs.
+function text.methods(t)
+    local methods = {}
+    local write = Mem.adapter(t, 'write')
+    methods.write = function(self, ...)
+        if not S.cur().fn then fail('a Text is runtime storage: it is written where it runs', 2) end
+        return write(self, ...)
+    end
+    methods.str = Mem.adapter(t, 'str')
+    S.arity[methods.write] = nil
+    S.arity[methods.str] = 1
+    return methods
+end
+
+return text

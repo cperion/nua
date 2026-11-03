@@ -107,7 +107,7 @@ function layout.storage(T, R, Elem, Slot, view, make_id, components)
     return p
 end
 function layout.maps(T, Entry, view)
-    local str = T.kind == "strmap"
+    local str = T.family == "StrMap"
     local EP = Ptr Entry
     local Cells = Ptr U32
     local Stored = Entry.index.key.type

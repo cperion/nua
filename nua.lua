@@ -31,7 +31,6 @@ local loader = require 'nua.loader'
 -- or discard native-backend/FFI state. This does not load libgccjit itself.
 local Mem = require 'nua.memory'
 local Str = require 'nua.strings'
-local Maps = require 'nua.maps'
 local Native = require 'nua.native'
 
 local nua = {}
@@ -81,6 +80,7 @@ function nua.prelude()
     env.ns, env.us, env.ms, env.seconds = S.ns, S.us, S.ms, S.seconds
     env.fence = S.fence
     env.trap = S.trap
+    env.TODO = S.trap    -- TODO "message": work not written yet; it traps with the message
     env.atomic_ptr = S.atomic_ptr
     env.bytes = S.bytes
     env.size_of = S.size_of
@@ -108,7 +108,6 @@ function nua.prelude()
     env.band, env.bor, env.bxor, env.shl, env.shr, env.bnot = S.band, S.bor, S.bxor, S.shl, S.shr, S.bnot
     Mem.prelude(env)
     Str.prelude(env)
-    Maps.prelude(env)
     return env
 end
 

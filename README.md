@@ -202,8 +202,9 @@ headless SDL checks. With SDL3 installed, run `make test-canvas` and then
 | Specialization, state, words, control, tasks | `nua/stage.lua` |
 | Goose storage and record layouts | `nua/memory.lua` |
 | Immutable fixed-array contents | `nua/array_value.lua` |
-| Text types and their compile-time fold | `nua/strings.lua` |
-| `Map` type hooks (including `Map(Str, V)`) | `nua/maps.lua` |
+| `Str` and its compile-time fold | `nua/strings.lua` |
+| `Text`, `Chars` and the `Text` words | `lib/text.nua` |
+| Owner type declarations (`Store`, `Grow`, `Array`, `Map`) | `lib/owners.nua`, `lib/map.nua` |
 | Module loader and compilation scope | `nua/loader.lua` |
 | C / libgccjit backends | `nua/cgen.lua`, `nua/jitgen.lua` |
 | Shared C rules / compiler-owned C reader | `nua/cjit.lua`, `nua/gccjit_h.lua` |

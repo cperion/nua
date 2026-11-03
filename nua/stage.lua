@@ -1007,6 +1007,24 @@ end
 S.set_iteration_key = function(place, key)
     for _, owner in ipairs(h.owners_of(place)) do rawset(owner, 'iteration_key', key) end
 end
+-- fixed(owner, body): the owner's structure is fixed while the body is compiled; an insertion or
+-- removal through any place of it is rejected there (design memory.md §10.1). The body's
+-- statements join the current block, as `m:each` does.
+S.fixed = function(ref, body)
+    local place = h.effect_owner(ref, 'fixed')
+    local b = cur()
+    local state = {}
+    for k, v in pairs(b.state) do state[k] = v end
+    local block, after, dead = b:sub(function()
+        S.begin_iteration(place)
+        local ok, err = pcall(body)
+        S.end_iteration(place)
+        if not ok then error(err, 0) end
+    end, state, 'known')
+    for _, statement in ipairs(block) do b.block[#b.block + 1] = statement end
+    b.state, b.dead = after, dead
+    S.bump_checked()
+end
 -- `key`: the semantic key of an insert-or-replace; it may name the visited entry
 S.note_structure = function(place, what, key)
     h.check_iterating(place, what, key)
@@ -5154,7 +5172,7 @@ function Builder:emit_call(w, fn, args)
     end
     -- the callee may insert into or remove from a Map argument: not while it is iterated
     for i, a in ipairs(args) do
-        if is_value(a) and a.k == 'ref' and (a.T.elem.kind == 'map' or a.T.elem.kind == 'strmap') then
+        if is_value(a) and a.k == 'ref' and rawget(a.T.elem, 'iterates') then
             if not done or (fn.restructures and fn.restructures[i]) then
                 -- a word still being built is assumed to change it (it is built again if not)
                 if done then

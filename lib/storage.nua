@@ -159,6 +159,99 @@ function storage.grow(T, p)
             h.len = length + n
         end
     end
+    if T.elem == U8 then
+        -- g:write(a, b, ...): each part as text. Known parts join while specializing and
+        -- become one literal; each runtime part is the conversion its type needs.
+        local format = require "nua.format"
+        local strings = require "nua.strings"
+        local value_of, known_text = __S.value_of, strings.known_text
+        -- a host number or boolean is the typed value Nua would give it
+        local function normalize(part)
+            if type(part) == "boolean" then return __S.known(Bool, part) end
+            if type(part) == "number" then
+                -- negative zero stays a float
+                if part == math.floor(part) and math.abs(part) < 2 ^ 53 and not (part == 0 and 1 / part == -math.huge) then
+                    return I64(part)
+                end
+                return F64(part)
+            end
+            return part
+        end
+        -- what a runtime part is: "bool", "int", "signed", "float", "str", "cstring" or "other"
+        local function kind_of(part)
+            local t = value_of(part, nil, "write").T
+            if t.kind == "bool" then return "bool" end
+            if t.kind == "int" then return t.signed and "signed" or "int" end
+            if t.kind == "float" then return "float" end
+            if t == Str then return "str" end
+            if t.kind == "cstr" then return "cstring" end
+            return "other"
+        end
+        local function reject(part)
+            __S.fail("write: cannot write a " .. value_of(part, nil, "write").T.display ..
+                " as text (numbers, Bool, Str, CString)", 2)
+        end
+        local function known_cstring(part)
+            local v = value_of(part, nil, "write")
+            if v.k == "known" and v.T.kind == "cstr" then return v.v end
+        end
+        local function append(g, text)
+            __S.bump_checked()
+            api.append(g, text)
+        end
+        -- the text written so far that is known goes out as one literal
+        local function flush(g, pending)
+            if pending ~= "" then append(g, pending) end
+            return ""
+        end
+        -- known text joins what is pending; anything else is written after it
+        local function put(g, pending, text)
+            local known = known_text(text)
+            if known then return pending .. known end
+            flush(g, pending)
+            append(g, text)
+            return ""
+        end
+        api.write = do(g: Ref T, ..parts): Unit
+            grows g
+            local pending = ""
+            for i = 1, parts.length do
+                local part = normalize(parts[i])
+                if type(part) == "string" then
+                    pending = pending .. part
+                else
+                    local kind = kind_of(part)
+                    if kind == "bool" then
+                        pending = put(g, pending, format.boolean(part))
+                    elseif kind == "signed" then
+                        local digits = format.i64(I64 part)
+                        pending = put(g, pending, digits:str())
+                    elseif kind == "int" then
+                        local digits = format.u64(U64 part)
+                        pending = put(g, pending, digits:str())
+                    elseif kind == "float" then
+                        pending = flush(g, pending)
+                        local digits = format.f64(F64 part)
+                        append(g, digits:str())
+                    elseif kind == "str" then
+                        pending = put(g, pending, part)
+                    elseif kind == "cstring" then
+                        local known = known_cstring(part)
+                        if known then pending = pending .. known
+                        else pending = put(g, pending, strings.of(part)) end
+                    else
+                        reject(part)
+                    end
+                end
+            end
+            flush(g, pending)
+        end
+        -- the text as a Str borrowing it, of the length it has now: the text may grow while
+        -- the Str is used; clearing it ends the Str
+        api.str = do(g: Ref T): Str
+            return strings.of(api.all(g))
+        end
+    end
     api.push = do(g: Ref T, value: T.elem): Unit
         grows g
         local h = p.header g

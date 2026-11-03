@@ -101,18 +101,6 @@ function T.element(elem)
     return not (k == 'unit' or k == 'opaque' or k == 'atomic' or k == 'group' or elem.resizable)
 end
 
-function T.store(elem)
-    check_type(elem, 'Store')
-    if not T.element(elem) then
-        error('Store holds fixed-size values, not ' .. elem.display, 2)
-    end
-
-    return memoized('store', elem, function()
-        return { kind = 'owner', family = 'store', elem = elem, display = 'Store ' .. elem.display,
-                 resizable = true }
-    end)
-end
-
 function T.id(elem)
     check_type(elem, 'Id')
     return memoized('id', elem, function()
@@ -120,29 +108,24 @@ function T.id(elem)
     end)
 end
 
-function T.grow(elem)
-    check_type(elem, 'Grow')
-    if not T.element(elem) then
-        error('Grow holds fixed-size values, not ' .. elem.display, 2)
+-- A library owner type (design memory.md §10.1): `family` names the declaration that
+-- states its header, stacks, algorithms and operations; the type is only its identity,
+-- from the family, the optional key type and the element. What a family admits is its
+-- declaration's rule (T.element, T.map_key and T.map_value are the predicates).
+local owner_memo = {}
+function T.owner(family, elem, display, key)
+    check_type(elem, family)
+    if key ~= nil then check_type(key, family) end
+    local by_family = owner_memo[family]
+    if not by_family then by_family = {}; owner_memo[family] = by_family end
+    local by_key = by_family[key or false]
+    if not by_key then by_key = setmetatable({}, { __mode = 'k' }); by_family[key or false] = by_key end
+    local t = by_key[elem]
+    if not t then
+        t = new { kind = 'owner', family = family, elem = elem, key = key, display = display, resizable = true }
+        by_key[elem] = t
     end
-
-    return memoized('grow', elem, function()
-        return { kind = 'owner', family = 'grow', elem = elem, display = 'Grow ' .. elem.display,
-                 resizable = true }
-    end)
-end
-
--- Array T: an owner of elements whose count is fixed when it is built, at
--- runtime (design memory.md §5.1); Array(T, n) with a known n is a value
-function T.rtarray(elem)
-    check_type(elem, 'Array')
-    if not T.element(elem) then
-        error('Array holds fixed-size values, not ' .. elem.display, 2)
-    end
-    return memoized('rtarray', elem, function()
-        return { kind = 'owner', family = 'rtarray', elem = elem, display = 'Array ' .. elem.display,
-                 resizable = true }
-    end)
+    return t
 end
 
 -- structs -----------------------------------------------------------------------------
@@ -526,40 +509,6 @@ local function map_data(t, key, unit, visiting)
 end
 function T.map_key(t) return map_data(t, true, false, {}) end
 function T.map_value(t) return map_data(t, false, false, {}) end
-
-local maps, strmaps = {}, {}
-function T.map(key, value)
-    check_type(key, 'Map key'); check_type(value, 'Map value')
-    if not T.map_key(key) then error('Map key must have fixed semantic equality, not ' .. key.display, 2) end
-    if not T.map_value(value) then error('Map value must be fixed-size owned data, not ' .. value.display, 2) end
-    maps[key] = maps[key] or {}
-    if not maps[key][value] then
-        maps[key][value] = new { kind = 'map', key = key, elem = value, resizable = true,
-            display = ('Map(%s, %s)'):format(key.display, value.display) }
-    end
-    return maps[key][value]
-end
--- Map.borrowing(Str, V): the caller's Str keys are kept, not copied; each is a stored
--- borrow, checked against the map's owner, and keys compare by contents
-local borrowing_maps = {}
-function T.map_borrowing(value)
-    check_type(value, 'Map.borrowing value')
-    if not T.map_value(value) then error('Map.borrowing value must be fixed-size data, not ' .. value.display, 2) end
-    if not borrowing_maps[value] then
-        borrowing_maps[value] = new { kind = 'map', key = T.Str, elem = value, resizable = true, borrowing = true,
-            display = ('Map.borrowing(Str, %s)'):format(value.display) }
-    end
-    return borrowing_maps[value]
-end
-function T.strmap(value)
-    check_type(value, 'Map(Str, V) value')
-    if not T.map_value(value) then error('Map(Str, V) value must be fixed-size owned data, not ' .. value.display, 2) end
-    if not strmaps[value] then
-        strmaps[value] = new { kind = 'strmap', key = T.Str, elem = value, resizable = true,
-            display = ('Map(Str, %s)'):format(value.display) }
-    end
-    return strmaps[value]
-end
 
 -- C sizes for the default target (LP64). Used only for diagnostics; layout is
 -- left to the C compiler.

@@ -102,7 +102,7 @@ sum constructor, §11), and the prelude adds:
   `CString`, `Duration`, and the scalars of §7;
 * **the foreign boundary**: `extern`, `opaque`, `cstruct`,
   `cconst`, `cread`, `bytes`, `size_of`, `view_of`, `atomic_ptr`, `null`, `cformat`,
-  `fence`, `trap`, `rawmember`;
+  `fence`, `trap`, `TODO` (a `trap` that marks work not written yet), `rawmember`;
 * **binding time and the host**: `host`, `dynamic`, `native`, `global`, `fnptr`,
   `test`, `assert`, `Args`;
 * **concurrency**: `tasks`, `first_of`, `recv`, `send`, `after`, `take`, `spawn`,

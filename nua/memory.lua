@@ -29,13 +29,14 @@ local function elem_name(t)
     return t.name
 end
 
--- The families of library owner types (design memory.md §10.1): each is a declaration
--- (its C name, native header, algorithms, operations), and the generic code below reads
--- it. A new owner type is a new entry, not a new branch in the compiler.
+-- The library owner types (design memory.md §10.1): each is a declaration made by a Nua
+-- library module with `owner_type` (lib/owners.nua), and the generic code below reads
+-- it. A new owner type is a new declaration, not a new branch in the compiler.
 local families = {}
 local function family_of(t) return rawget(t, 'family') and families[t.family] end
 
 local function cname_of(t)
+    if rawget(t, 'cname') then return t.cname end    -- a family that names its own types (setup)
     local f = family_of(t)
     if f then return elem_name(t.elem) .. f.suffix end
     if t.kind == 'id' then return elem_name(t.elem) .. 'Id' end
@@ -92,7 +93,7 @@ local function layout_of(t)
     if r then return r end
     local layouts = layouts_module()
     local f = family_of(t)
-    r = { layout = f and layouts[f.layout] or layouts.Id }
+    r = { layout = f and f.header or layouts.Id }
     if f and f.slot then
         r.slot = S.struct(cname_of(t) .. 'Slot', { { 'gen', types.U32 }, { 'next', types.U32 }, { 'value', t.elem } })
     end
@@ -466,29 +467,15 @@ function Builder:init_resizable(p, v)
     S.clear_moved(p)
     local source, text = rawget(v, 'copy_of'), rawget(v, 'copy_text')
     local count, items = rawget(v, 'length'), rawget(v, 'copy_slice')
-    if rawget(p.T, 'init_word') then
-        -- a type with several stacks: one slot each, then its header word over their indices
-        local indices, first = {}, nil
-        for i, fields in ipairs(Mem.release_fields(p.T)) do
-            local k = self:gs_alloc(p, fields)
-            first = first or k
-            indices[i] = Mem.stack_index(k)
-        end
-        rawset(p, 'gs_k', first)
-        p.T.init_word(p, indices)
-        if source then p.T.copy_storage(p, source) end
-        return
+    -- one slot per stack the owner holds, then its init word over their indices
+    local indices, first = {}, nil
+    for i, fields in ipairs(Mem.release_fields(p.T)) do
+        local k = self:gs_alloc(p, fields)
+        first = first or k
+        indices[i] = Mem.stack_index(k)
     end
-    local k = self:gs_alloc(p)
-    storage_library(p.T).layout.init(S.Ref(p), Mem.stack_index(k))
-    -- `copy x`: the new owner receives x's contents (design memory.md §5.5)
-    if source then storage_library(p.T).copy(S.Ref(p), S.Ref(source)) end
-    if text then storage_library(p.T).append(S.Ref(p), text) end
-    if count then storage_library(p.T).allocate(S.Ref(p), count) end
-    if items then
-        local ptr, len = S.slice_parts(items)
-        storage_library(p.T).fill_from(S.Ref(p), ptr, len)
-    end
+    rawset(p, 'gs_k', first)
+    p.T.init_word(p, indices, { copy_of = source, text = text, length = count, items = items })
 end
 
 -- `copy x`: the visible O(n) duplicate of an owner, built in its destination.
@@ -516,12 +503,12 @@ function Mem.copy(x)
     end
     if S.is_place(x) then x = b:read(x) end
     if S.is_value(x) and rawget(x.T, 'is_str') then
-        local v = fresh(require('nua.strings').Text)
+        local v = fresh(Mem.owners.Grow(types.U8))
         rawset(v, 'copy_text', x)
         return v
     end
     if S.is_value(x) and rawget(x.T, 'slice_elem') then
-        local v = fresh(Mem.RtArray(rawget(x.T, 'slice_elem')))
+        local v = fresh(Mem.owners.Array(rawget(x.T, 'slice_elem')))
         rawset(v, 'copy_slice', x)
         return v
     end
@@ -683,11 +670,10 @@ storage_library = function(t)
     local id = f.ids and Mem.Id(t.elem)
     if id then layout_of(id) end
     local representation = layout_of(t)
-    local p = layout.storage(t, representation.layout, t.elem, representation.slot,
+    local p = f.projection and f.projection(t) or layout.storage(t, representation.layout, t.elem, representation.slot,
         function(x) return Mem.view(x, representation.layout) end,
         function(fields) return Mem.record(id, fields) end, S.id_components)
-    local library = require('nua.storage')
-    local api = f.api(library, t, id, p)
+    local api = f.api(t, id, p)
     api.layout = p
     storage_libraries[t] = api
     return api
@@ -695,24 +681,56 @@ end
 
 Mem.storage_library = storage_library
 
--- The operations of a container are the library's words (lib/storage.nua) over a Ref to
--- the owner; their effects on borrows are stated there (design §10.1). The adapter only
--- resolves the receiver and applies the language's index rule (D2: any unsigned integer)
--- to the arguments that are indices.
-local function library_methods(t, names, index_args)
+-- The arguments of a container operation, by what they are (a declaration's `args`):
+--   index       any unsigned integer, checked as U64 (design memory.md §15 D2)
+--   key         a key, converted to the family's key type
+--   stored_key  a key that is stored or named later: captured where it is written
+--   value       an element, converted and captured with the borrows it carries
+local arg_kinds = {
+    index = function(t, f, x) return S.index_value(x) end,
+    key = function(t, f, x) return f.key(t, x) end,
+    stored_key = function(t, f, x) return f.capture_key(t, f.key(t, x)) end,
+    value = function(t, f, x)
+        local given = S.coerce(x, t.elem, (f.label or f.name) .. ' value')
+        local view = S.value_view(given)
+        local v = capture(given, 'capturing a ' .. string.lower(f.label or f.name) .. ' value')
+        if view then rawset(v, 'view', view) end
+        return v
+    end,
+}
+
+-- the place a method receiver denotes, as the family wants it checked
+local function owner_receiver(t, f, x, what)
+    local p = receiver(x, what)
+    if f.receive then f.receive(t, p) end
+    return p
+end
+
+-- The operations of a container are the library's words (lib/storage.nua, lib/map.nua) over
+-- a Ref to the owner; their effects on borrows are stated there (design §10.1). The adapter
+-- only resolves the receiver and converts the arguments the declaration names.
+local function adapter(t, f, name)
     local n = cname_of(t)
-    local methods = {}
-    for _, name in ipairs(names) do
-        methods[name] = function(self, ...)
-            local p = receiver(self, n .. ':' .. name)
-            local b = S.cur()
-            if b.fn then b.fn.uses_rt = true end
-            local count = select('#', ...)
-            local args = { ... }
-            for _, i in ipairs(index_args[name] or {}) do args[i] = S.index_value(args[i]) end
-            return storage_library(t)[name](S.Ref(p), (table.unpack or unpack)(args, 1, count))
-        end
+    local kinds = f.args[name] or {}
+    local has_value = false
+    for _, kind in ipairs(kinds) do has_value = has_value or kind == 'value' end
+    return function(self, ...)
+        local p = owner_receiver(t, f, self, f.keyed and t.display or n .. ':' .. name)
+        local b = S.cur()
+        if b.fn then b.fn.uses_rt = true end
+        local count = select('#', ...)
+        local args = { ... }
+        for i, kind in ipairs(kinds) do args[i] = arg_kinds[kind](t, f, args[i]) end
+        if has_value then S.bump_checked() end
+        return storage_library(t)[name](S.Ref(p), (table.unpack or unpack)(args, 1, count))
     end
+end
+-- for a family's `extra` operations that are still one library word
+function Mem.adapter(t, name) return adapter(t, family_of(t), name) end
+
+local function library_methods(t, f)
+    local methods = {}
+    for _, name in ipairs(f.methods) do methods[name] = adapter(t, f, name) end
     return methods
 end
 
@@ -733,47 +751,41 @@ local function view_methods(t)
     return methods
 end
 
--- the declarations
-families.store = { suffix = 'Store', layout = 'Store', slot = true, ids = true,
-    api = function(library, t, id, p) return library.store(t, id, p) end,
-    methods = { 'add', 'remove', 'has' }, index_args = {}, arity = { add = 2, remove = 2, has = 2 } }
-families.grow = { suffix = 'Grow', layout = 'Grow', views = true,
-    api = function(library, t, id, p) return library.grow(t, p) end,
-    methods = { 'push', 'pop', 'truncate', 'clear' }, index_args = { truncate = { 1 } },
-    arity = { push = 2, all = 1, sub = 3, clear = 1, pop = 1, truncate = 2 } }
--- an Array T: its length is fixed when it is built, so it has no push and no clear
-families.rtarray = { suffix = 'Array', layout = 'Grow', views = true,
-    api = function(library, t, id, p) return library.grow(t, p) end,
-    methods = {}, index_args = {}, arity = { all = 1, sub = 3 },
-    construct = function(t)
-        return function() fail(t.display .. ' is built with its length: Array(' .. t.elem.display .. ', n) {}') end
-    end }
-
--- s[id] and g[i]: an element as a checked place. Its address is computed (and
--- checked: the Id is current, the index in range) when used, and reused for the
--- same index until something could change the storage, which is found again then
-local function index_hook(t)
+-- s[id], g[i] and m[k]: an element as a checked place. Its address is computed (and
+-- checked: the Id is current, the index in range, the key present) when used, and reused
+-- for the same index until something could change the storage, which is found again then
+local function index_hook(t, f)
     local n = cname_of(t)
     return function(x, key)
-        local f = family_of(t)
-        local p = receiver(x, f.ids and n .. '[id]' or n .. '[i]')
-        -- an index is any unsigned integer, checked as U64 (design memory.md §15 D2)
-        local k = f.ids and S.coerce(key, types.id(t.elem), 'Id') or S.index_value(key)
-        k = fix_index(k, 'capturing a storage index')
-        local function resolve() return S.ex(storage_library(t).locate(S.Ref(p), k)) end
+        local keyed = f.index == 'key'
+        local p = owner_receiver(t, f, x, keyed and t.display or (f.ids and n .. '[id]' or n .. '[i]'))
+        local k
+        if keyed then
+            k = arg_kinds.stored_key(t, f, key)
+        else
+            -- an index is any unsigned integer; an Id is the store's own handle
+            k = f.ids and S.coerce(key, types.id(t.elem), 'Id') or S.index_value(key)
+            k = fix_index(k, 'capturing a storage index')
+        end
+        local function resolve() return S.ex(S.value_of(storage_library(t).locate(S.Ref(p), k))) end
         local b = S.cur()
         if b.fn then b.fn.uses_rt = true end
-        local place = S.checked_place(t.elem, nil, nil, true, resolve,
-            n .. '/' .. S.expr_key(addr(p)) .. '/' .. S.expr_key(S.ex(k)))
+        local stable = f.index_stable == nil or f.index_stable(t)
+        local text = S.expr_key(S.ex(S.value_of(k)))
+        local place = S.checked_place(t.elem, nil, nil, stable, resolve,
+            n .. '/' .. S.expr_key(addr(p)) .. '/' .. text)
         -- an element is the container's contents: borrows of it, and borrows
         -- stored in it, are checked against the container's owner
         rawset(place, 'owner_place', p)
+        if keyed then rawset(place, 'element_key', { text = text, known = S.is_known(k) }) end
         return place
     end
 end
 
 local function length(x)
     local p = receiver(x, 'length')
+    local f = family_of(p.T)
+    if f and f.receive then f.receive(p.T, p) end
     return storage_library(p.T).length(S.Ref(p))
 end
 
@@ -800,21 +812,33 @@ local function decorate(t)
     if rawget(t, 'decorated_for') == S.module then return t end
     rawset(t, 'decorated_for', S.module)
     rawset(t, 'decorated', true)
+    local f = family_of(t)
+    -- names, entry types and the representation of this compilation's type
+    if f and f.setup then f.setup(t) end
     rawset(t, 'ctype', function() return cname_of(t) end)
     rawset(t, 'native_layout', function() return layout_of(t).layout end)
     rawset(t, 'cdecl', function() return 'typedef ' .. layout_of(t).layout.cname .. ' ' .. cname_of(t) .. ';' end)
-    local f = family_of(t)
     if not f then return t end    -- an Id has a name and a layout, nothing more
-    local ms = library_methods(t, f.methods, f.index_args)
+    rawset(t, 'init_word', function(p, indices, from)
+        f.init(storage_library(t), S.Ref(p), indices, from)
+    end)
+    if f.stacks then rawset(t, 'release_fields', f.stacks) end
+    local ms = library_methods(t, f)
     if f.views then
         -- the elements are borrowed like a Grow's (g:all(), g:sub(a, b))
         local views = view_methods(t)
         ms.all, ms.sub = views.all, views.sub
         rawset(t, 'viewed_elem', t.elem)
     end
+    -- operations that are not one library word over converted arguments
+    for name, fn in pairs(f.extra and f.extra(t, ms) or {}) do ms[name] = fn end
     for name, fn in pairs(ms) do S.arity[fn] = f.arity[name] end
     rawset(t, 'builtin_methods', merge_methods(t, ms))
-    rawset(t, '__index', index_hook(t))
+    rawset(t, '__index', index_hook(t, f))
+    if f.newindex then
+        rawset(t, '__newindex', function(self, k, value) return ms[f.newindex](self, k, value) end)
+    end
+    rawset(t, 'iterates', f.iterates and true or nil)
     rawset(t, 'properties', merge_properties(t, { length = length }))
     S.member_tables(t)
     rawset(t, 'construct', f.construct and f.construct(t) or function(x)
@@ -868,11 +892,35 @@ function S.release_place(p)
 end
 
 -- for nua.strings: Text is Grow U8 with text methods
-Mem.receiver, Mem.capture, Mem.addr = receiver, capture, addr
+Mem.receiver, Mem.capture, Mem.addr, Mem.fresh = receiver, capture, addr, fresh
 
-Mem.Store = checked(types.store, 'Store')
-Mem.Grow = checked(types.grow, 'Grow')
-Mem.RtArray = checked(types.rtarray, 'Array')
+-- A library module declares an owner type (lib/owners.nua) and gets its type constructor.
+-- Declarations belong to one compilation: they are made again by each one.
+Mem.owners = {}
+function S.owner_type(decl)
+    assert(type(decl) == 'table' and decl.name and decl.header and decl.api and decl.init,
+        'owner_type needs a name, header, api and init')
+    decl.suffix = decl.suffix or decl.name
+    decl.methods, decl.args, decl.arity = decl.methods or {}, decl.args or {}, decl.arity or {}
+    families[decl.name] = decl
+    local constructor = function(...)
+        local key, elem
+        if decl.keyed then key, elem = ... else elem = ... end
+        for _, x in ipairs(decl.keyed and { key, elem } or { elem }) do
+            if not types.is_type(x) then fail((decl.label or decl.name) .. ' expects a type, got ' .. tostring(x)) end
+        end
+        local message
+        if decl.admit then message = decl.admit(key, elem)
+        elseif not types.element(elem) then
+            message = decl.name .. ' holds fixed-size values, not ' .. elem.display
+        end
+        if message then fail(message) end
+        local display = decl.display and decl.display(key, elem) or (decl.name .. ' ' .. elem.display)
+        return decorate(types.owner(decl.name, elem, display, key))
+    end
+    Mem.owners[decl.name] = constructor
+    return constructor
+end
 
 -- Array(T, n) {} with n known only at runtime: an Array T of n zeroed elements
 function Mem.array_of_length(t, n)
@@ -894,14 +942,24 @@ function S.id_components(x)
     return field('token', types.U64), field('slot', types.U32), field('gen', types.U32)
 end
 
+local loading_owners = false
 function Mem.prelude(env)
-    env.Store, env.Grow, env.Id = Mem.Store, Mem.Grow, Mem.Id
+    env.Id = Mem.Id
+    -- the module that declares the owner types is itself loaded with this prelude
+    if not loading_owners then
+        loading_owners = true
+        local ok, owners = pcall(require, 'nua.owners')
+        loading_owners = false
+        if not ok then error(owners, 0) end
+        env.Store, env.Grow, env.Map, env.Chars = owners.Store, owners.Grow, owners.Map, owners.Chars
+        env.Text = owners.Grow(types.U8)
+    end
     env.copy = Mem.copy
     env.Array = function(elem, n)
-        if n == nil then return Mem.RtArray(elem) end
+        if n == nil then return Mem.owners.Array(elem) end
         if S.is_staged(n) and not S.is_known(S.value_of(n)) then
             -- a runtime length: the constructor of an Array T owner
-            local t = Mem.RtArray(elem)
+            local t = Mem.owners.Array(elem)
             return setmetatable({}, { __call = function(_, x)
                 if type(x) ~= 'table' or S.is_staged(x) or next(x) ~= nil then
                     fail(('Array(%s, n) {} with n known only at runtime starts zeroed; it takes no '

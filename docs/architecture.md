@@ -1540,8 +1540,9 @@ policy objects, recursive layouts and the queue/heap/channel/pool models.
 | Values, places, lazy stores, branches, loops, words, materialization, tasks, I/O | [`nua/stage.lua`](../nua/stage.lua) |
 | Goose storage and record layouts | [`nua/memory.lua`](../nua/memory.lua) |
 | Immutable fixed-array contents | [`nua/array_value.lua`](../nua/array_value.lua) |
-| Text types and their compile-time fold | [`nua/strings.lua`](../nua/strings.lua) |
-| `Map` type hooks and layouts (`Map(Str, V)` is the text-keyed map) | [`nua/maps.lua`](../nua/maps.lua) |
+| `Str` and its compile-time fold | [`nua/strings.lua`](../nua/strings.lua) |
+| `Text`, `Chars` and the `Text` words | [`lib/text.nua`](../lib/text.nua) |
+| Owner type declarations (`owner_type`: `Store`, `Grow`, `Array`, `Map`, `Map(Str, V)`, `Map.borrowing`) | [`lib/owners.nua`](../lib/owners.nua), [`lib/map.nua`](../lib/map.nua); the generic reader is `nua/memory.lua` |
 | Residual IR → C | [`nua/cgen.lua`](../nua/cgen.lua) |
 | Residual IR → libgccjit (mirrors cgen) | [`nua/jitgen.lua`](../nua/jitgen.lua) |
 | C rules over libgccjit; the C reader | [`nua/cjit.lua`](../nua/cjit.lua), [`nua/gccjit_h.lua`](../nua/gccjit_h.lua) |
