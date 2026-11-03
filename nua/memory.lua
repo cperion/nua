@@ -631,20 +631,6 @@ local function capture(value, what)
     return dyn(value.T, S.read_expr(tmp))
 end
 
--- A value entering a container: the lifetime rule checks what it borrows
--- against the container's owner, and records it there for later reads. The
--- container's algorithm then copies plain bytes through raw memory.
-function Mem.owned_copy(container, value, what) return Mem.owned_copy_impl(container, value, what) end
-local function owned_copy(container, value, what)
-    -- a reference stays a reference: reading it as a value would follow it
-    if not (S.is_value(value) and value.k == 'ref') then value = S.value_of(value) end
-    S.check_store_view(container, value)
-    local b = S.cur()
-    local tmp = b:new_temp(value.T)
-    b:emit { op = 'let', place = tmp, e = S.ex(value), what = what }
-    return S.dyn(value.T, S.read_expr(tmp))
-end
-Mem.owned_copy_impl = owned_copy
 
 -- An index or key fixed where it is written, so a checked place denotes the
 -- element it named then. A free expression is already its own value; one that
@@ -703,68 +689,44 @@ end
 
 Mem.storage_library = storage_library
 
-local function store_methods(t)
+-- The operations of a container are the library's words (lib/storage.nua) over a Ref to
+-- the owner; their effects on borrows are stated there (design §10.1). The adapter only
+-- resolves the receiver and applies the language's index rule (D2: any unsigned integer)
+-- to the arguments that are indices.
+local function library_methods(t, names, index_args)
     local n = cname_of(t)
-    local elem, id = t.elem, types.id(t.elem)
-    return {
-        add = function(self, v)
-            local p = receiver(self, n .. ':add')
-            S.note_growth(p)
-            S.bump_checked()
-            local val = S.coerce(v, elem, 'value added to ' .. t.display)
-            val = owned_copy(p, val, 'capturing a store value')
-            return storage_library(t).add(S.Ref(p), val)
-        end,
-        remove = function(self, i)
-            local p = receiver(self, n .. ':remove')
-            return storage_library(t).remove(S.Ref(p), S.coerce(i, id, 'Id to remove'))
-        end,
-        has = function(self, i)
-            local p = receiver(self, n .. ':has')
-            return storage_library(t).has(S.Ref(p), S.coerce(i, id, 'Id'))
-        end,
-    }
+    local methods = {}
+    for _, name in ipairs(names) do
+        methods[name] = function(self, ...)
+            local p = receiver(self, n .. ':' .. name)
+            local b = S.cur()
+            if b.fn then b.fn.uses_rt = true end
+            local count = select('#', ...)
+            local args = { ... }
+            for _, i in ipairs(index_args[name] or {}) do args[i] = S.index_value(args[i]) end
+            return storage_library(t)[name](S.Ref(p), (table.unpack or unpack)(args, 1, count))
+        end
+    end
+    return methods
+end
+
+local function store_methods(t)
+    return library_methods(t, { 'add', 'remove', 'has' }, {})
 end
 
 local function grow_methods(t)
     local n = cname_of(t)
-    local elem = t.elem
-    local grow_all
-    local methods
-    grow_all = function(self) return methods.all(self) end
-    methods = {
-        -- the elements as a read-only slice borrowing the Grow, of the length it
-        -- has now: growing keeps the slice valid (stacks never move); clearing
-        -- ends it
-        all = function(self)
-            local p = receiver(self, n .. ':all')
-            if not S.cur().fn then fail(n .. ' is runtime storage: it is viewed where it runs') end
-            return storage_library(t).all(S.Ref(p))
-        end,
-        sub = function(self, a, z)
-            local xs = grow_all(self)
-            return S.member_slice(xs, 'sub')(xs, a, z)
-        end,
-        clear = function(self)
-            local p = receiver(self, n .. ':clear')
-            local b = S.cur()
-            if b.fn then b.fn.uses_rt = true end
-            storage_library(t).clear(S.Ref(p))
-        end,
-        push = function(self, v)
-            local p = receiver(self, n .. ':push')
-            S.note_growth(p)
-            S.bump_checked()
-            local val = S.coerce(v, elem, 'value pushed onto ' .. t.display)
-            val = owned_copy(p, val, 'capturing a Grow value')
-            return storage_library(t).push(S.Ref(p), val)
-        end,
-    }
-    -- operations that are plain Nua words over the owner: pop, truncate (lib/storage.nua)
-    methods.pop = function(self, ...) return storage_library(t).pop(S.Ref(receiver(self, n .. ':pop')), ...) end
-    -- an index is any unsigned integer (D2): the language's index rule coerces it
-    methods.truncate = function(self, count)
-        return storage_library(t).truncate(S.Ref(receiver(self, n .. ':truncate')), S.index_value(count))
+    local methods = library_methods(t, { 'push', 'pop', 'truncate', 'clear' }, { truncate = { 1 } })
+    -- the elements as a read-only slice borrowing the Grow, of the length it has now:
+    -- growing keeps the slice valid (stacks never move); clear, pop and truncate end it
+    methods.all = function(self)
+        local p = receiver(self, n .. ':all')
+        if not S.cur().fn then fail(n .. ' is runtime storage: it is viewed where it runs') end
+        return storage_library(t).all(S.Ref(p))
+    end
+    methods.sub = function(self, a, z)
+        local xs = methods.all(self)
+        return S.member_slice(xs, 'sub')(xs, a, z)
     end
     return methods
 end

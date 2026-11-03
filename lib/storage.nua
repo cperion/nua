@@ -5,7 +5,7 @@ local stacks = require "nua.stacks"
 local storage = {}
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
-local retire, restructure, borrows = __S.retire, __S.restructure, __S.borrows
+local retire, restructure, borrows, grows = __S.retire, __S.restructure, __S.borrows, __S.grows
 local make_slice = __S.make_slice
 local none = U32 0xffffffff
 local maximum = U64 0xffffffffffffffffULL
@@ -52,6 +52,7 @@ function storage.store(T, Id, p)
         return Ptr entry.value
     end
     api.add = do(s: Ref T, value: T.elem): Id
+        grows s
         local h = p.header s
         local slot = h.free_head
         local entry = null Item
@@ -69,7 +70,9 @@ function storage.store(T, Id, p)
             entry.gen = 1
         end
         entry.next = occupied
-        entry.value = value
+        -- written through the owner's pointer: a borrow stored in the value is checked against it
+        local owned = borrows(s, p.items s)
+        owned[slot].value = value
         h.live = h.live + 1
         return p.id s slot entry.gen
     end
@@ -157,11 +160,14 @@ function storage.grow(T, p)
         end
     end
     api.push = do(g: Ref T, value: T.elem): Unit
+        grows g
         local h = p.header g
         local length = h.len
         grow(g, length, p.width())
         h.len = length + 1
-        local items = p.items g
+        -- the elements are reached through a pointer attached to the owner: a borrow stored
+        -- in one is checked against the owner (design memory.md §10.1)
+        local items = borrows(g, p.items g)
         items[length] = value
     end
     api.locate = do(g: Ref T, index: U64): Ptr T.elem

@@ -34,7 +34,7 @@ local str = require "nua.str"
 local stacks = require "nua.stacks"
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
-local retire, restructure = __S.retire, __S.restructure
+local retire, restructure, grows, borrows = __S.retire, __S.restructure, __S.grows, __S.borrows
 local none = U32 0xffffffff
 local libraries = {}
 
@@ -209,13 +209,15 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
     api.put = do(m: Ref T, key: K, value: V, only_missing): Unit
         -- an insertion changes the structure; replacing the entry being visited does not
         restructure(m, "put", key)
+        grows m
         local hashed = digest key
         local table = acquire m
         local cell = probe table key hashed
         if cell ~= none then
             if not only_missing then
-                local entry = Ptr table.entries[table.cells[cell] - 1]
-                entry.value = value
+                -- written through the owner's pointer: a stored borrow is checked against it
+                local owned = borrows(m, table.entries)
+                owned[table.cells[cell] - 1].value = value
             end
             return
         end
@@ -244,11 +246,12 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         local entry = Ptr at.entries[slot]
         entry[0] = zero Entry
         entry.hash = hashed
-        entry.value = value
+        local owned = borrows(m, at.entries)
+        owned[slot].value = value
         if string_keys then
             entry.key.offset = text_offset
             entry.key.len = key.length
-        else entry.key = key end
+        else owned[slot].key = key end
         local capacity = h.cap
         local previous = place at.cells capacity hashed slot
         if previous == 0 then h.used = h.used + 1 end

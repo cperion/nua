@@ -1113,10 +1113,34 @@ S.retire = function(ref, template, key)
     local selector = h.effect_key(key)
     if selector then h.end_elements(cur(), place, selector, why) else h.end_owner(cur(), place, why) end
 end
+-- the owner may grow here: the recursion and result-stack checks need to know (no borrow
+-- is affected: stacks never move)
+S.value_view = function(v) return h.value_view(v) end
+S.grows = function(ref)
+    S.note_growth(h.effect_owner(ref, 'grows'))
+    S.bump_checked()
+end
 -- `value` (a Slice or Str) borrows the owner's contents: it ends when the contents are
 -- freed (retire) or the owner ends, and must not outlive the owner.
-S.borrows = function(ref, value)
-    local place = h.effect_owner(ref, 'borrows')
+S.borrows = function(owner, value)
+    local place = h.effect_owner(owner, 'borrows')
+    -- a Ref to an element: the same place, attached to the owner. Borrows stored through
+    -- it are checked against the owner (the lifetime rule), and the element's own borrows
+    -- end when the owner's contents are freed.
+    if not (is_value(value) and value.k == 'ref') then value = S.value_of(value) end
+    -- a pointer to the owner's elements: the elements it reaches belong to the owner
+    if is_value(value) and value.T.kind == 'ptr' then
+        local attached = setmetatable(copy(value), V)
+        rawset(attached, 'owner_place', place)
+        return attached
+    end
+    if is_value(value) and value.k == 'ref' then
+        local target = value.place
+        local attached = new_place { pk = 'deref', T = target.T, name = rawget(target, 'name') or 'element',
+            ptr = { op = 'addr', place = target, T = types.ref(target.T) }, id = uid() }
+        rawset(attached, 'owner_place', place)
+        return ref(attached)
+    end
     return h.with_view(S.value_of(value), h.place_tokens(place, true))
 end
 -- an insertion or removal: not allowed while the owner is being iterated. `key` names the
@@ -6327,7 +6351,11 @@ function member_ptr(x, key)
     local pv = ptr_value(x)
     local elem = pv.T.elem
     if type(key) == 'number' or is_staged(key) then
-        return __index(pv, index_value(key), elem)
+        local place = __index(pv, index_value(key), elem)
+        -- elements of a pointer attached to an owner (borrows) belong to it
+        local owner = rawget(pv, 'owner_place')
+        if owner then rawset(place, 'owner_place', owner) end
+        return place
     end
     if elem.kind == 'struct' and elem.index[key] then
         local e = ex(pv)

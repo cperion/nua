@@ -81,11 +81,14 @@ local function decorate(t)
         ms[method] = function(self, k, value)
             local p = receiver(self)
             -- a borrowed key is stored as it is: a stored borrow, checked against the map's owner
-            local kv = borrowing and Mem.owned_copy(p, key(k), 'capturing a borrowed map key') or capture_key(key(k))
-            S.note_growth(p)
-            -- Eager by-value capture, including ensure's unused replacement.
-            -- a borrow stored as a value must not outlive the map's owner (§6.2)
-            local v = Mem.owned_copy(p, S.coerce(value, t.elem, 'Map value'), 'capturing a map value')
+            local kv = capture_key(key(k))
+            -- Eager by-value capture, including ensure's unused replacement. The captured
+            -- value keeps the borrows it carries: the library word stores it through the
+            -- owner's pointer, which checks them against the map's owner (§6.2).
+            local given = S.coerce(value, t.elem, 'Map value')
+            local view = S.value_view(given)
+            local v = Mem.capture(given, 'capturing a map value')
+            if view then rawset(v, 'view', view) end
             S.bump_checked()
             return library().put(S.Ref(p), kv, v, method == 'ensure')
         end

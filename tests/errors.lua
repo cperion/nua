@@ -348,7 +348,7 @@ export f
     local out = Grow(U32) {}
     if n == 0 then return out end
     local inner = build(n - 1)
-    out:push inner.length
+    out:push(U32 inner.length)
     return out
 end
 local f = do(n: U32): U32

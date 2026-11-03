@@ -579,6 +579,7 @@ as `Ref`, available to library modules only (they are unsafe-grade, like `Ptr`):
 | `retire(owner, selector?)` | storage is freed or reused: ends the borrows that may name the selector, or all of them |
 | `restructure(owner, selector?)` | an insertion or removal: rejected inside `fixed` |
 | `fixed(owner) do ... end` | the structure is fixed in the body (what `m:each` does) |
+| `grows(owner)` | the owner may grow here: a scheduling fact for the recursion and result-stack checks (§9), with no effect on borrows |
 
 The effects of operations, which is all the library has to say:
 
@@ -592,7 +593,10 @@ The effects of operations, which is all the library has to say:
 
 A selector lets the compiler keep borrows it can prove differ: a borrow of key 1
 survives `remove 2` when both are known and differ. Stores of borrows into elements
-stay checked by the compiler, because an element place records its owner.
+stay checked by the compiler, because an element place records its owner: a library
+word reaches its elements through a pointer attached to the owner
+(`borrows(owner, ptr)`), so `items[i] = value` is checked against the owner like any
+store into an element.
 
 **Effects are summarized, not annotated.** A word that calls `retire` or
 `restructure` on a `Ref` parameter carries that effect in its boundary summary, as
