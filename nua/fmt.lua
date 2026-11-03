@@ -10,7 +10,7 @@ local M = {}
 local environment
 M.defaults = { indent_width = 4, column_width = 100, call_style = 'minimal', spine_style = 'pure',
                type_style = 'inferred', table_style = 'shorthand', opening_style = 'anonymous',
-               block_style = 'colon' }
+               block_style = 'colon', data_style = 'with' }
 
 function M.options(options)
     local out = {}
@@ -41,6 +41,9 @@ function M.options(options)
     end
     if out.block_style ~= 'colon' and out.block_style ~= 'do' then
         error('fmt: block_style must be "colon" or "do"', 0)
+    end
+    if out.data_style ~= 'with' and out.data_style ~= 'preserve' then
+        error('fmt: data_style must be "with" or "preserve"', 0)
     end
     if out.spine_style ~= 'pure' and out.spine_style ~= 'all' and out.spine_style ~= 'none' then
         error('fmt: spine_style must be "pure", "all" or "none"', 0)
@@ -1039,7 +1042,8 @@ function format(source, options, filename)
     if fingerprint(parse(result, filename).ast) ~= signature then
         error(filename .. ': fmt: formatting would change the parsed program; source left unchanged', 0)
     end
-    result = colon.withize(result)
+    if options.data_style == 'with' then result = colon.mark_tables(result) end
+    result = colon.withize(result, (' '):rep(options.indent_width))
     if options.block_style == 'colon' then result = colon.colonize(result) end
     return prefix .. result
 end

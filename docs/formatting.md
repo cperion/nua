@@ -45,6 +45,7 @@ return {
     table_style = "shorthand",
     opening_style = "anonymous",
     block_style = "colon",
+    data_style = "with",
 }
 ```
 
@@ -65,6 +66,7 @@ file, not arbitrary downloaded Lua code.
 | `opening_style` | `"anonymous"`, `"preserve"` | Remove an unused name from an opened `do` parameter, or keep named openings. |
 | `block_style` | `"colon"`, `"do"` | Write an untyped trailing `do(..)` that ends a line as the colon form (syntax §2.4, rule 11), or keep the `do` spelling. |
 | `block_style` | `"colon"`, `"do"` | Write an untyped trailing `do(..)` that ends a line in the colon form (syntax §2.4, rule 11), or keep the `do` spelling. |
+| `data_style` | `"with"`, `"preserve"` | Write a multi-line table that follows a head (`T {`, `f(x) {`) as a `with` block (syntax §2.4, rule 12), or keep the braces. |
 | `spine_style` | `"pure"`, `"all"`, `"none"` | Which link bodies of an `endall` spine lose their indent. |
 
 Unknown settings and invalid values are errors, not silently ignored options.
@@ -144,12 +146,21 @@ is analysed, and the result is accepted only when that reading equals the source
 
 ## With blocks
 
-A `with` block (syntax §2.4, rule 12) stays a `with` block: the formatter lays its
-entries out like a table's, one entry per line when it does not fit, and writes
-the block back without the separators the reader would put back. Braces are never
-converted into `with`. A separator is kept where the reader would not recover it
-(before an entry that starts with a bracket or a literal), and the result is
-accepted only when expanding it gives the same program.
+A `with` block (syntax §2.4, rule 12) stays a `with` block, and with
+`data_style = "with"` a multi-line table that follows a head is written as one.
+The head is an operand: a name, a call or an index (`Point {`, `Store(Node) {`,
+`s {` for a match, `f(x) {`). Tables on one line, and tables with no head
+(`{ 1, 2 }`, `local t = { a = 1 }`, `return { ... }`, which are Lua's), keep their
+braces. `data_style = "preserve"` keeps every table as written: `with` blocks stay
+`with`, braces stay braces.
+
+The entries are laid out as a table's are, and the block is written without the
+separators the reader would put back: the comma at the end of a line goes, and a
+trailing comma goes too. Entries that share a line keep their commas, which keeps
+them readable (`Point with x = 1, y = 2 end`). A separator is
+kept where the reader would not recover it, before an entry that starts with a
+bracket or a literal. Each table is converted on its own, and only when expanding
+the result gives the same program as the braces.
 
 ## Default style
 

@@ -129,6 +129,12 @@ local function expression_lambda(tokens, i)
     return false
 end
 
+local function skip_forward(tokens, i)
+    i = i + 1
+    while tokens[i] and (tokens[i][1] == 'space' or tokens[i][1] == 'comment') do i = i + 1 end
+    return tokens[i] and i
+end
+
 local function significant_after(tokens, i)
     i = i + 1
     while tokens[i] and (tokens[i][1] == 'space' or tokens[i][1] == 'comment') do i = i + 1 end
@@ -389,12 +395,72 @@ local function frames_of(tokens)
     return top_at, opened
 end
 
+-- Mark the multi-line tables that follow a head (`T {`, `f(x) {`): `withize` writes
+-- them as `with` blocks. One-line tables and tables with no head (`{ 1, 2 }`,
+-- `local t = { a = 1 }`, which are Lua's) are left alone.
+function M.mark_tables(source)
+    local tokens = lexer.scan_raw_tokenlist(source)
+    local close_of, stack = {}, {}
+    for i, tk in ipairs(tokens) do
+        local t = tk[1]
+        if t == '(' or t == '{' or t == '[' then stack[#stack + 1] = i
+        elseif t == ')' or t == '}' or t == ']' then close_of[table.remove(stack)] = i end
+    end
+    -- a table is data when some top-level entry is keyed (`k = v`, `k: T`, `[k] = v`, `.k`)
+    local function keyed(open)
+        local depth = 0
+        for k = open + 1, close_of[open] - 1 do
+            local t = tokens[k][1]
+            if t == '(' or t == '{' or t == '[' then
+                if t == '[' and depth == 0 then
+                    local c = close_of[k]
+                    local nx = c and skip_forward(tokens, c)
+                    if nx and tokens[nx][1] == '=' then return true end
+                end
+                depth = depth + 1
+            elseif t == ')' or t == '}' or t == ']' then depth = depth - 1
+            elseif depth == 0 and t == 'iden' then
+                local nx = skip_forward(tokens, k)
+                local n = nx and tokens[nx]
+                if n and (n[1] == '=' or (n[1] == ':' and tokens[nx + 1] and tokens[nx + 1][1] == 'space')) then
+                    return true
+                end
+            elseif depth == 0 and t == '.' and tokens[k + 1] and tokens[k + 1][1] == 'iden' then
+                local p = skip_back(tokens, k)
+                local pt = p >= 1 and tokens[p][1]
+                if pt == '{' or pt == ',' or pt == ';' then return true end
+            end
+        end
+        return false
+    end
+    local out, header = {}, false              -- header: between `for`/`while` and its `do`
+    for i, tk in ipairs(tokens) do
+        out[#out + 1] = tk
+        if tk[1] == 'keyword' and (tk[2] == 'for' or tk[2] == 'while') then header = true
+        elseif tk[1] == 'keyword' and tk[2] == 'do' then header = false end
+        if tk[1] == '{' and close_of[i] and not header and keyed(i) then
+            local p = skip_back(tokens, i)
+            local head = p >= 1 and (OPERAND[tokens[p][1]]) and tokens[p][1] ~= 'string'
+            local multiline = false
+            for k = i + 1, close_of[i] - 1 do
+                if tokens[k][1] == 'space' and tokens[k][2]:find '\n' then multiline = true; break end
+            end
+            local k = i + 1
+            while tokens[k] and tokens[k][1] == 'space' do k = k + 1 end
+            local marked = tokens[k] and tokens[k][1] == 'comment' and tokens[k][2] == MARK
+            if head and multiline and not marked then out[#out + 1] = { 'comment', MARK, tk[3] } end
+        end
+    end
+    return text_of(out)
+end
+
 -- Write the braces `expand` marked back as `with ... end`. A separator is dropped
 -- where the reader would put it back (before an entry that starts with `name =`,
 -- `name:` or a line of its own, and before the closing brace). Without the marks
 -- the source is returned with its braces; the result is only accepted when
 -- expanding it gives the braces' own token stream.
-function M.withize(source)
+function M.withize(source, unit)
+    unit = unit or '    '
     local tokens = lexer.scan_raw_tokenlist(source)
     local top_at, opened = frames_of(tokens)
     local close_of, stack = {}, {}
@@ -408,31 +474,80 @@ function M.withize(source)
         while tokens[i] and (tokens[i][1] == 'space' or tokens[i][1] == 'comment') do i = i + 1 end
         return i
     end
-    local marker, drop, replace, plain = {}, {}, {}, {}
+    local blocks, plain = {}, {}
     for i, tk in ipairs(tokens) do
         if tk[1] == '{' then
             local j = i + 1
             while tokens[j] and tokens[j][1] == 'space' do j = j + 1 end
             if tokens[j] and tokens[j][1] == 'comment' and tokens[j][2] == MARK then
-                marker[i] = j
-                for k = i + 1, j do drop[k] = true end
+                local block = { open = i, close = close_of[i], drop = {} }
+                blocks[#blocks + 1] = block
+                for k = i + 1, j do block.drop[k] = true end
                 local f = opened[i]
-                -- `with` follows its head after a space
-                replace[i] = 'with'
-                replace[close_of[i]] = 'end'
+                local function has_newline(a, b)
+                    for q = a, b do
+                        if tokens[q][1] == 'space' and tokens[q][2]:find '\n' then return true end
+                    end
+                    return false
+                end
+                -- a table that spans lines is written one entry per line, `end` on a line of its own
+                local multiline = has_newline(i + 1, close_of[i] - 1)
+                block.before, block.moved = {}, {}
+                if multiline then
+                    -- the block's own line is indented like the entry of the block around it
+                    -- (that entry gets a line of its own), else like the line it is on
+                    local indent
+                    for q = #blocks - 1, 1, -1 do
+                        local outer = blocks[q]
+                        if outer.open < i and i < outer.close and outer.moved then
+                            -- the entry of `outer` this table sits in, if that entry was moved to a line
+                            -- of its own and no line break separates its start from the table
+                            local start
+                            for at in pairs(outer.moved) do
+                                if at < i and (not start or at > start) then start = at end
+                            end
+                            if start and not has_newline(start, i) then indent = outer.moved[start] end
+                            break
+                        end
+                    end
+                    if not indent then
+                        indent = ''
+                        for q = i - 1, 1, -1 do
+                            if tokens[q][1] == 'space' and tokens[q][2]:find '\n' then
+                                indent = tokens[q][2]:match('[^\n]*$'); break
+                            end
+                        end
+                    end
+                    block.indent = indent
+                    local function own_line(at, text)
+                        local p = at - 1
+                        if tokens[p][1] == 'space' and tokens[p][2]:find '\n' then return end
+                        if tokens[p][1] == 'space' then block.drop[p] = true end
+                        block.before[at] = '\n' .. text
+                        block.moved[at] = text
+                    end
+                    local at = next_sig(j)
+                    if at < close_of[i] then own_line(at, indent .. unit) end
+                    for k = i + 1, close_of[i] - 1 do
+                        local c = tokens[k]
+                        if top_at[k] == f and (c[1] == ',' or c[1] == ';') then
+                            local nx = next_sig(k)
+                            if nx < close_of[i] then own_line(nx, indent .. unit) end
+                        end
+                    end
+                    own_line(close_of[i], indent)
+                end
                 for k = i + 1, close_of[i] - 1 do
                     local c = tokens[k]
                     if top_at[k] == f and (c[1] == ',' or c[1] == ';') then
                         local nx = next_sig(k)
                         local first, second = tokens[nx], tokens[next_sig(nx)]
-                        local newline = false
-                        for q = k + 1, nx - 1 do
-                            if tokens[q][1] == 'space' and tokens[q][2]:find '\n' then newline = true end
-                        end
+                        local newline = multiline or has_newline(k + 1, nx - 1)
                         local starts = first and first[1] == 'iden' and second and (second[1] == '='
                             or (second[1] == ':' and tokens[next_sig(nx) + 1] and tokens[next_sig(nx) + 1][1] == 'space'))
-                        if nx == close_of[i] or starts or (newline and first and (first[1] == 'iden' or first[1] == '.')) then
-                            drop[k] = true
+                        -- entries on one line keep their commas; at a line end the reader writes it back
+                        if nx == close_of[i] or (newline and (starts or (first and (first[1] == 'iden' or first[1] == '.')))) then
+                            block.drop[k] = true
                         end
                     end
                 end
@@ -441,10 +556,18 @@ function M.withize(source)
             plain[i] = true
         end
     end
-    local function build()
+    -- the source with the selected blocks written as `with ... end`
+    local function build(selected)
+        local drop, replace, before = {}, {}, {}
+        for _, block in ipairs(selected) do
+            for k in pairs(block.drop) do drop[k] = true end
+            for k, text in pairs(block.before) do before[k] = text end
+            replace[block.open], replace[block.close] = 'with', 'end'
+        end
         local out = {}
         for i, tk in ipairs(tokens) do
             if not plain[i] and not drop[i] then
+                if before[i] then out[#out + 1] = { 'space', before[i] } end
                 local text = replace[i]
                 if text then
                     if out[#out] and out[#out][1] ~= 'space' then out[#out + 1] = { 'space', ' ' } end
@@ -465,17 +588,31 @@ function M.withize(source)
         return text_of(out)
     end
     local function normal(text)
+        -- a comma before the closing brace is only spelling
         local parts = {}
         for _, tk in ipairs(lexer.scan_raw_tokenlist(text)) do
-            if tk[1] ~= 'space' and tk[1] ~= 'comment' then parts[#parts + 1] = tk[2] end
+            if tk[1] ~= 'space' and tk[1] ~= 'comment' then
+                if tk[1] == '}' and parts[#parts] == ',' then parts[#parts] = nil end
+                parts[#parts + 1] = tk[2]
+            end
         end
         return table.concat(parts, '\0')
     end
     local braces = plain_text()
-    if next(marker) == nil then return braces end
-    local with = build()
-    if normal(M.expand(with)) == normal(braces) then return with end
-    return braces
+    if #blocks == 0 then return braces end
+    local want = normal(braces)
+    local function accepted(selected)
+        local text = build(selected)
+        return normal(M.expand(text)) == want and text
+    end
+    local all = accepted(blocks)
+    if all then return all end
+    -- one block the reader would not recover must not keep the others from converting
+    local chosen = {}
+    for _, block in ipairs(blocks) do
+        if accepted({ block }) then chosen[#chosen + 1] = block end
+    end
+    return accepted(chosen) or braces
 end
 
 return M

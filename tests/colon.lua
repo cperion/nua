@@ -139,13 +139,34 @@ formatted('fmt: nullary block untouched', 'spawn do\n    go\nend\n', 'spawn do\n
 formatted('fmt: block style do', 'xs:each: x\n    go x\nend\n', 'xs:each do(x)\n    go x\nend\n',
     { block_style = 'do' })
 formatted('fmt: with block kept', 'local p = Point with\nx = 1\ny = 2\nend\n', 'local p = Point with\n    x = 1\n    y = 2\nend\n')
-formatted('fmt: with on one line', 'local p = Point   with x=1   y=2 end\n', 'local p = Point with x = 1 y = 2 end\n')
+formatted('fmt: with on one line keeps commas', 'local p = Point   with x=1   y=2 end\n', 'local p = Point with x = 1, y = 2 end\n')
 formatted('fmt: braces stay braces', 'local p = Point { x = 1, y = 2 }\n', 'local p = Point { x = 1, y = 2 }\n')
-formatted('fmt: with commas written out go', 'local p = Point with x = 1, y = 2 end\n', 'local p = Point with x = 1 y = 2 end\n')
+formatted('fmt: with commas on one line stay', 'local p = Point with x = 1, y = 2 end\n', 'local p = Point with x = 1, y = 2 end\n')
 formatted('fmt: with and a block entry', 'local r = s with\n  a =: v\n    local x, y = v, v\n    go x y\n  end\n  b = 2\nend\n',
     'local r = s with\n    a =: v\n        local x, y = v, v\n        go x y\n    end\n    b = 2\nend\n')
 formatted('fmt: Struct with', 'local P = Struct with\nx: F32\ny: F32\nend\n', 'local P = Struct with\n    x: F32\n    y: F32\nend\n')
 formatted('fmt: positional entries keep commas', 'local a = Array(U32, 2) with 1, 2 end\n', 'local a = Array(U32, 2) with 1, 2 end\n')
+formatted('fmt: multi-line table after a head becomes with', 'local q = Point {\n    x = 1,\n    y = 2,\n}\n',
+    'local q = Point with\n    x = 1\n    y = 2\nend\n')
+formatted('fmt: head-less tables stay braces', 'local t = {\n    a = 1,\n    b = 2,\n}\n', 'local t = {\n    a = 1,\n    b = 2,\n}\n')
+formatted('fmt: one-line tables stay braces', 'local q = Point { x = 1, y = 2 }\n', 'local q = Point { x = 1, y = 2 }\n')
+formatted('fmt: handlers become with', 'local r = s {\n    a =: v\n        go v\n    end,\n    b = do(x) = x,\n}\n',
+    'local r = s with\n    a =: v\n        go v\n    end\n    b = do(x) = x\nend\n')
+formatted('fmt: positional entries keep their commas', 'local a = Array(U32, 2) {\n    1,\n    [3] = 2,\n}\n',
+    'local a = Array(U32, 2) with\n    1,\n    [3] = 2\nend\n')
+formatted('fmt: nested tables convert one by one', 'local p = T {\n    inner = U {\n        k = 1,\n    },\n    z = {1, 2},\n}\n',
+    'local p = T with\n    inner = U with\n        k = 1\n    end\n    z = { 1, 2 }\nend\n')
+formatted('fmt: data style preserve', 'local q = Point {\n    x = 1,\n    y = 2,\n}\n', 'local q = Point {\n    x = 1,\n    y = 2,\n}\n',
+    { data_style = 'preserve' })
+formatted('fmt: lists of values stay braces', 'local names = ipairs {\n    "x",\n    "y",\n}\n', 'local names = ipairs {\n    "x",\n    "y",\n}\n')
+formatted('fmt: a loop header keeps its braces', 'for _, n in ipairs {\n    a = 1,\n    b = 2,\n} do\n    go n\nend\n',
+    'for _, n in ipairs {\n    a = 1,\n    b = 2,\n} do\n    go n\nend\n')
+formatted('fmt: a table wrapped by width puts every entry on its own line, end on its own line',
+    'local c = App {\n    counter = Counter { count = Number { x = 20, y = 20, width = 208, height = 24, color = 66051, value = 7 }, up = Button { x = 20, y = 60, width = 100, height = 30 } },\n}\n',
+    'local c = App with\n    counter = Counter with\n        count = Number with\n            x = 20\n            y = 20\n            width = 208\n            height = 24\n            color = 66051\n            value = 7\n        end\n        up = Button { x = 20, y = 60, width = 100, height = 30 }\n    end\nend\n')
+formatted('fmt: a short table stays braces inside a with', 'local c = App {\n    counter = Counter { count = 1, up = 2 },\n}\n',
+    'local c = App with\n    counter = Counter { count = 1, up = 2 }\nend\n')
+check('fmt: bad data style', not pcall(fmt.format, 'x = 1\n', { data_style = 'pretty' }))
 check('fmt: bad block style', not pcall(fmt.format, 'x = 1\n', { block_style = 'ruby' }))
 
 print(('%d trailing colon checks passed'):format(passed))
