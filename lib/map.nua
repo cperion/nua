@@ -12,15 +12,15 @@ function map.each(T, storage, body)
     if by_body[body] then return by_body[body] end
     -- Distinct activities are distinct specializations: a nested traversal is
     -- not recursion with a changing compile-time callback parameter.
-    -- The iteration guard rejects structural mutation, so the capacity holds;
+    -- The iteration guard rejects structural mutation, so the slots hold;
     -- the body is opaque, so the table is acquired again for every entry.
     local each = do(m: Ref T): Unit
-        local capacity = storage.header(m).cap
+        local count = storage.header(m).len
         local slot = U32 0
-        while slot < capacity do
+        while slot < count do
             local table = storage.acquire m
             local entry = table.entries[slot]
-            if entry.hash ~= 0 then storage.lend(table, entry, body) end
+            if band(entry.hash, 0x8000000000000000ULL) == 0 then storage.lend(table, entry, body) end
             slot = slot + 1
         end
     end
@@ -30,132 +30,132 @@ end
 
 local hash = require "nua.hash"
 local keys = require "nua.key"
+local str = require "nua.str"
 local stacks = require "nua.stacks"
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
 local none = U32 0xffffffff
 local libraries = {}
 
--- Every operation acquires the table once and probes, reads and writes inside
--- that acquisition. Only growth (a push onto the table's stack) and arena
--- compaction move storage; the table is acquired again after them.
-function map.library(T, storage, Entry, Result, string_keys)
+-- Entries live in slots that never move, so a borrow of an entry survives
+-- insertions; a removed slot joins a free list (its hash has the top bit set and
+-- names the next free slot). A separate index of slot numbers is rebuilt when
+-- the map grows: cells hold slot + 1, zero is empty and 0xffffffff a removed
+-- cell. Every operation acquires the table once and probes, reads and writes
+-- inside that acquisition; only the index and the key arena move.
+local free_bit = U64 0x8000000000000000ULL
+local removed_cell = U32 0xffffffff
+function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
     if libraries[T] then return libraries[T] end
     local K, V = T.key, T.elem
     local EP, View = Ptr Entry, storage.View
-    local equal = keys.equal K
-    local digest = string_keys and hash.text or keys.hash K
+    local equal = borrowed_keys and str.equals or keys.equal K
+    local text_digest = hash.text
+    local key_digest = keys.hash K
+    -- a stored hash has the top bit clear: the top bit marks a free slot
+    local digest = do(key: K): U64
+        local h = U64 0
+        if string_keys or borrowed_keys then h = text_digest key else h = key_digest key end
+        local low = band h 0x7fffffffffffffffULL
+        return bor low 1
+    end
     local header, acquire, entries, stored_key = storage.header, storage.acquire, storage.entries, storage.key
     local maximum = storage.maximum
     local api = {}
 
-    local distance = do(h: U64, slot: U32, capacity: U32): U32
-        local low = U32 h
-        local delta = slot - low
-        local mask = capacity - 1
-        return band delta mask
-    end
-    local byte_count = do(capacity: U32): U64
-        local count = U64 capacity
-        count = count + 1
+    local slot_bytes = do(count: U32): U64
         local width = size_of Entry
-        if count > maximum() / width then trap "Map is full" end
-        return count * width
+        local n = U64 count
+        if n * width / width ~= n then trap "Map is full" end
+        return n * width
     end
-    local check_top = do(m: Ref T): Unit
+    local check_slots_top = do(m: Ref T): Unit
         local h = header m
-        local bytes = U64 0
-        if h.cap ~= 0 then bytes = byte_count h.cap end
         local top = stacks.top h.stack
-        if top - h.base ~= bytes then trap "Map grew while it was not at the top of its data stack" end
+        if top - h.base ~= slot_bytes h.len then trap "Map grew while it was not at the top of its data stack" end
+    end
+    local check_index_top = do(m: Ref T): Unit
+        local h = header m
+        local bytes = U64 h.cap * 4
+        local top = stacks.top h.index_stack
+        if top - h.index_base ~= bytes then trap "Map index grew while it was not at the top of its data stack" end
     end
     local check_mutation = do(m: Ref T): Unit
         local h = header m
         if h.iterating ~= 0 then trap "Map structural mutation during iteration" end
     end
-    -- the slot holding key, or none
+    -- the index cell naming key's slot, or none
     local probe = do(table: View, key: K, hashed: U64): U32
         local capacity = table.cap
-        local steps = U32 0
+        if capacity == 0 then return none end
         local mask = capacity - 1
-        local low = U32 hashed
+        local cell = band (U32 hashed) mask
+        local steps = U32 0
         while steps < capacity do
-            local candidate = low + steps
-            local slot = band candidate mask
-            local entry = Ptr table.entries[slot]
-            local resident = entry.hash
-            if resident == 0 then return none end
-            local prior = distance resident slot capacity
-            if prior < steps then return none end
-            if resident == hashed then
-                local found = stored_key table entry.key
-                if equal found key then return slot end
+            local at = table.cells[cell]
+            if at == 0 then return none end
+            if at ~= removed_cell then
+                local entry = Ptr table.entries[at - 1]
+                if entry.hash == hashed then
+                    local found = stored_key table entry.key
+                    if equal found key then return cell end
+                end
             end
+            cell = band (cell + 1) mask
             steps = steps + 1
         end
         return none
     end
-    -- Robin Hood insertion of an absent key into an acquired table with room
-    local insert = do(table: EP, capacity: U32, value: Entry): Unit
-        local entry = value
+    -- put slot + 1 in the first empty or removed cell on hashed's probe path
+    local place = do(cells: Ptr U32, capacity: U32, hashed: U64, slot: U32): U32
         local mask = capacity - 1
-        local low = U32 entry.hash
-        local slot = band low mask
-        local steps = U32 0
+        local cell = band (U32 hashed) mask
         while true do
-            local at = Ptr table[slot]
-            local resident = at.hash
-            if resident == 0 then
-                at[0] = entry
-                return
+            local at = cells[cell]
+            if at == 0 or at == removed_cell then
+                cells[cell] = slot + 1
+                return at
             end
-            local prior = distance resident slot capacity
-            if prior < steps then
-                local old = at[0]
-                at[0] = entry
-                entry = old
-                steps = prior
-            end
-            local next_slot = slot + 1
-            slot = band next_slot mask
-            steps = steps + 1
+            cell = band (cell + 1) mask
         end
+        return 0
     end
-    local grow = do(m: Ref T): Unit
+    -- rebuild the index for at least `needed` entries into the spare bytes above
+    -- it, then move it down. Slots do not move.
+    local rebuild = do(m: Ref T, needed: U32): Unit
         local h = header m
         local old_capacity = h.cap
-        if old_capacity >= 0x80000000 then trap "Map is full" end
         local capacity = U32 8
-        if old_capacity ~= 0 then capacity = old_capacity * 2 end
-        local bytes = byte_count capacity
-        local base = h.base
-        local used = U64 0
-        if old_capacity ~= 0 then used = byte_count old_capacity end
-        local fresh = stacks.extend(h.stack, base, used, bytes,
-            "Map grew while it was not at the top of its data stack")
-        -- rehash into the spare bytes above the table, then move the table down
-        local s = stacks.at h.stack
+        while U64 capacity < U64 needed * 2 do
+            if capacity >= 0x40000000 then trap "Map is full" end
+            capacity = capacity * 2
+        end
+        local bytes = U64 capacity * 4
+        local used = U64 old_capacity * 4
+        local fresh = stacks.extend(h.index_stack, h.index_base, used, bytes,
+            "Map index grew while it was not at the top of its data stack")
+        local s = stacks.at h.index_stack
         local spare = stacks.span s fresh bytes
         stacks.fill spare bytes
-        local old_bytes = U64 old_capacity * size_of Entry
-        local source = EP stacks.span(s, base, old_bytes)
-        local target = EP spare
+        local target = Ptr U32 spare
+        local table = acquire m
         local slot = U32 0
-        while slot < old_capacity do
-            local entry = Ptr source[slot]
-            if entry.hash ~= 0 then insert target capacity entry[0] end
+        while slot < table.len do
+            local entry = Ptr table.entries[slot]
+            if band(entry.hash, free_bit) == 0 then place target capacity entry.hash slot end
             slot = slot + 1
         end
-        stacks.move (stacks.span s base bytes) spare bytes
-        local top = base + bytes
-        stacks.reset h.stack top
+        stacks.move (stacks.span s h.index_base bytes) spare bytes
+        local top = h.index_base + bytes
+        stacks.reset h.index_stack top
         h.cap = capacity
+        h.used = h.live
     end
     local append
     if string_keys then
         -- key's bytes at target. The key may lie in this arena: stacks never
         -- move, and compaction writes above the arena, so its bytes are intact.
-        local place = do(s: Ptr stacks.Stack, target: U64, key: Str): Unit
+        local place_key = do(s: Ptr stacks.Stack, target: U64, key: Str): Unit
             local n = U64 key.length
             local destination = stacks.span s target n
             local ptr, len = slice_parts key
@@ -171,10 +171,10 @@ function map.library(T, storage, Entry, Result, string_keys)
             local offset = length
             if dead >= 4096 and dead >= length / 2 then
                 local live = length - dead
-                if n > maximum() - live then trap "StrMap key arena is full" end
+                if n > maximum() - live then trap "Map(Str, V) key arena is full" end
                 local bytes = live + n
                 local fresh = stacks.extend(stack, base, length, bytes,
-                    "StrMap grew while its arena was not at the top of its data stack")
+                    "Map(Str, V) grew while its arena was not at the top of its data stack")
                 -- compact the live keys above the arena, then move them down
                 local s = stacks.at stack
                 local keys_now = stacks.span s base length
@@ -182,9 +182,9 @@ function map.library(T, storage, Entry, Result, string_keys)
                 local table = acquire m
                 local out = U64 0
                 local slot = U32 0
-                while slot < table.cap do
+                while slot < table.len do
                     local entry = Ptr table.entries[slot]
-                    if entry.hash ~= 0 then
+                    if band(entry.hash, free_bit) == 0 then
                         local size = U64 entry.key.len
                         stacks.move(Ptr compacted[out], Ptr keys_now[entry.key.offset], size)
                         entry.key.offset = out
@@ -193,7 +193,7 @@ function map.library(T, storage, Entry, Result, string_keys)
                     slot = slot + 1
                 end
                 offset = out
-                place s (fresh + out) key
+                place_key s (fresh + out) key
                 stacks.move (stacks.span s base bytes) compacted bytes
                 local end_at = base + bytes
                 stacks.reset stack end_at
@@ -201,8 +201,8 @@ function map.library(T, storage, Entry, Result, string_keys)
                 a.dead = n
             else
                 stacks.extend(stack, base, length, n,
-                    "StrMap grew while its arena was not at the top of its data stack")
-                place (stacks.at stack) (base + offset) key
+                    "Map(Str, V) grew while its arena was not at the top of its data stack")
+                place_key (stacks.at stack) (base + offset) key
                 a.arena_len = length + n
                 a.dead = dead + n
             end
@@ -212,30 +212,49 @@ function map.library(T, storage, Entry, Result, string_keys)
     api.put = do(m: Ref T, key: K, value: V, only_missing): Unit
         local hashed = digest key
         local table = acquire m
-        local slot = probe table key hashed
-        if slot ~= none then
+        local cell = probe table key hashed
+        if cell ~= none then
             if not only_missing then
-                local entry = Ptr table.entries[slot]
+                local entry = Ptr table.entries[table.cells[cell] - 1]
                 entry.value = value
             end
             return
         end
         check_mutation m
-        check_top m
-        local entry = zero Entry
+        check_index_top m
+        local text_offset = U64 0
+        if string_keys then text_offset = append m key end
+        local h = header m
+        -- the index keeps its load factor: removed cells count as used
+        if h.cap == 0 or (U64 h.used + 1) * 4 > U64 h.cap * 3 then
+            rebuild(m, h.live + 1)
+        end
+        check_slots_top m
+        local slot = h.free_head
+        if slot ~= none then
+            local at = acquire m
+            local reused = Ptr at.entries[slot]
+            h.free_head = U32 reused.hash
+        else
+            slot = h.len
+            if slot >= 0xfffffffe then trap "Map is full" end
+            stacks.extend(h.stack, h.base, slot_bytes slot, size_of Entry,
+                "Map grew while it was not at the top of its data stack")
+            h.len = slot + 1
+        end
+        local at = acquire m
+        local entry = Ptr at.entries[slot]
+        entry[0] = zero Entry
         entry.hash = hashed
         entry.value = value
         if string_keys then
-            entry.key.offset = append m key
+            entry.key.offset = text_offset
             entry.key.len = key.length
         else entry.key = key end
-        local h = header m
-        local length = h.len
-        if h.cap == 0 or length >= h.cap - h.cap / 8 then grow m end
         local capacity = h.cap
-        local target = entries(m, h.base, capacity)
-        insert target capacity entry
-        h.len = length + 1
+        local previous = place(at.cells, capacity, hashed, slot)
+        if previous == 0 then h.used = h.used + 1 end
+        h.live = h.live + 1
         if string_keys then
             local a = storage.strmap m
             local n = U64 key.length
@@ -245,85 +264,93 @@ function map.library(T, storage, Entry, Result, string_keys)
     api.has = do(m: Ref T, key: K): Bool
         local hashed = digest key
         local table = acquire m
-        local slot = probe table key hashed
-        return slot ~= none
+        local cell = probe table key hashed
+        return cell ~= none
     end
     api.find = do(m: Ref T, key: K): Result
         local hashed = digest key
         local table = acquire m
-        local slot = probe table key hashed
-        if slot == none then return Result.missing() end
-        local entry = Ptr table.entries[slot]
+        local cell = probe table key hashed
+        if cell == none then return Result.missing() end
+        local entry = Ptr table.entries[table.cells[cell] - 1]
         return Result.found entry.value
     end
     api.locate = do(m: Ref T, key: K): Ptr V
         local hashed = digest key
         local table = acquire m
-        local slot = probe table key hashed
-        if slot == none then trap "map-key: missing key" end
-        local entry = Ptr table.entries[slot]
+        local cell = probe table key hashed
+        if cell == none then trap "map-key: missing key" end
+        local entry = Ptr table.entries[table.cells[cell] - 1]
         return Ptr entry.value
     end
     api.remove = do(m: Ref T, key: K): Bool
         local hashed = digest key
         local table = acquire m
-        local slot = probe table key hashed
-        if slot == none then return false end
+        local cell = probe table key hashed
+        if cell == none then return false end
         check_mutation m
-        local capacity = table.cap
-        local mask = capacity - 1
-        local removed = Ptr table.entries[slot]
+        local slot = table.cells[cell] - 1
+        local entry = Ptr table.entries[slot]
         local removed_bytes = U64 0
-        if string_keys then removed_bytes = U64 removed.key.len end
-        local moving = Bool true
-        while moving do
-            local next_slot = slot + 1
-            next_slot = band next_slot mask
-            local entry = Ptr table.entries[next_slot]
-            local resident = entry.hash
-            local prior = distance resident next_slot capacity
-            if resident == 0 or prior == 0 then moving = false
-            else
-                table.entries[slot] = entry[0]
-                slot = next_slot
-            end
-        end
-        table.entries[slot] = zero Entry
+        if string_keys then removed_bytes = U64 entry.key.len end
+        table.cells[cell] = removed_cell
         local h = header m
-        local length = h.len - 1
-        h.len = length
+        entry[0] = zero Entry
+        entry.hash = bor free_bit (U64 h.free_head)
+        h.free_head = slot
+        local live = h.live - 1
+        h.live = live
         if string_keys then
             local a = storage.strmap m
             a.dead = a.dead + removed_bytes
-            if length == 0 then
+            if live == 0 then
                 stacks.reset a.arena_stack a.arena_base
                 a.arena_len = 0
                 a.dead = 0
             end
         end
+        if live == 0 then
+            -- nothing is borrowed from an empty map: start over
+            stacks.reset h.stack h.base
+            h.len = 0
+            h.free_head = none
+            stacks.fill (stacks.span (stacks.at h.index_stack) h.index_base (U64 h.cap * 4)) (U64 h.cap * 4)
+            h.used = 0
+        end
         return true
     end
-    api.length = do(m: Ref T): U64 return U64 header(m).len end
-    -- `copy m` into a new, empty map: the table, and for text keys the arena
-    -- the stored keys point into by offset
+    api.length = do(m: Ref T): U64 return U64 header(m).live end
+    -- `copy m` into a new, empty map: the slots, the index, and for text keys the
+    -- arena the stored keys point into by offset
     api.copy = do(m: Ref T, from: Ref T): Unit
         local source = header from
         local h = header m
-        if source.cap ~= 0 then
-            local bytes = byte_count source.cap
+        if source.len ~= 0 then
+            local bytes = slot_bytes source.len
             local at = stacks.extend(h.stack, h.base, U64 0, bytes,
                 "Map copy target was not at the top of its data stack")
             stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
         end
+        if source.cap ~= 0 then
+            local bytes = U64 source.cap * 4
+            local at = stacks.extend(h.index_stack, h.index_base, U64 0, bytes,
+                "Map copy target was not at the top of its data stack")
+            local target = stacks.region h.index_stack at bytes
+            local origin = stacks.region source.index_stack source.index_base bytes
+            stacks.move target origin bytes
+        end
         h.len = source.len
+        h.live = source.live
+        h.free_head = source.free_head
         h.cap = source.cap
+        h.used = source.used
         if string_keys then
             local a = storage.strmap m
             local b = storage.strmap from
             local n = b.arena_len
             if n ~= 0 then
                 local at = stacks.extend(a.arena_stack, a.arena_base, U64 0, n,
-                    "StrMap copy target was not at the top of its data stack")
+                    "Map(Str, V) copy target was not at the top of its data stack")
                 stacks.move (stacks.region a.arena_stack at n) (stacks.region b.arena_stack b.arena_base n) n
             end
             a.arena_len = n

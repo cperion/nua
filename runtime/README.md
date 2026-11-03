@@ -27,7 +27,7 @@ Runtime policy is ordinary Nua, built from [the runtime entry](scheduler.nua).
 - [Backend](backend.nua): the poller thread and submission entry of the poll and
   kqueue backends.
 - [Stacks](../lib/stacks.nua) and [storage layout](../lib/storage_layout.nua):
-  data-stack growth/access/unwinding and Store, Grow, Id, Map and StrMap record
+  data-stack growth/access/unwinding and Store, Grow, Id, Map and Map(Str, V) record
   access. The runtime entry exports both sets, so programs and the runtime share
   one implementation.
 

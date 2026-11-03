@@ -92,7 +92,7 @@ check('owner chosen at run time across call', owners.call_picked(true, 5) == 100
     and owners.call_picked(false, 5) == 10113)
 check('owner parameter across call', owners.call_consume(3) == 7)
 check('owner passed through and returned across call, in a loop', owners.call_through(3) == 20020)
-check('copy of Grow, owner struct, StrMap and text', owners.copies(3) == 234521465)
+check('copy of Grow, owner struct, Map(Str, V) and text', owners.copies(3) == 234521465)
 check('Array T of runtime length, and copy of a slice', owners.arrays(5) == 1000509)
 check('owners lend Slice and Slice.mut', owners.views(4) == 6000020)
 check('handler borrows the payload of a sum place', owners.payloads(4) == 57)
@@ -253,6 +253,9 @@ check('still running', ch.late_reply() == 42)
 -- Maps share the runtime table algorithm and generated semantic key adapters.
 local maps = nua.load(root .. '/examples/maps.nua')
 check('Map insertion and checked update', maps.map_tally(1000) == 1000)
+check('Map m[k] = v inserts; an entry borrow survives rehashing', maps.insert_by_index(1000) == 12 + 101 + 1002)
+check('Map.borrowing keeps the caller\'s keys', maps.borrowed_keys(0) == 10 + 4 * 3 + 5 + 3)
+check('Map values may be borrows', maps.borrowed_values(0) == 17)
 check('Map replace, ensure and find snapshots', maps.edit_counts(0xffffffff) == 20)
 local label = maps.types.Str { ptr = ffi.cast('uint8_t *', 'cat'), len = 3 }
 check('Map Chars key equality', maps.label_count(label) == 3)

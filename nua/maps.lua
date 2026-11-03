@@ -15,7 +15,8 @@ local function decorate(t)
     t.map_decorated_for = S.module
     t.map_decorated = true
     local is_str = t.kind == 'strmap'
-    local prefix = is_str and 'StrMap' or ('Map_' .. G.ctype(t.key):gsub('[^%w_]', '_'))
+    local borrowing = rawget(t, 'borrowing')
+    local prefix = is_str and 'StrMap' or borrowing and 'MapBorrowing' or ('Map_' .. G.ctype(t.key):gsub('[^%w_]', '_'))
     local n = S.unique_global(prefix .. '_' .. G.ctype(t.elem):gsub('[^%w_]', '_'))
     t.ctype = function() return n end
     local stored_key = is_str and S.struct(n .. 'Bytes', { { 'offset', types.U64 }, { 'len', types.U64 } }) or t.key
@@ -26,49 +27,70 @@ local function decorate(t)
     t.cdecl = function() return 'typedef ' .. t.representation.cname .. ' ' .. n .. ';' end
     local storage
     t.init_storage = function(b, p)
-        local table_stack = b:gs_alloc(p, is_str and { 'entries.stack', 'entries.base' } or nil)
+        -- three data stacks: the slots (which never move), the hash index, and for
+        -- text keys the arena of key bytes
+        local entry_fields = is_str and { 'entries.stack', 'entries.base' } or nil
+        local table_stack = b:gs_alloc(p, entry_fields)
+        local index_stack = b:gs_alloc(p, is_str and { 'entries.index_stack', 'entries.index_base' }
+            or { 'index_stack', 'index_base' })
         local arena_stack = is_str and b:gs_alloc(p, { 'arena_stack', 'arena_base' }) or table_stack
         rawset(p, 'gs_k', table_stack)
         local function index(k) return Mem.stack_index(k) end
-        storage.init(S.Ref(p), index(table_stack), index(arena_stack))
+        storage.init(S.Ref(p), index(table_stack), index(index_stack), index(arena_stack))
     end
-    t.release_fields = is_str and { { 'entries.stack', 'entries.base' }, { 'arena_stack', 'arena_base' } } or nil
+    t.release_fields = is_str and { { 'entries.stack', 'entries.base' }, { 'entries.index_stack', 'entries.index_base' },
+        { 'arena_stack', 'arena_base' } } or { { 'stack', 'base' }, { 'index_stack', 'index_base' } }
     t.construct = function(x)
         if type(x) ~= 'table' or S.is_staged(x) or next(x) then fail(t.display .. ' {} takes no fields') end
         return setmetatable({ T = t, k = 'fresh' }, S.V)
     end
-    local function receiver(x) return Mem.receiver(x, t.display) end
+    local function receiver(x)
+        local p = Mem.receiver(x, t.display)
+        if borrowing then S.check_stored(p) end    -- the keys it compares against are borrows
+        return p
+    end
     local function ex(x) return S.ex(S.value_of(x)) end
     local function key(x)
-        return is_str and require('nua.strings').as_str(x, 'StrMap key') or S.coerce(x, t.key, 'Map key')
+        if is_str or borrowing then return require('nua.strings').as_str(x, 'Map(Str, V) key') end
+        return S.coerce(x, t.key, 'Map key')
     end
     local function capture_key(kv)
         if S.is_known(kv) then return kv end
-        if not is_str then return Mem.fix_index(kv, 'capturing a map key') end
+        if not (is_str or borrowing) then return Mem.fix_index(kv, 'capturing a map key') end
         local view = rawget(kv, 'view')
         kv = Mem.capture(kv, 'capturing a map key')
         if view then rawset(kv, 'view', view) end
         return kv
     end
     storage = layouts.maps(t, t.entry, function(x) return Mem.view(receiver(x), t.representation) end)
-    local function library() return require('nua.map').library(t, storage, t.entry, t.lookup, is_str) end
+    local function library() return require('nua.map').library(t, storage, t.entry, t.lookup, is_str, borrowing) end
     -- `copy m`: the new map receives m's table and keys
     t.copy_storage = function(p, source)
         library().copy(S.Ref(p), S.Ref(source))
+        -- borrowed keys and values the source holds are held by the copy too
+        if borrowing then S.hold_stored(p, source) end
     end
     local ms = {}
     for _, method in ipairs { 'has', 'find', 'remove' } do
         ms[method] = function(self, k)
-            if method == 'remove' then S.bump_checked() end
+            if method == 'remove' then
+                -- a removed entry's slot is reused: borrows of entries end here
+                local p = receiver(self)
+                S.end_borrows(p, ("an entry of '" .. tostring(p.name) .. "' was removed"))
+                S.bump_checked()
+            end
             return library()[method](S.Ref(receiver(self)), key(k))
         end
     end
     for _, method in ipairs { 'put', 'ensure' } do
         ms[method] = function(self, k, value)
-            local p, kv = receiver(self), capture_key(key(k))
+            local p = receiver(self)
+            -- a borrowed key is stored as it is: a stored borrow, checked against the map's owner
+            local kv = borrowing and Mem.owned_copy(p, key(k), 'capturing a borrowed map key') or capture_key(key(k))
             S.note_growth(p)
             -- Eager by-value capture, including ensure's unused replacement.
-            local v = Mem.capture(S.coerce(value, t.elem, 'Map value'), 'capturing a map value')
+            -- a borrow stored as a value must not outlive the map's owner (§6.2)
+            local v = Mem.owned_copy(p, S.coerce(value, t.elem, 'Map value'), 'capturing a map value')
             S.bump_checked()
             return library().put(S.Ref(p), kv, v, method == 'ensure')
         end
@@ -83,7 +105,7 @@ local function decorate(t)
             k = S.make_slice(types.Str, ptr, len, token)
             local ok, err = pcall(body, k, v)
             if not ok then token.ended = true; error(err, 0) end
-            S.end_view(token, nil, 'a StrMap key cannot outlive its iteration')
+            S.end_view(token, nil, 'a Map(Str, V) key cannot outlive its iteration')
         else body(k, v) end
     end
     S.arity[storage.lend] = 3
@@ -109,13 +131,26 @@ local function decorate(t)
     t.__index = function(self, k)
         local p, kv = receiver(self), capture_key(key(k))
         local function resolve() return ex(library().locate(S.Ref(p), kv)) end
-        return S.checked_place(t.elem, nil, nil, not is_str, resolve,
+        local place = S.checked_place(t.elem, nil, nil, not is_str, resolve,
             n .. '/' .. S.expr_key(Mem.addr(p)) .. '/' .. S.expr_key(ex(kv)))
+        -- an entry is the map's contents: its slot never moves, so a borrow of it
+        -- lives until the entry is removed, and is checked against the map's owner
+        rawset(place, 'owner_place', p)
+        return place
     end
+    -- `m[k] = v` inserts or replaces, as in Lua; reading a missing key still traps
+    t.__newindex = function(self, k, value) return ms.put(self, k, value) end
     return t
 end
 function Maps.Map(k, v)
+    -- text keys are copied into the map's own arena: Map(Str, V) is the text-keyed map
+    if k == types.Str then return Maps.StrMap(v) end
     local ok, t = pcall(types.map, k, v)
+    if not ok then fail(tostring(t):gsub('^[^:]+:%d+: ', '')) end
+    return decorate(t)
+end
+function Maps.Borrowing(v)
+    local ok, t = pcall(types.map_borrowing, v)
     if not ok then fail(tostring(t):gsub('^[^:]+:%d+: ', '')) end
     return decorate(t)
 end
@@ -136,7 +171,7 @@ local function known_description(t, entries)
     local str = t.kind == 'strmap'
     local strings = require 'nua.strings'
     local function key(x)
-        return str and strings.as_str(x, 'known StrMap key') or S.coerce(x, t.key, 'known Map key')
+        return str and strings.as_str(x, 'known Map(Str, V) key') or S.coerce(x, t.key, 'known Map key')
     end
     local copied = {}
     local equal = require('nua.key').equal(t.key)
@@ -149,7 +184,7 @@ local function known_description(t, entries)
         if not S.is_known(k) or not S.is_known(v) then fail('known map keys and values must be known') end
         -- A known owner-backed text view must become immutable bytes, not a
         -- retained view of a local that may subsequently change.
-        if str then k = strings.as_str(S.known_text(k), 'known StrMap key') end
+        if str then k = strings.as_str(S.known_text(k), 'known Map(Str, V) key') end
         for j = 1, i - 1 do
             if S.host(equal(k, copied[j][1])) then fail('duplicate semantic key in known map at entry ' .. i) end
         end
@@ -183,11 +218,12 @@ function Maps.prelude(env)
     local map = setmetatable({ known = function(k, v, entries)
         return known_description(Maps.Map(k, v), entries)
     end }, { __call = function(_, k, v) return Maps.Map(k, v) end })
-    local strmap = setmetatable({ known = function(v, entries)
-        return known_description(Maps.StrMap(v), entries)
-    end }, { __call = function(_, v) return Maps.StrMap(v) end })
-    S.arity[map], S.arity[strmap] = 2, 1
-    S.arity[map.known], S.arity[strmap.known] = 3, 2
-    env.Map, env.StrMap = map, strmap
+    map.borrowing = function(k, v)
+        if k ~= types.Str then fail('Map.borrowing keeps Str keys: Map.borrowing(Str, V)') end
+        return Maps.Borrowing(v)
+    end
+    S.arity[map] = 2
+    S.arity[map.known], S.arity[map.borrowing] = 3, 2
+    env.Map = map
 end
 return Maps

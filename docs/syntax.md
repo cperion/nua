@@ -99,7 +99,7 @@ sum constructor, §11), and the prelude adds:
 
 * **types and their constructors**: `Ref`, `Store`, `Id`, `Grow`, `Ptr`, `Slice`,
   `Array`, `Atomic`, `Chan`, `Pool`, `Slot`, `Fn`, `Str`, `Text`, `Chars`, `Map`,
-  `StrMap`, `CString`, `Duration`, and the scalars of §7;
+  `CString`, `Duration`, and the scalars of §7;
 * **the foreign boundary**: `extern`, `opaque`, `cstruct`,
   `cconst`, `cread`, `bytes`, `size_of`, `view_of`, `atomic_ptr`, `null`, `cformat`,
   `fence`, `trap`, `rawmember`;
@@ -1088,7 +1088,7 @@ Native types are compile-time Lua values: `U8 U16 U32 U64 I8 I16 I32 I64 F32 F64
 Bool Unit`; the constructors `Ref T`, `Store T`, `Id T`, `Grow T`, `Ptr T`, `Slice T`
 (§12), `Array(T, n)` (§13), `Chars(n)`, `Str` and `Text` (§14), `Atomic T` (§19),
 `Chan T`, `Pool T` and `Slot T` (§20) and `Fn(params): ret` (§21); the `Map` and
-`StrMap` families of §15; and structs, sums (§11) and library-defined types (§16).
+`Map(Str, V)` of §15; and structs, sums (§11) and library-defined types (§16).
 
 ### 7.1 C semantics
 
@@ -1190,7 +1190,7 @@ Scalars, structs without owner fields, references and IDs are fixed-size. They l
 
 ### 9.2 Owners
 
-`Grow T`, `Array T`, `Store T`, `Map(K, V)`, `StrMap V` and `Text` are owners: they have storage of their own on a data stack. A struct holding owner fields, any number of them and in any order, is an owner too.
+`Grow T`, `Array T`, `Store T`, `Map(K, V)` (including `Map(Str, V)`) and `Text` are owners: they have storage of their own on a data stack. A struct holding owner fields, any number of them and in any order, is an owner too.
 
 - **Created in place.** An owner is constructed where it lives: `local xs = Grow(U32) {}`, a field of an owner struct, or the place a word's owner result is built in. Declared without a value, it starts empty: `local s: Store Node`. An owner struct's omitted owner fields start empty and its omitted value fields start zeroed: `Graph {}`, `Graph { name = Chars(32) "roads" }`.
 - **One data stack each.** Creation takes the lowest free data-stack index of the function. An owner occupies the top of its stack, and no other live owner of the function shares it. A recursion is the exception that keeps the number of stacks fixed: its levels share stack indices, each level's owners above the previous level's (§9.10).
@@ -2191,8 +2191,10 @@ Everything above, on both backends (`examples/strings.nua`, `tests/strings_main.
 
 ### 15.1 Owned mutable storage
 
-`Map(K, V)` owns fixed-size entries on one Goose data stack. `StrMap(V)` owns
-entries and copied arbitrary byte keys on two stacks. Either is an owner (§9.2):
+`Map(K, V)` owns fixed-size entries in slots that never move (a free list reuses
+removed ones) and a hash index of slot numbers, on two Goose data stacks; only the
+index is rebuilt when the map grows. `Map(Str, V)` also owns copied arbitrary byte
+keys, on a third. Iteration follows slot order. Either is an owner (§9.2):
 created in place with `{}`, moved, returned, copied with `copy`, passed by `Ref`,
 and never captured by another task. A task may own its own map. A struct may hold
 maps among any number of owner fields. Scope exit and trap recovery release its
@@ -2201,11 +2203,20 @@ owned stacks.
 Keys of `Map` are integers (including Duration), Bool, Id, Chars, or recursive
 structs and sums of these. General arrays, floating keys, pointers and borrowed
 views are not keys. A key type, or a type its encoding walks through, may not
-define `__eq` (§15.2). Values are fixed owned data: numeric scalars, Bool, Id, Chars,
-arrays, and recursive structs/sums. Standalone Unit, views, pointers, channels,
-atomics and resizable values are not map values. Unit remains valid as a sum
-alternative. `StrMap` accepts Str and ordinary text-to-Str coercions, including
+define `__eq` (§15.2). A value is any element (§9.12): numeric scalars, Bool, `Id`, Chars,
+borrows (`Ref`, `Str`, `Slice`), handles (`Ptr`, `Slot`, `Chan`, `Pool`), and arrays,
+structs and sums of these. A borrow stored as a value is checked like any stored
+borrow (§9.4): it must not outlive its owner, and it is rejected once its source is
+cleared or ends. Standalone Unit, atomics (deferred) and resizable values are not map
+values; Unit remains valid as a sum alternative. `Map(Str, V)` accepts Str and ordinary text-to-Str coercions, including
 empty keys and embedded NUL bytes.
+
+`Map.borrowing(Str, V)` keeps the caller's `Str` keys instead of copying them into
+an arena, and compares them by contents. Each key is a stored borrow (§9.4): it must
+not outlive its owner, and the map is rejected once a source is cleared or ends
+(`Map.borrowing(Str, V)` operations check the keys they compare against). Tokens keyed
+by their text in a source buffer need no copies. `put(k, v)` and `m[k] = v` store the
+borrow; `find`, `has`, `remove` and `m[k]` look it up by contents.
 
 ```lua
 local Counts = Map(U32, U64)
@@ -2223,15 +2234,20 @@ end
 export count
 ```
 
-- `m[k]` is a checked existing value place. Missing keys trap with `map-key`;
-  assignment does not insert. Aggregate fields of the value are places too.
+- `m[k]` is a borrow of an existing entry. Reading a missing key traps with
+  `map-key`; **assigning inserts or replaces**, as in Lua (`m[k] = v` and `put(k, v)`
+  are the same operation), while `m[k].x = 1` modifies an entry and so traps on a
+  missing key (`ensure` creates one). Aggregate fields of the value are places too.
+  An entry lives in a slot that never moves, so a borrow of it survives later
+  inserts and rehashing; `remove` ends borrows of entries (a borrow used afterwards
+  is rejected while compiling), because the removed slot is reused.
 - `find(k)` returns `Sum { found: V, missing: Unit }`, with a found value snapshot.
 - `has(k)` returns Bool. `put(k, v)` inserts or replaces and returns Unit.
 - `ensure(k, initial)` inserts only if absent. Both arguments evaluate eagerly,
   including when an existing value makes `initial` unnecessary.
 - `remove(k)` returns whether an entry was removed. `length` is the live count, a U64.
 - `each(activity)` visits an unspecified order. Fixed keys and values are snapshots;
-  a StrMap key is a read-only scoped view valid only during that callback. The
+  a `Map(Str, V)` key is a read-only scoped view valid only during that callback. The
   loan's provenance, expiration and native-boundary rules are those of §12.6;
   copy into owned storage to retain the bytes.
 
@@ -2267,17 +2283,17 @@ local Prices = Map(U32, Money)             -- fine: the key is the U32
 The rule is a diagnostic rather than a silent choice between the two equalities,
 and it is the same reason `Str` has no `==` (§14): one operation, one meaning.
 
-A checked place captures a fixed key by value and resolves again after mutation,
-calls and control-flow boundaries. Remove/reinsert of an equal key addresses the
-new entry; it is not Store's generational identity. A StrMap place instead captures
-a borrowed byte view and its length. Its owner must remain alive; each resolution
-observes the view's current bytes. It does not silently allocate an owning key.
+An entry borrow (`Ref m[k]`, `local r = m[k]` as a place) captures a fixed key by
+value; the map's owner must stay alive and no entry may be removed while the
+borrow is used. A `Map(Str, V)` entry borrow instead captures a borrowed byte view and its
+length; each resolution observes the view's current bytes. It does not silently
+allocate an owning key.
 
 ### 15.3 Immutable known descriptions
 
 ```lua
 local numbers = Map.known(U32, U32, { { 1, 10 }, { 2, 20 } })
-local keywords = StrMap.known(U32, { { "if", 1 }, { "while", 2 } })
+local keywords = Map.known(Str, U32, { { "if", 1 }, { "while", 2 } })
 local classify = do(s: Str): U32
     return keywords:find(s) { found(v) = v, missing() = U32 0 }
 end
@@ -2315,8 +2331,8 @@ descriptions have no mutable compile-time heap.
 ### 15.5 Design rationale
 
 A map is an owner like `Store` and `Grow`, so the decisions that shaped it
-were mostly decisions about the Goose model it already had: one data stack for a
-`Map` and two for a `StrMap` (entries, and an arena of copied key bytes), created in
+were mostly decisions about the Goose model it already had: two data stacks for a
+`Map` (slots and index) and three for a `Map(Str, V)` (slots, index, and an arena of copied key bytes), created in
 place, released at the end of the owning block, never captured by a task. Holding
 maps in a struct needed no new rule, only the existing ownership accounting; maps of maps need
 a representation decision that is still open, because a store slot holds fixed-size
@@ -2358,7 +2374,7 @@ authenticated MAC, and the claim it supports is that untrusted keys do not
 reproduce a collision set across processes — not that the mixer is cryptographically
 strong.
 
-**A `StrMap` arena is addressed by offset.** Entries keep byte offsets into their
+**A `Map(Str, V)` arena is addressed by offset.** Entries keep byte offsets into their
 movable arena, never pointers, so growth can relocate it. Removal marks bytes
 reclaimable, and a bounded dead-byte threshold triggers compaction before further
 growth, so insert/remove churn cannot accumulate historical key storage without
@@ -2458,7 +2474,7 @@ about them. The `Ref` returned by `__index` borrows from `self` (§9.5).
 
 ### 16.1 The built-in kinds
 
-`Str`, `Chars(n)` and the `x[k]` places of Store, Grow, Map and StrMap register
+`Str`, `Chars(n)` and the `x[k]` places of Store, Grow and Map register
 their hooks on their types. `Ptr`, `Slice`, `Atomic`, `Chan`, `Array`, `Pool` and
 `Slot` register once per family. Types with computed members and built-in methods
 (`properties`, `builtin_methods`) serve them through the same `__member` hook. A
@@ -2496,7 +2512,7 @@ type's `__index` for an element key, then a struct field, then a method, and
 finally the diagnostic that tells a sum's payload to be reached by matching.
 
 **Registration.** `Str`, `Chars(n)` and the `x[k]` places of `Store`, `Grow`, `Map`
-and `StrMap` register hooks on their own type objects. `Ptr`, `Slice`, `Atomic`,
+register hooks on their own type objects. `Ptr`, `Slice`, `Atomic`,
 `Chan`, `Array`, `Pool` and `Slot` register once per family in
 `S.family_hooks` (`nua/stage.lua`), because their types are constructed per element
 and per length. Types with computed members and built-in methods carry

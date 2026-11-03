@@ -28,7 +28,7 @@ static void guarded_failure(void *p) {
 }
 static void local_guard_failure(void *unused) {
     (void)unused;
-    nua_map local = nua_map_new(2, sizeof(Entry));
+    nua_map local = nua_map_new(2, 6, sizeof(Entry));
     (void)nua_map_iter_new(3, &local);
     nua_trap("unwind local map");
 }
@@ -38,11 +38,11 @@ static void exercise(void *unused) {
     (void)unused;
     nua_gs_push(0, 32); /* preserve a preexisting owner's bytes at a nonzero base */
     memset(nua_gs(0)->data, 0xa5, 32);
-    nua_map m = nua_map_new(0, sizeof(Entry));
+    nua_map m = nua_map_new(0, 5, sizeof(Entry));
     uint64_t values[512] = { 0 };
     bool present[512] = { false };
     uint32_t round, key, count = 0;
-    assert(m.base == 32 && m.len == 0 && find(&m, 1) == NUA_NONE);
+    assert(m.base == 32 && m.live == 0 && find(&m, 1) == NUA_NONE);
     for (round = 0; round < 20000; round++) {
         key = random_u32() % 512;
         if (random_u32() & 1) {
@@ -55,7 +55,7 @@ static void exercise(void *unused) {
             assert((slot != NUA_NONE) == present[key]);
             if (present[key]) { nua_map_remove(&m, slot); count--; present[key] = false; }
         }
-        assert(m.len == count);
+        assert(m.live == count);
         if (round % 97 == 0) for (key = 0; key < 512; key++) {
             uint32_t slot = find(&m, key);
             assert((slot != NUA_NONE) == present[key]);
@@ -78,12 +78,13 @@ static void exercise(void *unused) {
     assert(nua_try(local_guard_failure, NULL) == 1);
     assert(nua_gs(3)->map_counter == NULL);
     uint32_t visited = 0, at;
-    for (at = 0; at < m.cap; at++) if (((Entry *)nua_map_at(&m, at))->hash) visited++;
-    assert(visited == m.len);
+    for (at = 0; at < m.len; at++) if (map_occupied(&m, at)) visited++;
+    assert(visited == m.live);
     assert(nua_try(missing_bucket, &m) == 1);
     for (key = 0; key < 32; key++) assert(nua_gs(0)->data[key] == 0xa5);
+    nua_release(m.index_stack, m.index_base);
     nua_release(m.stack, m.base);
-    assert(nua_gs_top(0) == 32);
+    assert(nua_gs_top(0) == 32 && nua_gs_top(5) == 0);
 }
 int main(void) {
     assert(nua_try(exercise, NULL) == 0);

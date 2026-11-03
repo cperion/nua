@@ -434,7 +434,7 @@ Every function that allocates on data stacks records the tops of its stacks on e
 
 An owner reached through a reference keeps its stack identity in its header, so it can grow, move and be released through any place that holds the header.
 
-**Owner slots.** Each owner place holds slots: one per stack (two for a `StrMap`), released through the place's header. A slot is on one of the function's own indices (claimed in `gs_live`, counted in `gs_claims`), adopted from a header that arrived by value (an owner parameter; `gs_extra`), or on a result stack (`gs_res_slots`). Slot records are never handed between places: a move copies the header and gives the destination slots of its own over the same storage, and an index stays claimed while any slot over it lives. Who releases what is a path fact: a place's held mark (set when it receives storage) and its move mark live in the path state, so branches, joins and rollbacks treat them like any other state. A join releases, on the paths that kept it, an owner another path moved; a release (block end, jump, exit) skips places this path does not hold or has moved on. A materialized function releases its adopted slots on every exit, since its epilogue resets only its own indices.
+**Owner slots.** Each owner place holds slots: one per stack (two for a `Map`: slots and index; three for a `Map(Str, V)`: slots, index and key arena), released through the place's header. A slot is on one of the function's own indices (claimed in `gs_live`, counted in `gs_claims`), adopted from a header that arrived by value (an owner parameter; `gs_extra`), or on a result stack (`gs_res_slots`). Slot records are never handed between places: a move copies the header and gives the destination slots of its own over the same storage, and an index stays claimed while any slot over it lives. Who releases what is a path fact: a place's held mark (set when it receives storage) and its move mark live in the path state, so branches, joins and rollbacks treat them like any other state. A join releases, on the paths that kept it, an owner another path moved; a release (block end, jump, exit) skips places this path does not hold or has moved on. A materialized function releases its adopted slots on every exit, since its epilogue resets only its own indices.
 
 **Owner results.** A word evaluated in place builds its owner result in a place of the caller's block, into which its returns move. A materialized word returning an owner takes a `gs_res` parameter: its result stacks. Allocations are numbered; when a return finds the returned owner on another stack, the function is built again with that allocation placed on result stack `j` of its own (`fn.result_allocs`), so candidate results never stack on each other. A non-recursive caller reserves the callee's result stacks past its live indices and releases the result by rewinding them to their tops before the call. A recursion's functions share one region (`S.result_region`: each function at an offset, in a fixed order, read by the backends from the `res_index` operation once `plan_stacks` has set it); any function of the recursion that passes results down takes `gs_res`, and calls emitted before it did are given the argument. A recursive call passes `gs_res` through, so every level's results share the result stacks; a returning level releases the result-stack owners placed after its result, and leaves those below it (results it consumed) for the outermost caller's rewind. On a result stack only the newest owner may grow.
 
@@ -449,7 +449,7 @@ Knownness is semantic information used during residualization; memory facts are 
 Specialization keys contain code identity, native types and known arguments — never absolute data-stack positions, because `gs_sp` is a relative base.
 
 Borrow provenance is staged information, not a pointer-field ABI extension.
-Tokens name what a borrow depends on: an activity (`view_of`, a StrMap key during
+Tokens name what a borrow depends on: an activity (`view_of`, a `Map(Str, V)` key during
 `each`), an owner place, or, inside a materialized function, an argument. An owner
 has a whole token, taken by a `Ref` to it and by views of fixed arrays, which ends
 with its word or block, and a contents token, taken by views of a `Grow` or `Text`
@@ -1424,7 +1424,7 @@ what `nua build` uses; `-O3` spends 14 KB to stand still on that program.
 
 **Run on the libraries.** Running this loop over the builtin libraries is what set
 the `call` sites §5.7 lists, and the first table is what drove the last round of it:
-`lib/stacks.nua` was 42% of a StrMap program and 53% of a store program, and the
+`lib/stacks.nua` was 42% of a `Map(Str, V)` program and 53% of a store program, and the
 ranked list named `get`, twelve lines of C copied 41 to 361 times. Sharing it took
 `examples/strmaps.nua` from 14,422 lines to 10,612 and `examples/maps.nua` from 11,386
 to 9,607, with the map and store harnesses unchanged; it cost six lines on a program
@@ -1451,7 +1451,7 @@ that links the generated C and checks results, and by the in-process checks.
 | pointers, slices, range facts | syntax §12 | `examples/memory_views.nua` |
 | fixed-length arrays | syntax §13 | `examples/arrays.nua` |
 | text: `Str`, `Text`, `Chars(n)`, UTF-8, parse | syntax §14 | `examples/strings.nua`, `examples/staged_values.nua` |
-| maps, `StrMap`, known descriptions | syntax §15 | `examples/maps.nua`, `examples/strmaps.nua`, `examples/known_maps.nua`, `examples/map_models.nua` |
+| maps, `Map(Str, V)`, known descriptions | syntax §15 | `examples/maps.nua`, `examples/strmaps.nua`, `examples/known_maps.nua`, `examples/map_models.nua` |
 | library-defined types | syntax §16 | `examples/user_types.nua`, `examples/ring.nua` |
 | externs, `CString`, formats, libc, POSIX | syntax §17–§18 | `examples/libc_demo.nua`, `examples/posix_demo.nua`, `examples/base64.nua`, `examples/boundary.nua` |
 | atomics, fences, `atomic_ptr` | syntax §19 | `examples/atomics.nua` (also under ThreadSanitizer) |
@@ -1496,10 +1496,10 @@ and saved to `tests/fuzz/regressions/`, which `tests/run.lua` re-checks on every
 backend.
 
 **The storage model fuzzer** ([`storage.lua`](../tests/fuzz/storage.lua)) runs random
-store, grow, text, map and `StrMap` operation sequences in Nua and on a Lua model with
+store, grow, text, map and `Map(Str, V)` operation sequences in Nua and on a Lua model with
 exact 64-bit checksums, including deliberate stale-`Id`, out-of-range, removed-key and
-removed-`StrMap`-key cases that must trap where the model says they are invalid. A
-`StrMap`'s iteration order is unspecified, so the model checks membership, not order.
+removed-`Map(Str, V)`-key cases that must trap where the model says they are invalid. A
+`Map(Str, V)`'s iteration order is unspecified, so the model checks membership, not order.
 
 **The task fuzzer** ([`tasks.lua`](../tests/fuzz/tasks.lua)) runs five written
 templates whose result cannot depend on the schedule — a pipeline, four shared
@@ -1541,7 +1541,7 @@ policy objects, recursive layouts and the queue/heap/channel/pool models.
 | Goose storage and record layouts | [`nua/memory.lua`](../nua/memory.lua) |
 | Immutable fixed-array contents | [`nua/array_value.lua`](../nua/array_value.lua) |
 | Text types and their compile-time fold | [`nua/strings.lua`](../nua/strings.lua) |
-| `Map`/`StrMap` type hooks and layouts | [`nua/maps.lua`](../nua/maps.lua) |
+| `Map` type hooks and layouts (`Map(Str, V)` is the text-keyed map) | [`nua/maps.lua`](../nua/maps.lua) |
 | Residual IR → C | [`nua/cgen.lua`](../nua/cgen.lua) |
 | Residual IR → libgccjit (mirrors cgen) | [`nua/jitgen.lua`](../nua/jitgen.lua) |
 | C rules over libgccjit; the C reader | [`nua/cjit.lua`](../nua/cjit.lua), [`nua/gccjit_h.lua`](../nua/gccjit_h.lua) |

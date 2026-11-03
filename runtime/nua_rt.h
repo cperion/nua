@@ -145,12 +145,18 @@ typedef struct nua_args {
 /* Checked slice access is a library word (lib/slice.nua), not a C macro. */
 
 /* Native storage metadata. Encoding, equality, probing, growth and mutation
- * are ordinary Nua words. Bucket zero hashes denote empty slots. */
+ * are ordinary Nua words. Entries live in slots that never move (a free list
+ * reuses removed ones); a separate index of slot numbers is rebuilt when the
+ * map grows. A slot whose hash has its top bit set is free: the low 32 bits
+ * name the next free slot. Index cells hold slot + 1; zero is empty and
+ * 0xffffffff a removed cell. */
 typedef struct nua_map {
     size_t stack, base, width;
-    uint32_t len, cap, iterating;
+    uint32_t len, live, free_head, iterating;
+    size_t index_stack, index_base;
+    uint32_t cap, used;
 } nua_map;
-nua_map nua_map_new(size_t stack, size_t width);
+nua_map nua_map_new(size_t stack, size_t index_stack, size_t width);
 void *nua_map_at(const nua_map *m, uint32_t slot);
 /* Internal scope-owned guard, represented by an ordinary stack/base header. */
 nua_grow nua_map_iter_new(size_t stack, nua_map *m);
@@ -168,7 +174,7 @@ typedef struct nua_strmap {
     nua_map entries;
     size_t arena_stack, arena_base, arena_len, dead;
 } nua_strmap;
-nua_strmap nua_strmap_new(size_t table_stack, size_t arena_stack, size_t width);
+nua_strmap nua_strmap_new(size_t table_stack, size_t index_stack, size_t arena_stack, size_t width);
 
 /* tasks, channels, timers (runtime/tasks.nua) ---------------------------------------------------
  * A task is a frame whose first member is a nua_task, and a step function the

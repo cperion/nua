@@ -56,11 +56,11 @@ function model(T, string_keys)
     end
 end
 local map_model = model(Map(U32, U32), false)
-local strmap_model = model(StrMap U32, true)
+local strmap_model = model(Map(Str, U32), true)
 export map_model
 export strmap_model
 
-local Texts = StrMap Buffer
+local Texts = Map(Str, Buffer)
 local map_table_alias = do(count: U32): U32
     local m = Texts {}
     m:put("source", Buffer "new-key")
@@ -84,7 +84,7 @@ local map_eager_ensure = do(): U32
 end
 export map_eager_ensure
 
-local Counts = StrMap U32
+local Counts = Map(Str, U32)
 local arena_alias = extern("map_model_arena_alias", { Ref Counts }, Str)
 local map_arena_alias = do(count: U32, width: U32): U32
     local m = Counts {}

@@ -492,8 +492,16 @@ end
 
 -- Maps: recursively admit data, never merely an outer fixed-size layout.
 local function map_data(t, key, unit, visiting)
-    if not T.is_type(t) or t.resizable or rawget(t, 'slice_elem') then return false end
+    if not T.is_type(t) or t.resizable then return false end
+    if key and rawget(t, 'slice_elem') then return false end
     local k = t.kind
+    if not key then
+        -- a value is any element: scalars, ids, borrows (Ref, Str, Slice), handles (Ptr, Slot,
+        -- Chan, Pool), and structs, sums and arrays of these. Atomics wait (design D4).
+        if k == 'unit' then return unit end
+        if k == 'atomic' or k == 'group' or k == 'opaque' then return false end
+        if k ~= 'struct' and k ~= 'sum' and k ~= 'array' then return true end
+    end
     if k == 'int' or k == 'bool' or k == 'id' or rawget(t, 'chars_cap') then return true end
     if k == 'unit' then return unit end
     if k == 'float' then return not key end
@@ -531,12 +539,24 @@ function T.map(key, value)
     end
     return maps[key][value]
 end
+-- Map.borrowing(Str, V): the caller's Str keys are kept, not copied; each is a stored
+-- borrow, checked against the map's owner, and keys compare by contents
+local borrowing_maps = {}
+function T.map_borrowing(value)
+    check_type(value, 'Map.borrowing value')
+    if not T.map_value(value) then error('Map.borrowing value must be fixed-size data, not ' .. value.display, 2) end
+    if not borrowing_maps[value] then
+        borrowing_maps[value] = new { kind = 'map', key = T.Str, elem = value, resizable = true, borrowing = true,
+            display = ('Map.borrowing(Str, %s)'):format(value.display) }
+    end
+    return borrowing_maps[value]
+end
 function T.strmap(value)
-    check_type(value, 'StrMap value')
-    if not T.map_value(value) then error('StrMap value must be fixed-size owned data, not ' .. value.display, 2) end
+    check_type(value, 'Map(Str, V) value')
+    if not T.map_value(value) then error('Map(Str, V) value must be fixed-size owned data, not ' .. value.display, 2) end
     if not strmaps[value] then
         strmaps[value] = new { kind = 'strmap', key = T.Str, elem = value, resizable = true,
-            display = ('StrMap(%s)'):format(value.display) }
+            display = ('Map(Str, %s)'):format(value.display) }
     end
     return strmaps[value]
 end

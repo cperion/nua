@@ -38,7 +38,7 @@ static void exercise(void *unused) {
     (void)unused;
     nua_gs_push(0, 16); nua_gs_push(1, 32);
     memset(nua_gs(0)->data, 0x55, 16); memset(nua_gs(1)->data, 0xaa, 32);
-    nua_strmap m = nua_strmap_new(0, 1, sizeof(Entry));
+    nua_strmap m = nua_strmap_new(0, 4, 1, sizeof(Entry));
     uint8_t keys[128][64];
     uint32_t lens[128], i, j, count = 0;
     uint64_t values[128] = { 0 };
@@ -62,7 +62,7 @@ static void exercise(void *unused) {
             if (present[key]) count--;
             present[key] = false;
         }
-        assert(m.entries.len == count);
+        assert(m.entries.live == count);
         if (i % 97 == 0) for (j = 0; j < 128; j++) {
             uint32_t slot = find_key(&m, keys[j], lens[j]);
             assert((slot != NUA_NONE) == present[j]);
@@ -72,7 +72,7 @@ static void exercise(void *unused) {
         assert(m.arena_len < 16384);
     }
     for (j = 0; j < 128; j++) remove_key(&m, keys[j], lens[j]);
-    assert(m.entries.len == 0 && m.arena_len == 0 && m.dead == 0);
+    assert(m.entries.live == 0 && m.arena_len == 0 && m.dead == 0);
     put(&m, NULL, 0, 99); assert(get(&m, NULL, 0) == 99);
     remove_key(&m, NULL, 0);
 
@@ -97,7 +97,7 @@ static void exercise(void *unused) {
     assert(m.dead == 0 && m.arena_len == 15000);
 
     /* A key can also be borrowed from a value in the table being grown. */
-    nua_strmap table_alias = nua_strmap_new(2, 3, sizeof(Entry));
+    nua_strmap table_alias = nua_strmap_new(2, 5, 3, sizeof(Entry));
     for (i = 0; i < 7; i++) put(&table_alias, (uint8_t *)&i, sizeof i, UINT64_C(0x0123456789abcdef));
     i = 0; slot = find_key(&table_alias, (uint8_t *)&i, sizeof i);
     uint8_t expected[8]; memcpy(expected, &at(&table_alias, slot)->value, 8);
@@ -105,6 +105,7 @@ static void exercise(void *unused) {
     put(&table_alias, view, 8, 77);
     assert(table_alias.entries.cap == 16 && get(&table_alias, expected, 8) == 77);
     nua_release(table_alias.arena_stack, table_alias.arena_base);
+    nua_release(table_alias.entries.index_stack, table_alias.entries.index_base);
     nua_release(table_alias.entries.stack, table_alias.entries.base);
 
     nua_grow guard = nua_map_iter_new(2, &m.entries);
@@ -115,12 +116,13 @@ static void exercise(void *unused) {
     for (i = 0; i < 16; i++) assert(nua_gs(0)->data[i] == 0x55);
     for (i = 0; i < 32; i++) assert(nua_gs(1)->data[i] == 0xaa);
     nua_release(m.arena_stack, m.arena_base);
+    nua_release(m.entries.index_stack, m.entries.index_base);
     nua_release(m.entries.stack, m.entries.base);
     assert(nua_gs_top(0) == 16 && nua_gs_top(1) == 32);
 }
 int main(void) {
     assert(nua_try(exercise, NULL) == 0);
     nua_stacks_free(&nua_own_stacks);
-    puts("StrMap runtime: owned bytes, NULs, model, growth, compaction, aliases and guards passed");
+    puts("Map(Str, V) runtime: owned bytes, NULs, model, growth, compaction, aliases and guards passed");
     return 0;
 }

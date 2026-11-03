@@ -22,7 +22,7 @@ end
 export two_fields
 
 -- an owner struct inside an owner struct, with text and maps, passed by Ref
-local Index = Struct { words: StrMap U32, names: Text, counts: Map(U32, U32) }
+local Index = Struct { words: Map(Str, U32), names: Text, counts: Map(U32, U32) }
 local World = Struct { graph: Graph, index: Index, ticks: U32 }
 local fill = do(w: Ref World, n: U32): Unit
     for i: U32 = 1, n do
@@ -175,7 +175,7 @@ local copies = do(n: U32): U32
     local h = copy g
     h.order:push 7
     h.label = 5
-    local words = StrMap(U32) {}
+    local words = Map(Str, U32) {}
     words:put("cat", 3)
     words:put("dog", 4)
     local other = copy words

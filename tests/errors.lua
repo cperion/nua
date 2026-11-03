@@ -38,7 +38,7 @@ end
 export f
 ]] },
     { name = 'known map missing key fails during specialization', expect = 'map-key',
-      src = [[local m = StrMap.known(U32, {})
+      src = [[local m = Map.known(Str, U32, {})
 local f = do(): U32 return m["missing"] end
 export f
 ]] },
@@ -108,8 +108,6 @@ export f
 ]] },
     { name = 'floating map keys', expect = 'Map key must have fixed semantic equality',
       src = [[local M = Map(F64, U32)]] },
-    { name = 'borrowed map values', expect = 'Map value must be fixed-size owned data',
-      src = [[local M = Map(U32, Str)]] },
     { name = 'nested mutable maps', expect = 'Map value must be fixed-size owned data',
       src = [[local M = Map(U32, Map(U32, U32))]] },
     { name = 'a map created while compiling', expect = 'runtime storage',
@@ -558,6 +556,85 @@ export f
       src = [[local f = do(p: Ptr U32): U32
     local r = Ref(p)
     return 0
+end
+export f
+]] },
+    { name = 'a Map entry borrow used after a removal', expect = "a borrow of 'm' is used after an entry of 'm' was removed",
+      src = [[local f = do(n: U32): U32
+    local m = Map(U32, U32) {}
+    m[1] = 10
+    local r = Ref m[1]
+    m:remove 2
+    r = r + 5
+    return m[1]
+end
+export f
+]] },
+    { name = 'a borrow stored in a Grow used after its source was cleared', expect = "a borrow of 'text' is used after 'text' was cleared",
+      src = [[local f = do(n: U32): U32
+    local text = Text {}
+    text:write "inner"
+    local g = Grow(Str) {}
+    g:push(text:str())
+    text:clear()
+    return U32 g[0].length
+end
+export f
+]] },
+    { name = 'a borrow stored in a struct used after its source was cleared', expect = "a borrow of 'text' is used after 'text' was cleared",
+      src = [[local Token = Struct { text: Str }
+local f = do(n: U32): U32
+    local text = Text {}
+    text:write "inner"
+    local t = Token { text = text:str() }
+    text:clear()
+    return U32 t.text.length
+end
+export f
+]] },
+    { name = 'a borrow stored in a Map used after its source was cleared', expect = "a borrow of 'text' is used after 'text' was cleared",
+      src = [[local f = do(n: U32): U32
+    local text = Text {}
+    text:write "inner"
+    local m = Map(U32, Str) {}
+    m[1] = text:str()
+    text:clear()
+    return U32 m[1].length
+end
+export f
+]] },
+    { name = 'a borrow of an inner owner stored in an outer Map', expect = "cannot be stored in 'm', which outlives it",
+      src = [[local f = do(n: U32): U32
+    local m = Map(U32, Str) {}
+    if n > 0 then
+        local text = Text {}
+        text:write "inner"
+        m[1] = text:str()
+    end
+    return 0
+end
+export f
+]] },
+    { name = 'a borrowed Map key from an inner scope', expect = "cannot be stored in 'm', which outlives it",
+      src = [[local f = do(n: U32): U32
+    local m = Map.borrowing(Str, U32) {}
+    if n > 0 then
+        local src = Text {}
+        src:write "alpha"
+        m:put(src:str(), 1)
+    end
+    return 0
+end
+export f
+]] },
+    { name = 'a borrowed Map key used after its source was cleared', expect = "a borrow of 'src' is used after 'src' was cleared",
+      src = [[local f = do(n: U32): U32
+    local src = Text {}
+    src:write "alpha"
+    local m = Map.borrowing(Str, U32) {}
+    m:put(src:str(), 1)
+    src:clear()
+    return U32 m.length + m["alpha"]
 end
 export f
 ]] },

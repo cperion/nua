@@ -12,7 +12,8 @@ layout.Grow = cstruct("nua_grow", h, { { "stack", U64 }, { "base", U64 }, { "len
 layout.Id = cstruct("nua_id", h, { { "token", U64 }, { "slot", U32 }, { "gen", U32 } })
 layout.Map = cstruct("nua_map", h, {
         { "stack", U64 },
-        { "base", U64 }, { "width", U64 }, { "len", U32 }, { "cap", U32 }, { "iterating", U32 },
+        { "base", U64 }, { "width", U64 }, { "len", U32 }, { "live", U32 }, { "free_head", U32 },
+        { "iterating", U32 }, { "index_stack", U64 }, { "index_base", U64 }, { "cap", U32 }, { "used", U32 },
     })
 layout.StrMap = cstruct("nua_strmap", h, {
         { "entries", layout.Map },
@@ -24,11 +25,11 @@ local maximum = U64 0xffffffffffffffffULL
 local Void = opaque "void"
 local VP = Ptr Void
 local ReadMap = cstruct("const nua_map", h, {
-        { "stack", U64 }, { "base", U64 }, { "width", U64 }, { "cap", U32 },
+        { "stack", U64 }, { "base", U64 }, { "width", U64 }, { "len", U32 },
     })
 local ReadMapPtr = Ptr ReadMap
 layout.map_address = do(map: ReadMapPtr, slot: U32): VP
-    if slot >= map.cap then trap "Map: invalid bucket" end
+    if slot >= map.len then trap "Map: invalid bucket" end
     local width = map.width
     local at = map.base + U64 slot * width
     return VP stacks.region(map.stack, at, width)
@@ -48,22 +49,29 @@ end
 layout.grow_new = do(stack: U64): layout.Grow
     return layout.Grow { .stack, base = stacks.begin stack, len = 0 }
 end
-layout.map_new = do(stack: U64, width: U64): layout.Map
-    if width < 8 or width % 8 ~= 0 then trap "Map: invalid entry layout" end
+layout.map_new = do(stack: U64, index_stack: U64, width: U64): layout.Map
+    if width < 8 or width % 8 ~= 0 or stack == index_stack then trap "Map: invalid entry layout" end
     return layout.Map with
         .stack
         base = stacks.begin stack
         .width
         len = 0
-        cap = 0
+        live = 0
+        free_head = 0xffffffff
         iterating = 0
+        .index_stack
+        index_base = stacks.begin index_stack
+        cap = 0
+        used = 0
     end
 end
-layout.strmap_new = do(table_stack: U64, arena_stack: U64, width: U64): layout.StrMap
+layout.strmap_new = do(table_stack: U64, index_stack: U64, arena_stack: U64, width: U64): layout.StrMap
     -- nua_strkey is the full fixed prefix, including native trailing padding.
     local Key = cstruct("nua_strkey", h, { { "hash", U64 }, { "offset", U64 }, { "len", U64 } })
-    if table_stack == arena_stack or width < size_of Key then trap "StrMap: invalid storage layout" end
-    local entries = layout.map_new table_stack width
+    if table_stack == arena_stack or index_stack == arena_stack or width < size_of Key then
+        trap "Map(Str, V): invalid storage layout"
+    end
+    local entries = layout.map_new table_stack index_stack width
     local base = stacks.begin arena_stack
     return layout.StrMap with
         .entries
@@ -75,7 +83,7 @@ layout.strmap_new = do(table_stack: U64, arena_stack: U64, width: U64): layout.S
 end
 layout.iter_new = do(stack: U64, map: Ptr layout.Map): layout.Grow
     local s = stacks.claim stack
-    if stack == map.stack or s.map_counter ~= null U32 then trap "Map: invalid iteration guard stack" end
+    if stack == map.stack or stack == map.index_stack or s.map_counter ~= null U32 then trap "Map: invalid iteration guard stack" end
     if map.iterating == U32 0xffffffff then trap "Map: too many nested iterations" end
     local id = token()
     local guard = layout.grow_new stack
@@ -117,26 +125,33 @@ end
 function layout.maps(T, Entry, view)
     local str = T.kind == "strmap"
     local EP = Ptr Entry
+    local Cells = Ptr U32
     local Stored = Entry.index.key.type
-    -- One acquisition of a table: its buckets and, for text keys, the live
-    -- arena bytes the stored keys point into.
-    local View = Struct { entries: EP, cap: U32 }
-    if str then View = Struct { entries: EP, cap: U32, arena: Ptr U8 } end
+    -- One acquisition of a table: its slots (which never move), its index
+    -- cells and, for text keys, the live arena bytes the stored keys point into.
+    local View = Struct { entries: EP, len: U32, cells: Cells, cap: U32 }
+    if str then View = Struct { entries: EP, len: U32, cells: Cells, cap: U32, arena: Ptr U8 } end
     local header = do(self: Ref T): Ptr layout.Map
         local h = view self
         if str then return Ptr h.entries end
         return h
     end
-    local entries = do(self: Ref T, base: U64, capacity: U32): EP
+    -- the slots, as many as the map has used so far
+    local entries = do(self: Ref T): EP
         local h = header self
-        local bytes = U64 capacity * size_of Entry
-        return EP stacks.region(h.stack, base, bytes)
+        local bytes = U64 h.len * size_of Entry
+        return EP stacks.region(h.stack, h.base, bytes)
     end
-    local p = { .View, .header, .entries }
-    p.init = do(self: Ref T, stack: U64, arena: U64): Unit
+    local cells = do(self: Ref T): Cells
+        local h = header self
+        local bytes = U64 h.cap * 4
+        return Cells stacks.region(h.index_stack, h.index_base, bytes)
+    end
+    local p = { .View, .header, .entries, .cells }
+    p.init = do(self: Ref T, stack: U64, index: U64, arena: U64): Unit
         local h = view self
-        if str then h[0] = layout.strmap_new stack arena (size_of Entry)
-        else h[0] = layout.map_new stack (size_of Entry) end
+        if str then h[0] = layout.strmap_new stack index arena (size_of Entry)
+        else h[0] = layout.map_new stack index (size_of Entry) end
     end
     p.iter = do(self: Ref T, guard: Ptr layout.Grow, stack: U64): Unit
         guard[0] = layout.iter_new stack (header self)
@@ -144,13 +159,14 @@ function layout.maps(T, Entry, view)
     p.strmap = do(self: Ref T): Ptr layout.StrMap return view self end
     p.acquire = do(self: Ref T): View
         local h = header self
-        local table = entries self h.base h.cap
+        local table = entries self
+        local index = cells self
         if str then
             local s = view self
             local arena = stacks.region s.arena_stack s.arena_base s.arena_len
-            return View { entries = table, cap = h.cap, .arena }
+            return View { entries = table, len = h.len, cells = index, cap = h.cap, .arena }
         end
-        return View { entries = table, cap = h.cap }
+        return View { entries = table, len = h.len, cells = index, cap = h.cap }
     end
     -- the key a stored key denotes, inside the view that holds its bytes
     p.key = do(table: View, stored: Stored): T.key

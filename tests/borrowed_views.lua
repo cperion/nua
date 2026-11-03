@@ -159,13 +159,13 @@ local rejected = {
         local v: U32 = r
     ]], 'used after' },
     { 'borrow stored in an outer record field', [[fill_token(Ref outer, false)]], 'cannot be stored' },
-    { 'StrMap key assignment', [[
-        local map = StrMap(U32) {}
+    { 'Map(Str, V) key assignment', [[
+        local map = Map(Str, U32) {}
         map:put("key", 1)
         map:each do(key, value) kept = key end
     ]], 'cannot be stored' },
-    { 'StrMap dynamic key assignment', [[
-        local map = StrMap(U32) {}
+    { 'Map(Str, V) dynamic key assignment', [[
+        local map = Map(Str, U32) {}
         map:put("key", 1)
         map:each do(key, value) kept = dynamic key end
     ]], 'cannot be stored' },
@@ -208,8 +208,8 @@ local accepted = {
         bytes:push 65
         local size = call length(Str.of(bytes:all()))
     ]] },
-    { 'StrMap key at a native boundary', [[
-        local map = StrMap(U32) {}
+    { 'Map(Str, V) key at a native boundary', [[
+        local map = Map(Str, U32) {}
         map:put("key", 1)
         map:each do(key, value) local size = call length key end
     ]] },
@@ -299,8 +299,8 @@ local accepted = {
         local twice = do(value: U64): U64 = value * 2
         view_of(p, n) do(xs) local result = call twice(xs.length) end
     ]] },
-    { 'StrMap key copied into owned storage', [[
-        local map = StrMap(U32) {}
+    { 'Map(Str, V) key copied into owned storage', [[
+        local map = Map(Str, U32) {}
         map:put("key", 1)
         local owned = Chars 32 ()
         map:each do(key, value) owned = Chars 32 key end

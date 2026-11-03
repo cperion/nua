@@ -11,10 +11,10 @@ typedef struct Str { uint8_t *ptr; uint64_t len; } Str;
 uint64_t map_model_extent(nua_strmap *m) { return m->arena_len; }
 Str map_model_arena_alias(nua_strmap *m) {
     uint32_t i;
-    for (i = 0; i < m->entries.cap; i++) {
+    for (i = 0; i < m->entries.len; i++) {
         nua_strkey key;
         memcpy(&key, nua_map_at(&m->entries, i), sizeof key);
-        if (key.hash && key.len > 1) {
+        if (!(key.hash >> 63) && key.len > 1) {
             Str view = { nua_gs(m->arena_stack)->data + m->arena_base + key.offset + 1, key.len - 1 };
             return view;
         }

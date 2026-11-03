@@ -626,6 +626,7 @@ end
 -- A value entering a container: the lifetime rule checks what it borrows
 -- against the container's owner, and records it there for later reads. The
 -- container's algorithm then copies plain bytes through raw memory.
+function Mem.owned_copy(container, value, what) return Mem.owned_copy_impl(container, value, what) end
 local function owned_copy(container, value, what)
     -- a reference stays a reference: reading it as a value would follow it
     if not (S.is_value(value) and value.k == 'ref') then value = S.value_of(value) end
@@ -635,6 +636,7 @@ local function owned_copy(container, value, what)
     b:emit { op = 'let', place = tmp, e = S.ex(value), what = what }
     return S.dyn(value.T, S.read_expr(tmp))
 end
+Mem.owned_copy_impl = owned_copy
 
 -- An index or key fixed where it is written, so a checked place denotes the
 -- element it named then. A free expression is already its own value; one that

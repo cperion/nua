@@ -290,13 +290,13 @@ local function make_map_program(seed, missing)
     return { text = table.concat(src, '\n') .. '\n', model = model }
 end
 
--- a StrMap family: text keys of any length; iteration is unspecified in order,
+-- a Map(Str, V) family: text keys of any length; iteration is unspecified in order,
 -- so its contribution is commutative (xor over the entries)
 local STRKEYS = { 'a', 'b', 'c', 'aa', 'ab', 'ba' }
 local function make_strmap_program(seed, missing)
     local r = rng(seed)
     local src = {
-        'local Counts = StrMap(U32)',
+        'local Counts = Map(Str, U32)',
         'local run = do(): U64',
         '    local m: Counts = Counts {}',
         '    local acc: U64 = 0',

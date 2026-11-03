@@ -38,6 +38,6 @@ int main(void) {
         assert(strmap_copy() == 27);
     }
     nua_stacks_free(&nua_own_stacks);
-    puts("StrMap: copied keys, binary text, iteration, live view keys and scope cleanup passed");
+    puts("Map(Str, V): copied keys, binary text, iteration, live view keys and scope cleanup passed");
     return 0;
 }

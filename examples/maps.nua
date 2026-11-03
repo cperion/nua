@@ -33,6 +33,52 @@ local edit_counts = do(k: U32): U64
 end
 export edit_counts
 
+-- `m[k] = v` inserts or replaces, and an entry's address survives later inserts
+-- and rehashing: a borrow of an entry lives until some entry is removed.
+local insert_by_index = do(n: U32): U64
+    local m = Counts {}
+    m[7] = 1
+    local held = Ref m[7]
+    for i: U32 = 100, 100 + n do
+        m[i] = U64 i
+    end
+    m[7] = m[7] + 1
+    held = held + 10
+    m[100] = m[100] + 1
+    return m[7] + m[100] + U64 m.length
+end
+export insert_by_index
+
+-- values may be borrows: this one is a view of a text, checked against the map's owner
+local Views = Map(U32, Str)
+local borrowed_values = do(n: U32): U64
+    local text = Text {}
+    text:write "hello world"
+    local m = Views {}
+    m[1] = text:str()
+    m[2] = "static"
+    return m[1].length + m[2].length
+end
+export borrowed_values
+
+-- Map.borrowing keeps the caller's Str keys instead of copying them into an arena:
+-- tokens keyed by their text in a source buffer need no copies. The keys are stored
+-- borrows, checked against the map's owner.
+local Tokens = Map.borrowing(Str, U32)
+local borrowed_keys = do(n: U32): U32
+    local source = Text {}
+    source:write "alpha beta gamma beta alpha beta"
+    local seen = Tokens {}
+    source:str():split(U8 32) do(word)
+        local count = seen:find(word) { found(c) = c, missing() = U32 0 }
+        seen[word] = count + 1
+    end
+    local total: U32 = 0
+    seen:each do(k, v) total = total + U32 k.length * v end
+    return total + seen["beta"]
+end
+export borrowed_keys
+
 local Label = Chars 16
 local Labels = Map(Label, U32)
 local label_count = do(s: Str): U32
@@ -107,9 +153,12 @@ local checked_map_place = do(k: U32): U64
         m:put(k + i, Payload { count = i, weight = 0 })
     end
     cell.count = cell.count + 1
+    local before = U64 cell.count
+    -- a removal ends borrows of entries: borrow the new entry afresh
     m:remove k
     m:put(k, Payload { count = 19, weight = 200 })
-    return U64 cell.count + cell.weight
+    local again = Ref m[k]
+    return before + U64 again.count + again.weight
 end
 export checked_map_place
 

@@ -117,7 +117,7 @@ hash.sip24 = do(text: Str, k0: U64, k1: U64): U64
 end
 
 -- Seed acquisition is platform state; every mix and encoding stays visible to
--- the specializer. The length prefix is StrMap's canonical key encoding.
+-- the specializer. The length prefix is Map(Str, V)'s canonical key encoding.
 -- Once the runtime has the process's key, reading it is two loads; the first
 -- use takes the out-of-line path, which fills it or traps.
 local h = '"nua_rt.h"'

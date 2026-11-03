@@ -17,15 +17,19 @@ for _, ty in ipairs { T.F32, T.F64, T.array(T.U8, 4), T.Str, T.CString,
     T.ptr(T.U8), T.ref(Node), T.atomic(T.U32), T.Unit, T.grow(T.U32), T.map(T.U32, T.U32) } do
     rejects(function() T.map(ty, T.U32) end, 'Map key')
 end
-for _, ty in ipairs { T.Str, T.CString, T.ptr(T.U8), T.ref(Node), T.atomic(T.U32),
-    T.Unit, T.grow(T.U32), T.map(T.U32, T.U32) } do
+-- a value is any element: borrows and handles included (design memory.md §5.11);
+-- atomics wait (D4), a standalone Unit is nothing, and owners come with nested owners
+for _, ty in ipairs { T.atomic(T.U32), T.Unit, T.grow(T.U32), T.map(T.U32, T.U32) } do
     rejects(function() T.map(T.U32, ty) end, 'Map value')
-    rejects(function() T.strmap(ty) end, 'StrMap value')
+    rejects(function() T.strmap(ty) end, 'Map(Str, V) value')
+end
+for _, ty in ipairs { T.Str, T.CString, T.ptr(T.U8), T.ref(Node), T.id(Node) } do
+    assert(T.map(T.U32, ty).elem == ty and T.strmap(ty).elem == ty)
 end
 local Borrowed = T.struct('MapTypeBorrowed', { { 'p', T.ptr(T.U8) } })
 local Hidden = T.sum('MapTypeHidden', { { 'none', T.Unit }, { 'some', Borrowed } })
-assert(not T.map_key(Hidden) and not T.map_value(Hidden))
-assert(not T.map_value(T.array(Borrowed, 2)))
+assert(not T.map_key(Hidden) and T.map_value(Hidden))
+assert(T.map_value(T.array(Borrowed, 2)))
 local Owner = T.struct('MapTypeOwner', { { 'n', T.U32 }, { 'entries', T.strmap(Value) } })
 assert(Owner.resizable and not T.map_value(Owner))
 -- owner fields may come in any order, any number of them (design memory.md §5.2)

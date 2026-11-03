@@ -728,7 +728,8 @@ function Builder:read(p)
     if p.T.kind == 'struct' then
         local f = {}
         for _, fd in ipairs(p.T.fields) do f[fd.name] = self:read(field_place(p, fd.name)) end
-        return agg(p.T, f)
+        -- an aggregate read back from memory carries what was stored into it
+        return h.with_view(agg(p.T, f), h.place_view(p))
     end
     if p.T.resizable then
         fail(("'%s' is a %s: it cannot be read or copied as a value; use its operations "
@@ -744,7 +745,8 @@ function Builder:read(p)
             fail(("'%s' is read before it is written"):format(p.name), 3)
         end
         if en.mat then return h.reref(h.with_view(dyn(p.T, read_expr(p, en.ver)), h.place_view(p))) end
-        return en.val
+        -- a local holding borrows stored into it reads back carrying them
+        return h.with_view(en.val, h.place_view(p))
     end
     self:flush_pending(p)
     return h.reref(h.with_view(dyn(p.T, read_expr(p)), h.place_view(p)))
@@ -1355,6 +1357,13 @@ h.check_store_view = function(b, p, v)
     rawset(root, 'stored_view', h.merge_view(rawget(root, 'stored_view'), view))
 end
 S.check_store_view = function(p, v) return h.check_store_view(cur(), p, v) end
+-- using a container whose keys are borrows: those borrows must still be alive
+S.check_stored = function(p) h.check_tokens(rawget(root_of(p), 'stored_view')) end
+-- a copy of a container holds the borrows its source holds
+S.hold_stored = function(p, source)
+    local root, from = root_of(p), rawget(root_of(source), 'stored_view')
+    if from then rawset(root, 'stored_view', h.merge_view(rawget(root, 'stored_view'), from)) end
+end
 h.check_view_boundary = function(v)
     if h.check_view(v) then
         fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 4)
@@ -2169,9 +2178,15 @@ end
 local member_ptr, member_slice
 
 local raw_member
+-- using a value or a place: its borrows must still be alive. A place holding
+-- borrows (a local, a field, an element) is checked against what was stored into it.
+h.check_use = function(x)
+    if is_place(x) and h.view_type(x.T) then h.check_tokens(h.place_view(x)) end
+    h.check_view(x)
+end
 local function member(x, key)
     x = h.through(x)
-    h.check_view(x)
+    h.check_use(x)
     local h, t, family = type_hook(x, '__member')
     if h then
         local r
@@ -2183,7 +2198,7 @@ end
 S.rawmember = function(x, key) return raw_member(x, key) end
 
 function raw_member(x, key)
-    h.check_view(x)
+    h.check_use(x)
     local t = struct_of(x)
     local ip = rawget(t, '__index')
     if ip and (type(key) == 'number' or is_staged(key)) then return ip(x, key) end
@@ -2238,12 +2253,12 @@ function S.dot(obj, key)
     if is_staged(obj) then return member(obj, key) end
     return obj[key]
 end
--- Brackets are distinct from member selection: a StrMap key may be "length",
+-- Brackets are distinct from member selection: a Map(Str, V) key may be "length",
 -- "put", or any internal evaluator field name, without shadowing the API.
 function S.index(obj, key)
     obj = h.through(obj)
     if is_staged(obj) then
-        h.check_view(obj)
+        h.check_use(obj)
         local h, t = type_hook(obj, '__index')
         if h then return run_hook(t, h, obj, key) end
     end
