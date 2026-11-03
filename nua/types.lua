@@ -405,26 +405,12 @@ function T.slice_mut(elem)
     return t
 end
 
--- text: Str is a read-only view of bytes (a slice of U8 with text words);
--- Chars(n) is short text as a value: a length and n bytes
+-- text: Str is a read-only view of bytes (a slice of U8 with text words); Chars(n), short
+-- text as a value, is a library type (lib/chars.nua)
 T.Str = T.struct('Str', { { 'ptr', T.ptr(T.U8) }, { 'len', T.U64 } })
 T.Str.display = 'Str'
 T.Str.slice_elem = T.U8
 T.Str.is_str = true
-
-local chars = {}
-function T.chars(n)
-    if type(n) ~= 'number' or n < 1 or n ~= math.floor(n) or n > 65536 then
-        error('Chars(n) takes a known length from 1 to 65536, got ' .. tostring(n), 2)
-    end
-    if not chars[n] then
-        local t = T.struct('Chars' .. n, { { 'len', T.U32 }, { 'bytes', T.array(T.U8, n) } })
-        t.display = 'Chars(' .. n .. ')'
-        t.chars_cap = n
-        chars[n] = t
-    end
-    return chars[n]
-end
 
 -- sums -------------------------------------------------------------------------------------
 -- A finite set of named alternatives, each with a payload type (Unit for none).

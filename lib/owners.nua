@@ -47,7 +47,7 @@ owners.Grow = owner_type {
         if T.elem == U8 then return text.methods(T, offered) end
     end,
 }
-owners.Chars = text.Chars
+owners.Chars = require("nua.chars").Chars
 
 -- an Array T: its length is fixed when it is built, so it has no push and no clear
 owners.Array = owner_type {

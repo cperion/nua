@@ -2,6 +2,7 @@
 -- specialize for known bytes or residualize for runtime text.
 local chars = {}
 local constructors = {}
+local array_pointer = __S.array_pointer
 local trap = extern("nua_trap", { CString }, Unit)
 
 function chars.from(T)
@@ -20,6 +21,57 @@ function chars.from(T)
     end
     constructors[T] = from
     return from
+end
+
+-- Chars(n): short text as a value, a length and n bytes. The type is a plain struct; its
+-- words are Nua words, and only the constructor (which folds known text) is host code.
+local strings = require "nua.strings"
+local made = {}
+local function fail(message, level) __S.fail(message, level or 2) end
+
+function chars.Chars(n)
+    if type(n) ~= "number" or n < 1 or n ~= math.floor(n) or n > 65536 then
+        fail("Chars(n) takes a known length from 1 to 65536, got " .. tostring(n), 3)
+    end
+    if made[n] then return made[n] end
+    local T = __S.struct("Chars" .. n, { { "len", U32 }, { "bytes", Array(U8, n) } })
+    rawset(T, "display", "Chars(" .. n .. ")")
+    rawset(T, "chars_cap", n)
+    made[n] = T
+    -- the length is stored as U32 (n is at most 65536); every length is a U64
+    local length = do(c: T): U64 = U64 c.len
+    rawset(T, "properties", { length = function(c) return length(c) end })
+    -- c:str() views the text; the Str borrows c. A member of the place itself (not a method
+    -- word over a Ref), so a task that copied c reads its own copy.
+    rawset(T, "builtin_methods", {
+        str = function(self)
+            if not __S.is_place(self) then
+                fail(T.display .. ":str() views storage: call it on a typed local or a field", 2)
+            end
+            local builder = __S.cur()
+            local pointer = array_pointer(__S.field_place(self, "bytes"))
+            local length = builder.bind(builder, U64(builder.read(builder, __S.field_place(self, "len"))))
+            return __S.make_slice(Str, pointer, length, __S.owner_token(self))
+        end,
+    })
+    __S.arity[T.builtin_methods.str] = 1
+    __S.member_tables(T)
+    -- Chars(n) "text" or Chars(n)(s): filled from text; Chars(n)() is empty
+    rawset(T, "construct", function(x)
+        if x == nil or (type(x) == "table" and not __S.is_staged(x) and next(x) == nil) then
+            return __S.zero_value(T)
+        end
+        local text = strings.as_str(x, T.display)
+        local known = strings.known_text(text)
+        if known and #known > n then
+            fail(("%s holds %d bytes; this text has %d"):format(T.display, n, #known), 3)
+        end
+        if not known and not __S.cur().fn then
+            fail(T.display .. " from unknown text needs runtime storage", 3)
+        end
+        return chars.from(T)(text)
+    end)
+    return T
 end
 
 return chars

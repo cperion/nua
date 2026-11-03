@@ -5,7 +5,10 @@ local function rejects(f, message)
     assert(not ok and tostring(err):find(message, 1, true), tostring(err))
 end
 local Node = T.struct('MapTypeNode', { { 'n', T.U32 } })
-local Key = T.struct('MapTypeKey', { { 'label', T.chars(8) }, { 'id', T.id(Node) } })
+-- Chars(n) is a library struct marked with its capacity (lib/chars.nua)
+local Chars8 = T.struct('Chars8', { { 'len', T.U32 }, { 'bytes', T.array(T.U8, 8) } })
+Chars8.chars_cap = 8
+local Key = T.struct('MapTypeKey', { { 'label', Chars8 }, { 'id', T.id(Node) } })
 local Choice = T.sum('MapTypeChoice', { { 'none', T.Unit }, { 'some', Key } })
 local Value = T.struct('MapTypeValue', { { 'samples', T.array(T.F64, 4) }, { 'tag', Choice } })
 -- The type is its identity: the family, the key and the element (what a family admits is
