@@ -738,11 +738,8 @@ local function grow_methods(t)
         -- ends it
         all = function(self)
             local p = receiver(self, n .. ':all')
-            local b = S.cur()
-            if not b.fn then fail(n .. ' is runtime storage: it is viewed where it runs') end
-            local ptr = storage_library(t).items(S.Ref(p))
-            local len = storage_library(t).length(S.Ref(p))
-            return S.make_slice(types.slice(elem), b:bind(ptr), b:bind(len), S.place_tokens(p, true))
+            if not S.cur().fn then fail(n .. ' is runtime storage: it is viewed where it runs') end
+            return storage_library(t).all(S.Ref(p))
         end,
         sub = function(self, a, z)
             local xs = grow_all(self)
@@ -754,18 +751,6 @@ local function grow_methods(t)
             if b.fn then b.fn.uses_rt = true end
             storage_library(t).clear(S.Ref(p))
         end,
-        truncate = function(self, count)
-            local p = receiver(self, n .. ':truncate')
-            local b = S.cur()
-            if b.fn then b.fn.uses_rt = true end
-            return storage_library(t).truncate(S.Ref(p), S.index_value(count))
-        end,
-        pop = function(self)
-            local p = receiver(self, n .. ':pop')
-            local b = S.cur()
-            if b.fn then b.fn.uses_rt = true end
-            return storage_library(t).pop(S.Ref(p))
-        end,
         push = function(self, v)
             local p = receiver(self, n .. ':push')
             S.note_growth(p)
@@ -775,6 +760,12 @@ local function grow_methods(t)
             return storage_library(t).push(S.Ref(p), val)
         end,
     }
+    -- operations that are plain Nua words over the owner: pop, truncate (lib/storage.nua)
+    methods.pop = function(self, ...) return storage_library(t).pop(S.Ref(receiver(self, n .. ':pop')), ...) end
+    -- an index is any unsigned integer (D2): the language's index rule coerces it
+    methods.truncate = function(self, count)
+        return storage_library(t).truncate(S.Ref(receiver(self, n .. ':truncate')), S.index_value(count))
+    end
     return methods
 end
 

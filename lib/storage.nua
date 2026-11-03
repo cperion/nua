@@ -5,7 +5,8 @@ local stacks = require "nua.stacks"
 local storage = {}
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
-local retire, restructure = __S.retire, __S.restructure
+local retire, restructure, borrows = __S.retire, __S.restructure, __S.borrows
+local make_slice = __S.make_slice
 local none = U32 0xffffffff
 local maximum = U64 0xffffffffffffffffULL
 local occupied = U32 0xfffffffe
@@ -171,6 +172,13 @@ function storage.grow(T, p)
     end
     api.items = p.items
     api.length = do(g: Ref T): U64 return p.header(g).len end
+    -- the elements as a read-only slice borrowing the owner, of the length it has now:
+    -- growing keeps it valid (stacks never move); clear, pop and truncate end it
+    api.all = do(g: Ref T): Slice T.elem
+        local h = p.header g
+        local view = Slice(p.items(g), h.len)
+        return borrows(g, view)
+    end
     -- an empty owner takes n zeroed elements (Array(T, n) {} with a runtime n)
     api.allocate = do(g: Ref T, n: U64): Unit
         local h = p.header g

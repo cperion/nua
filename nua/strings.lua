@@ -395,8 +395,6 @@ end
 
 text_methods.clear = function(self)
     local p = Mem.receiver(self, 'Text:clear')
-    S.end_borrows(p, ("'" .. tostring(p.name) .. "' was cleared"))
-    S.bump_checked()
     local b = S.cur()
     if b.fn then b.fn.uses_rt = true end
     Mem.storage_library(Text).clear(S.Ref(p))

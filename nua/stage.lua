@@ -1113,6 +1113,12 @@ S.retire = function(ref, template, key)
     local selector = h.effect_key(key)
     if selector then h.end_elements(cur(), place, selector, why) else h.end_owner(cur(), place, why) end
 end
+-- `value` (a Slice or Str) borrows the owner's contents: it ends when the contents are
+-- freed (retire) or the owner ends, and must not outlive the owner.
+S.borrows = function(ref, value)
+    local place = h.effect_owner(ref, 'borrows')
+    return h.with_view(S.value_of(value), h.place_tokens(place, true))
+end
 -- an insertion or removal: not allowed while the owner is being iterated. `key` names the
 -- entry of an insert-or-replace: replacing the entry being visited changes no structure.
 S.restructure = function(ref, what, key)
