@@ -144,15 +144,15 @@ search order, the compilation-scope cache and the acceptance checks.
 ### 2.2 Types are compile-time values
 
 ```lua
-local Vec2 = Struct {
-    x: F32,
-    y: F32,
-}
+local Vec2 = Struct with
+    x: F32
+    y: F32
+end
 
-local Player = Struct {
-    position: Vec2,
-    health: U32,
-}
+local Player = Struct with
+    position: Vec2
+    health: U32
+end
 ```
 
 `Vec2` and `Player` are Lua bindings to native type objects.
@@ -181,10 +181,10 @@ It is not a struct declaration merely because its value happens to be a type.
 ### 2.3 Generic types are ordinary Lua functions
 
 ```lua
-local Pair = do(A, B) = Struct {
-    first: A,
-    second: B,
-}
+local Pair = do(A, B) = Struct with
+    first: A
+    second: B
+end
 
 local IntPair = Pair(U32, U32)
 local MixedPair = Pair(U32, F64)
@@ -210,9 +210,9 @@ local times8 = choose(true, 8)
 and constructor-headed arguments:
 
 ```lua
-self.nodes:add Node {
-    value = 42,
-}
+self.nodes:add Node with
+    value = 42
+end
 ```
 
 which means:
@@ -268,13 +268,13 @@ end
 local p = Point with
     x = 1
     .y
-    found =: v          -- a keyed handler is an entry too
+    found =: v  -- a keyed handler is an entry too
         go v
     end
 end
 
-local q = Point with x = 1 y = 2 end
-local area = s with     -- matching is keyed application: the handlers are the entries
+local q = Point with x = 1, y = 2 end
+local area = s with  -- matching is keyed application: the handlers are the entries
     circle = do(r) = r * r
     rect =: p
         return p.x * p.y
@@ -295,11 +295,11 @@ local make = do(n: U32): Point
 end
 
 local pair: Pair = with
-    left = with x = 3, y = 4 end      -- a field of a record: its type is Pair's field type
+    left = with x = 3, y = 4 end  -- a field of a record: its type is Pair's field type
     right = origin
 end
 
-total(with x = 1, y = 2 end)          -- a typed parameter
+total with x = 1, y = 2 end  -- a typed parameter
 ```
 
 The type is found by the coercion that every typed position already performs, so it works wherever an expected type is known and nowhere else: `local p = with x = 1 end`, with no type in the context, is rejected (`with` here has no type) rather than guessed. A variable named `with` is still a variable (`with + 1`, `t.with`, `pass(with)`); `with` begins a block only before an entry (`name =`, `.name`, `[`, a literal).
@@ -332,7 +332,7 @@ The language distinguishes **host computation** from **native computation**, but
 ### 3.1 Ordinary Lua
 
 ```lua
-local make_multiplier = do(k)
+local make_multiplier =: k
     return do(x: U32): U32 =
     x * k
 end
@@ -803,7 +803,7 @@ There is one iteration mechanism: **tail recursion**. `while` and typed `for` ar
 An untyped `for` is ordinary Lua and runs while the word is being constructed or evaluated:
 
 ```lua
-local make_sum = do(n)
+local make_sum =: n
     return do(x: U32): U32
         local total = x
         for i = 1, n do
@@ -835,9 +835,9 @@ Typed bodies are deterministic and stage-safe, so the round that failed the test
 ```lua
 local function count_down(k: U32, x: U32): U32
     if x == 0 then return k end
-    return count_down(k + 1, x - 1)
+    return count_down (k + 1) (x - 1)
 end
-local walk = do(x: U32): U32 = count_down(0, x)
+local walk = do(x: U32): U32 = count_down 0 x
 ```
 
 The test `x == 0` is dynamic, so the first round is not known; `k`, the known argument that changed (0 → 1), is generalized. `count_down` re-enters only in tail position, so it does not become a function at all: its application turns into a loop in place, with one variable per dynamic parameter:
@@ -863,7 +863,7 @@ A word that also re-enters in non-tail position becomes a C function (architectu
 ```lua
 local function gcd(a: U32, b: U32): U32
     if b == 0 then return a end
-    return gcd(b, a % b)
+    return gcd b (a % b)
 end
 export gcd
 ```
@@ -1089,9 +1089,9 @@ Non-tail recursion under known control keeps unfolding, as any evaluation does:
 ```lua
 local function pow(x: U32, n: U32): U32
     if n == 0 then return 1 end
-    return x * pow(x, n - 1)
+    return x * pow x (n - 1)
 end
-local cube = do(x: U32): U32 = pow(x, 3)
+local cube = do(x: U32): U32 = pow x 3
 ```
 
 ```c
@@ -1136,9 +1136,9 @@ LuaJIT's GC owns compiler objects: types, words, closures, staged values, comman
 ## 8. Methods and `self`
 
 ```lua
-local Counter = Struct {
-    value: U32,
-}
+local Counter = Struct with
+    value: U32
+end
 
 function Counter:add(n: U32): Unit
     self.value = self.value + n
@@ -1308,9 +1308,9 @@ borrow is used, so a borrow that is not used again is no obstacle:
 
 ```lua
 local head = xs:sub(0, 3)
-xs:push 99            -- fine: head stays valid
+xs:push 99  -- fine: head stays valid
 local first = head[0]
-xs:clear()            -- fine: head is not used again
+xs:clear  -- fine: head is not used again
 ```
 
 Using `head` after the `clear` is rejected
@@ -1327,13 +1327,13 @@ A store slot is addressed as a place, `s[id]`, whose address is recomputed and w
 ### 9.8 Managed stores and generational IDs
 
 ```lua
-local Node = Struct {
-    value: U32,
-}
+local Node = Struct with
+    value: U32
+end
 
-local Graph = Struct {
-    nodes: Store Node,
-}
+local Graph = Struct with
+    nodes: Store Node
+end
 ```
 
 | Operation | Meaning |
@@ -1360,10 +1360,10 @@ A store's slots live on its data stack; its header (stack index, base offset, co
 Graph edges contain IDs, not owning references:
 
 ```lua
-local Edge = Struct {
-    from: Id Node,
-    to: Id Node,
-}
+local Edge = Struct with
+    from: Id Node
+    to: Id Node
+end
 ```
 
 Cycles are ordinary relationships; they create no ownership cycles. Objects are removed explicitly or with their store.
@@ -1389,10 +1389,10 @@ An untyped lambda inside a typed body is a **callback**. It is evaluated in plac
 ```lua
 local apply = do(f, x: U32): U32 = f x
 local clamp_cb = do(x: U32): U32
-    return apply(do(v)
-            if v > 10 then return v - 10 end
-            return v
-        end, x) + 1
+    return apply: v
+        if v > 10 then return v - 10 end
+        return v
+    end x + 1
 end
 ```
 
@@ -1441,9 +1441,9 @@ local transaction = do(document: Ref Document, body): Unit
 end
 
 local type_text = do(doc: Ref Document, n: U32): Unit
-    transaction doc do(draft..)
+    transaction doc:
         insert n
-        move_left()
+        move_left
         if cursor > 3 then
             insert 1
         end
@@ -1491,10 +1491,10 @@ local counting = do(body): U32
     return counting.count
 end
 local evens = do(n: U32): U32 =
-counting do(..)
+counting:
     for i: U32 = 1, n do
         if i % 2 == 0 then
-            tick()
+            tick
         end
     end
 end
@@ -1643,7 +1643,7 @@ local logged = do(f, ..args): U32
     log_call args.length
     return f(..args)
 end
-local use_logged = do(x: U32, y: U32): U32 = logged(twice, x) + logged(add3, x, y, 1)
+local use_logged = do(x: U32, y: U32): U32 = logged twice x + logged add3 x y 1
 ```
 
 ```c
@@ -1664,7 +1664,7 @@ A pack's shape is part of the specialization key, so each shape gets its own res
 local import_rows = do(doc: Ref Document, n: U32): Unit
     traced 1 do
     traced 2 do
-    transaction doc do(draft..)
+    transaction doc:
         insert n
     endall
     trace 9
@@ -1675,15 +1675,20 @@ end
 
 ```lua
 tasks:
-spawn:
-    io.listen(0) with
-        failed = do(e) end
-    done =: l
-    io.accept(l) with
-        failed = do(e) end
-    done =: c
-        go c
-endall
+    spawn:
+        io.listen(0) with
+            failed = do(e) end
+            done =: l
+                io.accept(l) with
+                    failed = do(e) end
+                    done =: c
+                        go c
+                    end
+                end
+            end
+        end
+    end
+end
 return n
 ```
 
@@ -1732,7 +1737,7 @@ Member selection on the sum type names a constructor. A record payload is built 
 ```lua
 Shape.rect { width = 4, height = 5 }
 Opt.some x
-Opt.none()
+Opt.none
 ```
 
 In C, a sum is a tag and a union of the payloads, with the tags as named constants:
@@ -1753,14 +1758,14 @@ typedef struct Shape {
 Matching is keyed application of a sum value, with one handler per alternative. Each handler receives that alternative's payload, as a copy, or, when the matched sum is a place and the handler declares its parameter `Ref`, as a borrow of the payload in place (`running = do(r: Ref Running): Unit ... end`). Giving the sum another variant ends such a borrow:
 
 ```lua
-local area = do(s: Shape): U32 = s {
-    circle = do(c) = c.radius * c.radius * 3,
-    rect = do(r)
+local area = do(s: Shape): U32 = s with
+    circle = do(c) = c.radius * c.radius * 3
+    rect =: r
         local w = r.width
         return w * r.height
-    end,
-    dot = do() = 0,
-}
+    end
+    dot = do() = 0
+end
 ```
 
 `name(params) = body` in a headed supply is `name = do(params) = body`: `o { some(v) = v, none() = d }`.
@@ -1810,25 +1815,25 @@ local Direction = Sum { left: Unit, right: Unit }
 local Command = Sum { move: Direction, insert: U32, undo: Unit }
 
 local apply = do(e: Ref Editor, c: Command): Unit
-    c {
-        move = do(d)
-            d {
+    c with
+        move =: d
+            d with
                 left = do
                     if e.cursor > 0 then e.cursor = e.cursor - 1 end
-                end,
+                end
                 right = do
                     if e.cursor < e.length then e.cursor = e.cursor + 1 end
-                end,
-            }
-        end,
-        insert = do(n)
+                end
+            end
+        end
+        insert =: n
             e.length = e.length + n
             e.cursor = e.cursor + n
-        end,
+        end
         undo = do
             e.undos = e.undos + 1
-        end,
-    }
+        end
+    end
 end
 ```
 
@@ -2010,7 +2015,7 @@ local parse = do(buf: Slice U8): Packet
     local h = buf:sub(0, size)
     local fields = {}
     for _, f in ipairs format do
-        fields[f[1]] = read_be(h, f[2], f[3])
+        fields[f[1]] = read_be h f[2] f[3]
     end
     return Packet fields
 end
@@ -2062,7 +2067,7 @@ activity instead of handing the callback an unscoped `Slice(p, n)`:
 
 ```lua
 local foreign_sum = do(pointer: Ptr U8, length: U32): U32
-    return view_of(pointer, length) do(bytes)
+    return view_of(pointer, length): bytes
         local text = Str.of bytes
         return checksum text
     end
@@ -2491,7 +2496,7 @@ storage is a field of an existing resizable kind (`Grow`, `Store`), and `[]` is 
 hook that returns the element's place:
 
 ```lua
-local Ring = do(E, capacity)
+local Ring =: E capacity
     local R = Struct { head: U32, len: U32, items: Grow E }
 
     function R:push(v: E): Unit
@@ -2647,7 +2652,7 @@ function File:say(..parts): Unit
 end
 
 local with_file = do(path: CString, mode: CString, body): Bool
-    local h: Ptr FILE = fopen(path, mode)
+    local h: Ptr FILE = fopen path mode
     if h == null FILE then
         return false
     end
@@ -2667,7 +2672,7 @@ local c = require "nua.libc"
 
 local report = do(path: CString, n: U32, ratio: F64): Bool
     local c..
-    return with_file(path, "w") do(file..)
+    return with_file(path, "w"):
         write "report\n"
         say("n = ", n, ", ratio = ", ratio, "\n")
         if n > 10 then
@@ -2704,7 +2709,7 @@ A heap buffer, written through its `Ptr`, read through a checked `Slice`:
 local sum_filled = do(n: U32, byte: U8): U32
     local c..
     local total: U32 = 0
-    with_buffer n do(buffer..)
+    with_buffer n:
         fill byte
         data[0] = 1
         local bytes = Slice(data, size)
@@ -2794,7 +2799,7 @@ local px = require "nua.posix"
 
 local make_file = do(path: CString): I32
     local px..
-    return with_fd(path, bor(O_WRONLY, bor(O_CREAT, O_TRUNC))) do(writing..)
+    return with_fd(path, bor(O_WRONLY, bor(O_CREAT, O_TRUNC))):
         write_text "NUA1"
         write_text "hello, kernel\n"
     end { done() = 0, failed(e) = e }
@@ -2838,7 +2843,7 @@ Constants are the header's (`O_WRONLY | (O_CREAT | O_TRUNC)`); text known while 
 A mapping is a view, so the header format idiom applies (§12.3): one sub-slice of known length, then constant offsets, with no check left:
 
 ```lua
-mapped 4 do(bytes)
+mapped 4: bytes
     local h = bytes:sub(0, 4)
     found = U32(h[0]) * 16777216 + U32(h[1]) * 65536 + U32(h[2]) * 256 + U32(h[3])
 end
@@ -2861,10 +2866,10 @@ And the kernel's own event machinery, an eventfd watched by epoll, as a spine of
 local ping = do(n: U64): U64
     local px..
     local got: U64 = 0
-    with_eventfd do(counter..)
+    with_eventfd:
         local value = n
         write_bytes(bytes value, size_of U64)
-        with_epoll do(poll..)
+        with_epoll:
             watch fd
             if next_ready 100 == fd then
                 local back: U64 = 0
@@ -2913,7 +2918,7 @@ local SpinLock = Struct { held: Atomic Bool }
 local with_lock = do(lock: Ref SpinLock, body): Unit
     while not lock.held:cas(false, true, "acquire") do
     end
-    body()
+    body
     lock.held:store(false, "release")
 end
 
@@ -2965,7 +2970,7 @@ local push = do(r: Ref Ring, v: U32): Bool
     if tail - head > r.mask then
         return false  -- full
     end
-    r.slots[band(tail, r.mask)] = v
+    r.slots[band tail r.mask] = v
     r.tail:store(tail + 1, "release")
     return true
 end
@@ -3011,11 +3016,11 @@ library internals; they are not how tasks cooperate.
 ### 20.1 Scopes
 
 ```lua
-tasks do(scope..)
+tasks:
     local jobs = channel(Job, 16)
     spawn do
         for i: U32 = 1, n do jobs:send(Job { id = i, n = i }) end
-        jobs:close()
+        jobs:close
     end
     jobs:each(do(j) total = total + U64(j.n) end)
 end
@@ -3044,7 +3049,7 @@ Scopes nest. A task may open its own scope. It may also spawn into the scope it 
 ```lua
 spawn do
     for i: U32 = 1, n do jobs:send(Job { id = i, n = i }) end
-    jobs:close()
+    jobs:close
 end
 ```
 
@@ -3065,10 +3070,10 @@ A task is not a thread. It compiles to a **resumable C function**: a frame struc
 
 ```lua
 local square = do(inp: Chan U32, out: Chan U64): Unit
-    inp:each do(v)
+    inp:each: v
         out:send(U64 v * U64 v)
     end
-    out:close()
+    out:close
 end
 ```
 
@@ -3257,7 +3262,7 @@ local Block = Struct { n: U32, data: Array(U8, 64) }
 
 local pooled = do(count: U32): U64
     local total: U64 = 0
-    tasks do(scope..)
+    tasks:
         local buffers = pool(Block, 4)
         local full = channel(Slot Block, 4)
         spawn do
@@ -3268,9 +3273,9 @@ local pooled = do(count: U32): U64
                 full:send s  -- s now belongs to the receiver
                 k = k + 1
             end
-            full:close()
+            full:close
         end
-        full:each do(s)
+        full:each: s
             total = total + U64(checksum buffers[s])
             buffers:release s
         endall

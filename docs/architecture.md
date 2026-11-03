@@ -509,9 +509,9 @@ The objective is not a small number of source-level features. It is a **small nu
 
 ```lua
 function Graph:add(value: U32): Id Node
-    return self.nodes:add Node {
-        .value,
-    }
+    return self.nodes:add Node with
+        .value
+    end
 end
 
 local insert = do(
@@ -549,10 +549,10 @@ NodeId insert_double(Graph *graph, uint32_t value) {
 
 ```lua
 -- Generic compile-time type generator
-local Box = do(T)
-    local B = Struct {
-        value: T,
-    }
+local Box =: T
+    local B = Struct with
+        value: T
+    end
 
     function B:get(): T
         return self.value
@@ -583,9 +583,9 @@ local process = do(
     x: U32
 ): U32
 
-    local box = NumberBox {
-        value = transform x,
-    }
+    local box = NumberBox with
+        value = transform x
+    end
 
     if enabled then
         box:set(box:get() * 2)
@@ -635,18 +635,18 @@ No generic abstraction, partial-application environment, closure, method dispatc
 A computation that genuinely needs dynamic native storage:
 
 ```lua
-local Node = Struct {
-    value: U32,
-}
+local Node = Struct with
+    value: U32
+end
 
-local Graph = Struct {
-    nodes: Store Node,
-}
+local Graph = Struct with
+    nodes: Store Node
+end
 
 function Graph:add(value: U32): Id Node
-    return self.nodes:add Node {
-        .value,
-    }
+    return self.nodes:add Node with
+        .value
+    end
 end
 
 local populate = do(
@@ -663,9 +663,9 @@ end
 local populate_double = populate 2
 
 local run = do(n: U32): U32
-    local g = Graph {
-        nodes = Store(Node) {},
-    }
+    local g = Graph with
+        nodes = Store(Node) {}
+    end
 
     populate_double(Ref g, n)
 
@@ -904,7 +904,7 @@ local tab_stop = do(config, column: U32): U32
     local width: U32 = config.tab_width
     return (column / width + 1) * width
 end
-local width = tonumber(arg[1])
+local width = tonumber arg[1]
 local stop = native(tab_stop { tab_width = width })
 io.write(stop 5, "\n")
 ```
