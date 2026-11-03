@@ -10,7 +10,7 @@ local M = {}
 local environment
 M.defaults = { indent_width = 4, column_width = 100, call_style = 'minimal', spine_style = 'pure',
                type_style = 'inferred', table_style = 'shorthand', opening_style = 'anonymous',
-               block_style = 'colon', data_style = 'with' }
+               block_style = 'colon', data_style = 'with', inline_with = 2 }
 
 function M.options(options)
     local out = {}
@@ -19,6 +19,10 @@ function M.options(options)
     for k, v in pairs(options or {}) do
         if out[k] == nil then error('fmt: unknown setting ' .. tostring(k), 0) end
         out[k] = v
+    end
+    if type(out.inline_with) ~= 'number' or out.inline_with ~= math.floor(out.inline_with)
+        or out.inline_with < 0 or out.inline_with > 16 then
+        error('fmt: inline_with must be an integer from 0 to 16', 0)
     end
     for _, k in ipairs { 'indent_width', 'column_width' } do
         local v = out[k]
@@ -1040,6 +1044,7 @@ function format(source, options, filename)
         info = parse(source, filename)
     end
     local result = layout(info, options)
+    if options.data_style == 'with' then result = colon.inline_tables(result, options.inline_with, options.column_width) end
     if fingerprint(parse(result, filename).ast) ~= signature then
         error(filename .. ': fmt: formatting would change the parsed program; source left unchanged', 0)
     end

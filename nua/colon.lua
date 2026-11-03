@@ -465,18 +465,15 @@ local function frames_of(tokens)
     return top_at, opened
 end
 
--- Mark the multi-line tables that follow a head (`T {`, `f(x) {`): `withize` writes
--- them as `with` blocks. One-line tables and tables with no head (`{ 1, 2 }`,
--- `local t = { a = 1 }`, which are Lua's) are left alone.
-function M.mark_tables(source)
-    local tokens = lexer.scan_raw_tokenlist(source)
+-- The matching closers of a token list, and whether a table is data: some top-level entry
+-- is keyed (`k = v`, `k: T`, `[k] = v`, `.k`).
+local function table_scanner(tokens)
     local close_of, stack = {}, {}
     for i, tk in ipairs(tokens) do
         local t = tk[1]
         if t == '(' or t == '{' or t == '[' then stack[#stack + 1] = i
         elseif t == ')' or t == '}' or t == ']' then close_of[table.remove(stack)] = i end
     end
-    -- a table is data when some top-level entry is keyed (`k = v`, `k: T`, `[k] = v`, `.k`)
     local function keyed(open)
         local depth = 0
         for k = open + 1, close_of[open] - 1 do
@@ -503,6 +500,116 @@ function M.mark_tables(source)
         end
         return false
     end
+    return close_of, keyed
+end
+
+-- A table of at most `limit` plain entries that follows a head (`T { .. }`) is written on one
+-- line when the line then fits `width`: `Point { x = 1, y = 2 }`. A table with a block, a
+-- comment, more entries, or no room stays as it is (and is written as `with` when it spans
+-- lines). Contextual `with` has no type head to attach braces to, so it is left alone.
+local BLOCK = { ['do'] = true, ['function'] = true, ['end'] = true, ['if'] = true, ['for'] = true,
+                ['while'] = true, ['repeat'] = true, ['return'] = true }
+local function inline_pass(source, limit, width)
+    local tokens = lexer.scan_raw_tokenlist(source)
+    local close_of, keyed = table_scanner(tokens)
+    -- top-level entries of the table opened at i; nil when something forbids a single line
+    local function entries(open)
+        local depth, count, any = 0, 0, false
+        for k = open + 1, close_of[open] - 1 do
+            local t, text = tokens[k][1], tokens[k][2]
+            if t == 'comment' and text ~= MARK then return nil end
+            if t == 'keyword' and BLOCK[text] then return nil end
+            if t == '(' or t == '{' or t == '[' then depth = depth + 1
+            elseif t == ')' or t == '}' or t == ']' then depth = depth - 1
+            elseif depth == 0 and (t == ',' or t == ';') then count = count + 1; any = false
+            elseif t ~= 'space' and t ~= 'comment' then any = true end
+        end
+        if any then count = count + 1 end
+        return count
+    end
+    local function nested_within_limit(open)
+        for k = open + 1, close_of[open] - 1 do
+            if tokens[k][1] == '{' and close_of[k] then
+                local n = entries(k)
+                if n == nil or n > limit then return false end
+            end
+        end
+        return true
+    end
+    local out, i, line_used = {}, 1, {}
+    local line_start = 1                       -- index of the first token of the current line
+    while i <= #tokens do
+        local tk = tokens[i]
+        local replaced = false
+        if tk[1] == '{' and close_of[i] and keyed(i) then
+            local p = skip_back(tokens, i)
+            local head = p >= 1 and OPERAND[tokens[p][1]] and tokens[p][1] ~= 'string'
+                and not (tokens[p][1] == 'iden' and tokens[p][2] == 'with')
+            local n = head and entries(i)
+            if n and n >= 1 and n <= limit and nested_within_limit(i) and not line_used[line_start] then
+                -- the table on one line: newlines inside become single spaces
+                local inner = {}
+                for k = i + 1, close_of[i] - 1 do
+                    local t = tokens[k]
+                    if t[1] == 'comment' and t[2] == MARK then
+                        -- dropped: the table is written with braces
+                    elseif t[1] == 'space' then
+                        inner[#inner + 1] = { 'space', ' ', t[3] }
+                    else
+                        inner[#inner + 1] = t
+                    end
+                end
+                while inner[1] and inner[1][1] == 'space' do table.remove(inner, 1) end
+                while inner[#inner] and inner[#inner][1] == 'space' do table.remove(inner) end
+                -- a trailing separator is not needed before the closing brace
+                if inner[#inner] and (inner[#inner][1] == ',' or inner[#inner][1] == ';') then table.remove(inner) end
+                while inner[#inner] and inner[#inner][1] == 'space' do table.remove(inner) end
+                local flat = { { '{', '{', tk[3] }, { 'space', ' ', tk[3] } }
+                for _, t in ipairs(inner) do flat[#flat + 1] = t end
+                flat[#flat + 1] = { 'space', ' ', tk[3] }
+                flat[#flat + 1] = tokens[close_of[i]]
+                -- the line it would make: what precedes `{` on its line, the table, what follows `}`
+                local before = 0
+                for k = line_start, i - 1 do before = before + #tokens[k][2] end
+                local after, k = 0, close_of[i] + 1
+                while tokens[k] and not (tokens[k][1] == 'space' and tokens[k][2]:find '\n') do
+                    after = after + #tokens[k][2]; k = k + 1
+                end
+                local width_now = before + after
+                for _, t in ipairs(flat) do width_now = width_now + #t[2] end
+                if width_now <= width then
+                    for _, t in ipairs(flat) do out[#out + 1] = t end
+                    line_used[line_start] = true
+                    i = close_of[i] + 1
+                    replaced = true
+                end
+            end
+        end
+        if not replaced then
+            out[#out + 1] = tk
+            if tk[1] == 'space' and tk[2]:find '\n' then line_start = i + 1 end
+            i = i + 1
+        end
+    end
+    return text_of(out)
+end
+function M.inline_tables(source, limit, width)
+    if not limit or limit < 1 then return source end
+    for _ = 1, 8 do
+        local result = inline_pass(source, limit, width)
+        if result == source then break end
+        source = result
+    end
+    return source
+end
+
+
+-- Mark the multi-line tables that follow a head (`T {`, `f(x) {`): `withize` writes
+-- them as `with` blocks. One-line tables and tables with no head (`{ 1, 2 }`,
+-- `local t = { a = 1 }`, which are Lua's) are left alone.
+function M.mark_tables(source)
+    local tokens = lexer.scan_raw_tokenlist(source)
+    local close_of, keyed = table_scanner(tokens)
     local out, header = {}, false              -- header: between `for`/`while` and its `do`
     for i, tk in ipairs(tokens) do
         out[#out + 1] = tk

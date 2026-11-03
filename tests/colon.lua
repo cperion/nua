@@ -155,6 +155,9 @@ check('colon blocks run as host code', true)
 
 -- the formatter prints the colon form for untyped trailing blocks, and only there
 local function formatted(name, source, expected, options)
+    -- these cases pin how `with` is written; inline_with has its own cases in tests/formatter.lua
+    options = options or {}
+    if options.inline_with == nil then options.inline_with = 0 end
     local out = fmt.format(source, options, name)
     check(name, out == expected, out)
     check(name .. ': idempotent', fmt.format(out, options, name) == out)

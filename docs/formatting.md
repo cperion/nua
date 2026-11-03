@@ -46,6 +46,7 @@ return {
     opening_style = "anonymous",
     block_style = "colon",
     data_style = "with",
+    inline_with = 2,
 }
 ```
 
@@ -67,6 +68,7 @@ file, not arbitrary downloaded Lua code.
 | `block_style` | `"colon"`, `"do"` | Write an untyped trailing `do(..)` that ends a line as the colon form (syntax §2.4, rule 11), or keep the `do` spelling. |
 | `block_style` | `"colon"`, `"do"` | Write an untyped trailing `do(..)` that ends a line in the colon form (syntax §2.4, rule 11), or keep the `do` spelling. |
 | `data_style` | `"with"`, `"preserve"` | Write a multi-line table that follows a head (`T {`, `f(x) {`) as a `with` block (syntax §2.4, rule 12), or keep the braces. |
+| `inline_with` | integer 0–16 | A table of at most this many plain entries that follows a head is written on one line (`Point { x = 1, y = 2 }`) when it fits `column_width`; `0` keeps the layout as written. Has no effect with `data_style = "preserve"`. |
 | `spine_style` | `"pure"`, `"all"`, `"none"` | Which link bodies of an `endall` spine lose their indent. |
 
 Unknown settings and invalid values are errors, not silently ignored options.
@@ -153,6 +155,14 @@ The head is an operand: a name, a call or an index (`Point {`, `Store(Node) {`,
 (`{ 1, 2 }`, `local t = { a = 1 }`, `return { ... }`, which are Lua's), keep their
 braces. `data_style = "preserve"` keeps every table as written: `with` blocks stay
 `with`, braces stay braces.
+
+A short table is not worth a block. With `inline_with = 2` (the default) a table that
+follows a head and has one or two entries is written on one line, in braces, when the line
+fits `column_width`: `local p = Point { x = 1, y = 2 }`, whether it was written as a `with`
+block or as a multi-line table. A table keeps its block when it has more entries, when an
+entry holds a handler or a comment, when its line would not fit, and when its head is the
+contextual `with` (there is no type to put braces after). Formatting twice changes nothing:
+a one-line table stays one line, and a long one stays a block.
 
 The entries are laid out as a table's are, and the block is written without the
 separators the reader would put back: the comma at the end of a line goes, and a

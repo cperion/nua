@@ -476,4 +476,19 @@ for _, options in ipairs { '--write -', '--write --check ' .. q(source_path), '-
     text, rc = capture(cli .. options)
     check('CLI invalid options', rc == 2, text)
 end
+-- inline_with: a table of at most that many plain entries is written on one line when it fits
+formatted('inline_with: short tables take one line',
+    'local a = Point with\n    x = 1\n    y = 2\nend\nlocal b = Point with x = 1 end\nlocal c = Point {\n    x = 1,\n    y = 2,\n}\n',
+    'local a = Point { x = 1, y = 2 }\nlocal b = Point { x = 1 }\nlocal c = Point { x = 1, y = 2 }\n')
+formatted('inline_with: three entries, handlers and long lines stay with',
+    'local a = Point with\n    x = 1\n    y = 2\n    z = 3\nend\nlocal b = Point with\n    x = 1\n    found =: v\n        go v\n    end\nend\n'
+    .. 'local c = Point with\n    x = compute_something_long_enough(alpha, beta, gamma)\n    y = compute_other_long_thing(delta, epsilon, zeta, eta)\nend\n',
+    'local a = Point with\n    x = 1\n    y = 2\n    z = 3\nend\nlocal b = Point with\n    x = 1\n    found =: v\n        go v\n    end\nend\n'
+    .. 'local c = Point with\n    x = compute_something_long_enough(alpha, beta, gamma)\n    y = compute_other_long_thing(delta, epsilon, zeta, eta)\nend\n')
+formatted('inline_with: contextual with has no head for braces',
+    'local a = with\n    x = 1\nend\n', 'local a = with\n    x = 1\nend\n')
+formatted('inline_with = 0 keeps the layout', 'local a = Point with\n    x = 1\n    y = 2\nend\n',
+    'local a = Point with\n    x = 1\n    y = 2\nend\n', { inline_with = 0 })
+check('inline_with must be an integer', not pcall(fmt.format, 'local a = 1\n', { inline_with = 'x' }, 'x'))
+
 print(('%d formatter checks passed'):format(passed))
