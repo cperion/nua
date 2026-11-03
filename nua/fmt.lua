@@ -4,11 +4,13 @@ local lexer = require 'macro.lexer'
 local syntax = require 'nua.syntax'
 local application = require 'nua.application'
 local loader = require 'nua.loader'
+local colon = require 'nua.colon'
 local M = {}
 -- the word facts of the chunk being formatted (see module_environment)
 local environment
 M.defaults = { indent_width = 4, column_width = 100, call_style = 'minimal', spine_style = 'pure',
-               type_style = 'inferred', table_style = 'shorthand', opening_style = 'anonymous' }
+               type_style = 'inferred', table_style = 'shorthand', opening_style = 'anonymous',
+               block_style = 'colon' }
 
 function M.options(options)
     local out = {}
@@ -36,6 +38,9 @@ function M.options(options)
     end
     if out.opening_style ~= 'anonymous' and out.opening_style ~= 'preserve' then
         error('fmt: opening_style must be "anonymous" or "preserve"', 0)
+    end
+    if out.block_style ~= 'colon' and out.block_style ~= 'do' then
+        error('fmt: block_style must be "colon" or "do"', 0)
     end
     if out.spine_style ~= 'pure' and out.spine_style ~= 'all' and out.spine_style ~= 'none' then
         error('fmt: spine_style must be "pure", "all" or "none"', 0)
@@ -1000,6 +1005,8 @@ function format(source, options, filename)
         prefix = source:match('^[^\n]*') .. '\n'
         source = source:sub(#prefix + 1)
     end
+    -- the trailing colon is read as the do-block it means; see nua.colon
+    source = colon.expand(source)
     local info = parse(source, filename)
     if options.type_style == 'inferred' then
         source = drop_inferred(source, info, filename)
@@ -1032,6 +1039,7 @@ function format(source, options, filename)
     if fingerprint(parse(result, filename).ast) ~= signature then
         error(filename .. ': fmt: formatting would change the parsed program; source left unchanged', 0)
     end
+    if options.block_style == 'colon' then result = colon.colonize(result) end
     return prefix .. result
 end
 

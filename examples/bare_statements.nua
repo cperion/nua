@@ -27,7 +27,7 @@ local counting = do(body): U32
     return c.count
 end
 local bare_opened = do(n: U32): U32
-    return counting do(..)
+    return counting:
         for i: U32 = 1, n do
             tick
         end
@@ -55,7 +55,7 @@ export bare_qualified
 local bare_shadow = do(): U32
     local total: U32 = 0
     local tick = do() total = total + 10 end
-    local inside = counting do(..)
+    local inside = counting:
         tick
     end
     return total + inside

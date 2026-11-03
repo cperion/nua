@@ -13,8 +13,14 @@ conditions, typed assignment, loops and `return` into staged operations.
 ]==]
 
 local M = require 'macro'
-require 'macro.let'
 local lexer = require 'macro.lexer'
+-- The trailing colon is a token rewrite, so it goes below macro.let's lexer
+-- rules: a `do` it writes is applied like one the source wrote.
+assert(not package.loaded['macro.let'], 'macro.nua must be loaded before macro.let')
+local colon = require 'nua.colon'
+local base_scan = lexer.scan_lua_tokenlist
+function lexer.scan_lua_tokenlist(input) return colon.rewrite(base_scan(input)) end
+require 'macro.let'
 local TokenList = require 'macro.TokenList'
 local syntax = require 'nua.syntax'
 

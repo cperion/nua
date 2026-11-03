@@ -316,7 +316,7 @@ str.parse_F64 = do(s: Str): str.parsed F64
     local P = str.parsed F64
     if parse_known_p s then return parse_known s end
     if not float_syntax s then return P.bad() end
-    return s:cstring() do(c)
+    return s:cstring(): c
         return P.value strtod(c, null CString)
     end
 end

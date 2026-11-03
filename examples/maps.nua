@@ -117,7 +117,7 @@ local map_each_sum = do(n: U32): U64
     local m = Counts {}
     for i: U32 = 1, n do m:put(i, U64 i) end
     local total: U64 = 0
-    m:each do(k, v)
+    m:each: k v
         m:put(k, v + 100)
         m:ensure(k, 999)  -- existing key: not a structural change
         m:remove 0  -- absent key: not a structural change
@@ -134,8 +134,8 @@ local map_each_nested = do(n: U32): U64
     m:put(2, 2)
     local total: U64 = 0
     for i: U32 = 1, n do
-        m:each do(k, v)
-            m:each do(k2, v2)
+        m:each: k v
+            m:each: k2 v2
                 total = total + v2
                 if k2 == k then return end
                 total = total + 10
@@ -152,7 +152,7 @@ local map_each_mutation = do(mode: U32): U64
     local m = Counts {}
     m:put(1, 1)
     local alias = Ref m
-    m:each do(k, v)
+    m:each: k v
         if mode == 0 then alias:put(k + 1, v) end
         if mode == 1 then alias:remove k end
         if mode == 2 then alias:ensure(k + 1, v) end
@@ -163,12 +163,12 @@ export map_each_mutation
 
 local map_task_each = do(n: U32): U64
     local total: U64 = 0
-    tasks do(..)
+    tasks:
         local out = channel(U64, 0)
         spawn do
             local m = Counts {}
             for i: U32 = 1, n do m:put(i, U64 i) end
-            m:each do(k, v)
+            m:each: k v
                 out:send v  -- suspends with the iteration guard active
                 m[k] = v + 100
             end

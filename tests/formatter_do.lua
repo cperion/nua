@@ -14,27 +14,27 @@ local function formatted(name, source, expected, options)
     return result
 end
 formatted('host method block', 'items:each(do(item)\nconsume item\nend)',
-    'items:each do(item)\n    consume item\nend\n')
+    'items:each: item\n    consume item\nend\n')
 formatted('host plain block', 'visit(do\nwork()\nend)',
     'visit do\n    work\nend\n')
 formatted('inline block', 'visit(do(x) return x end)', 'visit do(x) return x end\n')
 formatted('comments in body', 'visit(do(x) -- keep this\n-- and this\nconsume x\nend)',
-    'visit do(x)  -- keep this\n    -- and this\n    consume x\nend\n')
+    'visit: x  -- keep this\n    -- and this\n    consume x\nend\n')
 formatted('already bare', 'visit do(x)\nconsume x\nend',
-    'visit do(x)\n    consume x\nend\n')
+    'visit: x\n    consume x\nend\n')
 formatted('preserve option', 'visit(do(x)\nconsume x\nend)',
     'visit(do(x)\n        consume x\n    end)\n', { call_style = 'preserve' })
 formatted('next-line do joins owning call', 'visit(\ndo(x)\nconsume x\nend)',
-    'visit do(x)\n    consume x\nend\n')
+    'visit: x\n    consume x\nend\n')
 check('invalid split owning call rejected', not pcall(fmt.format, 'visit\n(do end)'))
 formatted('multiple arguments stay together', 'visit(1, do(x)\nconsume x\nend)',
     'visit(1, do(x)\n        consume x\n    end)\n')
 formatted('callee after call', 'visit(1)(do(x)\nconsume x\nend)',
-    'visit 1 do(x)\n    consume x\nend\n')
+    'visit 1: x\n    consume x\nend\n')
 formatted('native block', 'local f=do():Unit\nvisit(do(x)\nconsume x\nend)\nend',
-    'local f = do(): Unit\n    visit do(x)\n        consume x\n    end\nend\n')
+    'local f = do(): Unit\n    visit: x\n        consume x\n    end\nend\n')
 formatted('nested do blocks', 'visit(do(x)\nother(do(y)\nconsume y\nend)\nend)',
-    'visit do(x)\n    other do(y)\n        consume y\n    end\nend\n')
+    'visit: x\n    other: y\n        consume y\n    end\nend\n')
 
 -- Exercise the actual macro translator independently of runtime/compiler
 -- initialization. Execute the host case; compare generated staged Lua for the

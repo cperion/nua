@@ -239,6 +239,22 @@ This is a statement-only rule. `local action = refresh` and `return refresh` sti
 
 The syntax remains independent of the runtime arity of the callee.
 
+11. **Trailing colon.** A colon that ends a line, optionally after parameter names, opens an untyped block lambda: it is `do(..)`, `do(names)` or `do(scope..)`.
+
+```lua
+with_buffer n:               -- with_buffer n do(..)
+    ...
+end
+words:each: key value        -- words:each do(key, value)
+    ...
+end
+tasks: scope..               -- tasks do(scope..)
+    ...
+end
+```
+
+`:` alone opens whatever the activity hands over, exactly as `do(..)` does. An activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. The names are untyped; a typed parameter list keeps `do(x: U32)`. A colon is a block opener only where Nua has no annotation colon, so these are unchanged: the result type after a parameter list (`do(x: U32): U32`, `function f(x): T`), the names of a `local` (`local s: Store Node`), fields inside brackets, `::label::`, and a method call, where the name follows the colon directly (`xs:each`). It is a token rewrite below every other rule, so the block is translated as the `do(..)` it stands for, and line numbers do not move. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
+
 ### 2.5 Words and host functions
 
 A lambda is a **native word** exactly when it declares a result type:

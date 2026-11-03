@@ -102,6 +102,45 @@ local run = do(): Unit
     end
 end
 ]], 'endall stops at control blocks and does not affect later lambdas')
+-- The trailing colon opens a block; annotation colons, labels and methods do not.
+local colon_tree = parse([[
+with_buffer n:
+    go
+end
+words:each: key value
+    go key
+end
+tasks: scope..
+    go
+end
+local total = view_of(p, n): bytes
+    go
+end
+spawn:
+    go
+endall
+]], 'trailing colon blocks')
+local colon_sexpr = colon_tree:root():sexpr()
+assert(select(2, colon_sexpr:gsub('%(lambda', '')) == 5, 'colon blocks are not lambdas: ' .. colon_sexpr)
+assert(select(2, colon_sexpr:gsub('%(parameter%s', '')) == 4, 'colon block parameters missing: ' .. colon_sexpr)
+local plain = parse([[
+local s: Store Node
+local a, b: U32
+local f = do(x: U32): U32
+    return x
+end
+local Pair = struct {
+    first: U32,
+    last: U32
+}
+do
+    goto done
+    ::done::
+end
+xs:refresh
+xs:each(f)
+]], 'annotation colons are not blocks')
+assert(select(2, plain:root():sexpr():gsub('%(lambda', '')) == 2, 'an annotation colon opened a block (only the typed lambda and the plain do block are lambdas): ' .. plain:root():sexpr())
 local ok, missing = pcall(require('nua_treesitter').setup, { parser = root .. '/build/no-such-nua-parser.so' })
 assert(not ok and tostring(missing):find('make tree%-sitter'), 'missing parser must produce build guidance')
 require('nua_treesitter').setup({ parser = root .. '/build/tree-sitter-nua/nua.so' })

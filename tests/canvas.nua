@@ -7,10 +7,10 @@ local exercise = do(mode: I32): U32
     return canvas.open {
         title = "canvas test", width = 640, height = 480,
         resizable = true, frame_delay_ms = 0,
-    } do(..)
+    }:
         if mode == 1 then return canvas.Result.done() end
         if mode == 2 then
-            return frame do(..)
+            return frame:
                 clear canvas.Color.black
                 return
             end

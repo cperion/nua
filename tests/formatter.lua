@@ -339,9 +339,9 @@ formatted('an existing endall keeps its column', [[local ping = do(n: U64): U64
 end
 export ping
 ]], [[local ping = do(n: U64): U64
-    with_eventfd do(..)
+    with_eventfd:
         local value = n
-        with_epoll do(..)
+        with_epoll:
             watch fd
         endall
     return n
@@ -425,7 +425,7 @@ export opening_result
 ]]
 local anonymous_program = fmt.format(opening_program)
 check('unused openings removed in semantic fixture', not anonymous_program:find('unused', 1, true))
-check('enclosing home preserved in semantic fixture', anonymous_program:find('do(keep..)', 1, true) ~= nil)
+check('enclosing home preserved in semantic fixture', anonymous_program:find(': keep..', 1, true) ~= nil)
 local original_opening_c = nua.compile(opening_program, 'opening.nua')
 local anonymous_opening_c = nua.compile(anonymous_program, 'opening.nua')
 -- Eliminating a named receiver can also eliminate an unused copy header.

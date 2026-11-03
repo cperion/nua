@@ -3,7 +3,7 @@ const sep = (rule, delimiter = ',') => seq(rule, repeat(seq(delimiter, rule)));
 module.exports = grammar({
   name: 'nua',
   extras: $ => [/\s/, $.comment, $._endall_reset],
-  externals: $ => [$.long_string, $.long_comment, $.name_argument, $._endall, $._implicit_end, $._error_sentinel, $._endall_reset, $._attached_paren],
+  externals: $ => [$.long_string, $.long_comment, $.name_argument, $._endall, $._implicit_end, $._error_sentinel, $._endall_reset, $._attached_paren, $._block_colon, $._header_name, $._header_dots],
   word: $ => $.identifier,
   conflicts: $ => [[$.expression_statement, $._expression], [$.bare_method_call, $._expression], [$.parameter, $._expression], [$.field, $._expression], [$.parameter, $.vararg_expression], [$.handler, $._expression]],
   rules: {
@@ -45,6 +45,12 @@ module.exports = grammar({
       seq('=', $._expression),
       seq(optional($.block), choice('end', alias($._endall, 'endall'), $._implicit_end))
     ))),
+    // The trailing colon (`f x:`, `xs:each: key value`, `tasks: scope..`) opens a block.
+    // It is only ever a call's last argument, never a free lambda.
+    colon_lambda: $ => prec.right(seq(alias($._block_colon, ':'), optional(alias($.colon_parameters, $.parameters)),
+      optional($.block), choice('end', alias($._endall, 'endall'), $._implicit_end))),
+    colon_parameters: $ => repeat1(alias($.colon_parameter, $.parameter)),
+    colon_parameter: $ => prec.right(choice(seq(alias($._header_name, $.identifier), optional(alias($._header_dots, '..'))), alias($._header_dots, '..'))),
     function_expression: $ => seq('function', $.parameters, optional($.block), 'end'),
     struct_expression: $ => seq('struct', $.table_constructor),
     table_constructor: $ => seq('{', optional(seq(sep($.field, choice(',', ';')), optional(choice(',', ';')))), '}'),
@@ -69,7 +75,7 @@ module.exports = grammar({
     index_expression: $ => prec.left(15, seq($._expression, '[', $._expression, ']')),
     spread_expression: $ => prec.right(1, seq('..', $._expression)),
     call_expression: $ => prec.left(14, seq(field('function', $._expression), optional(seq(':', field('method', $.identifier))), field('arguments', $.arguments))),
-    arguments: $ => choice(seq('(', optional(sep($._expression)), ')'), $.table_constructor, $.string, $.number, $.boolean, $.lambda, alias($.name_argument, $.identifier), $.member_argument),
+    arguments: $ => choice(seq('(', optional(sep($._expression)), ')'), $.table_constructor, $.string, $.number, $.boolean, $.lambda, alias($.colon_lambda, $.lambda), alias($.name_argument, $.identifier), $.member_argument),
     // `f a.b[i]` is f(a.b[i]): a juxtaposed name argument keeps its postfix chain
     // (spec 3.3, rule 3), so the call is a complete statement. Only an attached
     // `(` continues it: `f a(b)` is f(a(b)), `f a (b)` is f(a)(b) (spec 10.4).

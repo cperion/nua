@@ -17,7 +17,7 @@ local activity = do(c: Ref Counter, body): U32 = body c
 
 local opened_lexical = do(n: U32): U32
     local c = Counter { total = 1 }
-    return activity(Ref c) do(state..)
+    return activity(Ref c): state..
         call update(state, n)
         return call update state n
     end
@@ -26,7 +26,7 @@ export opened_lexical
 
 local opened_home = do(n: U32): U32
     local c = Counter { total = 1 }
-    return activity(Ref c) do(..)
+    return activity(Ref c):
         return call update(.., n)
     end
 end
@@ -34,7 +34,7 @@ export opened_home
 
 local opened_member = do(n: U32): U32
     local c = Counter { total = 1 }
-    return activity(Ref c) do(..)
+    return activity(Ref c):
         call add n
         return call scaled n 3
     end
@@ -43,7 +43,7 @@ export opened_member
 
 local opened_local = do(n: U32): U32
     local c = Counter { total = 1 }
-    return activity(Ref c) do(..)
+    return activity(Ref c):
         local add = do(x: U32): U32 = x * 7
         return call add n
     end

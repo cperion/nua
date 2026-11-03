@@ -5677,6 +5677,7 @@ end
 
 -- Validate the source; collisions follow lexical binding order in syntax.lua.
 function S.open(ctx)
+    if ctx == nil then return ctx end    -- an activity that hands over nothing opens the empty set
     if is_pack(ctx) then fail('spread-source: packs cannot introduce names', 2) end
     h.names_of(ctx)
     return ctx

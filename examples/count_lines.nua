@@ -36,7 +36,7 @@ local main = do(args: Args): I32
         return 2
     end
     local n: U32 = 0
-    args[1]:cstring() do(c)
+    args[1]:cstring(): c
         n = count_file c
     end
     libc.say("lines = ", n, "\n")

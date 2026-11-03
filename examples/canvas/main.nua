@@ -7,7 +7,7 @@ local main = do(): I32
     return canvas.open {
         title = "Nua canvas — SDL3",
         width = 800, height = 600, resizable = true,
-    } do(..)
+    }:
         return interact {
             key = do(..)
                 if pressed then

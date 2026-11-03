@@ -27,7 +27,7 @@ local transaction = do(document: Ref Document, body): Unit
 end
 
 local type_text = do(doc: Ref Document, n: U32): Unit
-    transaction doc do(..)
+    transaction doc:
         insert n
         move_left
         if cursor > 3 then
@@ -40,7 +40,7 @@ export type_text
 -- open to work; bind to remember
 local back_and_forth = do(doc: Ref Document): U32
     local moved: U32 = 0
-    transaction doc do(..)
+    transaction doc:
         local before = cursor
         move_left
         moved = before - cursor
@@ -52,7 +52,7 @@ export back_and_forth
 -- a private document: the whole activity folds away
 local fresh_length = do(n: U32): U32
     local doc = Document { length = 0, cursor = 0, edits = 0 }
-    transaction(Ref doc) do(..)
+    transaction(Ref doc):
         insert n
         insert 2
     end
@@ -71,7 +71,7 @@ local counting = do(body): U32
     return counting.count
 end
 local evens = do(n: U32): U32 =
-counting do(..)
+counting:
     for i: U32 = 1, n do
         if i % 2 == 0 then
             tick
@@ -138,7 +138,7 @@ end
 local import_rows = do(doc: Ref Document, n: U32): Unit
     traced 1 do
     traced 2 do
-    transaction doc do(..)
+    transaction doc:
         insert n
     endall
     trace 9
@@ -148,7 +148,7 @@ export import_rows
 -- callbacks: staged control flow; `return` leaves only the callback
 local apply = do(f, x: U32): U32 = f x
 local clamp_cb = do(x: U32): U32
-    return apply do(v)
+    return apply: v
         if v > 10 then return v - 10 end
         return v
     end x + 1

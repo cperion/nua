@@ -86,6 +86,7 @@ doctor: dirs
 
 test-macros: dirs
 	$(LUA) tests/macros.lua
+	$(LUA) tests/colon.lua
 
 test-format: dirs
 	$(LUA) tests/formatter_do.lua

@@ -363,7 +363,7 @@ end
 ```lua
 local type_word = do(document: Ref Document, n: U32): U32
     local moved: U32 = 0
-    transaction document do(..)
+    transaction document:
         insert n
         local before = cursor
         move_left
@@ -442,7 +442,7 @@ end
 
 ```lua
 local type_capped = do(document: Ref Document, n: U32, cap: U32): Bool
-    return attempt document do(..)
+    return attempt document:
         insert n
         if length > cap then
             return Outcome.abort length
@@ -501,7 +501,7 @@ end
 local import_capped = do(document: Ref Document, stats: Ref Stats, n: U32): Unit
     counted stats do
     clamped document 100 do
-    transaction document do(..)
+    transaction document:
         insert n
     endall
 end
@@ -528,8 +528,8 @@ local logged = do(body): U32
 end
 
 local type_logged = do(document: Ref Document, n: U32): U32
-    return logged do(..)
-        transaction document do(..)
+    return logged:
+        transaction document:
             insert n
             note 1
         end
@@ -586,7 +586,7 @@ local keymap = function(body)
     return bindings
 end
 
-local editor_keys = keymap do(..)
+local editor_keys = keymap:
     bind "h" (Command.move(Direction.left()))
     bind "l" (Command.move(Direction.right()))
     bind "u" (Command.undo())

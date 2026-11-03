@@ -2,14 +2,14 @@
 local Counts = StrMap U32
 local strmap_words = do(text: Str): U32
     local words = Counts {}
-    text:split " " do(word)
+    text:split " ": word
         if word.length > 0 then
             words:ensure(word, 0)
             words[word] = words[word] + 1
         end
     end
     local total: U32 = 0
-    words:each do(key, count)
+    words:each: key count
         total = total + count
         words:put(key, count + 1)  -- replacement is safe while the key is borrowed
         words:remove "not-present"
@@ -67,7 +67,7 @@ export strmap_missing
 local strmap_mutation = do(mode: U32): U32
     local words = Counts {}
     words:put("a", 1)
-    words:each do(key, value)
+    words:each: key value
         if mode == 0 then words:put("b", value) end
         if mode == 1 then words:remove key end
     end

@@ -9,7 +9,7 @@ local logged = do(body): U32
     return log.notes
 end
 local return_logged = do(n: U32): U32
-    return logged do(..)
+    return logged:
         note n
     end
 end
@@ -23,7 +23,7 @@ local completed = do(body): U32
     return log.notes
 end
 local return_completed = do(n: U32): U32
-    return completed do(..)
+    return completed:
         note n
         if n > 3 then return end
         note 2

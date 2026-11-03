@@ -44,6 +44,7 @@ return {
     type_style = "inferred",
     table_style = "shorthand",
     opening_style = "anonymous",
+    block_style = "colon",
 }
 ```
 
@@ -62,6 +63,8 @@ file, not arbitrary downloaded Lua code.
 | `type_style` | `"inferred"`, `"preserve"` | Drop a local's annotation when its initializer is an application of that same type (below), or keep every annotation. |
 | `table_style` | `"shorthand"`, `"preserve"` | `"shorthand"` writes a table entry `name = name` as `.name` (syntax §2.4); `"preserve"` keeps the spelling, including any `.name` already written. |
 | `opening_style` | `"anonymous"`, `"preserve"` | Remove an unused name from an opened `do` parameter, or keep named openings. |
+| `block_style` | `"colon"`, `"do"` | Write an untyped trailing `do(..)` that ends a line as the colon form (syntax §2.4, rule 11), or keep the `do` spelling. |
+| `block_style` | `"colon"`, `"do"` | Write an untyped trailing `do(..)` that ends a line in the colon form (syntax §2.4, rule 11), or keep the `do` spelling. |
 | `spine_style` | `"pure"`, `"all"`, `"none"` | Which link bodies of an `endall` spine lose their indent. |
 
 Unknown settings and invalid values are errors, not silently ignored options.
@@ -119,6 +122,25 @@ could change that lookup. It also avoids conflicting `__home` parameters and
 repeated parameter names that affect which argument is opened.
 The candidate is reparsed and checked against exactly the intended parameter
 change. Set `opening_style = "preserve"` to retain named openings.
+
+## Trailing colon
+
+With `block_style = "colon"`, an untyped `do(names)` that ends a line, after an
+operand and outside brackets, is written `: names` (`do(..)` as `:`, `do(scope..)`
+as `: scope..`). Typed lambdas, inline blocks, blocks that open a new argument
+inside brackets and parameterless `do` blocks keep their spelling. The colon form
+is read back as the `do(..)` it means before anything else is analysed, and the
+result is accepted only when that reading equals the original source.
+
+## Trailing colon
+
+With `block_style = "colon"`, an untyped `do(names)` that ends a line, after an
+operand and outside brackets, is written `: names` (`do(..)` as `:`, `do(scope..)`
+as `: scope..`). Typed lambdas, inline blocks, blocks inside brackets and
+parameterless `do` blocks keep their spelling (a line-ending `do` cannot be told
+from a loop header without parsing, so `spawn do` stays; `spawn:` is accepted as
+source). The colon form is read back as the `do(..)` it means before anything else
+is analysed, and the result is accepted only when that reading equals the source.
 
 ## Default style
 

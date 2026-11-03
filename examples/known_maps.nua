@@ -23,7 +23,7 @@ export known_constant
 assert(host(known_constant()) == 13)
 local known_order = do(): U32
     local result = U32 0
-    numbers:each do(k, v)
+    numbers:each: k v
         result = result * 10 + k
     end
     return result
