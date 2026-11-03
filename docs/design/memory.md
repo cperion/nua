@@ -118,9 +118,10 @@ follows slot order. Consequences:
   `m:has k` are the non-trapping forms. Writing a field of a missing entry
   (`m[k].x = 1`) modifies an entry, so it traps too; `m:ensure(k, initial)` creates
   it. Today assignment does not insert (syntax §15.1).
-- `Map(Str, V)` keeps its keys in a key arena. Removed keys' bytes are reclaimed when
-  they exceed the live bytes, by compacting the arena; compaction moves keys, so a
-  `put` that may compact ends borrows of the keys (not of the values).
+- `Map(Str, V)` keeps its keys in a key arena, a shared position (§5.9). Removed
+  keys' bytes are reclaimed by compacting the arena inside `remove`, which already
+  ends borrows (rule R5), so `put` ends no borrows. Today the compaction runs in
+  `put` and ends borrows of the keys; milestone 5 moves it.
 
 ### 5.2 Creation
 
@@ -179,8 +180,12 @@ local edges = load_edges file
 local g = Graph { .nodes, .edges }   -- moved: nothing is copied
 ```
 
-- **Nothing is copied.** The storage stays where it is; the destination takes over
-  the duty to release it.
+- **Nothing is copied** when the destination is a position with one tenant (a
+  local, a field of one, a parameter, a result, §5.9): the storage stays where it is,
+  the destination takes over its stack and the duty to release it. A move into or
+  out of a shared position (an element) copies the bytes once, since an owner's
+  bytes always live on its position's stack (§5.9, R3); `lines:push(read_line f)`
+  builds in the element and copies nothing.
 - **Use after a move is rejected,** with the move site in the diagnostic: `nodes
   moved into g.nodes at line 3`. Last use is liveness, as for invalidation (§6.3).
 - **Using a named owner as a value when it is used again later** is rejected, with
@@ -246,12 +251,14 @@ Implemented: exact release for moves on some paths and for replacement; every ot
 owner is released when its scope ends, the latest point allowed. Releasing every
 owner at its last use needs a liveness pass over the generated program, including
 pointers derived from the owner (*decided* 2026-11-02: a later milestone). A nested
-owner's contents (§5.9) are not released one by one: they return with their arena.
+owner's contents at a shared position (§5.9) are not released one by one: they
+become dead bytes, reclaimed by compaction or when the position's stack is reset.
 
 ### 5.9 Nested owners
 
-(proposed) An owner may sit inside a container element, an `Array(T, n)` or
-`Bounded(T, n)` element, a `Sum` payload or a map value:
+(*decided* 2026-11-03, D13) An owner may sit anywhere a value can: a field, a
+container element, an `Array(T, n)` or `Bounded(T, n)` element, a `Sum` payload, a
+map value.
 
 ```lua
 local lines = Grow Text {}
@@ -259,45 +266,85 @@ local players = Store Player {}      -- Player = Struct { name: Text, items: Gro
 local cache = Map(U64, Text) {}
 ```
 
-**The mechanism: one arena per nesting level.** The number of data stacks must stay
-fixed while compiling (§9). A holder whose elements contain owners takes one extra
-stack, its arena, where those owners' contents live. Each element holds a small
-header (where its contents begin, length, capacity). The depth of owner nesting is
-part of the type, so the stack count is static: `Grow Text` uses 2 stacks, `Store
-Player` 3 (slots, names' arena, items' arena), `Grow (Grow (Grow U8))` 3.
-`Map(Str, V)`'s key arena is this mechanism already.
+The model has one unit, the **owner position**: a place in a root owner's type where
+an owner sits. A root is an owner held by a local, a parameter, a result or a global.
+Five rules decide everything about nesting.
 
-- **Growth.** A nested owner whose contents end at the arena's top extends in place:
-  building elements one at a time never moves anything. Otherwise its contents move
-  to the top with doubled capacity.
-- **What moving costs.** Growing a nested owner ends borrows of *that* owner's
-  contents (liveness, §6.3). When the compiler cannot tell two elements apart
-  (`lines[i]` and `lines[j]` with unknown indices), it ends borrows of the contents
-  of every element of that holder. Top-level owners never move, and borrows of the
-  elements themselves (the headers) are unaffected.
-- **Reclaiming.** Space abandoned by moving, and the contents of removed elements,
-  return when the outer owner is cleared or ends, or on an explicit `compact()`
-  (which moves contents, so it ends borrows of them). Doubling bounds the space
-  abandoned by growth to the live size; space abandoned by removal is bounded by
-  the outer owner's lifetime.
-- **A `Sum` with an owner payload** is an owner with one stack: replacing the
-  variant resets that stack to its base. No arena is needed, since only one payload
-  exists at a time.
-- **Copying** an outer owner copies the nested contents (`copy` is deep).
+**R1. One header.** Every owner is a header `{ stack, base, length, capacity }` over a
+region of one stack. A word over `Ref Text` is the same word whether the `Text` is a
+local or an element, and a `Ref` to an element needs no other context.
+
+**R2. One stack per position.** Each owner position of a root's type has one data
+stack. A position under a container element, an array element or a map value is
+**shared** by every element there; its stack is that position's *arena*. Every
+other position has **one tenant**. Alternatives of a `Sum` share their positions, so
+a `Sum` needs as many stacks as its largest alternative. The stack count is the
+number of positions, so it is fixed while compiling (§9): `Grow Text` uses 2 stacks,
+`Store Player` 3 (slots, names, items), `Map(Str, Text)` 4 (slots, index, keys,
+values), `Grow (Grow (Grow U8))` 3. A recursive owner type has unboundedly many
+positions and is rejected; a tree goes through `Id` into a `Store` (§6.4).
+
+**R3. An owner's bytes always live on its position's stack.** Growth extends in
+place when the owner's region ends at the stack's top, and otherwise relocates the
+contents to the top with doubled capacity. A one-tenant owner is always at its
+stack's top, so it never relocates: top-level owners keep today's cost, one
+comparison. A move to a different position copies the bytes once; a move within the
+same kind of one-tenant position hands over the stack (§5.4). Storing an owner into
+an element, `push` of a named owner at its last use, `pop` and `take` are such
+copies; a call result or a constructor is built in the element and copies nothing.
+Moving out of an element is rejected (D6); `copy`, `pop` and `take` are the ways out.
+
+**R4. Borrows of a shared position's contents end when they may relocate.** Growing
+a nested owner ends borrows of that owner's contents; when the compiler cannot tell
+two elements apart (`lines[i]`, `lines[j]` with unknown indices), it ends borrows of
+the contents of every element at that position. Whether a growth relocates is a
+runtime fact, so the rule is static: any growth counts. The diagnostic names the
+growth (`names[0]:write may move the contents at names[_]`). Borrows of the elements
+themselves (the headers) are unaffected, and one-tenant positions never relocate:
+growing a top-level owner invalidates nothing (§6.3).
+
+**R5. Bytes at a shared position are reclaimed only by operations that already end
+its borrows.** Removing, popping, truncating or overwriting an element turns its
+contents into dead bytes, and these operations compact the arena when the dead bytes
+are at least the live bytes and at least 4096. `clear` and the release of the root
+reset the whole stack. Growth never compacts, so R4 is the only invalidation growth
+causes. `compact()` compacts explicitly and ends the same borrows. Growth leaves at
+most the live size abandoned (doubling); removal leaves at most the live size dead
+(the threshold), so memory stays bounded under churn.
+
+Consequences:
+
+- **One mechanism.** An arena is a stack used by several owners, with the holder
+  keeping its bookkeeping (stack, base, length, dead bytes), as `Map(Str, V)`'s key
+  arena does. Creating a nested owner is its type's `init` on the arena; filling it
+  is `copy` (§5.5) with an element as the destination. Compaction is one Nua word over
+  the type's positions, specialized per type.
+- **`Sum`.** A `Sum` in a one-tenant position resets its stacks when its variant is
+  replaced. A `Sum` that is an element sits in shared positions, and replacing its
+  variant turns the old payload into dead bytes (R5).
+- **Copying** a holder builds the nested contents compact in the new stacks (`copy`
+  is deep). **Moving** a holder moves its header and stacks, with no work per
+  element.
+- **Borrow roots** name the position: a borrow of `names[i]`'s contents has the root
+  `names`, position `names[_]`, and a selector for `i` when it is known (`retire`
+  with a selector, §10.1). Boundary summaries record nested growth the same way.
 
 ### 5.10 Owner globals
 
-(proposed) A global may be an owner. Each owner global gets its own reserved region,
-reserved at its first use and released at exit; the number of owner globals is known
-while compiling. Today's global rules apply unchanged: tasks do not write ordinary
-globals (syntax §21.1).
+(*decided* 2026-11-03, D13) A global may be an owner. It is a root whose positions get
+stacks reserved for the process at its first use and released at exit; the number of
+owner globals is known while compiling. Owner globals belong to the main thread: a
+task may neither read nor write one, since the main thread could grow it while the
+task reads (a task owns its memory, §8). Trap recovery does not release them.
+Shared read-only tables are static data or `Map.known`. Today's global rules apply
+unchanged: tasks do not write ordinary globals (syntax §21.1).
 
 ### 5.11 What may hold what
 
 Every holder crossed with every role. Three invariants decide each cell:
 
-1. **The number of data stacks is fixed while compiling** (§9). Nested owners use
-   arenas (§5.9), so owners fit everywhere the compiler counts nesting.
+1. **The number of data stacks is fixed while compiling** (§9). Each owner position
+   has one stack (§5.9), so owners fit everywhere except in recursive owner types.
 2. **Every borrow's owner is known to the compiler** (§6.2). A borrow may sit wherever
    the holder's lifetime can be compared with its owner's.
 3. **A task owns its memory** (§8). It may read its spawner's owners for the
@@ -312,7 +359,7 @@ Every holder crossed with every role. Three invariants decide each cell:
 | `Grow`, `Array T`, `Store` element | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
 | `Map` value | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
 | `Map` key | with semantic equality (syntax §15.1), `Bounded(T, n)` of such | yes, with `Map.borrowing` (below) | as its borrow type, copied by the map | yes | no | no | no | no |
-| global | yes | of static data or globals (*decided*) | yes (§5.10) | yes | yes (*decided*, D3) | yes | yes | yes |
+| global | yes | of static data or globals (*decided*) | yes, main thread only (§5.10) | yes | yes (*decided*, D3) | yes | yes | yes |
 | task crossing: spawn copy, message, pool slot type | sendable (syntax §20.5) | no | no | no | yes | moves | no | no |
 | a task's view of its spawner, within a tasks scope | read | read-only (*decided*, D1, §8) | read-only borrow | yes | yes | no | no | atomic operations, as today |
 
@@ -385,7 +432,8 @@ may hold a borrow only of static data or of another global.
 
 ### 6.3 Invalidation
 
-Top-level owners never move, so **growing a top-level owner invalidates nothing**.
+Owners at one-tenant positions never move (§5.9), so **growing a top-level owner
+invalidates nothing**.
 Only operations that free, reuse or move storage end borrows, and only borrows that
 are used afterwards matter:
 
@@ -394,9 +442,10 @@ are used afterwards matter:
 | `xs:push v`, `xs:append s`, text writes on a top-level owner | nothing | implemented |
 | `xs:pop()`, `xs:clear()`, `xs:truncate n` | `xs`'s contents | implemented |
 | `s:remove id` (Store), `m:remove k` (Map) | the store's or map's elements; only the removed one when the compiler proves the others differ | proposed: today a borrow of a removed element sees the next entity put in its slot |
-| `m:put k v` (Map) | nothing; for `Map(Str, V)`, the keys (arena compaction) | proposed |
-| growing a nested owner (§5.9) | that owner's contents | proposed |
-| `compact()` of a holder with nested owners | the nested contents | proposed |
+| `m:put k v` (Map) | nothing (§5.9, R5) | proposed: today `Map(Str, V)` compacts its keys here |
+| growing a nested owner (§5.9, R4) | that owner's contents; every element's at that position when the index is unknown | proposed |
+| removing, popping, truncating or overwriting an element with nested owners (R5) | the contents at its shared positions (compaction) | proposed |
+| `compact()` of a holder with nested owners | the contents at its shared positions | proposed |
 | replacing a `Sum` variant (§4) | the old payload | proposed |
 
 "Used afterwards" is liveness, not lexical scope: a borrow whose last use comes
@@ -488,8 +537,7 @@ frozen owner is read-only in the task. Atomics keep their own rules (syntax §19
 - **Static data stacks.** Each program (main and each task program) has a number of
   data stacks fixed while compiling. Simultaneously live top-level owners get
   distinct stacks; owners with disjoint lifetimes share them, assigned like
-  registers. Each nesting level of owners inside a holder adds one arena stack
-  (§5.9). A top-level owner is always the top of its stack.
+  registers. Each owner position in an owner's type has one stack (§5.9). A top-level owner is always the top of its stack.
 - **Stacks never move** (*implemented*). A stack is a reserved address range,
   committed when touched. Growth bumps the top after one comparison against the
   reservation's limit; exceeding it traps. There are no guard pages: a guard costs a
@@ -589,7 +637,8 @@ The effects of operations, which is all the library has to say:
 | overwrite an element (`m[k] = v` on an existing key) | none |
 | reuse a slot (`Store:remove`, `Map:remove`) | `retire(owner, element)` and `restructure(owner, element)` |
 | shrink (`pop`, `truncate`, `clear`) | `retire(owner)` of the freed contents, and `restructure` |
-| move nested storage (compaction, milestone 5) | `retire(owner)` of the moved contents |
+| grow a nested owner (milestone 5) | `retire(owner, position)` of that owner's contents (§5.9, R4) |
+| compact a shared position (milestone 5) | `retire(owner, position)` of its contents (R5) |
 
 A selector lets the compiler keep borrows it can prove differ: a borrow of key 1
 survives `remove 2` when both are known and differ. Stores of borrows into elements
@@ -698,8 +747,9 @@ test-native`).
    `Map.borrowing`; the
    text types; all as Nua over the compiler primitives; compile-time `each` checks
    with no runtime guard; `init_storage` and the compiler storage kinds removed.
-5. **Nested owners.** Arenas for owners in container elements, arrays, `Bounded`,
-   payloads and map values; `compact()`; owner globals.
+5. **Nested owners.** The position model (§5.9): the uniform header and relocation,
+   one stack per position, the owner-aware element store, dead bytes and
+   compaction in borrow-ending operations, `compact()`; owner globals (§5.10).
 6. **Capacity.** Reservations per tasks scope and from known bounds.
 7. **Tasks.** Read-only borrows of the spawner's owners across a tasks scope, with
    frozen owners (D1).
@@ -746,6 +796,16 @@ Recorded 2026-11-02.
   (§10.1), summarized through boundary summaries. Rejected: inferring effects from
   `stacks.reset` (it cannot see slot reuse), and a table of per-method effects in
   Lua (the effect layer would stay in the compiler).
+- **D13. Nested owners: the position model** (§5.9, §5.10). Decided 2026-11-03, after
+  the [audit](nested-owners-audit.md). One header for every owner, one stack per owner
+  position, bytes always on their position's stack, borrows of a shared position
+  ending when it may relocate, reclamation only in operations that already end those
+  borrows; recursive owner types rejected; owner globals for the main thread only.
+  Rejected: an arena per nesting level (its own examples counted positions);
+  forbidding growth of nested owners (it rules out `players[id].items:push item`);
+  compaction during growth (it would make growth end borrows of every element);
+  a runtime generation check instead of R4 (a check facts could remove). The extension
+  for recursive types is one shared stack per recursive component of the type.
 - **D5. Partial moves: no choice was needed.** The earlier options (keep the unmoved
   owner's bytes until the destination ends, or reject) came from keeping Goose's
   release-at-scope-exit. Releasing an owner at the end of its life (§5.8) makes a move

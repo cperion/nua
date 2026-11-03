@@ -163,7 +163,7 @@ pass `-u </dev/null` or avoid commands that open an editor.
 hooks (see §7); the checked-place index hook is the generic protocol in `nua/memory.lua`;
 `Str` is a compiler type.
 
-**Later milestones (memory.md §13):** 5 nested owners (arenas, `compact()`, owner globals;
+**Later milestones (memory.md §13):** 5 nested owners (the position model, memory.md §5.9 R1–R5 and D13; `compact()`, owner globals;
 reuse the `Map(Str, V)` key-arena code); 6 capacity sizing per tasks scope; 7 task borrows with
 frozen owners (D1). Deferred by decision: D4 atomics in containers, D8 general last-use release.
 

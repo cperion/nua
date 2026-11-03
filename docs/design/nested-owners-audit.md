@@ -5,6 +5,10 @@ Written 2026-11-03. This audits the *proposed* design of nested owners against t
 changes no design text: §5.9 and §5.10 are still "(proposed)" and §14 still says "None". The
 corrections it asks for are listed in §6 for approval, not applied.
 
+**Resolved 2026-11-03.** The findings were folded into one model instead of nine separate
+decisions: owner *positions* (memory.md §5.9 R1–R5, §5.10, decision D13). N1–N9 and C1–C6
+below are superseded by that text; they are kept as the record of why.
+
 Method: every holder crossed with every role (the §5.11 table, owner column), then every
 operation on a holder crossed with what it does to nested contents, the stack count, borrows
 and release. Each finding says what the proposal claims, what breaks or is missing, and what
