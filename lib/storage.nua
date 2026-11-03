@@ -5,6 +5,7 @@ local stacks = require "nua.stacks"
 local storage = {}
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
+local retire, restructure = __S.retire, __S.restructure
 local none = U32 0xffffffff
 local maximum = U64 0xffffffffffffffffULL
 local occupied = U32 0xfffffffe
@@ -74,6 +75,8 @@ function storage.store(T, Id, p)
     api.remove = do(s: Ref T, id: Id): Bool
         local entry = occupant s id
         if entry == null Item then return false end
+        -- a removed slot is reused: borrows of the store's elements end here
+        retire(s, "an element of '%s' was removed")
         local token, slot, generation = p.components id
         local h = p.header s
         h.live = h.live - 1
@@ -111,12 +114,14 @@ function storage.grow(T, p)
     local what = T.kind == "rtarray" and "Array" or (T.elem == U8 and "Text" or "Grow")
     local grow = extend(T, p, what)
     api.clear = do(g: Ref T): Unit
+        retire(g, "'%s' was cleared")
         local h = p.header g
         stacks.reset h.stack h.base
         h.len = 0
     end
     -- keep the first n elements: the storage above them is released
     api.truncate = do(g: Ref T, n: U64): Unit
+        retire(g, "'%s' was truncated")
         local h = p.header g
         if n > h.len then trap "Grow truncate beyond its length" end
         stacks.reset h.stack (h.base + n * p.width())
@@ -124,6 +129,7 @@ function storage.grow(T, p)
     end
     -- the last element, removed
     api.pop = do(g: Ref T): T.elem
+        retire(g, "'%s' was popped")
         local h = p.header g
         if h.len == 0 then trap "Grow pop of an empty Grow" end
         local last = h.len - 1

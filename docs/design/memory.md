@@ -562,6 +562,48 @@ Written in Nua, specialized with the program:
 The `init_storage` hook, the compiler-side Store/Grow kinds and the Grow loan
 activity are removed.
 
+### 10.1 Library owner types
+
+A container is a **declaration plus ordinary words**. The declaration gives its
+header layout, its stacks (the release fields: one data stack each) and an init and
+copy word; the owner machinery of §5 needs nothing else. Its operations are words
+over `Ref` to the container. Nothing about a container is special to the compiler.
+
+What a container does to **borrows** is not inferred from stack operations, which
+cannot see a slot being reused. It is stated by four primitives over an owner passed
+as `Ref`, available to library modules only (they are unsafe-grade, like `Ptr`):
+
+| Primitive | Meaning |
+|---|---|
+| `borrows(owner, value)` | `value` (an element `Ref`, a `Slice`, a `Str`) is a borrow of the owner's contents; a keyed element carries a selector |
+| `retire(owner, selector?)` | storage is freed or reused: ends the borrows that may name the selector, or all of them |
+| `restructure(owner, selector?)` | an insertion or removal: rejected inside `fixed` |
+| `fixed(owner) do ... end` | the structure is fixed in the body (what `m:each` does) |
+
+The effects of operations, which is all the library has to say:
+
+| Operation | Effect |
+|---|---|
+| append (`push`, `put` of a new key, `add`) | none: stacks never move |
+| overwrite an element (`m[k] = v` on an existing key) | none |
+| reuse a slot (`Store:remove`, `Map:remove`) | `retire(owner, element)` and `restructure(owner, element)` |
+| shrink (`pop`, `truncate`, `clear`) | `retire(owner)` of the freed contents, and `restructure` |
+| move nested storage (compaction, milestone 5) | `retire(owner)` of the moved contents |
+
+A selector lets the compiler keep borrows it can prove differ: a borrow of key 1
+survives `remove 2` when both are known and differ. Stores of borrows into elements
+stay checked by the compiler, because an element place records its owner.
+
+**Effects are summarized, not annotated.** A word that calls `retire` or
+`restructure` on a `Ref` parameter carries that effect in its boundary summary, as
+the `shrinks` and `restructures` summaries do today, so a user word that calls
+`g:pop()` inherits the effect and a call inside `fixed` is rejected.
+
+**Trust.** A library owner type is trusted code, as `unsafe` code is: a missing
+`retire` is a library bug, and each container has rejection tests for its borrow
+rules. User programs are checked either way, and a user type built from `Grow` or
+`Map` needs no primitives.
+
 ## 11. Choosing the right primitive
 
 The static rules are the fast, default path. When one rejects a program, it is
@@ -694,6 +736,12 @@ Recorded 2026-11-02.
   recursion is planned, and every level passes the region down; the summaries of
   which `Ref` arguments its words move out are computed together over the
   recursion, which is built again until they agree.
+- **D12. Library owner types and four borrow-effect primitives.** Decided 2026-11-03.
+  A container is a declaration (header, stacks, init, copy) plus Nua words; its
+  effects on borrows are stated with `borrows`, `retire`, `restructure` and `fixed`
+  (§10.1), summarized through boundary summaries. Rejected: inferring effects from
+  `stacks.reset` (it cannot see slot reuse), and a table of per-method effects in
+  Lua (the effect layer would stay in the compiler).
 - **D5. Partial moves: no choice was needed.** The earlier options (keep the unmoved
   owner's bytes until the destination ends, or reject) came from keeping Goose's
   release-at-scope-exit. Releasing an owner at the end of its life (§5.8) makes a move

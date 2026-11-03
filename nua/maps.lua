@@ -50,11 +50,18 @@ local function decorate(t)
     end
     local function capture_key(kv)
         if S.is_known(kv) then return kv end
-        if not (is_str or borrowing) then return Mem.fix_index(kv, 'capturing a map key') end
-        local view = rawget(kv, 'view')
-        kv = Mem.capture(kv, 'capturing a map key')
-        if view then rawset(kv, 'view', view) end
-        return kv
+        local text = S.expr_key(ex(kv))
+        local captured
+        if not (is_str or borrowing) then
+            captured = Mem.fix_index(kv, 'capturing a map key')
+        else
+            local view = rawget(kv, 'view')
+            captured = Mem.capture(kv, 'capturing a map key')
+            if view then rawset(captured, 'view', view) end
+        end
+        -- the captured temporary stands for the key it came from (iteration and removal compare keys)
+        if S.is_value(captured) then rawset(captured, 'key_text', text) end
+        return captured
     end
     storage = layouts.maps(t, t.entry, function(x) return Mem.view(receiver(x), t.representation) end)
     local function library() return require('nua.map').library(t, storage, t.entry, t.lookup, is_str, borrowing) end
@@ -67,23 +74,12 @@ local function decorate(t)
     local ms = {}
     for _, method in ipairs { 'has', 'find', 'remove' } do
         ms[method] = function(self, k)
-            if method == 'remove' then
-                -- a removed entry's slot is reused: borrows of entries end here
-                -- only the borrows that may name the removed entry end
-                local p = receiver(self)
-                S.note_structure(p, 'remove')
-                local removed = key(k)
-                S.end_elements(p, { text = S.expr_key(ex(removed)), known = S.is_known(removed) },
-                    ("an entry of '" .. tostring(p.name) .. "' was removed"))
-                S.bump_checked()
-            end
             return library()[method](S.Ref(receiver(self)), key(k))
         end
     end
     for _, method in ipairs { 'put', 'ensure' } do
         ms[method] = function(self, k, value)
             local p = receiver(self)
-            S.note_structure(p, method, S.expr_key(ex(key(k))))
             -- a borrowed key is stored as it is: a stored borrow, checked against the map's owner
             local kv = borrowing and Mem.owned_copy(p, key(k), 'capturing a borrowed map key') or capture_key(key(k))
             S.note_growth(p)

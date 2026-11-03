@@ -34,6 +34,7 @@ local str = require "nua.str"
 local stacks = require "nua.stacks"
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
+local retire, restructure = __S.retire, __S.restructure
 local none = U32 0xffffffff
 local libraries = {}
 
@@ -206,6 +207,8 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         end
     end
     api.put = do(m: Ref T, key: K, value: V, only_missing): Unit
+        -- an insertion changes the structure; replacing the entry being visited does not
+        restructure(m, "put", key)
         local hashed = digest key
         local table = acquire m
         local cell = probe table key hashed
@@ -279,6 +282,9 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         return Ptr entry.value
     end
     api.remove = do(m: Ref T, key: K): Bool
+        restructure(m, "remove")
+        -- the slot is reused: only the borrows that may name this key end
+        retire(m, "an entry of '%s' was removed", key)
         local hashed = digest key
         local table = acquire m
         local cell = probe table key hashed

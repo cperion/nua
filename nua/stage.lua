@@ -1088,6 +1088,38 @@ h.end_owner = function(b, place, why)
     h.end_token(b, rawget(root, 'contents_token'), root, 'contents_token', why)
 end
 S.end_borrows = function(place, why) h.end_owner(cur(), place, why) end
+
+-- Borrow effects of a library owner type (design memory.md §10.1, D12). A library word
+-- that frees, reuses or restructures its owner says so with these, over the owner it
+-- received as a Ref; the boundary summaries carry the effect to its callers.
+h.effect_owner = function(ref, what)
+    ref = h.through(ref)
+    if is_value(ref) and ref.k == 'ref' then return ref.place end
+    if is_place(ref) then return ref end
+    fail(what .. ' needs the owner itself (a Ref)', 3)
+end
+h.effect_key = function(key)
+    if key == nil then return nil end
+    -- a key captured into a temporary keeps the semantic key it was captured from
+    return { text = (is_value(key) and rawget(key, 'key_text')) or expr_key(S.ex(S.value_of(key))),
+             known = S.is_known(key) }
+end
+-- storage is freed or reused: borrows of the owner end. `template` names the owner (%s);
+-- a key narrows it to the elements that may name that key.
+S.retire = function(ref, template, key)
+    local place = h.effect_owner(ref, 'retire')
+    local why = template:format(tostring(rawget(root_of(place), 'name')))
+    S.bump_checked()
+    local selector = h.effect_key(key)
+    if selector then h.end_elements(cur(), place, selector, why) else h.end_owner(cur(), place, why) end
+end
+-- an insertion or removal: not allowed while the owner is being iterated. `key` names the
+-- entry of an insert-or-replace: replacing the entry being visited changes no structure.
+S.restructure = function(ref, what, key)
+    local place = h.effect_owner(ref, 'restructure')
+    local selector = h.effect_key(key)
+    S.note_structure(place, what, selector and selector.text)
+end
 -- the field names leading from a place's root to it
 function S.field_path(p)
     local names = {}

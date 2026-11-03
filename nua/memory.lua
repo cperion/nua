@@ -717,9 +717,6 @@ local function store_methods(t)
         end,
         remove = function(self, i)
             local p = receiver(self, n .. ':remove')
-            -- a removed slot is reused: borrows of the store's elements end here
-            S.end_borrows(p, ("an element of '" .. tostring(p.name) .. "' was removed"))
-            S.bump_checked()
             return storage_library(t).remove(S.Ref(p), S.coerce(i, id, 'Id to remove'))
         end,
         has = function(self, i)
@@ -753,25 +750,18 @@ local function grow_methods(t)
         end,
         clear = function(self)
             local p = receiver(self, n .. ':clear')
-            S.end_borrows(p, ("'" .. tostring(p.name) .. "' was cleared"))
-            S.bump_checked()
             local b = S.cur()
             if b.fn then b.fn.uses_rt = true end
             storage_library(t).clear(S.Ref(p))
         end,
-        -- shrinking frees the storage above the new end: borrows of the contents end
         truncate = function(self, count)
             local p = receiver(self, n .. ':truncate')
-            S.end_borrows(p, ("'" .. tostring(p.name) .. "' was truncated"))
-            S.bump_checked()
             local b = S.cur()
             if b.fn then b.fn.uses_rt = true end
             return storage_library(t).truncate(S.Ref(p), S.index_value(count))
         end,
         pop = function(self)
             local p = receiver(self, n .. ':pop')
-            S.end_borrows(p, ("'" .. tostring(p.name) .. "' was popped"))
-            S.bump_checked()
             local b = S.cur()
             if b.fn then b.fn.uses_rt = true end
             return storage_library(t).pop(S.Ref(p))
