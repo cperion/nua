@@ -3,7 +3,7 @@ const sep = (rule, delimiter = ',') => seq(rule, repeat(seq(delimiter, rule)));
 module.exports = grammar({
   name: 'nua',
   extras: $ => [/\s/, $.comment, $._endall_reset],
-  externals: $ => [$.long_string, $.long_comment, $.name_argument, $._endall, $._implicit_end, $._error_sentinel, $._endall_reset, $._attached_paren, $._block_colon, $._header_name, $._header_dots],
+  externals: $ => [$.long_string, $.long_comment, $.name_argument, $._endall, $._implicit_end, $._error_sentinel, $._endall_reset, $._attached_paren, $._block_colon, $._header_name, $._header_dots, $._with],
   word: $ => $.identifier,
   conflicts: $ => [[$.expression_statement, $._expression], [$.bare_method_call, $._expression], [$.parameter, $._expression], [$.field, $._expression], [$.parameter, $.vararg_expression], [$.handler, $._expression]],
   rules: {
@@ -54,7 +54,14 @@ module.exports = grammar({
     colon_parameters: $ => repeat1(alias($.colon_parameter, $.parameter)),
     colon_parameter: $ => prec.right(choice(seq(alias($._header_name, $.identifier), optional(alias($._header_dots, '..'))), alias($._header_dots, '..'))),
     function_expression: $ => seq('function', $.parameters, optional($.block), 'end'),
-    struct_expression: $ => seq('struct', $.table_constructor),
+    struct_expression: $ => seq('struct', choice($.table_constructor, alias($.with_block, $.table_constructor))),
+    // `T with entries end` is `T { entries }`: entries need no separators.
+    with_block: $ => seq(alias($._with, 'with'), repeat(choice(seq(alias($.with_entry, $.field), choice(',', ';')), alias($.with_entry, $.field))), 'end'),
+    // A named entry never starts a call, so a colon after the name is its annotation
+    // (`x: U32`), not a block. Positional entries are literals, tables and lambdas.
+    with_entry: $ => choice($.handler, seq('.', $.identifier), seq($.identifier, ':', $._expression), seq($.identifier, '=', $._value),
+      seq('[', $._expression, ']', '=', $._value), $.number, $.string, $.boolean, $.nil, $.table_constructor,
+      $.parenthesized_expression, $.struct_expression, $.lambda),
     table_constructor: $ => seq('{', optional(seq(sep($.field, choice(',', ';')), optional(choice(',', ';')))), '}'),
     // `.name` is the shorthand for `name = name`.
     field: $ => choice($.handler, seq('.', $.identifier), seq($.identifier, ':', $._expression), seq($.identifier, '=', $._value),
@@ -77,7 +84,7 @@ module.exports = grammar({
     index_expression: $ => prec.left(15, seq($._expression, '[', $._expression, ']')),
     spread_expression: $ => prec.right(1, seq('..', $._expression)),
     call_expression: $ => prec.left(14, seq(field('function', $._expression), optional(seq(':', field('method', $.identifier))), field('arguments', $.arguments))),
-    arguments: $ => choice(seq('(', optional(sep($._expression)), ')'), $.table_constructor, $.string, $.number, $.boolean, $.lambda, alias($.colon_lambda, $.lambda), alias($.name_argument, $.identifier), $.member_argument),
+    arguments: $ => choice(seq('(', optional(sep($._expression)), ')'), $.table_constructor, alias($.with_block, $.table_constructor), $.string, $.number, $.boolean, $.lambda, alias($.colon_lambda, $.lambda), alias($.name_argument, $.identifier), $.member_argument),
     // `f a.b[i]` is f(a.b[i]): a juxtaposed name argument keeps its postfix chain
     // (spec 3.3, rule 3), so the call is a complete statement. Only an attached
     // `(` continues it: `f a(b)` is f(a(b)), `f a (b)` is f(a)(b) (spec 10.4).

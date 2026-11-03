@@ -142,6 +142,15 @@ from a loop header without parsing, so `spawn do` stays; `spawn:` is accepted as
 source). The colon form is read back as the `do(..)` it means before anything else
 is analysed, and the result is accepted only when that reading equals the source.
 
+## With blocks
+
+A `with` block (syntax §2.4, rule 12) stays a `with` block: the formatter lays its
+entries out like a table's, one entry per line when it does not fit, and writes
+the block back without the separators the reader would put back. Braces are never
+converted into `with`. A separator is kept where the reader would not recover it
+(before an entry that starts with a bracket or a literal), and the result is
+accepted only when expanding it gives the same program.
+
 ## Default style
 
 ```lua

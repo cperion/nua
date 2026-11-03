@@ -141,6 +141,29 @@ end
 ]], '=: assigns a block')
 local assigned_sexpr = assigned:root():sexpr()
 assert(select(2, assigned_sexpr:gsub('%(lambda', '')) == 4, '=: blocks are not lambdas: ' .. assigned_sexpr)
+local with_tree = parse([[
+local Point = struct with
+    x: U32
+    y: U32
+end
+local p = Point with
+    .y
+    x = 1
+    found =: v
+        go v
+    end
+end
+local q = Point with x = 1, y = 2 end
+local r = s with
+    circle = do(c) = c * c
+    rect =: p
+        go p
+    end
+end
+local with_name = 3
+]], 'with blocks supply keyed data')
+local with_sexpr = with_tree:root():sexpr()
+assert(select(2, with_sexpr:gsub('%(table_constructor', '')) == 4, 'with blocks are not table constructors: ' .. with_sexpr)
 local plain = parse([[
 local s: Store Node
 local a, b: U32

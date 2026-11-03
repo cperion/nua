@@ -2,7 +2,7 @@
 
 This is an in-repository Nua editor parser, not the Lua parser with extra keywords.
 It handles Lua host code and Nua's typed locals/functions, `do` lambdas, `struct`,
-`export`, application, handlers, spread, opened parameters, `endall` and the trailing-colon block (`f x:`, `xs:each: key value`, `tasks: scope..`).
+`export`, application, handlers, spread, opened parameters, `endall` the trailing-colon block (`f x:`, `xs:each: key value`, `tasks: scope..`, `key =: x`) and `with` blocks (`T with k = v end`). Highlighting limits: a `with` block's entries on one line need `,` or `;` between them, and a `.name` entry on a new line after a value reads as member access.
 Queries highlight keywords, types, functions, parameters, fields, literals and
 comments. Native types are highlighted by spelling; this is not semantic type
 resolution. The compiler remains the authority for valid programs.

@@ -257,6 +257,35 @@ end
 
 `:` alone opens whatever the activity hands over, exactly as `do(..)` does. An activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. The names are untyped; a typed parameter list keeps `do(x: U32)`. A colon is a block opener only where Nua has no annotation colon, so these are unchanged: the result type after a parameter list (`do(x: U32): U32`, `function f(x): T`), the names of a `local` (`local s: Store Node`), fields inside brackets, `::label::`, and a method call, where the name follows the colon directly (`xs:each`). It is a token rewrite below every other rule, so the block is translated as the `do(..)` it stands for, and line numbers do not move. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
 
+12. **With blocks.** `T with entries end` is `T { entries }`: keyed data without commas, closed by `end`. `with` is to data what `do` is to computation: a `with` block supplies keyed data to the expression before it, a `do` block (or its colon form, rule 11) supplies a trailing computation.
+
+```lua
+local Point = struct with
+    x: F32
+    y: F32
+end
+
+local p = Point with
+    x = 1
+    .y
+    found =: v          -- a keyed handler is an entry too
+        go v
+    end
+end
+
+local q = Point with x = 1 y = 2 end
+local area = s with     -- matching is keyed application: the handlers are the entries
+    circle = do(r) = r * r
+    rect =: p
+        return p.x * p.y
+    end
+end
+```
+
+Every table-shaped form takes it: constructors, `struct`, `oneof`, matches and any constructor-headed argument (`f x with k = 1 end` is `f(x { k = 1 })`, rule 3). Lua's own `{ }` tables are untouched, so no Lua table semantics change; `with` is the Nua spelling for keyed data and `{ }` stays for Lua tables and compact one-liners.
+
+*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`struct with x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
+
 ### 2.5 Words and host functions
 
 A lambda is a **native word** exactly when it declares a result type:

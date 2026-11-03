@@ -7,7 +7,7 @@
 (boolean) @boolean
 (nil) @constant.builtin
 
-["local" "struct" "export" "goto"] @keyword
+["local" "struct" "with" "export" "goto"] @keyword
 ["do" "function" "end" "endall"] @keyword.function
 ["if" "then" "elseif" "else"] @keyword.conditional
 ["for" "in" "while" "repeat" "until" "break" "continue"] @keyword.repeat

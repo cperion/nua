@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-enum { LONG_STRING, LONG_COMMENT, NAME_ARGUMENT, ENDALL, IMPLICIT_END, ERROR_SENTINEL, ENDALL_RESET, ATTACHED_PAREN, BLOCK_COLON, HEADER_NAME, HEADER_DOTS };
+enum { LONG_STRING, LONG_COMMENT, NAME_ARGUMENT, ENDALL, IMPLICIT_END, ERROR_SENTINEL, ENDALL_RESET, ATTACHED_PAREN, BLOCK_COLON, HEADER_NAME, HEADER_DOTS, WITH };
 typedef struct { bool endall; bool header; uint32_t column; int32_t next; } Scanner;
 void *tree_sitter_nua_external_scanner_create(void) { return calloc(1, sizeof(Scanner)); }
 void tree_sitter_nua_external_scanner_destroy(void *p) { free(p); }
@@ -100,7 +100,7 @@ bool tree_sitter_nua_external_scanner_scan(void *p, TSLexer *l, const bool *vali
     }
   }
   if (s->header && !same_line) s->header = false;
-  if ((valid[ENDALL] || (valid[NAME_ARGUMENT] && same_line && space)) && name_start(l->lookahead)) {
+  if ((valid[ENDALL] || valid[WITH] || (valid[NAME_ARGUMENT] && same_line && space)) && name_start(l->lookahead)) {
     char name[128]; unsigned n = 0;
     while (name_char(l->lookahead)) {
       if (n < sizeof(name) - 1) name[n++] = (char)l->lookahead;
@@ -111,8 +111,10 @@ bool tree_sitter_nua_external_scanner_scan(void *p, TSLexer *l, const bool *vali
       s->endall = true; s->column = l->get_column(l); s->next = l->lookahead;
       l->mark_end(l); l->result_symbol = ENDALL; return true;
     }
+    // `T with entries end`: scanned here so it wins over a statement starting with the name
+    if (valid[WITH] && !strcmp(name, "with")) { l->mark_end(l); l->result_symbol = WITH; return true; }
     if (!valid[NAME_ARGUMENT] || !same_line || !space) return false;
-    const char *keywords[] = {"and", "break", "continue", "do", "else", "elseif", "end", "endall", "export", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "struct", "then", "true", "until", "while"};
+    const char *keywords[] = {"and", "break", "continue", "do", "else", "elseif", "end", "endall", "export", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "struct", "then", "true", "until", "while", "with"};
     for (unsigned i = 0; i < sizeof(keywords)/sizeof(*keywords); ++i) if (!strcmp(name, keywords[i])) return false;
     l->mark_end(l); l->result_symbol = NAME_ARGUMENT; return true;
   }

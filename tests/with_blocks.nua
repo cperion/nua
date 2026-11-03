@@ -1,0 +1,38 @@
+-- `T with entries end` is `T { entries }`: keyed data without commas.
+local Point = struct with
+    x: U32
+    y: U32
+end
+
+local Shape = oneof with
+    circle: U32
+    rect: Point
+end
+
+local sum = do(n: U32): U32
+    local p = Point with
+        x = n
+        y = n * 2
+    end
+    local q = Point with x = 1 y = 2 end
+    local x = 5
+    local r = Point with
+        .x
+        y = q.y
+    end
+    return p.x + p.y + q.x + r.x + r.y
+end
+export sum
+
+-- matching is keyed application: the handlers are the entries
+local area = do(n: U32): U32
+    local s = Shape.rect(Point with x = n y = 3 end)
+    return s with
+        circle = do(r) = r * r
+        rect =: p
+            local w = p.x
+            return w * p.y
+        end
+    end
+end
+export area

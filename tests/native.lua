@@ -75,6 +75,9 @@ check('Store of references', refs.store_of_refs(4) == 12)
 
 -- Owners: several owner fields, moves, returns, owner parameters, copies,
 -- runtime-length arrays, views, payload borrows and recursion (memory.md §5).
+-- `T with entries end` is keyed data without commas (docs/syntax.md, §2.4 rule 12)
+local with_blocks = nua.load(root .. '/tests/with_blocks.nua')
+check('with blocks build structs, sums and handlers', with_blocks.sum(7) == 29 and with_blocks.area(4) == 12)
 local owners = nua.load(root .. '/tests/owners.nua')
 check('owner struct with two owner fields', owners.two_fields(3) == 70303)
 check('nested owner structs through Ref and call', owners.nested(2) == 202020804)

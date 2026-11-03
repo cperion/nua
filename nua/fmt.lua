@@ -1006,7 +1006,7 @@ function format(source, options, filename)
         source = source:sub(#prefix + 1)
     end
     -- the trailing colon is read as the do-block it means; see nua.colon
-    source = colon.expand(source)
+    source = colon.expand(source, true)
     local info = parse(source, filename)
     if options.type_style == 'inferred' then
         source = drop_inferred(source, info, filename)
@@ -1039,6 +1039,7 @@ function format(source, options, filename)
     if fingerprint(parse(result, filename).ast) ~= signature then
         error(filename .. ': fmt: formatting would change the parsed program; source left unchanged', 0)
     end
+    result = colon.withize(result)
     if options.block_style == 'colon' then result = colon.colonize(result) end
     return prefix .. result
 end
