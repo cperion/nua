@@ -4,8 +4,6 @@
 local h = '"nua_rt.h"'
 local Stack = cstruct("nua_stack", h, {
         { "data", Ptr U8 }, { "top", U64 }, { "cap", U64 }, { "region", U64 },
-        { "map_counter", Ptr U32 },
-        { "map_guard_base", U64 }, { "map_guard_token", U64 },
     })
 local Set = cstruct("nua_stackset", h, { { "stacks", Ptr Stack }, { "n", U64 } })
 -- the stack set in use on this thread: a task's while a worker runs it, otherwise
@@ -101,13 +99,6 @@ stacks.push = do(index: U64, n: U64): U64
     s.top = at + n
     return at
 end
-local release_guard = do(s: Ptr Stack): Unit
-    if s.map_counter ~= null U32 then
-        s.map_counter[0] = s.map_counter[0] - 1
-        s.map_counter = null U32
-        s.map_guard_token = 0
-    end
-end
 stacks.reset = do(index: U64, top: U64): Unit
     local context = current()
     if index >= context.n then
@@ -116,7 +107,6 @@ stacks.reset = do(index: U64, top: U64): Unit
     end
     local s = Ptr context.stacks[index]
     if top > s.top then trap "data stack reset above its top" end
-    if s.map_counter ~= null U32 and top <= s.map_guard_base then release_guard s end
     s.top = top
 end
 -- The bytes [at, at + n) of one stack, checked once. The pointer stays valid
@@ -171,17 +161,6 @@ stacks.free = do(set: Ptr Set): Unit
     free_stacks set.stacks
     set.stacks = null Stack
     set.n = 0
-end
-stacks.unwind = do(set: Ptr Set, mark: U64): Unit
-    local i = U64 0
-    while i < set.n do
-        local s = Ptr set.stacks[i]
-        if s.map_counter ~= null U32 and s.map_guard_token > mark then
-            s.top = s.map_guard_base
-            release_guard s
-        end
-        i = i + 1
-    end
 end
 stacks.clear = do(set: Ptr Set): Unit
     local i = U64 0

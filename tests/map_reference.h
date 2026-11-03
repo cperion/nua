@@ -72,7 +72,6 @@ static inline void map_rebuild(nua_map *m, uint32_t needed) {
 static inline void nua_map_insert(nua_map *m, const void *entry) {
     uint32_t slot;
     uint64_t hash = map_stored(map_hash(entry));
-    if (m->iterating) nua_trap("Map structural mutation during iteration");
     map_top(m);
     /* entry is an adapter's by-value local, never a slot address. */
     if (!m->cap || ((uint64_t)m->used + 1) * 4 > (uint64_t)m->cap * 3) map_rebuild(m, m->live + 1);
@@ -93,7 +92,6 @@ static inline void nua_map_insert(nua_map *m, const void *entry) {
 static inline void nua_map_remove(nua_map *m, uint32_t slot) {
     uint32_t cell, steps;
     uint64_t hash, free;
-    if (m->iterating) nua_trap("Map structural mutation during iteration");
     if (slot >= m->len || !map_occupied(m, slot)) nua_trap("Map: removing an empty bucket");
     hash = map_hash(nua_map_at(m, slot));
     cell = (uint32_t)hash & (m->cap - 1);
@@ -179,7 +177,6 @@ static inline size_t strmap_append(nua_strmap *m, const uint8_t *key, uint32_t l
 }
 static inline void nua_strmap_insert(nua_strmap *m, const uint8_t *key, uint32_t len, void *entry, uint64_t hash) {
     nua_strkey header = { 0 };
-    if (m->entries.iterating) nua_trap("Map structural mutation during iteration");
     map_top(&m->entries);
     header.hash = map_stored(hash);
     header.len = len;
@@ -192,7 +189,7 @@ static inline void nua_strmap_insert(nua_strmap *m, const uint8_t *key, uint32_t
 }
 static inline void nua_strmap_remove(nua_strmap *m, uint32_t slot) {
     nua_strkey key = strmap_header(m, slot);
-    nua_map_remove(&m->entries, slot); /* checks the guard before changing anything */
+    nua_map_remove(&m->entries, slot);
     m->dead += key.len;
     if (!m->entries.live) {
         nua_gs_reset(m->arena_stack, m->arena_base);

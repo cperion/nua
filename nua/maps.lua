@@ -26,17 +26,11 @@ local function decorate(t)
     t.representation = is_str and layouts.StrMap or layouts.Map
     t.cdecl = function() return 'typedef ' .. t.representation.cname .. ' ' .. n .. ';' end
     local storage
-    t.init_storage = function(b, p)
-        -- three data stacks: the slots (which never move), the hash index, and for
-        -- text keys the arena of key bytes
-        local entry_fields = is_str and { 'entries.stack', 'entries.base' } or nil
-        local table_stack = b:gs_alloc(p, entry_fields)
-        local index_stack = b:gs_alloc(p, is_str and { 'entries.index_stack', 'entries.index_base' }
-            or { 'index_stack', 'index_base' })
-        local arena_stack = is_str and b:gs_alloc(p, { 'arena_stack', 'arena_base' }) or table_stack
-        rawset(p, 'gs_k', table_stack)
-        local function index(k) return Mem.stack_index(k) end
-        storage.init(S.Ref(p), index(table_stack), index(index_stack), index(arena_stack))
+    -- The stacks a map owns, one per release field below: the slots (which never move),
+    -- the hash index, and for text keys the arena of key bytes. `init_word` builds the
+    -- header over their indices; the owner machinery allocates them (nua.memory).
+    t.init_word = function(p, indices)
+        storage.init(S.Ref(p), indices[1], indices[2], indices[3] or indices[1])
     end
     t.release_fields = is_str and { { 'entries.stack', 'entries.base' }, { 'entries.index_stack', 'entries.index_base' },
         { 'arena_stack', 'arena_base' } } or { { 'stack', 'base' }, { 'index_stack', 'index_base' } }
@@ -75,8 +69,12 @@ local function decorate(t)
         ms[method] = function(self, k)
             if method == 'remove' then
                 -- a removed entry's slot is reused: borrows of entries end here
+                -- only the borrows that may name the removed entry end
                 local p = receiver(self)
-                S.end_borrows(p, ("an entry of '" .. tostring(p.name) .. "' was removed"))
+                S.note_structure(p, 'remove')
+                local removed = key(k)
+                S.end_elements(p, { text = S.expr_key(ex(removed)), known = S.is_known(removed) },
+                    ("an entry of '" .. tostring(p.name) .. "' was removed"))
                 S.bump_checked()
             end
             return library()[method](S.Ref(receiver(self)), key(k))
@@ -85,6 +83,7 @@ local function decorate(t)
     for _, method in ipairs { 'put', 'ensure' } do
         ms[method] = function(self, k, value)
             local p = receiver(self)
+            S.note_structure(p, method, S.expr_key(ex(key(k))))
             -- a borrowed key is stored as it is: a stored borrow, checked against the map's owner
             local kv = borrowing and Mem.owned_copy(p, key(k), 'capturing a borrowed map key') or capture_key(key(k))
             S.note_growth(p)
@@ -97,8 +96,11 @@ local function decorate(t)
     end
     -- An entry's key and value go to an activity; a text key is a view of the
     -- arena that ends when the activity returns.
+    local iterating = {}    -- the maps being iterated here, innermost last
     storage.lend = function(table, entry, body)
         local k, v = storage.key(table, S.dot(entry, 'key')), S.dot(entry, 'value')
+        local owner = iterating[#iterating]
+        if owner then S.set_iteration_key(owner, S.expr_key(S.ex(S.value_of(k)))) end
         if is_str then
             local ptr, len = S.slice_parts(k)
             local token = S.activity_token()
@@ -114,11 +116,13 @@ local function decorate(t)
         local b, p = S.cur(), receiver(self)
         local state = {}; for k, v in pairs(b.state) do state[k] = v end
         local block, after, dead = b:sub(function()
-            local guard = b:new_local(Mem.Grow(types.U8), 'map_iter')
-            local stack = b:gs_alloc(guard)
-            storage.iter(S.Ref(p), Mem.view(guard, layouts.Grow),
-                Mem.stack_index(stack))
-            require('nua.map').each(t, storage, body)(S.Ref(p))
+            -- the map's structure is fixed inside the body: changing it is rejected while compiling
+            S.begin_iteration(p)
+            iterating[#iterating + 1] = p
+            local ok, err = pcall(function() require('nua.map').each(t, storage, body)(S.Ref(p)) end)
+            iterating[#iterating] = nil
+            S.end_iteration(p)
+            if not ok then error(err, 0) end
         end, state, 'known')
         for _, statement in ipairs(block) do b.block[#b.block + 1] = statement end
         b.state, b.dead = after, dead
@@ -136,6 +140,7 @@ local function decorate(t)
         -- an entry is the map's contents: its slot never moves, so a borrow of it
         -- lives until the entry is removed, and is checked against the map's owner
         rawset(place, 'owner_place', p)
+        rawset(place, 'element_key', { text = S.expr_key(ex(kv)), known = S.is_known(kv) })
         return place
     end
     -- `m[k] = v` inserts or replaces, as in Lua; reading a missing key still traps

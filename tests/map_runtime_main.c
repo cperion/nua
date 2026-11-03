@@ -17,21 +17,8 @@ static void put(nua_map *m, uint64_t key, uint64_t value) {
     if (slot != NUA_NONE) ((Entry *)nua_map_at(m, slot))->value = value;
     else { Entry entry = { hash(key), key, value }; nua_map_insert(m, &entry); }
 }
-static void blocked_insert(void *p) { put(p, 10000, 1); }
-static void blocked_remove(void *p) { nua_map *m = p; nua_map_remove(m, find(m, 42)); }
+static void remove_absent(void *p) { nua_map *m = p; nua_map_remove(m, find(m, 10000)); }
 static void missing_bucket(void *p) { nua_map_at(p, UINT32_MAX); }
-static void guarded_failure(void *p) {
-    nua_map *m = p;
-    (void)nua_map_iter_new(2, m);
-    assert(m->iterating == 2);
-    blocked_insert(m);
-}
-static void local_guard_failure(void *unused) {
-    (void)unused;
-    nua_map local = nua_map_new(2, 6, sizeof(Entry));
-    (void)nua_map_iter_new(3, &local);
-    nua_trap("unwind local map");
-}
 static uint32_t rng = 12345;
 static uint32_t random_u32(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 static void exercise(void *unused) {
@@ -63,20 +50,9 @@ static void exercise(void *unused) {
         }
     }
     put(&m, 42, 100);
-    nua_grow guard = nua_map_iter_new(1, &m);
     put(&m, 42, 101); /* value replacement is not structural */
-    assert(nua_try(blocked_insert, &m) == 1);
-    assert(strstr(nua_trap_message(), "structural mutation") != NULL);
-    assert(find(&m, 10000) == NUA_NONE);
-    assert(nua_try(blocked_remove, &m) == 1);
     assert(((Entry *)nua_map_at(&m, find(&m, 42)))->value == 101);
-    assert(m.iterating == 1); /* guards outside a nested try stay active */
-    assert(nua_try(guarded_failure, &m) == 1);
-    assert(m.iterating == 1 && nua_gs_top(2) == 0);
-    nua_release(guard.stack, guard.base);
-    assert(m.iterating == 0);
-    assert(nua_try(local_guard_failure, NULL) == 1);
-    assert(nua_gs(3)->map_counter == NULL);
+    assert(nua_try(remove_absent, &m) == 1); /* iteration is checked by the compiler, not here */
     uint32_t visited = 0, at;
     for (at = 0; at < m.len; at++) if (map_occupied(&m, at)) visited++;
     assert(visited == m.live);

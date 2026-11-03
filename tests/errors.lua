@@ -564,9 +564,21 @@ export f
     local m = Map(U32, U32) {}
     m[1] = 10
     local r = Ref m[1]
-    m:remove 2
+    m:remove 1
     r = r + 5
-    return m[1]
+    return 0
+end
+export f
+]] },
+    { name = 'a Map entry borrow used after a removal of an unknown key', expect = "a borrow of 'm' is used after an entry of 'm' was removed",
+      src = [[local f = do(n: U32): U32
+    local m = Map(U32, U32) {}
+    m[1] = 10
+    m[n] = 20
+    local r = Ref m[1]
+    m:remove n
+    r = r + 5
+    return 0
 end
 export f
 ]] },
@@ -676,6 +688,66 @@ local f = do(n: U32): U32
     local r = Ref nodes[a]
     nodes:remove b
     return r.value
+end
+export f
+]] },
+    { name = 'a Map insertion inside its own each', expect = "changes 'm' while it is being iterated",
+      src = [[local f = do(n: U32): U32
+    local m = Map(U32, U32) {}
+    m[1] = 1
+    m:each do(k, v)
+        m[k + 100] = v
+    end
+    return 0
+end
+export f
+]] },
+    { name = 'a Map removal inside its own each', expect = "changes 'm' while it is being iterated",
+      src = [[local f = do(n: U32): U32
+    local m = Map(U32, U32) {}
+    m[1] = 1
+    m:each do(k, v)
+        m:remove k
+    end
+    return 0
+end
+export f
+]] },
+    { name = 'a Map change through a reference inside its own each', expect = "changes 'm' while it is being iterated",
+      src = [[local f = do(n: U32): U32
+    local m = Map(U32, U32) {}
+    m[1] = 1
+    local alias = Ref m
+    m:each do(k, v)
+        alias:put(k + 1, v)
+    end
+    return 0
+end
+export f
+]] },
+    { name = 'a word that changes a Map called inside its own each', expect = "changes 'm' while it is being iterated",
+      src = [[local Counts = Map(U32, U32)
+local add = do(m: Ref Counts, k: U32): Unit
+    m[k] = 1
+end
+local f = do(n: U32): U32
+    local m = Counts {}
+    m[1] = 1
+    m:each do(k, v)
+        add(Ref m, k + 10)
+    end
+    return 0
+end
+export f
+]] },
+    { name = 'a Map(Str, V) insertion inside its own each', expect = "changes 'words' while it is being iterated",
+      src = [[local f = do(n: U32): U32
+    local words = Map(Str, U32) {}
+    words:put("a", 1)
+    words:each do(key, value)
+        words:put("b", value)
+    end
+    return 0
 end
 export f
 ]] },

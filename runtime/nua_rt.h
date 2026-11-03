@@ -39,11 +39,6 @@ typedef struct nua_stack {
     size_t top;
     size_t cap;         /* the bytes reserved for this stack: top never passes it */
     size_t region;      /* nonzero on the first stack of a reservation: its size */
-    /* An iteration guard owns its own data stack. Resetting that stack
-     * releases the borrow, including returns and residual loop exits. */
-    uint32_t *map_counter;
-    size_t map_guard_base;
-    uint64_t map_guard_token;
 } nua_stack;
 
 /* a failed runtime check: invalid ID, misuse of a growing value */
@@ -69,7 +64,6 @@ nua_stack *nua_gs_slow(size_t i);
 nua_stackset *nua_stacks_current(void);
 nua_stack *nua_gs(size_t i);
 size_t nua_gs_top(size_t i);
-void nua_stacks_unwind(nua_stackset *set, uint64_t mark);
 void nua_stacks_clear(nua_stackset *set);
 void nua_gs_write_bytes(size_t stack, size_t dst, uint8_t *src, size_t bytes);
 void nua_gs_reset(size_t i, size_t top);
@@ -152,14 +146,12 @@ typedef struct nua_args {
  * 0xffffffff a removed cell. */
 typedef struct nua_map {
     size_t stack, base, width;
-    uint32_t len, live, free_head, iterating;
+    uint32_t len, live, free_head;
     size_t index_stack, index_base;
     uint32_t cap, used;
 } nua_map;
 nua_map nua_map_new(size_t stack, size_t index_stack, size_t width);
 void *nua_map_at(const nua_map *m, uint32_t slot);
-/* Internal scope-owned guard, represented by an ordinary stack/base header. */
-nua_grow nua_map_iter_new(size_t stack, nua_map *m);
 
 /* Platform boundary used by Nua hashing; no hashing algorithm in this accessor. */
 uint64_t nua_hash_seed_word(uint32_t index);

@@ -155,7 +155,7 @@ end
 -- is one C file; the C beside it is runtime/nua_rt.c (and nua_io_uring.c).
 local RUNTIME_ROOTS = {
     -- what runtime/nua_rt.c, which is C, calls
-    'nua_trap_recoverable', 'nua_stacks_unwind', 'nua_stacks_clear', 'nua_stacks_current',
+    'nua_trap_recoverable', 'nua_stacks_clear', 'nua_stacks_current',
     'nua_next_token', 'nua_gs', 'nua_gs_write_bytes',
 }
 -- does anything in the program call into the runtime (or need it to)?

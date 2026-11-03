@@ -24,14 +24,10 @@
  * other threads may be in the middle of its work. */
 static __thread jmp_buf *trap_jmp;
 static __thread const char *trap_what;
-static __thread uint64_t trap_map_mark;
 
 void nua_trap(const char *what) {
     if (trap_jmp && nua_trap_recoverable()) {
         trap_what = what;
-        /* Release before longjmp, while the map headers in the unwound native
-         * frames are still alive. An enclosing try's guards remain active. */
-        nua_stacks_unwind(&nua_own_stacks, trap_map_mark);
         longjmp(*trap_jmp, 1);
     }
     fprintf(stderr, "Nua runtime check failed: %s\n", what);
@@ -41,19 +37,15 @@ void nua_trap(const char *what) {
 int nua_try(void (*body)(void *), void *env) {
     jmp_buf jb;
     jmp_buf *saved = trap_jmp;
-    uint64_t saved_mark = trap_map_mark;
-    trap_map_mark = nua_next_token();
     trap_jmp = &jb;
     if (setjmp(jb)) {
         trap_jmp = saved;
-        trap_map_mark = saved_mark;
         /* the outermost call gives the thread's data stacks back */
         if (!saved) nua_stacks_clear(&nua_own_stacks);
         return 1;
     }
     body(env);
     trap_jmp = saved;
-    trap_map_mark = saved_mark;
     return 0;
 }
 

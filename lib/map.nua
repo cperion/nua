@@ -12,7 +12,7 @@ function map.each(T, storage, body)
     if by_body[body] then return by_body[body] end
     -- Distinct activities are distinct specializations: a nested traversal is
     -- not recursion with a changing compile-time callback parameter.
-    -- The iteration guard rejects structural mutation, so the slots hold;
+    -- The compiler rejects structural mutation in the body, so the slots hold;
     -- the body is opaque, so the table is acquired again for every entry.
     local each = do(m: Ref T): Unit
         local count = storage.header(m).len
@@ -79,10 +79,6 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         local bytes = U64 h.cap * 4
         local top = stacks.top h.index_stack
         if top - h.index_base ~= bytes then trap "Map index grew while it was not at the top of its data stack" end
-    end
-    local check_mutation = do(m: Ref T): Unit
-        local h = header m
-        if h.iterating ~= 0 then trap "Map structural mutation during iteration" end
     end
     -- the index cell naming key's slot, or none
     local probe = do(table: View, key: K, hashed: U64): U32
@@ -220,7 +216,6 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
             end
             return
         end
-        check_mutation m
         check_index_top m
         local text_offset = U64 0
         if string_keys then text_offset = append m key end
@@ -288,7 +283,6 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         local table = acquire m
         local cell = probe table key hashed
         if cell == none then return false end
-        check_mutation m
         local slot = table.cells[cell] - 1
         local entry = Ptr table.entries[slot]
         local removed_bytes = U64 0

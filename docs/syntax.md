@@ -2239,8 +2239,11 @@ export count
   are the same operation), while `m[k].x = 1` modifies an entry and so traps on a
   missing key (`ensure` creates one). Aggregate fields of the value are places too.
   An entry lives in a slot that never moves, so a borrow of it survives later
-  inserts and rehashing; `remove` ends borrows of entries (a borrow used afterwards
-  is rejected while compiling), because the removed slot is reused.
+  inserts and rehashing; `remove` ends the borrows of entries it may name (a borrow used afterwards
+  is rejected while compiling), because the removed slot is reused. A borrow of key 1
+  survives `remove 2` when both keys are known and differ; with any unknown key the
+  compiler assumes the two may be equal. (`Store` ends every element borrow: `Id`s are
+  runtime values.)
 - `find(k)` returns `Sum { found: V, missing: Unit }`, with a found value snapshot.
 - `has(k)` returns Bool. `put(k, v)` inserts or replaces and returns Unit.
 - `ensure(k, initial)` inserts only if absent. Both arguments evaluate eagerly,
@@ -2251,10 +2254,16 @@ export count
   loan's provenance, expiration and native-boundary rules are those of §12.6;
   copy into owned storage to retain the bytes.
 
-During iteration, existing-value replacement and no-op ensure/remove are allowed.
-Actual insertion/removal traps before changing storage, including through aliases
-or calls. Nested traversal is allowed. Guard ownership survives task suspension
-and is balanced by scope cleanup and trap recovery.
+**Iteration.** Inside `m:each`, the map's structure is fixed, and the compiler enforces
+it: `remove`, `put`, `ensure` and `m[k] = v` are rejected while compiling, except to
+replace the entry being visited (`m[k] = v` with the callback's own key `k`). The check
+follows the map through references (`Ref m` stored in a local, a parameter) and through
+words it is passed to: a call that may insert or remove is rejected, and a word's
+summary records which of its `Ref` parameters it may change. Values are modified in
+place through `m[k]` borrows, which is not a structural change. Nested iteration of one
+map is allowed. There is no runtime guard: a trap-free program cannot change a map's
+structure while it is walked, and collecting the keys first (into a `Grow`) is how to
+change it afterwards.
 
 ### 15.2 Semantic keys and checked references
 
@@ -2322,7 +2331,7 @@ load, and offset-based string arenas with bounded dead-byte compaction. Pending
 keys are copied before table movement, and arena aliases are rebased after
 allocation. Hashing incorporates a per-process random seed; entropy failure traps.
 
-Compiler hooks provide type/layout projection, scoped storage/guard ownership and
+Compiler hooks provide type/layout projection, scoped storage ownership and
 borrow lifetime checks. Native runtime primitives provide allocation, checked
 byte spans/copies, relocation offsets, entropy and trapping—not map algorithms.
 Mutable maps remain runtime storage even when their arguments are known. Known

@@ -837,6 +837,7 @@ h.check_tokens = function(view)
     h.each_view(view, function(token)
         if token.ended then fail(h.token_ended(token), 5) end
         if token.whole and token.whole.ended then fail(h.token_ended(token.whole), 5) end
+        if token.parent and token.parent.ended then fail(h.token_ended(token.parent), 5) end
         if current and current.fn ~= token.owner then
             fail('a scoped view cannot cross a native function boundary; use an in-place word or an owned copy', 5)
         end
@@ -924,11 +925,110 @@ h.container_of = function(place)
     end
     return nil
 end
+-- The element a place belongs to, when the container names it by a key: its key info
+-- ({ text = the semantic key, value = the known key or nil }).
+h.element_key = function(place)
+    local q = place
+    while q do
+        if rawget(q, 'owner_place') then return rawget(q, 'element_key') end
+        q = rawget(q, 'parent')
+    end
+end
+-- A borrow of one element of a map: it ends with the contents, or alone when that
+-- element may be removed (a removal ends the tokens of every element it may name).
+h.element_token = function(container, key)
+    local croot = root_of(container)
+    local contents = h.contents_token(croot)
+    if not contents then return nil end
+    local list = rawget(croot, 'element_tokens')
+    if not list or list.contents ~= contents then
+        list = { contents = contents, tokens = {} }
+        rawset(croot, 'element_tokens', list)
+    end
+    local token = list.tokens[key.text]
+    if token and not token.ended then return token end
+    token = {}
+    for k, v in pairs(contents) do token[k] = v end
+    token.contents, token.parent, token.element = nil, contents, key
+    list.tokens[key.text] = token
+    return token
+end
+-- a removal of `removed` ends the borrows of the elements it may name
+h.end_elements = function(b, container, removed, why)
+    local croot = root_of(container)
+    local list = rawget(croot, 'element_tokens')
+    if not list then return end
+    for text, token in pairs(list.tokens) do
+        local a, c = token.element, removed
+        local distinct = a.known and c.known and a.text ~= c.text
+        if not distinct then h.end_token(b, token, list.tokens, text, why) end
+    end
+end
+S.end_elements = function(p, removed, why) h.end_elements(cur(), p, removed, why) end
+
+-- Map iteration (design memory.md §6.3). Inside `m:each` the map's structure must not
+-- change: an insertion or removal through the map, through any reference to it, or in
+-- a word it is passed to is rejected while compiling. No runtime guard remains.
+-- A map is named by its owner place(s): the root itself, and, for a reference, the
+-- owners its tokens name.
+h.owners_of = function(place)
+    local root = root_of(place)
+    local list = { root }
+    local carried = rawget(root, 'carried_view')
+    if carried then
+        h.each_view(carried, function(token)
+            if token.place and token.place ~= root then list[#list + 1] = token.place end
+        end)
+    end
+    return list
+end
+S.begin_iteration = function(place)
+    for _, owner in ipairs(h.owners_of(place)) do
+        rawset(owner, 'iterating', (rawget(owner, 'iterating') or 0) + 1)
+    end
+end
+S.end_iteration = function(place)
+    for _, owner in ipairs(h.owners_of(place)) do
+        rawset(owner, 'iterating', (rawget(owner, 'iterating') or 1) - 1)
+    end
+end
+h.check_iterating = function(place, what, key)
+    for _, owner in ipairs(h.owners_of(place)) do
+        -- replacing the entry being visited changes no structure
+        if (rawget(owner, 'iterating') or 0) > 0 and not (key and rawget(owner, 'iteration_key') == key) then
+            fail(("%s changes '%s' while it is being iterated: a Map's structure cannot change inside "
+                .. "its own each; collect the keys first, or change it after the loop"):format(
+                what, tostring(rawget(owner, 'name') or 'the map')), 4)
+        end
+    end
+end
+-- an insertion or removal through `place`: rejected while iterating, and part of the
+-- word's summary so that a call with an iterated map is rejected too
+S.set_iteration_key = function(place, key)
+    for _, owner in ipairs(h.owners_of(place)) do rawset(owner, 'iteration_key', key) end
+end
+-- `key`: the semantic key of an insert-or-replace; it may name the visited entry
+S.note_structure = function(place, what, key)
+    h.check_iterating(place, what, key)
+    local b = cur()
+    local root = root_of(place)
+    if b and b.fn and root.pk == 'deref' and rawget(root, 'param_index') then
+        b.fn.restructures = b.fn.restructures or {}
+        b.fn.restructures[rawget(root, 'param_index')] = true
+    end
+end
 h.place_tokens = function(place, contents)
     local root = root_of(place)
     local carried = rawget(root, 'carried_view')
     local container = h.container_of(place)
-    if container then return h.merge_view(carried, h.place_tokens(container, true)) end
+    if container then
+        local key = h.element_key(place)
+        if key and not contents then
+            local token = h.element_token(container, key)
+            if token then return h.merge_view(carried, token) end
+        end
+        return h.merge_view(carried, h.place_tokens(container, true))
+    end
     if carried then return carried end
     if contents then return h.contents_token(root) end
     return h.owner_token(root)
@@ -4974,6 +5074,19 @@ function Builder:emit_call(w, fn, args)
                     releases = self:hand_off(place)
                 end
                 S.mark_moved(place, { name = 'the call to ' .. w.name }, releases)
+            end
+        end
+    end
+    -- the callee may insert into or remove from a Map argument: not while it is iterated
+    for i, a in ipairs(args) do
+        if is_value(a) and a.k == 'ref' and (a.T.elem.kind == 'map' or a.T.elem.kind == 'strmap') then
+            if not done or (fn.restructures and fn.restructures[i]) then
+                -- a word still being built is assumed to change it (it is built again if not)
+                if done then
+                    S.note_structure(a.place, ('the call to %s'):format(w.name))
+                else
+                    h.check_iterating(a.place, ('the recursive call to %s'):format(w.name))
+                end
             end
         end
     end

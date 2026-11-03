@@ -6,7 +6,7 @@ local nua_gs, nua_gs_slow, nua_gs_top = stacks.claim, stacks.claim, stacks.top
 local nua_gs_begin, nua_gs_push, nua_gs_reset = stacks.begin, stacks.push, stacks.reset
 local nua_release, nua_gs_bytes = stacks.reset, stacks.bytes
 local nua_gs_copy, nua_gs_write_bytes, nua_gs_zero = stacks.copy, stacks.write, stacks.zero
-local nua_stacks_free, nua_stacks_unwind, nua_stacks_clear = stacks.free, stacks.unwind, stacks.clear
+local nua_stacks_free, nua_stacks_clear = stacks.free, stacks.clear
 export nua_gs
 export nua_gs_slow
 export nua_gs_top
@@ -19,18 +19,16 @@ export nua_gs_copy
 export nua_gs_write_bytes
 export nua_gs_zero
 export nua_stacks_free
-export nua_stacks_unwind
 export nua_stacks_clear
 local layouts = require "nua.storage_layout"
 local nua_store_new, nua_grow_new = layouts.store_new, layouts.grow_new
 local nua_map_new, nua_map_at = layouts.map_new, layouts.map_address
-local nua_strmap_new, nua_map_iter_new = layouts.strmap_new, layouts.iter_new
+local nua_strmap_new = layouts.strmap_new
 export nua_store_new
 export nua_grow_new
 export nua_map_new
 export nua_map_at
 export nua_strmap_new
-export nua_map_iter_new
 local header = '"nua_scheduler.h"'
 local Void = opaque "void"
 local Set = stacks.Set

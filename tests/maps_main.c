@@ -14,9 +14,7 @@ uint64_t map_field(uint32_t n);
 uint64_t checked_map_place(uint32_t k);
 uint64_t map_each_sum(uint32_t n);
 uint64_t map_each_nested(uint32_t n);
-uint64_t map_each_mutation(uint32_t mode);
 uint64_t map_task_each(uint32_t n);
-static void mutate(void *mode) { (void)map_each_mutation(*(uint32_t *)mode); }
 static void missing(void *unused) { (void)unused; (void)absent(123); }
 int main(void) {
     uint32_t n;
@@ -25,18 +23,13 @@ int main(void) {
         assert(map_each_sum(n) == (uint64_t)n * (n + 1) / 2 + 1);
         assert(map_each_nested(n) == 29 * n + 1);
     }
-    for (n = 0; n < 3; n++) {
-        assert(nua_try(mutate, &n) == 1);
-        assert(strstr(nua_trap_message(), "structural mutation") != NULL);
-        assert(map_each_sum(10) == 56);
-    }
     assert(map_task_each(0) == 1);
     assert(map_task_each(100) == 5051);
     assert(record_keys(15) == 56);
     assert(sum_keys(INT64_MIN) == 19 && sum_keys(INT64_MAX) == 19);
     assert(id_keys(42) == 42);
     assert(map_field(99) == 19);
-    assert(checked_map_place(17) == 219);
+    assert(checked_map_place(17) == 227);
     assert(edit_counts(0) == 20);
     assert(edit_counts(UINT32_MAX) == 20);
     Str cat = { (uint8_t *)"cat", 3 }, dog = { (uint8_t *)"dog", 3 }, empty = { NULL, 0 };

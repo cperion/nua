@@ -49,6 +49,19 @@ local insert_by_index = do(n: U32): U64
 end
 export insert_by_index
 
+-- removing one entry ends only the borrows that may name it: a borrow of key 1 survives
+-- `remove 2` because the compiler knows the keys differ
+local remove_other = do(n: U32): U64
+    local m = Counts {}
+    m[1] = 10
+    m[2] = 20
+    local held = Ref m[1]
+    m:remove 2
+    held = held + 5
+    return m[1] + U64 m.length
+end
+export remove_other
+
 -- values may be borrows: this one is a view of a text, checked against the map's owner
 local Views = Map(U32, Str)
 local borrowed_values = do(n: U32): U64
@@ -168,11 +181,10 @@ local map_each_sum = do(n: U32): U64
     local total: U64 = 0
     m:each: k v
         m:put(k, v + 100)
-        m:ensure(k, 999)  -- existing key: not a structural change
-        m:remove 0  -- absent key: not a structural change
+        m:ensure(k, 999)  -- the visited key: not a structural change
         total = total + v  -- callback received a snapshot before the replacement
     end
-    m:put(0, 1)  -- the iteration guard ended
+    m:put(0, 1)  -- the loop is over: the structure may change again
     return total + m[0]
 end
 export map_each_sum
@@ -197,19 +209,6 @@ local map_each_nested = do(n: U32): U64
 end
 export map_each_nested
 
-local map_each_mutation = do(mode: U32): U64
-    local m = Counts {}
-    m:put(1, 1)
-    local alias = Ref m
-    m:each: k v
-        if mode == 0 then alias:put(k + 1, v) end
-        if mode == 1 then alias:remove k end
-        if mode == 2 then alias:ensure(k + 1, v) end
-    end
-    return m[1]
-end
-export map_each_mutation
-
 local map_task_each = do(n: U32): U64
     local total: U64 = 0
     tasks:
@@ -218,7 +217,7 @@ local map_task_each = do(n: U32): U64
             local m = Counts {}
             for i: U32 = 1, n do m:put(i, U64 i) end
             m:each: k v
-                out:send v  -- suspends with the iteration guard active
+                out:send v  -- suspends inside the loop
                 m[k] = v + 100
             end
             m:put(0, 1)

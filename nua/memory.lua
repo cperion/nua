@@ -461,8 +461,16 @@ function Builder:init_resizable(p, v)
     S.clear_moved(p)
     local source, text = rawget(v, 'copy_of'), rawget(v, 'copy_text')
     local count, items = rawget(v, 'length'), rawget(v, 'copy_slice')
-    if rawget(p.T, 'init_storage') then
-        p.T.init_storage(self, p)
+    if rawget(p.T, 'init_word') then
+        -- a type with several stacks: one slot each, then its header word over their indices
+        local indices, first = {}, nil
+        for i, fields in ipairs(Mem.release_fields(p.T)) do
+            local k = self:gs_alloc(p, fields)
+            first = first or k
+            indices[i] = Mem.stack_index(k)
+        end
+        rawset(p, 'gs_k', first)
+        p.T.init_word(p, indices)
         if source then p.T.copy_storage(p, source) end
         return
     end

@@ -31,7 +31,6 @@ static uint64_t get(nua_strmap *m, const uint8_t *key, uint32_t len) {
     uint32_t slot = find_key(m, key, len);
     assert(slot != NUA_NONE); return at(m, slot)->value;
 }
-static void blocked(void *p) { put(p, (const uint8_t *)"new", 3, 4); }
 static uint32_t rng = 98765;
 static uint32_t random_u32(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 static void exercise(void *unused) {
@@ -108,11 +107,6 @@ static void exercise(void *unused) {
     nua_release(table_alias.entries.index_stack, table_alias.entries.index_base);
     nua_release(table_alias.entries.stack, table_alias.entries.base);
 
-    nua_grow guard = nua_map_iter_new(2, &m.entries);
-    size_t bytes = m.arena_len;
-    assert(nua_try(blocked, &m) == 1);
-    assert(m.arena_len == bytes && m.entries.iterating == 1);
-    nua_release(guard.stack, guard.base);
     for (i = 0; i < 16; i++) assert(nua_gs(0)->data[i] == 0x55);
     for (i = 0; i < 32; i++) assert(nua_gs(1)->data[i] == 0xaa);
     nua_release(m.arena_stack, m.arena_base);
@@ -123,6 +117,6 @@ static void exercise(void *unused) {
 int main(void) {
     assert(nua_try(exercise, NULL) == 0);
     nua_stacks_free(&nua_own_stacks);
-    puts("Map(Str, V) runtime: owned bytes, NULs, model, growth, compaction, aliases and guards passed");
+    puts("Map(Str, V) runtime: owned bytes, NULs, model, growth, compaction, aliases passed");
     return 0;
 }

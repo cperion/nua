@@ -255,6 +255,7 @@ local maps = nua.load(root .. '/examples/maps.nua')
 check('Map insertion and checked update', maps.map_tally(1000) == 1000)
 check('Map m[k] = v inserts; an entry borrow survives rehashing', maps.insert_by_index(1000) == 12 + 101 + 1002)
 check('Map.borrowing keeps the caller\'s keys', maps.borrowed_keys(0) == 10 + 4 * 3 + 5 + 3)
+check('Map remove ends only the borrows that may name the entry', maps.remove_other(0) == 16)
 check('Map values may be borrows', maps.borrowed_values(0) == 17)
 check('Map replace, ensure and find snapshots', maps.edit_counts(0xffffffff) == 20)
 local label = maps.types.Str { ptr = ffi.cast('uint8_t *', 'cat'), len = 3 }
@@ -264,9 +265,6 @@ check('Map missing key traps', not ok and tostring(err):find('map-key', 1, true)
 check('Map after recovered trap', maps.map_tally(23) == 23)
 check('Map each snapshots and replacement', maps.map_each_sum(10) == 56)
 check('Map nested iteration and callback returns', maps.map_each_nested(10) == 291)
-ok, err = pcall(maps.map_each_mutation, 0)
-check('Map structural mutation through alias traps', not ok and tostring(err):find('structural mutation', 1, true), err)
-check('Map iteration after recovered trap', maps.map_each_sum(10) == 56)
 check('Map iteration across task suspension', maps.map_task_each(100) == 5051)
 
 -- stores and Grow arrays: helpers read from the same C the C backend prints
