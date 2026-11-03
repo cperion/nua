@@ -1,0 +1,363 @@
+-- Owners inside owners (design memory.md §5.9). An element may hold owners: their bytes live
+-- in arenas of the outermost container, one per owner position, and move only when they
+-- grow (R3). Each word returns 0, or the number of the check that failed.
+local Item = Struct { weight: U32 }
+local Player = Struct { score: U32, name: Text, items: Grow Item }
+local Writer = Struct { name: Text, log: Grow Text }
+
+-- one text grows while its neighbours keep theirs
+local lines = do(): I32
+    local lines = Grow(Text) {}
+    lines:push Text {}
+    lines:push Text {}
+    lines[0]:write "hello"
+    lines[1]:write "world"
+    lines[0]:write ", there"
+    if not lines[0]:str():equals "hello, there" then return 1 end
+    if not lines[1]:str():equals "world" then return 2 end
+    local t = Text {}
+    t:write "moved"
+    lines:push t
+    lines[2]:write "!"
+    if not lines[2]:str():equals "moved!" then return 3 end
+    for i: U32 = 0, 99 do lines[1]:write i end
+    if not lines[0]:str():equals "hello, there" then return 4 end
+    if lines[1]:str().length ~= 5 + 190 then return 5 end
+    return 0
+end
+
+-- a word compiled on its own grows an element's text or a local one
+local append = do(t: Ref Text, n: U32): Unit
+    for i: U32 = 1, n do t:write "ab" end
+end
+append.boundary = true
+
+-- structs holding owners, and owners two levels deep
+local structs = do(): I32
+    local players = Store(Player) {}
+    local p = Player { score = 7 }
+    p.name:write "ann"
+    local a = players:add p
+    local b = players:add Player { score = 9 }
+    players[b].name:write "bob"
+    players[a].items:push Item { weight = 3 }
+    players[b].items:push Item { weight = 4 }
+    players[a].items:push Item { weight = 5 }
+    players[a].name:write "-x"
+    if not players[a].name:str():equals "ann-x" then return 1 end
+    if not players[b].name:str():equals "bob" then return 2 end
+    if players[a].items[1].weight ~= 5 or players[b].items[0].weight ~= 4 then return 3 end
+    if players[a].score ~= 7 or players[b].score ~= 9 then return 4 end
+    local nested = Grow(Grow Text) {}
+    nested:push Grow(Text) {}
+    nested[0]:push Text {}
+    nested[0]:push Text {}
+    nested:push Grow(Text) {}
+    nested[1]:push Text {}
+    nested[0][1]:write "deep"
+    nested[1][0]:write "other"
+    nested[0][0]:write "first"
+    for i: U32 = 1, 50 do nested[0][1]:write "." end
+    if not nested[0][0]:str():equals "first" then return 5 end
+    if not nested[1][0]:str():equals "other" then return 6 end
+    if nested[0][1]:str().length ~= 54 then return 7 end
+    local texts = Grow(Text) {}
+    texts:push Text {}
+    texts:push Text {}
+    append(Ref texts[0], 3)
+    append(Ref texts[1], 2)
+    append(Ref texts[0], 1)
+    if not texts[0]:str():equals "abababab" or not texts[1]:str():equals "abab" then return 8 end
+    local top = Text {}
+    append(Ref top, 2)
+    if not top:str():equals "abab" then return 9 end
+    return 0
+end
+
+-- pop moves an element out; copy is deep; truncate and clear end elements
+local removals = do(): I32
+    local lines = Grow(Text) {}
+    lines:push Text {}
+    lines:push Text {}
+    lines[0]:write "keep"
+    lines[1]:write "leave"
+    local t = lines:pop()
+    if not t:str():equals "leave" or lines.length ~= 1 then return 1 end
+    lines:push Text {}
+    lines[1]:write "second"
+    local other = copy lines
+    other[0]:write "-changed"
+    if not lines[0]:str():equals "keep" then return 2 end
+    if not other[0]:str():equals "keep-changed" or not other[1]:str():equals "second" then return 3 end
+    local more = Grow(Text) {}
+    for k: U32 = 0, 99 do
+        more:push Text {}
+        more[more.length - 1]:write "abcdefghijklmnopqrstuvwxyz0123456789"
+    end
+    more:truncate 3
+    more:compact
+    if not more[2]:str():equals "abcdefghijklmnopqrstuvwxyz0123456789" then return 4 end
+    more:clear
+    more:push Text {}
+    more[0]:write "again"
+    if not more[0]:str():equals "again" then return 5 end
+    return 0
+end
+
+-- replacing an element's owner: a named owner, a fresh one, a copy, a field
+local replacements = do(): I32
+    local lines = Grow(Text) {}
+    lines:push Text {}
+    lines:push Text {}
+    lines[0]:write "old"
+    local t = Text {}
+    t:write "new"
+    lines[0] = t
+    if not lines[0]:str():equals "new" then return 1 end
+    lines[0] = Text {}
+    lines[0]:write "fresh"
+    lines[1] = copy lines[0]
+    if not lines[1]:str():equals "fresh" then return 2 end
+    local players = Store(Player) {}
+    local id = players:add Player { score = 1 }
+    players[id].name:write "ann"
+    local n = Text {}
+    n:write "bea"
+    players[id].name = n
+    if not players[id].name:str():equals "bea" or players[id].score ~= 1 then return 3 end
+    return 0
+end
+
+-- map values holding owners
+local maps = do(): I32
+    local names = Map(U64, Text) {}
+    names:put(1, Text {})
+    names[1]:write "one"
+    local t = Text {}
+    t:write "two"
+    names[2] = t
+    names[1]:write "!"
+    if not names[1]:str():equals "one!" or not names[2]:str():equals "two" then return 1 end
+    local c = copy names
+    c[2]:write "?"
+    if not names[2]:str():equals "two" or not c[2]:str():equals "two?" then return 2 end
+    names:remove 1
+    if names:has 1 then return 3 end
+    local total = U64 0
+    names:each(function(k, v) total = total + v:str().length end)
+    if total ~= 3 then return 4 end
+    local bykey = Map(Str, Grow U32) {}
+    bykey:put("a", Grow(U32) {})
+    bykey["a"]:push 3
+    bykey["a"]:push 4
+    if bykey["a"][1] ~= 4 then return 5 end
+    return 0
+end
+
+-- churn: removals compact the arenas, at the root and through owners inside elements (R5)
+local churn = do(rounds: U32): I32
+    local players = Store(Player) {}
+    local ids = Grow(Id Player) {}
+    local keeper = players:add Player { score = 0 }
+    players[keeper].name:write "keeper"
+    for round: U32 = 1, rounds do
+        local id = players:add Player { score = round }
+        for k: U32 = 0, 40 do players[id].name:write "x" end
+        ids:push id
+        if ids.length > 8 then
+            players:remove ids[0]
+            for k: U64 = 1, ids.length - 1 do ids[k - 1] = ids[k] end
+            ids:truncate(ids.length - 1)
+        end
+    end
+    if not players[keeper].name:str():equals "keeper" then return 1 end
+    if players[ids[ids.length - 1]].name:str().length ~= 41 then return 2 end
+    local writers = Store(Writer) {}
+    local w = writers:add Writer {}
+    for round: U32 = 1, rounds do
+        writers[w].log:push Text {}
+        writers[w].log[writers[w].log.length - 1]:write "entry entry entry entry entry entry"
+        if writers[w].log.length > 4 then
+            local gone = writers[w].log:pop()
+            local gone2 = writers[w].log:pop()
+        end
+    end
+    local overwritten = Grow(Text) {}
+    overwritten:push Text {}
+    for round: U32 = 1, rounds do
+        local x = Text {}
+        x:write "abcdefghijklmnopqrstuvwxyz"
+        overwritten[0] = x
+    end
+    if not overwritten[0]:str():equals "abcdefghijklmnopqrstuvwxyz" then return 3 end
+    return 0
+end
+
+-- Array(T, n) of owners: the array holds its elements' arenas
+local Contact = Struct { id: U32, names: Array(Text, 2) }
+local arrays = do(): I32
+    local a = Array(Text, 3) {}
+    a[0]:write "zero"
+    a[2]:write "two"
+    a[0]:write "!"
+    if not a[0]:str():equals "zero!" or not a[2]:str():equals "two" then return 1 end
+    if a[1]:str().length ~= 0 or a.length ~= 3 then return 2 end
+    local b = copy a
+    b[2]:write "?"
+    if not a[2]:str():equals "two" or not b[2]:str():equals "two?" then return 3 end
+    local t = Text {}
+    t:write "new"
+    a[1] = t
+    if not a[1]:str():equals "new" then return 4 end
+    local c = Array(Text, 2) { Text {}, copy a[0] }
+    if not c[1]:str():equals "zero!" then return 5 end
+    local contacts = Store(Contact) {}
+    local id = contacts:add Contact { id = 4 }
+    contacts[id].names[1]:write "nick"
+    contacts[id].names[0]:write "real"
+    if not contacts[id].names[1]:str():equals "nick" then return 6 end
+    local grid = Grow(Array(Text, 2)) {}
+    grid:push Array(Text, 2) {}
+    grid[0][1]:write "cell"
+    if not grid[0][1]:str():equals "cell" then return 7 end
+    for round: U32 = 1, 3000 do
+        local x = Text {}
+        x:write "abcdefghijklmnopqrstuvwxyz"
+        a[2] = x
+    end
+    if not a[2]:str():equals "abcdefghijklmnopqrstuvwxyz" or not a[1]:str():equals "new" then return 8 end
+    return 0
+end
+
+-- a Sum whose payloads hold owners: matched by reference, one payload at a time
+local Doc = Sum { empty: Unit, text: Text, list: Grow U32 }
+local doc_length = do(d: Ref Doc): U64
+    return d with
+        empty = do(): U64 return 0 end
+        text = do(t: Ref Text): U64 return t:str().length end
+        list = do(l: Ref (Grow U32)): U64 return l.length end
+    end
+end
+local add_to = do(d: Ref Doc, s: Str): Unit
+    d with
+        empty = do(): Unit
+        end
+        text = do(t: Ref Text): Unit
+            t:write s
+        end
+        list = do(l: Ref (Grow U32)): Unit
+            l:push(U32 s.length)
+        end
+    end
+end
+local Card = Struct { id: U32, doc: Doc }
+local sums = do(): I32
+    local d = Doc.text Text {}
+    add_to(Ref d, "hello")
+    if doc_length(Ref d) ~= 5 then return 1 end
+    local g = Grow(U32) {}
+    g:push 1
+    g:push 2
+    d = Doc.list g
+    if doc_length(Ref d) ~= 2 then return 2 end
+    d = Doc.empty()
+    if doc_length(Ref d) ~= 0 then return 3 end
+    local docs = Grow(Doc) {}
+    docs:push(Doc.text Text {})
+    docs:push Doc.empty()
+    docs:push(Doc.list Grow(U32) {})
+    add_to(Ref docs[0], "hello")
+    add_to(Ref docs[2], "abc")
+    if doc_length(Ref docs[0]) ~= 5 or doc_length(Ref docs[1]) ~= 0 or doc_length(Ref docs[2]) ~= 1 then
+        return 4
+    end
+    local copied = copy docs
+    add_to(Ref copied[0], "!")
+    if doc_length(Ref docs[0]) ~= 5 or doc_length(Ref copied[0]) ~= 6 then return 5 end
+    docs[1] = Doc.text Text {}
+    add_to(Ref docs[1], "xy")
+    local gone = docs:pop()
+    if doc_length(Ref gone) ~= 1 or doc_length(Ref docs[1]) ~= 2 then return 6 end
+    local cards = Store(Card) {}
+    local id = cards:add Card { id = 1, doc = Doc.text Text {} }
+    add_to(Ref cards[id].doc, "card")
+    if doc_length(Ref cards[id].doc) ~= 4 then return 7 end
+    for round: U32 = 1, 2000 do
+        docs[0] = Doc.text Text {}
+        add_to(Ref docs[0], "abcdefghijklmnopqrstuvwxyz")
+        d = Doc.text Text {}
+        add_to(Ref d, "abcdefghij")
+    end
+    if doc_length(Ref docs[0]) ~= 26 or doc_length(Ref d) ~= 10 then return 8 end
+    return 0
+end
+
+-- owner globals: set up at their first use, by the main thread (design memory.md §5.10)
+local journal = global(Grow Text, { name = "journal" })
+local note = do(s: Str): Unit
+    journal[0]:push Text {}
+    journal[0][journal[0].length - 1]:write s
+end
+note.boundary = true
+local globals = do(): I32
+    local before = journal[0].length
+    note "one"
+    note "two"
+    if journal[0].length ~= before + 2 then return 1 end
+    if not journal[0][journal[0].length - 1]:str():equals "two" then return 2 end
+    return 0
+end
+
+-- maps inside containers and map values: each of a map's stacks is a shared position
+local Tagged = Struct { id: U32, tags: Map(Str, U32) }
+local nested_maps = do(): I32
+    local outer = Map(U32, Map(U32, U32)) {}
+    outer:put(1, Map(U32, U32) {})
+    outer:put(2, Map(U32, U32) {})
+    for k: U32 = 0, 99 do
+        outer[1]:put(k, k * 2)
+        outer[2]:put(k, k * 3)
+    end
+    if outer[1][50] ~= 100 or outer[2][99] ~= 297 or outer[1].length ~= 100 then return 1 end
+    outer[1]:remove 50
+    if outer[1]:has 50 or outer[1].length ~= 99 then return 2 end
+    local words = Grow(Map(Str, U32)) {}
+    words:push Map(Str, U32) {}
+    words:push Map(Str, U32) {}
+    words[0]:put("alpha", 1)
+    words[1]:put("beta", 2)
+    for k: U32 = 0, 199 do words[0]:put("k", k) end
+    if words[0]["alpha"] ~= 1 or words[1]["beta"] ~= 2 then return 3 end
+    local copied = copy words
+    copied[0]:put("delta", 4)
+    if words[0]:has "delta" or copied[0]["delta"] ~= 4 then return 4 end
+    local items = Store(Tagged) {}
+    local id = items:add Tagged { id = 7 }
+    items[id].tags:put("red", 1)
+    items[id].tags:put("blue", 2)
+    if items[id].tags["blue"] ~= 2 or items[id].id ~= 7 then return 5 end
+    for round: U32 = 1, 3000 do
+        words[1]:put("churn", round)
+        words[1]:remove "churn"
+        outer[2]:put(1000 + round, round)
+        outer[2]:remove(1000 + round)
+    end
+    if words[1]["beta"] ~= 2 or outer[2][99] ~= 297 then return 6 end
+    local deep = Map(U32, Map(Str, Text)) {}
+    deep:put(1, Map(Str, Text) {})
+    deep[1]:put("x", Text {})
+    deep[1]["x"]:write "nested text"
+    if not deep[1]["x"]:str():equals "nested text" then return 7 end
+    return 0
+end
+
+export lines
+export nested_maps
+export globals
+export sums
+export arrays
+export structs
+export removals
+export replacements
+export maps
+export churn

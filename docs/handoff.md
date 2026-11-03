@@ -163,13 +163,16 @@ pass `-u </dev/null` or avoid commands that open an editor.
 hooks (see §7); the checked-place index hook is the generic protocol in `nua/memory.lua`;
 `Str` is a compiler type.
 
-**Later milestones (memory.md §13):** 5 nested owners (the position model, memory.md §5.9 R1–R5 and D13; `compact()`, owner globals;
-reuse the `Map(Str, V)` key-arena code); 6 capacity sizing per tasks scope; 7 task borrows with
+**Milestone 5 (nested owners, memory.md §5.9–§5.10, D13)** is implemented: syntax §9.13,
+architecture's "Owners inside owners", `examples/nested_owners.nua`. Not yet: a sum holding owners
+as a global, a call result built directly in a new element.
+**Later milestones (memory.md §13):** 6 capacity sizing per tasks scope; 7 task borrows with
 frozen owners (D1). Deferred by decision: D4 atomics in containers, D8 general last-use release.
 
-**Small leftovers:** `docs/designing-and-writing-nua.md` still has the older spellings: its
-blocks are verbatim excerpts of `examples/guide.nua` (tests/guide.lua), so change both together;
-`docs/formatting.md` has a duplicated `block_style` row; clearer diagnostic for `push i * 10`;
+**Design guide:** `docs/designing-and-writing-nua.md` was revised for structural design
+(`define`, keyed spread of vocabularies, §4.3 "name first, lay out on demand") and nested
+owners; its blocks are verbatim excerpts of `examples/guide.nua` (tests/guide.lua), so change
+both together. **Small leftovers:** `docs/formatting.md` has a duplicated `block_style` row; clearer diagnostic for `push i * 10`;
 the obsolete `nua/experiments/binary/reject_mutate_borrow.nua` and the old `struct`/`oneof`
 spellings under `nua/experiments/` (raw evidence, intentionally untouched); stale
 `/tmp/nua_io_test.bin`; tree-sitter limits (entries of a `with` on one line need `,` or `;`; a

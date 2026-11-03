@@ -270,6 +270,13 @@ check('Map nested iteration and callback returns', maps.map_each_nested(10) == 2
 check('Map iteration across task suspension', maps.map_task_each(100) == 5051)
 
 -- stores and Grow arrays: helpers read from the same C the C backend prints
+-- owners inside owners (design memory.md §5.9): arenas, relocation, compaction
+local nested = nua.load(root .. '/examples/nested_owners.nua')
+for _, name in ipairs { 'lines', 'structs', 'removals', 'replacements', 'maps', 'arrays', 'sums', 'globals', 'nested_maps' } do
+    local got = nested[name]()
+    check('nested owners: ' .. name, got == 0, 'failed check ' .. tostring(got))
+end
+check('nested owners: churn', nested.churn(3000) == 0)
 local st = nua.load(root .. '/examples/stores.nua')
 check('stores run', type(st.churn) == 'function')
 check('Grow pop and truncate', st.shrink(10) == 126)

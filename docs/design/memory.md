@@ -120,8 +120,7 @@ follows slot order. Consequences:
   it. Today assignment does not insert (syntax §15.1).
 - `Map(Str, V)` keeps its keys in a key arena, a shared position (§5.9). Removed
   keys' bytes are reclaimed by compacting the arena inside `remove`, which already
-  ends borrows (rule R5), so `put` ends no borrows. Today the compaction runs in
-  `put` and ends borrows of the keys; milestone 5 moves it.
+  ends borrows (rule R5), so `put` ends no borrows (implemented in milestone 5).
 
 ### 5.2 Creation
 
@@ -442,7 +441,7 @@ are used afterwards matter:
 | `xs:push v`, `xs:append s`, text writes on a top-level owner | nothing | implemented |
 | `xs:pop()`, `xs:clear()`, `xs:truncate n` | `xs`'s contents | implemented |
 | `s:remove id` (Store), `m:remove k` (Map) | the store's or map's elements; only the removed one when the compiler proves the others differ | proposed: today a borrow of a removed element sees the next entity put in its slot |
-| `m:put k v` (Map) | nothing (§5.9, R5) | proposed: today `Map(Str, V)` compacts its keys here |
+| `m:put k v` (Map) | nothing (§5.9, R5) | implemented |
 | growing a nested owner (§5.9, R4) | that owner's contents; every element's at that position when the index is unknown | proposed |
 | removing, popping, truncating or overwriting an element with nested owners (R5) | the contents at its shared positions (compaction) | proposed |
 | `compact()` of a holder with nested owners | the contents at its shared positions | proposed |
@@ -747,7 +746,8 @@ test-native`).
    `Map.borrowing`; the
    text types; all as Nua over the compiler primitives; compile-time `each` checks
    with no runtime guard; `init_storage` and the compiler storage kinds removed.
-5. **Nested owners.** The position model (§5.9): the uniform header and relocation,
+5. **Nested owners.** Done, except a sum holding owners as a global (rejected) and a call
+   result built directly in a new element (copied once). The position model (§5.9): the uniform header and relocation,
    one stack per position, the owner-aware element store, dead bytes and
    compaction in borrow-ending operations, `compact()`; owner globals (§5.10).
 6. **Capacity.** Reservations per tasks scope and from known bounds.
@@ -805,7 +805,9 @@ Recorded 2026-11-02.
   forbidding growth of nested owners (it rules out `players[id].items:push item`);
   compaction during growth (it would make growth end borrows of every element);
   a runtime generation check instead of R4 (a check facts could remove). The extension
-  for recursive types is one shared stack per recursive component of the type.
+  for recursive types is one shared stack per recursive component of the type. Accepted
+  in implementation (2026-11-03): a named owner moved into a sum's payload is copied once
+  onto the sum's stacks, though the payload is one-tenant (§5.4 would copy nothing).
 - **D5. Partial moves: no choice was needed.** The earlier options (keep the unmoved
   owner's bytes until the destination ends, or reject) came from keeping Goose's
   release-at-scope-exit. Releasing an owner at the end of its life (§5.8) makes a move

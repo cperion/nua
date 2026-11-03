@@ -7,12 +7,217 @@ local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
 local retire, restructure, borrows, grows = __S.retire, __S.restructure, __S.borrows, __S.grows
 local make_slice = __S.make_slice
+local shared_position = __S.shared_position
+local store_owner = __S.store_owner
+local element_ref, ref_field = __S.element_ref, __S.ref_field
+local own_stack_count, stack_count, library = __S.own_stack_count, __S.owner_stack_count, __S.storage_library
+local unpack = table.unpack or unpack
 local none = U32 0xffffffff
 local maximum = U64 0xffffffffffffffffULL
 local occupied = U32 0xfffffffe
 local retired = U32 0xfffffffd
 
--- Room for one more item at the top of the owner's data stack.
+-- Room for n more bytes after the first `used` bytes of an owner's region; returns where
+-- they begin (design memory.md §5.9, R3). An owner at a one-tenant position is always the
+-- top of its stack and extends there, as it always has. An owner at a shared position (an
+-- element's) extends within its capacity, or at the top when its region ends there, or
+-- moves its bytes to the top with doubled capacity; the region it leaves is dead until
+-- the holder compacts (R5), so bytes read from it while appending stay intact.
+local rooms = {}
+local function room_for(R)
+    if rooms[R] then return rooms[R] end
+    rooms[R] = do(h: Ptr R, used: U64, n: U64, shared, what: CString): U64
+        if n > maximum - used then trap "data stack too large" end
+        local need = used + n
+        if not shared then
+            local at = stacks.extend h.stack h.base used n what
+            h.cap = need
+            return at
+        end
+        if need <= h.cap then return h.base + used end
+        local s = stacks.at h.stack
+        if s.top == h.base + h.cap then
+            stacks.push h.stack (need - h.cap)
+            h.cap = need
+            return h.base + used
+        end
+        local cap = h.cap * 2
+        if cap < need then cap = need end
+        -- the region it leaves is dead until the holder compacts (R5)
+        stacks.abandon h.stack h.cap
+        local at = stacks.begin h.stack
+        stacks.push h.stack cap
+        stacks.move (stacks.span s at used) (stacks.span s h.base used) used
+        h.base = at
+        h.cap = cap
+        return at + used
+    end
+    return rooms[R]
+end
+-- the room word for the header h points to
+local function room(h, used, n, shared, what)
+    return room_for __S.value_of(h).T.elem (h, used, n, shared, what)
+end
+storage.room = room
+
+-- Owners inside elements (design memory.md §5.9). A holder's elements may hold owners; theirs
+-- live in the arenas of the root holder, one per owner position, each the stack at a fixed
+-- offset from the root's first. These walks run while compiling: they stage, for one holder
+-- type, the loops over its elements that reach one position.
+
+-- the owners inside an element type, depth first, with their field paths
+local function leaves(t, path, out)
+    out, path = out or {}, path or {}
+    if t.kind == "struct" then
+        for _, f in ipairs t.fields do
+            if f.type.resizable then
+                local sub = { unpack path }
+                sub[#sub + 1] = f.name
+                leaves(f.type, sub, out)
+            end
+        end
+    elseif t.resizable then
+        out[#out + 1] = { .path, T = t }
+    end
+    return out
+end
+-- the owner at path inside the element e refers to
+local function project(e, path)
+    for _, name in ipairs path do e = ref_field(e, name) end
+    return e
+end
+-- visit(owner, type) for every owner at position o of g's elements, o counted from g's
+-- first stack
+local each_at
+-- visit every owner at position o inside the value v of type t refers to (o counted from
+-- that value's first stack): a struct's owners in order, a sum's live payload, an owner itself
+-- or, past its own stacks, the owners inside its elements
+local function within(t, v, o, visit)
+    if t.kind == "sum" then
+        local place = rawget(v, "place")
+        for _, alt in ipairs t.alts do
+            if alt.type.resizable and o < stack_count alt.type then
+                __S.when_variant(place, alt, function()
+                        within(alt.type, __S.Ref(__S.payload_place(place, alt)), o, visit)
+                    end)
+            end
+        end
+    elseif t.kind == "struct" then
+        local off = 0
+        for _, leaf in ipairs(leaves t) do
+            local n = stack_count leaf.T
+            if o >= off and o < off + n then return within(leaf.T,
+                    project(v, leaf.path), o - off, visit) end
+            off = off + n
+        end
+    else
+        local own = own_stack_count t
+        if o >= own then return each_at(t, v, o, visit) end
+        -- one of its own stacks (a map has several): the region it holds there
+        visit(v, t, o)
+    end
+end
+-- visit(owner, type) for every owner at position o of g's elements, o counted from g's
+-- first stack (past its own)
+function each_at(T, g, o, visit)
+    local own = own_stack_count T
+    library(T).each_element(g, function(e) within(T.elem, e, o - own, visit) end)
+end
+-- an element's owners end: their bytes are dead in the arenas, theirs and their elements'
+local function abandon_owners(t, e)
+    if t.kind == "sum" then
+        local place = rawget(e, "place")
+        for _, alt in ipairs t.alts do
+            if alt.type.resizable then
+                local function payload() abandon_owners(alt.type,
+                        __S.Ref(__S.payload_place(place, alt))) end
+                __S.when_variant(place, alt, payload)
+            end
+        end
+        return
+    end
+    for _, leaf in ipairs(leaves t) do
+        local owner = project(e, leaf.path)
+        if leaf.T.kind == "sum" then
+            abandon_owners(leaf.T, owner)
+        else
+            local lib = library leaf.T
+            lib.abandon_region owner
+            local inner = rawget(leaf.T, "elem")
+            if inner and inner.resizable then
+                lib.each_element(owner, function(x) abandon_owners(inner, x) end)
+            end
+        end
+    end
+end
+-- a word that abandons owners inside an argument's elements says so: its caller compacts
+local function abandon(t, e)
+    __S.note_abandon e
+    abandon_owners(t, e)
+end
+storage.abandon = abandon
+-- R5: an arena whose dead bytes reach its live bytes (and 4096) is compacted: the live
+-- regions at its position are packed above its top, in walk order, then moved down to its
+-- start; each owner's header follows. Positions nearer the root come first, so a walk to a
+-- deeper position reads headers already in place.
+local minimum_dead = U64 4096
+local compactors = {}
+local function compactor(T)
+    if compactors[T] then return compactors[T] end
+    local header = library(T).layout.header
+    -- `forced`: an explicit compact(), whatever the dead bytes
+    compactors[T] = do(g: Ref T, o, forced): Unit
+        local h = header g
+        local arena = h.stack + o
+        local start = h.base + stacks.arena_record
+        local s = stacks.at arena
+        if not forced and (s.dead < minimum_dead or s.dead * 2 < s.top - start) then return end
+        local fresh = stacks.begin arena
+        local cursor = fresh
+        each_at(T, g, o, function(owner, L, which)
+                cursor = library(L).move_up(owner, cursor, start, fresh, which)
+            end)
+        local n = cursor - fresh
+        stacks.move (stacks.region arena start n) (stacks.region arena fresh n) n
+        stacks.reset arena (start + n)
+        s.dead = 0
+    end
+    return compactors[T]
+end
+-- after a root holder ended borrows of its contents: each arena, nearest first. Compaction
+-- moves every owner at its positions, so their borrows end.
+local function compact(T, g, forced)
+    __S.end_positions(g, "its container was compacted")
+    for o = own_stack_count T, stack_count T - 1 do compactor T (g, o, forced or false) end
+end
+storage.compact = compact
+-- after an operation on an owner inside elements that left dead bytes: its root compacts,
+-- when the root is known here (otherwise the root's next removal does)
+local function compact_root(g, forced)
+    local root = __S.root_holder g
+    if root then compact(rawget(root, "T").elem, root, forced) end
+end
+storage.compact_root = compact_root
+-- g:compact() on a container whose elements hold owners: its root's arenas, now
+storage.compact_now = function(g) compact_root(g, true) end
+
+-- An owner global (design memory.md §5.10) is set up at its first use, by the thread that
+-- uses it first: the main thread. Its stacks are reserved in that thread's set.
+function storage.owner_global(name, setup)
+    local thread = global(Ptr stacks.Set, { name = "nua_" .. name .. "_thread" })
+    local ensure = do(): Unit
+        local here = stacks.own_set()
+        if thread[0] == here then return end
+        if thread[0] ~= null stacks.Set then trap "an owner global belongs to the main thread" end
+        thread[0] = here
+        setup
+    end
+    ensure.boundary = true
+    ensure.owner_global = name
+    return ensure
+end
+
+-- Room for one more item in the owner's region.
 local function extend(T, p, what, counts_slots)
     local message = what .. " grew while it was not at the top of its data stack"
     return do(owner: Ref T, length: U64, width: U64): Unit
@@ -24,13 +229,79 @@ local function extend(T, p, what, counts_slots)
             local bytes = length * width
             if bytes / width ~= length then trap(what .. " is full") end
         end
-        stacks.extend h.stack h.base (length * width) width message
+        -- an owner inside an element may move its bytes (design memory.md §5.9, R4)
+        if shared_position owner then retire(owner,
+                "an element of '%s' grew, so its contents may have moved") end
+        room(h, length * width, width, shared_position owner, message)
     end
+end
+
+-- Array(T, n) whose elements hold owners (design memory.md §5.9): an owner with no stacks of
+-- its own. Its header holds the n elements and where its arenas began; the elements' owners
+-- live in those arenas, one per owner position, shared by the n elements.
+local init_element = __S.init_element
+function storage.fixed_layout(T, view)
+    local R = T.representation
+    local Items = Ptr T.elem
+    local p = {}
+    p.header = do(self: Ref T): Ptr R return view self end
+    -- the elements are the header's first field
+    p.items = do(self: Ref T): Items
+        local h = p.header self
+        return Items h
+    end
+    p.width = do(): U64 = size_of T.elem
+    -- the arenas begin at first: an empty array, its elements' owners empty there
+    p.init = do(self: Ref T, first: U64): Unit
+        local h = p.header self
+        h.stack = first
+        h.base = stacks.top first - stacks.arena_record
+        local items = p.items self
+        local i = U64 0
+        while i < T.length do
+            init_element(self, Ptr items[i])
+            i = i + 1
+        end
+    end
+    return p
+end
+function storage.fixed(T, p)
+    local api = {}
+    local n = T.length
+    api.locate = do(a: Ref T, index: U64): Ptr T.elem
+        if index >= n then trap "Array index out of range" end
+        local items = p.items a
+        return Ptr items[index]
+    end
+    api.length = do(a: Ref T): U64 return n end
+    api.each_element = do(a: Ref T, body): Unit
+        local items = p.items a
+        local i = U64 0
+        while i < n do
+            body element_ref(a, Ptr items[i])
+            i = i + 1
+        end
+    end
+    -- no region of its own: its elements' owners are in the arenas
+    api.abandon_region = do(a: Ref T): Unit end
+    -- `copy a` into a new array: each element's owners built anew in its arenas
+    api.copy = do(a: Ref T, from: Ref T): Unit
+        local items = p.items a
+        local from_items = p.items from
+        local i = U64 0
+        while i < n do
+            store_owner(a, Ptr items[i], element_ref(from, Ptr from_items[i]))
+            i = i + 1
+        end
+    end
+    return api
 end
 
 function storage.store(T, Id, p)
     local Item = p.Item
     local api = {}
+    -- elements that hold owners: theirs live in the store's arenas (design memory.md §5.9)
+    local nested = T.elem.resizable
     local grow = extend(T, p, "Store", true)
     -- the slot an Id names while it is current, or null
     local occupant = do(s: Ref T, id: Id): Ptr Item
@@ -72,9 +343,37 @@ function storage.store(T, Id, p)
         entry.next = occupied
         -- written through the owner's pointer: a borrow stored in the value is checked against it
         local owned = borrows(s, p.items s)
-        owned[slot].value = value
+        if nested then store_owner(s, Ptr owned[slot].value, Ref value)
+        else owned[slot].value = value end
         h.live = h.live + 1
         return p.id s slot entry.gen
+    end
+    if nested then
+        -- an element built where it lands: `build` receives a Ref to it (a fresh owner, §5.3)
+        api.add_built = do(s: Ref T, build): Id
+            grows s
+            local h = p.header s
+            local slot = h.free_head
+            local entry = null Item
+            if slot ~= none then
+                local items = p.items s
+                entry = Ptr items[slot]
+                h.free_head = entry.next
+            else
+                slot = h.len
+                if slot >= retired then trap "Store is full" end
+                grow(s, U64 slot, p.width())
+                h.len = slot + 1
+                local items = p.items s
+                entry = Ptr items[slot]
+                entry.gen = 1
+            end
+            entry.next = occupied
+            local owned = borrows(s, p.items s)
+            build element_ref(s, Ptr owned[slot].value)
+            h.live = h.live + 1
+            return p.id s slot entry.gen
+        end
     end
     api.remove = do(s: Ref T, id: Id): Bool
         local entry = occupant s id
@@ -84,6 +383,8 @@ function storage.store(T, Id, p)
         local token, slot, generation = p.components id
         local h = p.header s
         h.live = h.live - 1
+        -- its owners' bytes are dead in the arenas (R5)
+        if nested then abandon(T.elem, element_ref(s, Ptr entry.value)) end
         if generation == none then
             entry.next = retired
         else
@@ -91,6 +392,7 @@ function storage.store(T, Id, p)
             entry.next = h.free_head
             h.free_head = slot
         end
+        if nested then compact_root s end
         return true
     end
     api.length = do(s: Ref T): U64 return U64 p.header(s).live end
@@ -101,7 +403,7 @@ function storage.store(T, Id, p)
         local h = p.header s
         local bytes = U64 source.len * p.width()
         if bytes ~= 0 then
-            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+            local at = room(h, U64 0, bytes, shared_position s,
                 "Store copy target was not at the top of its data stack")
             stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
         end
@@ -109,40 +411,131 @@ function storage.store(T, Id, p)
         h.live = source.live
         h.free_head = source.free_head
         h.token = source.token
+        -- the owners inside occupied slots are built anew in this store's arenas
+        if nested then
+            local items = p.items s
+            local from_items = p.items from
+            local i = U32 0
+            while i < h.len do
+                if items[i].next == occupied then
+                    store_owner(s, Ptr items[i].value, element_ref(from, Ptr from_items[i].value))
+                end
+                i = i + 1
+            end
+        end
+    end
+    if nested then
+        api.each_element = do(s: Ref T, body): Unit
+            local h = p.header s
+            local items = p.items s
+            local i = U32 0
+            while i < h.len do
+                if items[i].next == occupied then body element_ref(s, Ptr items[i].value) end
+                i = i + 1
+            end
+        end
+    end
+    api.abandon_region = do(s: Ref T): Unit
+        local h = p.header s
+        stacks.abandon h.stack h.cap
+    end
+    api.move_up = do(s: Ref T, cursor: U64, start: U64, fresh: U64, which): U64
+        local h = p.header s
+        local bytes = U64 h.len * p.width()
+        local at = band (cursor + 15) bnot(U64 15)
+        stacks.push h.stack (at + bytes - cursor)
+        stacks.move (stacks.region h.stack at bytes) (stacks.region h.stack h.base bytes) bytes
+        h.base = at - fresh + start
+        h.cap = bytes
+        return at + bytes
     end
     return api
 end
 
 function storage.grow(T, p)
     local api = {}
+    -- elements that hold owners: theirs live in the container's arenas (design memory.md §5.9)
+    local nested = T.elem.resizable
     local what = T.kind == "rtarray" and "Array" or (T.elem == U8 and "Text" or "Grow")
     local grow = extend(T, p, what)
     api.clear = do(g: Ref T): Unit
         retire(g, "'%s' was cleared")
         local h = p.header g
-        stacks.reset h.stack h.base
+        -- an element's owner keeps its capacity: its region is its own (R3)
+        if not shared_position g then
+            stacks.reset h.stack h.base
+            h.cap = 0
+            -- a root's arenas end at once
+            if nested then
+                for o = own_stack_count T, stack_count T - 1 do stacks.empty_arena (h.stack + o) h.base end
+            end
+        elseif nested then
+            local items = p.items g
+            local i = U64 0
+            while i < h.len do
+                abandon(T.elem, element_ref(g, Ptr items[i]))
+                i = i + 1
+            end
+        end
         h.len = 0
+        if nested and shared_position g then compact_root g end
     end
     -- keep the first n elements: the storage above them is released
     api.truncate = do(g: Ref T, n: U64): Unit
         retire(g, "'%s' was truncated")
         local h = p.header g
         if n > h.len then trap "Grow truncate beyond its length" end
-        stacks.reset h.stack (h.base + n * p.width())
+        if nested then
+            local items = p.items g
+            local i = n
+            while i < h.len do
+                abandon(T.elem, element_ref(g, Ptr items[i]))
+                i = i + 1
+            end
+        end
+        if not shared_position g then
+            stacks.reset h.stack (h.base + n * p.width())
+            h.cap = n * p.width()
+        end
         h.len = n
+        if nested then compact_root g end
     end
     -- the last element, removed
-    api.pop = do(g: Ref T): T.elem
-        retire(g, "'%s' was popped")
-        local h = p.header g
-        if h.len == 0 then trap "Grow pop of an empty Grow" end
-        local last = h.len - 1
-        local items = p.items g
-        local value = items[last]
-        stacks.reset h.stack (h.base + last * p.width())
-        h.len = last
-        return value
+    if nested then
+        -- an element holding owners leaves as a new owner: its contents are copied out of
+        -- the arenas (design memory.md §5.9, R3), and its bytes there are dead
+        api.pop = do(g: Ref T): T.elem
+            retire(g, "'%s' was popped")
+            local h = p.header g
+            if h.len == 0 then trap "Grow pop of an empty Grow" end
+            local last = h.len - 1
+            local items = p.items g
+            local e = element_ref(g, Ptr items[last])
+            local out = copy e
+            abandon(T.elem, e)
+            if not shared_position g then
+                stacks.reset h.stack (h.base + last * p.width())
+                h.cap = last * p.width()
+            end
+            h.len = last
+            compact_root g
+            return out
+        end
     end
+    if not nested then api.pop = do(g: Ref T): T.elem
+            retire(g, "'%s' was popped")
+            local h = p.header g
+            if h.len == 0 then trap "Grow pop of an empty Grow" end
+            local last = h.len - 1
+            local items = p.items g
+            local value = items[last]
+            if not shared_position g then
+                stacks.reset h.stack (h.base + last * p.width())
+                h.cap = last * p.width()
+            end
+            h.len = last
+            return value
+        end end
     if T.elem == U8 then
         api.append = do(g: Ref T, text: Str): Unit
             local n = text.length
@@ -152,7 +545,8 @@ function storage.grow(T, p)
             -- text may be bytes of this stack, even of this Text: growth leaves
             -- them where they are, and the new bytes lie above them
             local bytes = n
-            local top = stacks.extend(h.stack, h.base, length, bytes,
+            if shared_position g then retire(g, "a text in '%s' grew, so its bytes may have moved") end
+            local top = room(h, length, bytes, shared_position g,
                 "Text grew while it was not at the top of its data stack")
             local ptr, len = slice_parts text
             stacks.write h.stack top ptr bytes
@@ -252,6 +646,18 @@ function storage.grow(T, p)
             return strings.of(api.all g)
         end
     end
+    if nested then
+        -- an element built where it lands: `build` receives a Ref to it (a fresh owner, §5.3)
+        api.push_built = do(g: Ref T, build): Unit
+            grows g
+            local h = p.header g
+            local length = h.len
+            grow(g, length, p.width())
+            h.len = length + 1
+            local items = borrows(g, p.items g)
+            build element_ref(g, Ptr items[length])
+        end
+    end
     api.push = do(g: Ref T, value: T.elem): Unit
         grows g
         local h = p.header g
@@ -261,7 +667,8 @@ function storage.grow(T, p)
         -- the elements are reached through a pointer attached to the owner: a borrow stored
         -- in one is checked against the owner (design memory.md §10.1)
         local items = borrows(g, p.items g)
-        items[length] = value
+        if nested then store_owner(g, Ptr items[length], Ref value)
+        else items[length] = value end
     end
     api.locate = do(g: Ref T, index: U64): Ptr T.elem
         local h = p.header g
@@ -272,11 +679,14 @@ function storage.grow(T, p)
     api.items = p.items
     api.length = do(g: Ref T): U64 return p.header(g).len end
     -- the elements as a read-only slice borrowing the owner, of the length it has now:
-    -- growing keeps it valid (stacks never move); clear, pop and truncate end it
-    api.all = do(g: Ref T): Slice T.elem
-        local h = p.header g
-        local view = Slice(p.items g, h.len)
-        return borrows(g, view)
+    -- growing keeps it valid (stacks never move); clear, pop and truncate end it. Elements
+    -- that hold owners are reached one at a time (g[i]): a slice would read their headers.
+    if not nested then
+        api.all = do(g: Ref T): Slice T.elem
+            local h = p.header g
+            local view = Slice(p.items g, h.len)
+            return borrows(g, view)
+        end
     end
     -- an empty owner takes n zeroed elements (Array(T, n) {} with a runtime n)
     api.allocate = do(g: Ref T, n: U64): Unit
@@ -284,7 +694,7 @@ function storage.grow(T, p)
         local bytes = n * p.width()
         if bytes / p.width() ~= n then trap "Array is too large" end
         if bytes ~= 0 then
-            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+            local at = room(h, U64 0, bytes, shared_position g,
                 "Array was not at the top of its data stack when built")
             stacks.zero h.stack at bytes
         end
@@ -295,7 +705,7 @@ function storage.grow(T, p)
         local h = p.header g
         local bytes = n * p.width()
         if bytes ~= 0 then
-            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+            local at = room(h, U64 0, bytes, shared_position g,
                 "copy target was not at the top of its data stack")
             stacks.write h.stack at (Ptr U8 items) bytes
         end
@@ -307,11 +717,48 @@ function storage.grow(T, p)
         local h = p.header g
         local bytes = source.len * p.width()
         if bytes ~= 0 then
-            local at = stacks.extend(h.stack, h.base, U64 0, bytes,
+            local at = room(h, U64 0, bytes, shared_position g,
                 "Grow copy target was not at the top of its data stack")
-            stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
+            if not nested then
+                stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
+            end
         end
         h.len = source.len
+        -- elements holding owners are built anew, their owners in this owner's arenas
+        if nested then
+            local items = p.items g
+            local from_items = p.items from
+            local i = U64 0
+            while i < h.len do
+                store_owner(g, Ptr items[i], element_ref(from, Ptr from_items[i]))
+                i = i + 1
+            end
+        end
+    end
+    if nested then
+        api.each_element = do(g: Ref T, body): Unit
+            local h = p.header g
+            local items = p.items g
+            local i = U64 0
+            while i < h.len do
+                body element_ref(g, Ptr items[i])
+                i = i + 1
+            end
+        end
+    end
+    api.abandon_region = do(g: Ref T): Unit
+        local h = p.header g
+        stacks.abandon h.stack h.cap
+    end
+    api.move_up = do(g: Ref T, cursor: U64, start: U64, fresh: U64, which): U64
+        local h = p.header g
+        local bytes = h.len * p.width()
+        local at = band (cursor + 15) bnot(U64 15)
+        stacks.push h.stack (at + bytes - cursor)
+        stacks.move (stacks.region h.stack at bytes) (stacks.region h.stack h.base bytes) bytes
+        h.base = at - fresh + start
+        h.cap = bytes
+        return at + bytes
     end
     return api
 end

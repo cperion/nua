@@ -206,6 +206,9 @@ function M.rewrite(tokens, mark, full)
             if t2 == ':' and tokens[nxt + 1] and tokens[nxt + 1][1] == 'space' then return true end
             return newline                        -- a positional value on a line of its own
         end
+        -- a keyed spread on a line of its own, `..base` (the raw lexer gives two dots)
+        if tk[1] == '.' and newline and tokens[i + 1] and tokens[i + 1][1] == '.'
+            and not (tokens[i + 2] and tokens[i + 2][1] == '.') then return true end
         return tk[1] == '.' and newline and tokens[i + 1] and tokens[i + 1][1] == 'iden'
     end
     while i <= n do

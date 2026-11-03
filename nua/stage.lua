@@ -71,6 +71,12 @@ end
 
 local function fail(msg, level)
     msg = msg .. active_trail()
+    -- a level that lands in Nua source names that frame: a builder reports at its user's line
+    local at = level and level > 1 and debug.getinfo(level + 1, 'Sl')
+    if at and at.currentline and at.currentline > 0 and (at.source == S.user_source or at.source:match('^@.*%.nua$')) then
+        local path = at.source == S.user_source and S.user_path or at.source:sub(2)
+        error(path .. ':' .. at.currentline .. ': ' .. msg, 0)
+    end
     local path, line = source_location(true)
     if path then error(path .. ':' .. line .. ': ' .. msg, 0) end
     error(msg, (level or 1) + 1)
@@ -628,7 +634,15 @@ function Builder:resolve_checked(p)
     local names, q = {}, p
     while q ~= r do names[#names + 1] = rawget(q, 'fname'); q = rawget(q, 'parent') end
     local out = e.root
-    for i = #names, 1, -1 do out = field_place(out, names[i]) end
+    for i = #names, 1, -1 do
+        local name = names[i]
+        -- a sum's payload (a sum holding owners, inside an element)
+        if name:sub(1, 3) == 'as.' and out.T.kind == 'sum' then
+            out = S.payload_place(out, out.T.index[name:sub(4)])
+        else
+            out = field_place(out, name)
+        end
+    end
     return out
 end
 S.resolve_checked = function(p) return current and current:resolve_checked(p) or p end
@@ -677,6 +691,14 @@ function S.checked_place(t, call, name, cache, resolve, key)
     assert(call or (resolve and key), 'a deferred checked place needs its semantic key')
     local p = new_place { pk = 'deref', T = t, name = name or 'element', ptr = call, id = uid() }
     rawset(p, 'checked', { key = key or expr_key(call), call = call, cache = cache ~= false, resolve = resolve })
+    return p
+end
+
+-- an element of a container reached through a pointer the container's word computed:
+-- its contents belong to the container (design memory.md §5.9)
+function S.element_place(t, ptr, owner)
+    local p = new_place { pk = 'deref', T = t, name = 'element', ptr = ptr, id = uid() }
+    rawset(p, 'owner_place', owner)
     return p
 end
 
@@ -953,9 +975,103 @@ h.element_token = function(container, key)
     list.tokens[key.text] = token
     return token
 end
+-- Owner positions (design memory.md §5.9, R4). An owner inside an element has its bytes in
+-- an arena of the outermost container, shared by every element at that position, and
+-- they may move when it grows. A borrow of its contents depends on its position: the
+-- container's root, the field path inside each element level, and the index of the
+-- innermost element when it is known. Nil when the place is not inside an element.
+h.position_of = function(place)
+    local parts, index, q, inside = {}, nil, place, false
+    while true do
+        local path, r = {}, q
+        while r and not (rawget(r, 'owner_place') and not S.one_tenant_payload(r)) do
+            table.insert(path, 1, rawget(r, 'fname') or '')
+            r = rawget(r, 'parent')
+        end
+        if not r then break end
+        if not inside then index = rawget(r, 'index_key') or rawget(r, 'element_key') end
+        inside = true
+        table.insert(parts, 1, table.concat(path, '.'))
+        q = rawget(r, 'owner_place')
+    end
+    if not inside then return nil end
+    return root_of(q), table.concat(parts, '/'), index
+end
+h.position_token = function(croot, key, index)
+    local contents = h.contents_token(croot)
+    if not contents then return nil end
+    local list = rawget(croot, 'position_tokens')
+    if not list or list.contents ~= contents then
+        list = { contents = contents, tokens = {} }
+        rawset(croot, 'position_tokens', list)
+    end
+    local id = key .. '#' .. (index and index.text or '?')
+    local token = list.tokens[id]
+    if token and not token.ended then return token end
+    token = {}
+    for k, v in pairs(contents) do token[k] = v end
+    token.contents, token.parent, token.position, token.index = nil, contents, key, index
+    list.tokens[id] = token
+    return token
+end
+-- an owner at a shared position may have moved its bytes: borrows of the contents at that
+-- position end, except those of an element whose known index differs
+h.end_position = function(b, croot, key, index, why)
+    if croot.pk == 'deref' and rawget(croot, 'param_index') and b.fn then
+        -- inside an argument: the caller learns that the argument's contents may move
+        b.fn.shrinks = b.fn.shrinks or {}
+        b.fn.shrinks[rawget(croot, 'param_index')] = true
+    end
+    local list = rawget(croot, 'position_tokens')
+    if not list then return end
+    for id, token in pairs(list.tokens) do
+        if token.position == key then
+            local a, c = token.index, index
+            local distinct = a and c and a.known and c.known and a.text ~= c.text
+            if not distinct then h.end_token(b, token, list.tokens, id, why) end
+        end
+    end
+end
+-- owners inside an argument's elements were abandoned here: the caller, which knows the
+-- root, compacts it after the call (design memory.md §5.9, R5)
+S.note_abandon = function(ref)
+    local b = cur()
+    local place = h.effect_owner(ref, 'abandon')
+    -- out through the containers it lies in, to the root they belong to
+    local root = root_of(place)
+    while rawget(root, 'owner_place') do root = root_of(rawget(root, 'owner_place')) end
+    if b and b.fn and root.pk == 'deref' and rawget(root, 'param_index') then
+        b.fn.abandons = b.fn.abandons or {}
+        b.fn.abandons[rawget(root, 'param_index')] = true
+    end
+end
+-- compaction moves every owner at the root's shared positions: their borrows end
+S.end_positions = function(ref, why)
+    local b = cur()
+    local place = h.effect_owner(ref, 'compaction')
+    local croot = root_of(place)
+    if croot.pk == 'deref' and rawget(croot, 'param_index') and b.fn then
+        b.fn.shrinks = b.fn.shrinks or {}
+        b.fn.shrinks[rawget(croot, 'param_index')] = true
+    end
+    local list = rawget(croot, 'position_tokens')
+    if list then
+        for id, token in pairs(list.tokens) do h.end_token(b, token, list.tokens, id, why) end
+    end
+    S.bump_checked()
+end
 -- a removal of `removed` ends the borrows of the elements it may name
 h.end_elements = function(b, container, removed, why)
     local croot = root_of(container)
+    -- the owners inside that element: their positions' borrows (R4)
+    local positions = rawget(croot, 'position_tokens')
+    if positions then
+        for id, token in pairs(positions.tokens) do
+            local a = token.index
+            local distinct = a and a.known and removed.known and a.text ~= removed.text
+            if not distinct then h.end_token(b, token, positions.tokens, id, why) end
+        end
+    end
     local list = rawget(croot, 'element_tokens')
     if not list then return end
     for text, token in pairs(list.tokens) do
@@ -1040,6 +1156,12 @@ h.place_tokens = function(place, contents)
     local carried = rawget(root, 'carried_view')
     local container = h.container_of(place)
     if container then
+        -- the contents of an owner inside an element: its position's token (R4)
+        if contents and place.T.resizable then
+            local croot, position, index = h.position_of(place)
+            local token = croot and h.position_token(croot, position, index)
+            if token then return h.merge_view(carried, token) end
+        end
         local key = h.element_key(place)
         if key and not contents then
             local token = h.element_token(container, key)
@@ -1079,6 +1201,11 @@ end
 -- the reason; borrows taken afterwards are new. Ending is checked where a
 -- borrow is used, so a borrow not used again is no error: liveness.
 h.end_owner = function(b, place, why)
+    -- an owner inside an element: the contents at its position (R4)
+    if place.T.resizable then
+        local croot, position, index = h.position_of(place)
+        if croot then return h.end_position(b, croot, position, index, why) end
+    end
     local root = root_of(place)
     if root.pk == 'deref' and rawget(root, 'param_index') then
         -- through an argument: the caller learns it from the summary, and any
@@ -1126,7 +1253,9 @@ end
 -- a key narrows it to the elements that may name that key.
 S.retire = function(ref, template, key)
     local place = h.effect_owner(ref, 'retire')
-    local why = template:format(tostring(rawget(root_of(place), 'name')))
+    -- an owner inside an element is named by its container
+    local croot = place.T.resizable and h.position_of(place)
+    local why = template:format(tostring(rawget(croot or root_of(place), 'name')))
     S.bump_checked()
     local selector = h.effect_key(key)
     if selector then h.end_elements(cur(), place, selector, why) else h.end_owner(cur(), place, why) end
@@ -1928,7 +2057,10 @@ function ex(v)
             end
         end
         if current and v.place.pk ~= 'deref' then current:escape(v.place) end
-        return { op = 'addr', place = v.place, T = v.T }
+        -- an element found by a checked lookup (an owner inside a container): found here
+        local target = v.place
+        if current and checked_root(target) then target = current:resolve_checked(target) end
+        return { op = 'addr', place = target, T = v.T }
     end
     if v.k == 'sumv' then
         local q = rawget(v, 'p')
@@ -2106,7 +2238,7 @@ local function coerce(x, t, what)
     end
     if t.resizable then
         -- an owner: a constructor builds it in place, a named owner moves
-        if is_value(x) and (x.k == 'fresh' or x.k == 'agg') and x.T == t then return x end
+        if is_value(x) and (x.k == 'fresh' or x.k == 'agg' or x.k == 'sumv') and x.T == t then return x end
         x = h.through(x)
         if is_value(x) and x.k == 'ref' and x.T.elem == t then
             fail(('%s: a %s owns its storage; a Ref borrows it. Pass the owner itself to move it, '
@@ -3051,7 +3183,10 @@ function Builder:release_moved_on(marker, path)
     local block, state, dead = self.block, self.state, self.dead
     self.block, self.state, self.dead = path.block or self.block, path.state, false
     local ok, err = pcall(function()
-        for _, r in ipairs(rawget(marker, 'releases') or {}) do r.free(r.place) end
+        -- only what this path holds: an owner made on another path only is not here
+        for _, r in ipairs(rawget(marker, 'releases') or {}) do
+            if S.held_on_path(path.state, r.place) then r.free(r.place) end
+        end
     end)
     self.block, self.state, self.dead = block, state, dead
     if not ok then error(err, 0) end
@@ -3552,7 +3687,8 @@ local function arg_key(v)
         end
         return v.T.display .. '[' .. table.concat(parts, ',') .. ']'
     end
-    if v.k == 'ref' then return '&' .. v.T.elem.display end
+    -- a Ref to an owner at a shared position (an element's): the word grows it differently
+    if v.k == 'ref' then return '&' .. v.T.elem.display .. (S.shared_position(v) and '@' or '') end
     return '?' .. v.T.display
 end
 
@@ -3643,7 +3779,8 @@ h.arg_shape = function(v)
     if is_place(v) then v = cur():read(v) end
     if is_host(v) then return 'H' end
     if static(v) then return 'K' .. v.T.display end
-    if v.k == 'ref' then return '&' .. v.T.elem.display end
+    -- a Ref to an owner at a shared position (an element's): the word grows it differently
+    if v.k == 'ref' then return '&' .. v.T.elem.display .. (S.shared_position(v) and '@' or '') end
     return '?' .. v.T.display
 end
 
@@ -4982,6 +5119,7 @@ function Builder:call_arg(v)
     if not (is_value(v) and v.k == 'ref') then h.check_view_boundary(v) end
     if v.k == 'ref' then
         local p = v.place
+        if checked_root(p) then p = self:resolve_checked(p) end
         if p.pk == 'deref' then return { op = 'addr', place = p, T = v.T } end
         self:escape(p)
         return { op = 'addr', place = p, T = v.T }
@@ -5096,6 +5234,7 @@ function Builder:emit_call(w, fn, args)
         elseif fn.dynamic_pos[i] then
             if a.k == 'ref' then
                 local p = a.place
+                if checked_root(p) then p = self:resolve_checked(p) end
                 if p.pk ~= 'deref' then self:escape(p) end
                 cargs[#cargs + 1] = { op = 'addr', place = p, T = a.T }
             else
@@ -5187,7 +5326,13 @@ function Builder:emit_call(w, fn, args)
     for i, a in ipairs(args) do
         if is_value(a) and a.k == 'ref' and a.T.elem.resizable
             and (not done or (fn.shrinks and fn.shrinks[i])) then
-            h.end_owner(self, a.place, ('the call to %s, which may clear it'):format(w.name))
+            local inside = a.place.T.resizable and h.position_of(a.place)
+            h.end_owner(self, a.place, ('the call to %s, which may %s it'):format(w.name,
+                inside and 'grow or clear' or 'clear'))
+            -- it left dead bytes in the arenas of a root known here: compact it
+            if done and fn.abandons and fn.abandons[i] then
+                require('nua.storage').compact_root(S.Ref(a.place))
+            end
         end
     end
     return result
@@ -5236,6 +5381,7 @@ function build_function(w, args, key, cname, opts)
                 local target = new_place { pk = 'deref', T = a.T.elem, name = p.name,
                     ptr = { op = 'param', name = pname, T = a.T, fn = fn }, id = uid(),
                     param_index = i, param_fn = fn }
+                if S.shared_position(a) then rawset(target, 'shared', true) end
                 vals[i] = ref(target)
                 if a.T.elem.resizable then
                     fn.ref_owner_params = fn.ref_owner_params or {}
@@ -5852,9 +5998,23 @@ function S.keyed(items)
             fields[it[2]] = it[3]
         end
     end
+    local records = false
     for n, it in ipairs(items) do
         if it[1] == 'spread' then
-            for _, fv in ipairs(h.record_fields(it[2])) do
+            local source = it[2]
+            local entries
+            if type(source) == 'table' and not is_staged(source) and not is_pack(source) then
+                -- a compile-time table (a vocabulary): its string keys, in order
+                local keys = {}
+                for k in pairs(source) do if type(k) == 'string' then keys[#keys + 1] = k end end
+                table.sort(keys)
+                entries = {}
+                for _, k in ipairs(keys) do entries[#entries + 1] = { k, source[k] } end
+            else
+                records = true
+                entries = h.record_fields(source)
+            end
+            for _, fv in ipairs(entries) do
                 local name = fv[1]
                 if spread_from[name] then
                     fail(("spread-overlap: field '%s' comes from two spreads"):format(name), 2)
@@ -5865,7 +6025,38 @@ function S.keyed(items)
             end
         end
     end
+    -- only compile-time tables spread: the result is one too
+    if not records then return fields end
     return setmetatable({ fields = fields, names = names }, Keyed)
+end
+
+-- `{ ..a, name = v, ..b }` arrives as a table whose spreads sit under marked keys, numbered in
+-- source order (macro/nua.lua); the rest are its fields
+h.spread_marks = {}
+function S.spread_mark(n)
+    local m = h.spread_marks[n]
+    if not m then
+        m = setmetatable({ spread = n }, { __tostring = function() return '..' end })
+        h.spread_marks[n] = m
+    end
+    return m
+end
+h.is_spread_mark = function(k) return type(k) == 'table' and h.spread_marks[rawget(k, 'spread') or 0] == k end
+function S.keyed_table(t)
+    local spreads, items = {}, {}
+    for k, v in pairs(t) do
+        if h.is_spread_mark(k) then
+            spreads[#spreads + 1] = { k.spread, v }
+        elseif type(k) == 'string' then
+            items[#items + 1] = { 'field', k, v }
+        else
+            fail('spread-context: a keyed spread admits only `name = value` items and spreads', 2)
+        end
+    end
+    table.sort(spreads, function(a, b) return a[1] < b[1] end)
+    table.sort(items, function(a, b) return a[2] < b[2] end)
+    for _, s in ipairs(spreads) do items[#items + 1] = { 'spread', s[2] } end
+    return S.keyed(items)
 end
 
 -- opening: names introduced by a context -----------------------------------------------------------
@@ -6015,7 +6206,17 @@ function S.constructor(t, name)
     local c = constructors[t][name]
     if c then return c end
     local pt = alt.type
-    if pt.kind == 'unit' then
+    if pt.resizable then
+        -- a payload holding owners: a named owner moves in, a fresh one is built there (§5.9)
+        c = function(x)
+            if not is_staged(x) and type(x) == 'table' and pt.kind == 'struct' then x = pt(x) end
+            if is_value(x) and x.k == 'ref' then x = x.place end
+            if not ((is_place(x) or is_value(x)) and x.T == pt) then
+                fail(('payload of %s.%s: expected a %s, got %s'):format(t.display, name, pt.display, describe(x)), 2)
+            end
+            return sumv(t, name, x)
+        end
+    elseif pt.kind == 'unit' then
         c = function(...)
             if select('#', ...) > 0 then
                 fail(('%s.%s takes no payload: %s.%s()'):format(t.display, name, t.display, name), 2)
@@ -6043,6 +6244,17 @@ h.payload_of = function(e, alt)
     return { op = 'field', a = { op = 'field', a = e, name = 'as' }, name = alt.name, T = alt.type }
 end
 
+-- run body in a branch taken when the sum place holds that variant (a release: no join)
+function S.when_variant(place, alt, body)
+    local b = cur()
+    if b.dead then return end
+    if checked_root(place) then place = b:resolve_checked(place) end
+    local cond = { op = 'cmp', o = 'eq', a = h.tag_of(read_expr(place)), T = types.Bool,
+                   b = { op = 'tagname', sum = place.T, alt = alt.name, T = types.U32 } }
+    local blk = b:sub(body, copy(b.state), 'dyn')
+    b:emit { op = 'if', c = cond, a = blk, b = {} }
+end
+
 -- matching is keyed application of a sum value: one handler per alternative
 h.match_handlers = function(t, handlers)
     if type(handlers) ~= 'table' or is_staged(handlers) or getmetatable(handlers) then
@@ -6066,6 +6278,10 @@ h.match_handlers = function(t, handlers)
             fail(("the handler for '%s' is not callable"):format(alt.name), 4)
         end
         if alt.type.kind == 'unit' then return h() end
+        if alt.type.resizable and not (place and S.handler_wants_ref(h, alt)) then
+            fail(("the payload of '%s' holds owners: its handler takes it by reference, do(p: Ref %s)"):format(
+                alt.name, alt.type.display), 4)
+        end
         -- a handler declaring `Ref P` borrows the payload of the sum place
         -- being matched (design memory.md §4); any other receives a copy
         if place and S.handler_wants_ref(h, alt) then return h(ref(S.payload_place(place, alt))) end
@@ -6098,6 +6314,7 @@ end
 
 local function match(s, handlers)
     local place
+    if is_value(s) and s.k == 'ref' and s.T.elem.kind == 'sum' then s = s.place end
     if is_place(s) then
         -- a payload borrowed in place needs the sum in memory
         local t = s.T
@@ -6105,7 +6322,14 @@ local function match(s, handlers)
             if type(handlers) == 'table' and S.handler_wants_ref(handlers[alt.name], alt) then place = s end
         end
         if place then cur():escape(place) end
-        s = cur():read(s)
+        -- a sum holding owners is matched where it is: its tag is read, its payload lent
+        if s.T.resizable then
+            if checked_root(s) then s = cur():resolve_checked(s) end
+            place = s
+            s = dyn(s.T, read_expr(s))
+        else
+            s = cur():read(s)
+        end
     end
     local t = s.T
     local call = h.match_handlers(t, handlers)
@@ -6115,7 +6339,7 @@ local function match(s, handlers)
     end
     -- a runtime tag: a test per alternative, the payload projected in its arm
     local b = cur()
-    local v = b:bind(s)
+    local v = t.resizable and s or b:bind(s)
     local e = ex(v)
     local desc = { kind = 'word', name = 'match on ' .. t.display, infer = true, body = function()
         local function arm(i)
@@ -6283,10 +6507,22 @@ function S.global(t, opts)
     if not is_type(t) then fail('global(T, opts) takes a type, got ' .. describe(t), 2) end
     -- handles are generational, so a stale Chan or Pool in a global traps at
     -- its next use and never reaches freed memory (design memory.md §15 D3)
-    if t.resizable or t.kind == 'unit' or t.kind == 'opaque' then
+    if t.kind == 'unit' or t.kind == 'opaque' then
         fail('global: a ' .. t.display .. ' cannot be static storage', 2)
     end
     opts = opts or {}
+    -- an owner global (design memory.md §5.10): its stacks are the first of the main
+    -- thread's, reserved for it; it is set up where it is first used
+    if t.resizable then
+        if t.kind == 'sum' then fail('global: a ' .. t.display .. ' (a sum holding owners) cannot be a global yet', 2) end
+        if opts.exported or opts.imported or opts.thread_local or opts.shared or opts.init ~= nil then
+            fail('global: an owner global takes only a name', 2)
+        end
+        local g = { T = t, name = opts.name or 'global', owner = true, first = module.owner_global_stacks or 0 }
+        module.owner_global_stacks = g.first + S.owner_stack_count(t)
+        local pt = types.ptr(t)
+        return dyn(pt, { op = 'gaddr', global = g, T = pt })
+    end
     if (opts.exported or opts.imported) and not opts.name then fail('global: an exported or imported global needs a name', 2) end
     if opts.exported and opts.imported then fail('global: a global is exported or imported, not both', 2) end
     if opts.init ~= nil and not (types.is_scalar(t) and type(opts.init) == 'number') then
@@ -6378,9 +6614,24 @@ local function __index(pv, iv, elem)
                        name = 'element', id = uid() }
 end
 
+-- the place of an owner global, without setting it up
+function S.global_place(g)
+    local place = __index(dyn(types.ptr(g.T), { op = 'gaddr', global = g, T = types.ptr(g.T) }), known(types.U64, 0), g.T)
+    rawset(place, 'owner_global', g)
+    return place
+end
+
 function member_ptr(x, key)
     local pv = ptr_value(x)
     local elem = pv.T.elem
+    -- an owner global is set up at its first use, by the main thread
+    local base = ex(pv)
+    if base.op == 'gaddr' and base.global.owner then
+        S.ensure_owner_global(base.global)
+        local place = S.global_place(base.global)
+        if type(key) == 'number' or is_staged(key) then return place end
+        return S.dot(place, key)
+    end
     if type(key) == 'number' or is_staged(key) then
         local place = __index(pv, index_value(key), elem)
         -- elements of a pointer attached to an owner (borrows) belong to it
@@ -6407,7 +6658,10 @@ function S.Ptr(x)
     else
         fail('Ptr(...) takes a type or a place (a typed local, a field, an element), got ' .. describe(x), 2)
     end
-    if place.T.resizable then
+    -- an owner held in a place moves only by reference; an element already reached through
+    -- a pointer (an owner inside a container, design memory.md §5.9) has an address like
+    -- any element, under the programmer's contract that Ptr always carries
+    if place.T.resizable and root_of(place).pk ~= 'deref' and root_of(place).pk ~= 'index' then
         fail(('Ptr(...) of a %s: resizable storage moves only by reference'):format(place.T.display), 2)
     end
     local b = cur()

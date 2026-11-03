@@ -217,4 +217,32 @@ status, output = command(quote(failure))
 check('ordinary compilation also rejects failed tests', status == 1
     and output:find('CLI assertion', 1, true), output)
 
+-- compile-time tables (syntax §10.7): define builds one, keyed spread extends it
+local vocab_ok, vocab_err = pcall(compile, [[
+local base = define with
+    add = do(a: U32, b: U32): U32 return a + b end
+    scale = 2
+end
+local more = define with
+    ..base
+    scale = 3
+    triple = do(a: U32): U32 return a * 3 end
+end
+assert(more.scale == 3 and base.scale == 2 and more.add == base.add)
+local plain = { ..base, extra = true }
+assert(plain.extra and plain.scale == 2)
+local f = do(x: U32): U32 return more.add(x, more.scale) + more.triple x end
+export f
+]])
+check('define and keyed spread build compile-time tables', vocab_ok, vocab_err)
+reject('two spreads giving one key', [[
+local a, b = define { k = 1 }, define { k = 2 }
+local c = { ..a, ..b }
+]], { "spread-overlap: field 'k' comes from two spreads" })
+
+reject('a duplicated field beside a spread', [[
+local a = define { k = 1 }
+local c = { ..a, x = 1, x = 2 }
+]], { "duplicate field 'x'" })
+
 print(('%d compile-time test checks passed'):format(passed))

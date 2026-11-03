@@ -2,7 +2,7 @@
 
 **Status: a guide to designing and writing programs in Nua, beside [the language](syntax.md) and [the compiler](architecture.md), which own the rules.** It follows Let's guide, *Designing and writing Let*, and keeps what transfers. Where Nua differs, it says how and why.
 
-This guide is about discovering a good program, not deriving one mechanically from the language's philosophy. Nua's mechanisms inform the questions (§1); requirements, diagrams, experiments and code help answer them. Its centre is the **activity**: bounded work with someone responsible for setup and completion. Inside an opened context, an **instruction** is a call without a receiver (§6). The same composition, run while compiling, builds descriptions and types (§6.10).
+This guide is about discovering a good program, not deriving one mechanically from the language's philosophy. Nua's mechanisms inform the questions (§1); requirements, diagrams, experiments and code help answer them. Its centre is the **activity**: bounded work with someone responsible for setup and completion. Inside an opened context, an **instruction** is a call without a receiver (§6). The same composition, run while compiling, builds descriptions and types (§6.10). Design is **structural by default**: things are grouped and composed by name, as vocabularies, and given a nominal type with a layout when the program demands one (§4).
 
 * **Part I** is a design process: ten questions to revisit as the design develops, with diagrams that help expose decisions and a small worked investigation.
 * **Part II** is about writing words.
@@ -16,11 +16,13 @@ Every `lua` block below is an excerpt of [`examples/guide.nua`](../examples/guid
 |---|---|
 | `local f = do(x: T): R ... end`, `do(x: T): R = e` | typed words: compiled to native code |
 | `function T:m(...): R ... end` | methods: the receiver is `self`, a reference |
-| `Struct { ... }`, `Sum { ... }` | records and sums |
+| `Struct { ... }`, `Sum { ... }` | records and sums: a layout, where one is needed (§4.2) |
 | `s { name = do(p) ... end, name(p) = e }` | matching a sum: one handler per alternative |
 | untyped parameters, `f known` | compile-time parameters, partial application |
 | `f "lit"`, `f 1 2`, `f x do ... end` | literal application and saturating chains |
 | `do(ctx..)`, `do(..)`, `local ctx.. = e` | opening a record or a vocabulary; `do(..)` leaves it unnamed |
+| `define with ... end`, `define { ... }` | a vocabulary: names bound while compiling, with no layout (§4.1) |
+| `{ ..base, name = v }`, `..base` in a `with` block | keyed spread: a vocabulary or a record extended, entries overriding |
 | `insert n`, `note 1` inside an opened block | instructions: calls the innermost opened receiver resolves (§6.3) |
 | `keymap do(..) bind "h" (...) end` | a builder: an activity run while compiling that returns a description or a type (§6.10) |
 | `endall` | closing a spine of trailing blocks |
@@ -48,6 +50,7 @@ These language properties make certain design practices especially useful. They 
 | Principle | What it asks of you |
 |---|---|
 | **Binding time is the centre.** Pure known work can run while specializing. | Preserve known descriptions (§3); an engine over a known description can lose its interpreter (§17). Choose optional start-up compilation deliberately. |
+| **Name structurally; lay out on demand.** A vocabulary groups names while compiling and costs nothing at run time; a type commits a layout. | Start with vocabularies and compose them; introduce a `Struct`, a `Sum` or an owner when something must exist at run time, carry an invariant or have an identity (§4.2). |
 | **A word is evaluated in place.** Ordinary application needs no runtime closure or call boundary. | Write words at the size the meaning wants (§15). Activities add no callback dispatch, but their work and storage may remain (§6). |
 | **Ownership is lexical.** Scopes own values; stores own slots. | Identify owners and distinguish identity from borrowed access (§5); make each borrow's valid lifetime clear. |
 | **The residual work is inspectable.** Generated C exposes operations and calls to mechanisms. | Read the C (§11.1); inspect reached library/runtime code when needed, and state costs, failures and lifetimes in contracts. |
@@ -76,7 +79,7 @@ flowchart TD
 |---|---|---|---|
 | 0. Frame | What is the job? | inputs, outputs, scale, failures, constraints; actor/use-case sketch | success and unacceptable outcomes have concrete examples |
 | 1. Binding times | What is known when? | availability and change frequency in lanes | known information has a path to its use; specialization choices have a reason |
-| 2. Values and outcomes | What does the program talk about? | records, sums and example values | alternatives, payloads and caller decisions are explicit |
+| 2. Names, values and outcomes | What does the program talk about, and what must exist at run time? | vocabularies first; records and sums with example values for what a trigger demands | the vocabulary reads; each nominal type names its trigger; alternatives, payloads and caller decisions are explicit |
 | 3. Ownership | Who owns what, and what is each relationship? | class/ownership diagram with labelled arrows | mutable storage has an owner and borrowed access has a valid lifetime |
 | 4. Activities | What bounded work happens, and what is said inside it? | sequence and activity diagrams; context vocabulary | setup, normal completion and rejection each have a responsible participant |
 | 5. States | What has a lifecycle? | state diagram or state/event table | legal transitions and invalid combinations are accounted for |
@@ -119,6 +122,8 @@ flowchart TD
 
 *This activity diagram is a behavior view: boxes are work, the diamond is a decision, and the two exits are distinct completion paths. The implementation uses a body outcome to choose them.*
 
+Then separate names from layout (§4). The verbs the body speaks (`insert`, `move_left`) are names: nothing about them must exist at run time, so they can start as a vocabulary. The document must be laid out: it persists across calls, so it is a `Struct`. The draft is laid out for a different reason: it carries an invariant, since only acceptance may copy it back, so it becomes a type whose activity guards the commit. Each nominal type in the example has a trigger, and later steps refer to it.
+
 Now revisit the other questions. The count and cap may be runtime inputs; making the cap a compile-time parameter is not required. The body needs `commit` or `abort` with the rejected length, while this caller needs only a `Bool`. There is one document owner and no concurrent work, so a task diagram adds nothing here. The sequence diagram in §6.1 will make the participant responsibilities explicit; §6.6 supplies the implementation; §11 returns to acceptance and rejection tests. The other examples show decisions this small frame does not need: persistent IDs, lifecycle states, builders and task groups.
 
 ### 2.3 Revisit and record
@@ -146,7 +151,7 @@ Start by separating when information becomes available from how often it changes
 | **steady state** | documents, connections, user data | runtime values |
 | **per event** | a keystroke, a request, a line | runtime values, the hot path |
 
-Preserve information already known while compiling: pass a Lua table, a known native value or an untyped parameter where appropriate. For start-up information, choose whether to keep it as runtime data or compile a specialization in the hosting Lua process. Availability makes specialization possible; reuse, code size and compilation cost decide whether it is worthwhile.
+Preserve information already known while compiling: pass a vocabulary (§4.1), a known native value or an untyped parameter where appropriate. For start-up information, choose whether to keep it as runtime data or compile a specialization in the hosting Lua process. Availability makes specialization possible; reuse, code size and compilation cost decide whether it is worthwhile.
 
 ```mermaid
 flowchart LR
@@ -169,11 +174,132 @@ flowchart LR
 
 **Where specializing pays.** Look first at **data that drives control flow**: programs, grammars, schemas, protocols, key maps and state machines. A known scalar can simplify an expression; a known description can remove an interpreter. Neither guarantees a speedup for the complete program. Measure compilation cost, generated size, expected reuse and runtime work on the actual workload before choosing start-up specialization (§11).
 
-## 4. Step 2: values and outcomes
+## 4. Step 2: names, values and outcomes
 
-### 4.1 Values first
+Design structurally by default: `define` everywhere, and a struct only when the program demands one. Name things first; give a grouping a type with a layout when a trigger (§4.2) prompts it. The program discovers which groupings those are as it is built; nothing has to be laid out in advance.
 
-Use scenarios to find the values: what must be stored, replayed, logged, undone or tested independently of the action that produced it? Model those things as data, and revise the records and sums as their behavior becomes clearer:
+### 4.1 Name first
+
+Start with names. While the design is being discovered, group things **by name**, not by layout: a vocabulary built with `define` binds names to words, values, types or other vocabularies while compiling. It has no layout, no field order and no run-time existence, so renaming, splitting and recombining stay cheap, and the parts show what they are by being used:
+
+```lua
+-- vocabularies: names bound while compiling, with no layout
+local Moves = define with
+    left = do(document: Ref Document): Unit
+        if document.cursor > 0 then document.cursor = document.cursor - 1 end
+    end
+    right = do(document: Ref Document): Unit
+        if document.cursor < document.length then document.cursor = document.cursor + 1 end
+    end
+end
+local Edits = define with
+    insert = do(document: Ref Document, n: U32): Unit
+        document.length = document.length + n
+        document.cursor = document.cursor + n
+    end
+end
+
+-- capabilities compose by spread; two that both offer a name are rejected
+local Editing = define with
+    ..Moves
+    ..Edits
+end
+```
+
+`define` is the identity; what it means comes from where it sits. `with` supplies keyed entries, an untyped parameter is a compile-time parameter, and keyed spread composes (syntax §10.7): explicit entries override, and two spreads that offer the same name are rejected rather than silently shadowing. A word takes a vocabulary as an untyped parameter and specializes against its members, or opens it:
+
+```lua
+-- a word that takes a vocabulary specializes against its members
+local type_and_step_back = do(ops, document: Ref Document, n: U32): Unit
+    ops.insert document n
+    ops.left document
+end
+local type_back = do(document: Ref Document, n: U32): Unit
+    type_and_step_back Editing document n
+end
+export type_back
+
+-- opening a vocabulary brings its names into scope
+local type_twice = do(document: Ref Document, n: U32): Unit
+    local Editing..
+    insert document n
+    insert document n
+end
+export type_twice
+```
+
+No table and no dispatch remain:
+
+```c
+void type_back(Document *document, uint32_t n) {
+    document->length = document->length + n;
+    document->cursor = document->cursor + n;
+    if (document->cursor > 0u) {
+        document->cursor = document->cursor - 1u;
+    }
+}
+```
+
+A vocabulary may hold runtime values too. It groups them by name without inventing a struct: the values stay separate native values, as if their struct had already been taken apart:
+
+```lua
+-- discovered as names: two runtime values that travel together through in-place words
+local remaining = do(document: Ref Document): U32
+    local span = define { start = document.cursor, stop = document.length }
+    return span.stop - span.start
+end
+export remaining
+```
+
+```c
+uint32_t remaining(Document *document) {
+    return document->length - document->cursor;
+}
+```
+
+A structural type carries its defaults: its values are the default of each member, and an instance is the type spread with overrides. No constructor, defaults table or prototype mechanism is needed, and an instance can serve as the type of further instances:
+
+```lua
+-- a structural type carries its defaults; an instance is the type spread with overrides
+local Margins = define { left = 4, right = 4 }
+local wide = define { ..Margins, right = 12 }
+local text_width = do(document: Ref Document): U32
+    return document.length - wide.left - wide.right
+end
+export text_width
+```
+
+```c
+uint32_t text_width(Document *document) {
+    return document->length - 4u - 12u;
+}
+```
+
+When the shape must be laid out (§4.2), the struct is filled from it, `MarginBytes { ..wide }`: the meaning, names and defaults, was defined once; the struct adds only the arrangement. Overrides are explicit fields, never a second spread: two spreads that offer one name are rejected, an explicit field wins by intent.
+
+### 4.2 Lay out on demand
+
+**A struct is a layout primitive, not a semantic product.** It says how bytes are arranged: field order, sizes, alignment, a C name. The meaning of a grouping (what its parts are called, what they do, how they compose) lives in names, and a vocabulary carries it without committing any bytes. A struct used only inside words evaluated in place never reaches the C anyway: the evaluator keeps it as separate field values, so its layout was never used. Structural design keeps only the layout the program needs, and every struct that remains marks a place where bytes really are arranged: a container element, a message, an ABI, a word compiled on its own.
+
+A grouping becomes a nominal type (a `Struct`, a `Sum`, an owner) when a trigger appears, and only then. The trigger is the reason the type exists; name it when you introduce one. A program can be written to meet only the unavoidable triggers: its own groupings stay vocabularies, its run-time data are scalars, library owners and the structs an outside ABI imposes (a `cstruct` from a C header), and it declares a struct of its own only when it must store its own records:
+
+| Trigger | Why names are not enough | Introduce |
+|---|---|---|
+| it must exist at run time as one thing: stored in a container, sent to a task, kept in a global, passed across a word compiled on its own (`call`, recursion, `export`) | a vocabulary exists only while compiling | a `Struct` or a `Sum` |
+| it carries an invariant: fields only certain verbs may change | a vocabulary's entries are open | a type whose methods guard its fields |
+| it has an identity or owns storage | identity and ownership are nominal by nature | an entity in a `Store` named by an `Id`, or an owner |
+| its misuse should be reported where it is declared | a structural mistake surfaces deep inside the generic word that uses it | a named type: `Point has no field 'z'` |
+| it is a contract with the outside | C needs a fixed layout | an exported struct, a `cstruct` |
+
+Promotion is mechanical, because the structural phase found the names: value entries become fields, in an order now chosen deliberately; word entries become methods; uses such as `span.stop` read the same.
+
+```lua
+-- promoted when it must be stored: now it needs a layout
+local Span = Struct { start: U32, stop: U32 }
+local Selections = Struct { spans: Grow Span }
+```
+
+Scenarios show which groupings meet a trigger: what must be stored, replayed, logged, undone or tested independently of the action that produced it? Those are the program's values, and they exist at run time, so they get a layout. A command that a key press produces, a log records and a replay re-applies is such a value:
 
 ```lua
 local Direction = Sum { left: Unit, right: Unit }
@@ -182,9 +308,14 @@ local Command = Sum { move: Direction, insert: U32, undo: Unit, quit: Unit }
 
 Commands as data give replay and tests a shared input, and (§17) they give specialization something to work with. Undo also needs enough history to reverse an operation; naming an `undo` command alone does not provide it. In this guide, `Document` tracks counts rather than actual text or undo history.
 
-### 4.2 Outcomes and failures
+**Closed sets and open sets.** A `Sum` is a closed set: its alternatives are fixed where it is declared, a match handles each one, and adding an alternative makes the compiler point to every match that must learn it. Use it where completeness is part of the meaning: a connection's states, an operation's outcomes, the commands an editor understands. A vocabulary of known values is an open set: an enumeration is names for codes (`define { get = 1, post = 2 }`, §6.11), its codes fold where they are used, and anyone may extend it by spread, so code that meets an unknown member needs a default. Use it where extension is expected: protocol methods, opcodes, tokens, plugin points. Ask whether someone else may legitimately add a member: if so, keep the set open; if adding one should make every user reconsider, close it. A `Sum` whose tag is known folds away as well, so choose by meaning, not by cost; a payload, or a variant that exists at run time, needs the `Sum`.
 
-Use a sum when alternatives carry different data or require distinct handling, and match it exhaustively. A predicate can return `Bool`; a named sum makes a richer protocol explicit. Do not encode absence as a magic value:
+
+Composing vocabularies structurally does not make types structural: a `Struct` stays nominal and ordered, and a `with` block stays keyed and unordered. A vocabulary that describes a structure (an interface, a capability set, a namespace) is capitalized like a type, `Editing`; one that holds data is lowercase, `config`, `span` (§19).
+
+### 4.3 Outcomes and failures
+
+An outcome a caller acts on is a value that crosses a word's boundary, so it is typed: use a sum when alternatives carry different data or require distinct handling, and match it exhaustively. A predicate can return `Bool`; a named sum makes a richer protocol explicit. Do not encode absence as a magic value:
 
 ```lua
 local Found = Sum { found: U64, missing: Unit }
@@ -218,24 +349,27 @@ A compile-time error is reported even in an arm that dynamic control may never r
 
 ## 5. Step 3: ownership
 
+Ownership concerns what has been laid out (§4.2). A vocabulary owns nothing and lives only while compiling; storage, identity and lifetimes begin where a grouping became a value, an entity or an owner.
+
 ### 5.1 Roles and relationships
 
 **Distinguish domain roles from storage and binding time.** These labels answer different questions and can overlap: the document is an entity in the design, but its small record representation is copyable. A description can itself contain known native values.
 
 | Role | What it is | Nua forms |
 |---|---|---|
+| **vocabulary** | names bound while compiling, with no layout (§4.1) | `define with ... end` |
 | **value** | copied freely; owned by whoever holds it | `Struct`, `Sum`, `Array`, `Chars n` |
 | **entity** | has identity across operations; independently recyclable entities can live in a store | a scope-owned record, or a struct in a `Store T` named by an `Id` |
-| **owned** | resizable storage, created in place, accessed through `Ref`, not copied or moved by value | `Store`, `Grow`, `Text`, `Map`; a struct holding one (a ring buffer) |
+| **owned** | resizable storage, created in place, moved at its last use, duplicated only by `copy`, lent through `Ref` | `Store`, `Grow`, `Text`, `Map`; a struct, sum or `Array(T, n)` holding one; an element holding one (`Store(Player)` with a `name: Text`) |
 | **view** | a window on someone else's storage, valid within its owner's lifetime and borrowing rules | `Slice`, `Str` |
 | **handle** | a small name for runtime-owned state; transfer rules depend on its kind | `Chan`, `Pool`, `Slot` |
-| **description** | known while compiling; shapes the code | a Lua table, a known value |
+| **description** | known while compiling; shapes the code | a vocabulary, a Lua table, a known value |
 
 **Label storage and communication relationships explicitly:**
 
 | Arrow | Meaning | Nua form |
 |---|---|---|
-| **field** | owns | a struct field (trees are fields) |
+| **field** | owns | a struct field (trees are fields), or an owner inside an element (its bytes live in the container's arenas) |
 | **name** | identifies without owning | an `Id T` (graphs are stores) |
 | **borrow** | uses for a valid bounded lifetime | a `Ref T` parameter, or borrowed access supplied by an activity |
 | **message** | crosses a task boundary | a channel (copies) or a pool slot (moves) |
@@ -287,9 +421,25 @@ end
 ```
 
   `outline.headings[id]` is a place, checked at every use. Nothing holds its address past the stretch it was found in, so the store may grow between two uses.
+* **An entity may own storage of its own.** An element may hold owners: each note's title is a `Text` in the store's arena, grown in place or moved when it outgrows its room (syntax §9.13):
+
+```lua
+-- an owner inside an element: each note's title lives in the store's arena
+local Note = Struct { title: Text, words: U32 }
+local notes_demo = do(n: U32): U64
+    local notes = Store(Note) {}
+    local first = notes:add Note { words = n }
+    notes[first].title:write "draft "
+    notes[first].title:write n
+    return notes[first].title:str().length
+end
+export notes_demo
+```
+
+  Growing an owner inside an element may move its bytes, so a borrow of its contents (`notes[first].title:str()`) ends there; a top-level owner never moves. Removing an element leaves its owners' bytes dead until the container compacts, which the removal does when they reach the live bytes. Moving an owner into an element copies its bytes once; a constructor builds it in place.
 * **A name is not the thing it names.** A `Ref` provides borrowed access; an `Id` identifies a slot without owning it. Sending a pool `Slot` transfers ownership: copying its bits does not duplicate permission to use the buffer.
-* **Aggregates hold no references.** A struct cannot contain a `Ref`, a `Slice` or a `Str`; long-lived relationships are `Id`s.
-* **Lua tables are for compile time.** Open, dynamic data is a Lua table while compiling. At run time, data has a shape.
+* **A stored borrow must not outlive its owner.** A struct field, an element or a payload may hold a `Ref`, a `Slice` or a `Str`, checked by the lifetime rule (syntax §9.5); a long-lived relationship between entities is an `Id`.
+* **Vocabularies and Lua tables are for compile time.** Open, keyed data is a vocabulary while compiling (§4.1). At run time, data has a shape.
 
 ## 6. Step 4: activities
 
@@ -559,30 +709,32 @@ If the draft also had a `note`, the draft's would win: the innermost context alw
 
 ### 6.9 Design the context's vocabulary
 
-The context type is the vocabulary of its block. Design it the way you would design a small language for that purpose:
+A context's vocabulary is the language of its block. Start it as names: the verbs a body needs, assembled from small capability vocabularies (§4.1), opened by the activity. Give the context a nominal type when it holds state with an invariant, as `Draft` does (only acceptance commits it): its fields are then guarded by its methods, and the capability vocabularies supply the verbs that need no guarded state. Design it the way you would design a small language for that purpose:
 
 * **Verbs for what happens**, as methods: `insert`, `move_left`, `note`. Put invariant-preserving changes behind these verbs; public fields do not enforce that discipline for you.
 * **Fields for what the block reads**: `cursor`, `length`. If callers repeatedly need to change a field directly, ask which operation is missing. Document which representation fields only the vocabulary should write.
 * **One context per purpose.** Repeatedly reaching around a context suggests a missing verb or mixed responsibilities (§2.3). Ordinary local computation and deliberate calls to other words are not forbidden.
 * **Outcomes for how it can end** (§6.6), named for what happened.
 * **Names that read in the block**: an instruction is read without its receiver, so `insert n` must say everything `draft:insert(n)` said.
+* **Words own their parameter roles; vocabularies compose words, not parameter lists.** An instruction usually takes one operand, because the opened context supplies its subject: `insert n`, `remove selection`. Several parameters are right when the operation relates distinct roles (`replace range text`, `connect parent child`), and those roles belong to that word alone. Do not impose one parameter convention across a vocabulary: two vocabularies compose by spread whatever their words' arities, and computations compose through results bound to locals. A role that is known configuration can be applied away (`encode message_format`).
+* **Compose capabilities rather than growing one type.** Verbs that do not need the context's fields can live in small vocabularies (`Moves`, `Edits`) assembled by spread (§4.1). An activity opens the composed vocabulary; it needs no nominal interface merely to recognize the operations it uses. Keep verbs that preserve the context's invariant as its methods.
 
 ### 6.10 Builders: activities while compiling
 
-A **builder** is an activity whose context is a vocabulary, a Lua table, and whose completion returns a description or a type. Each invocation runs while the program is built: the block's instructions declare things, and the builder collects them. There is no runtime builder dispatch; the description and any words or values it retains may shape the residual program. Opening supplies the vocabulary without a current-builder global or an interface argument on every instruction.
+A **builder** is an activity whose context is a vocabulary (§4.1) and whose completion returns a description or a type. Each invocation runs while the program is built: the block's instructions declare things, and the builder collects them. There is no runtime builder dispatch; the description and any words or values it retains may shape the residual program. Opening supplies the vocabulary without a current-builder global or an interface argument on every instruction.
 
 ```lua
 -- a builder: the block declares, the builder returns a description
 local keymap = function(body)
     local bindings = {}
-    local vocabulary = {
+    local Keys = define with
         bind = function(key)
             return function(command)
                 bindings[#bindings + 1] = { code = key:byte(), .command }
             end
-        end,
-    }
-    body vocabulary
+        end
+    end
+    body Keys
     return bindings
 end
 
@@ -633,6 +785,163 @@ What a builder's vocabulary offers, and how to design one:
 * **Keep builders pure** (§9.3): they build descriptions; engines, which are words, do the work.
 
 A builder is "describe, then run" (§17) with a syntax that reads like the domain. The UI library is the full example: a component is declared with a builder, its events become a sum, and its layout, routing and drawing are generated over the known tree ([UI components](ui-components.md), [UI style](ui-style.md)).
+
+### 6.11 Designing a DSL
+
+A DSL in Nua is not a parser. It is a vocabulary, a description and an engine, arranged so the user writes sentences of the domain and the compiler is left with only the work those sentences mean. Design it in this order.
+
+**1. Choose the kind of each phrase by its binding time.**
+
+| Kind | Runs | Built from | Example |
+|---|---|---|---|
+| instruction DSL | when the program runs | an activity that opens a context; the body speaks instructions (§6.3) | editing, transactions, I/O |
+| declarative DSL | while compiling | a builder that returns a description or a type (§6.10) | key maps, routes, UI, protocols |
+| data DSL | while compiling | a vocabulary (§4.1) | configuration, tokens, tables of constants |
+| syntax | while compiling | a macro | only for genuinely new grammar; last resort |
+
+Most DSLs mix them: a declarative front end describes, an engine runs, and its handlers are instruction blocks.
+
+**2. Design from the sentences.** Write the text the user should write before anything else, then derive the vocabulary from it: verbs become instructions, nouns become declared parts or tokens, qualifiers become properties or stacked policy activities (§6.7), alternatives become sums. A sentence that does not read is a vocabulary problem; parentheses or a new syntax will not fix it (§19). For a router, the sentence is `get "/":` followed by what the route does: the HTTP methods are the verbs.
+
+**3. Layer it structurally, and type what must exist at run time.** The words and tokens of a DSL are vocabularies: structural, composable, free of layout. What runs is nominal: here the request is a `Struct`, because it exists at run time and crosses into the program. The methods are a vocabulary of known values:
+
+```lua
+-- the methods a router speaks: a structural vocabulary of known values
+local Methods = define { get = 1, post = 2 }
+```
+
+**4. Make the builder check its sentences, and report at the user's line.** A structural mistake surfaces late, deep in an engine; a DSL feels like a language when a bad sentence is rejected where it is written. Validate while building, and give `fail` the level of the line that spoke the instruction:
+
+```lua
+-- the builder: one verb per method; sentences in, a checked description out
+local router = function(Verbs)
+    return function(body)
+        local routes, seen = {}, {}
+        local Routing = {}
+        for name, code in pairs Verbs do
+            Routing[name] = function(path)
+                -- level 3: the error names the line that spoke the route
+                if type path ~= "string" or path:sub(1, 1) ~= "/" then
+                    __S.fail(name .. ": a path starts with '/', got " .. tostring path, 3)
+                end
+                if seen[name .. path] then __S.fail(name .. " " .. path .. " is declared twice", 3) end
+                seen[name .. path] = true
+                return function(handler) routes[#routes + 1] = { method = code, .path, .handler } end
+            end
+        end
+        body Routing
+        return routes
+    end
+end
+local routes = router Methods
+```
+
+`get "notes"` is rejected at its own line, `get: a path starts with '/', got notes`; a second `post "/"` is rejected at the second one. The builder makes its verbs from the vocabulary it is given (one verb per method), so the vocabulary decides what can be said.
+
+**5. Treat the description as the interface.** The builder's result is keyed data, and the engine depends only on it. Keep it structural while only the engine reads it while specializing; promote it to a nominal type (a `Sum` of commands, a `Grow` of records) when it must exist at run time (§4.2, §17). Several front ends can then feed one engine: a builder, a file read at start-up, a test.
+
+```lua
+-- the engine over the description: one test per route, each handler inlined
+local dispatch = do(table, request: Request): U32
+    for _, r in ipairs table do
+        if request.method == r.method and request.path:equals r.path then
+            return r.handler request
+        end
+    end
+    return 404
+end
+```
+
+**6. Let handlers be instruction blocks.** A colon block with no names opens what it is given, so a handler speaks the request's fields directly, as an activity body speaks its context's (§6.4):
+
+```lua
+-- the sentences: each handler opens the request it is given
+local site = routes:
+    get "/":
+        return 200
+    end
+    post "/notes":
+        return 200 + U32 path.length
+    end
+end
+
+local handle = do(method: U8, path: Str): U32
+    return dispatch site Request { .method, .path }
+end
+export handle
+```
+
+The description is known, so the engine dissolves: one test per route, the known paths compared byte by byte, each handler inlined:
+
+```c
+uint32_t handle(uint8_t method, Str path) {
+    bool both;
+    bool r;
+    bool same;
+    bool both2;
+    bool r2;
+    bool same2;
+    if (method == 1u) {
+        if (path.len != 1ull) {
+            r = false;
+            goto L1;
+        }
+        same = path.ptr[0ull] == 47u;
+        r = same;
+    L1:;
+        both = r;
+    } else {
+        both = false;
+    }
+    if (both) {
+        return 200u;
+    }
+    if (method == 2u) {
+        if (path.len != 6ull) {
+            r2 = false;
+            goto L2;
+        }
+        same2 = path.ptr[0ull] == 47u;
+        same2 = same2 && path.ptr[1ull] == 110u;
+        same2 = same2 && path.ptr[2ull] == 111u;
+        same2 = same2 && path.ptr[3ull] == 116u;
+        same2 = same2 && path.ptr[4ull] == 101u;
+        same2 = same2 && path.ptr[5ull] == 115u;
+        r2 = same2;
+    L2:;
+        both2 = r2;
+    } else {
+        both2 = false;
+    }
+    if (both2) {
+        return 200u + (uint32_t)path.len;
+    }
+    return 404u;
+}
+```
+
+**7. Test the description where it is built.** It is data, so a compile-time assert checks it without running anything; golden C (§11.1) checks what the engine makes of it:
+
+```lua
+-- the description is data: test it while compiling
+assert(#site == 2 and site[2].path == "/notes")
+```
+
+**8. Compose by spread.** A dialect is the same builder over an extended vocabulary; a user extension overrides entries instead of forking the DSL, and the overlap rule turns two extensions defining one name into an error. Two DSLs used in one block must not compete for generic names: qualify a homonym rather than letting one shadow the other (§19):
+
+```lua
+-- a dialect: the same builder over a vocabulary extended by spread
+local Dav = define { ..Methods, propfind = 7 }
+local dav_routes = router Dav
+local share = dav_routes:
+    propfind "/":
+        return 207
+    end
+end
+assert(share[1].method == 7)
+```
+
+**9. Watch the cost.** A large known description makes a large residual program: one test per route here. Read the size report (`nua size`, §11.2) when a description grows, and share an engine with `call` only where measurement says so; a runtime description (§17) trades that size for a loop.
 
 ## 7. Step 5: states
 
@@ -807,6 +1116,7 @@ flowchart LR
 
 * **Exports are the composition roots.** C calls them, and they wire the parts together. Only what they reach is compiled.
 * **Effects enter at the edges.** Externs, `require "nua.io"` and the POSIX library are opened at the outside and passed in. The word that opens a file is not the word that parses it.
+* **Libraries are small instruction sets.** A low-level library (a transport, a codec, a scheduler, a kernel interface) is a vocabulary of a few verbs; a domain vocabulary composes several by spread, and an algorithm opens the composition (`do(ops.., fd: I32)`). Swapping a backend, or supplying a test double, is passing another vocabulary: no virtual interface, no runtime dispatch, the selected words specialize into the algorithm. Use nominal types for the data that crosses those boundaries and activities for the lifetimes they manage (sockets, requests, buffers).
 * **The pure core decides.** Words from values to values are testable while compiling. Applied to known values, a typed word computes in the compiler, and Lua asserts the answer:
 
 ```lua
@@ -825,7 +1135,7 @@ The line between host Lua and typed words is the main structural decision of a N
 | choosing what to compile (`export`, `native`) | |
 | compile-time tests (`assert(host(...))`) | |
 
-Modules are ordinary Lua values returned through `require` (see [module loading](architecture.md#13-modules-and-the-compilation-scope)). A library module exports types and words; a program module exports its edges.
+Modules are ordinary Lua values returned through `require` (see [module loading](architecture.md#13-modules-and-the-compilation-scope)). A library module exports types and words; a program module exports its edges. A library is a vocabulary: write its words as locals, so they can use each other, and end the file with the surface it offers, `return define with .square .double end`. What is not listed stays private, and an entry may rename (`area = square`). A layer (a platform, a backend) is a vocabulary that spreads its base and overrides a few entries; the overlap rule catches two layers defining the same name.
 
 ### 9.3 Discipline for compile-time Lua
 
@@ -959,7 +1269,7 @@ end
 
 ## 15. Keep known information available
 
-**An untyped parameter of a native word is a compile-time parameter.** Use it for descriptions, callbacks and other inputs that must be known at specialization, often as Lua tables. Typed parameters can also receive known values; use the native type when the word should accept either known or runtime data:
+**An untyped parameter of a native word is a compile-time parameter.** Use it for descriptions, callbacks and other inputs that must be known at specialization, often as vocabularies (§4.1): a table literal such as `{ tab_width = 4 }` is one, with or without `define`. Typed parameters can also receive known values; use the native type when the word should accept either known or runtime data:
 
 ```lua
 local tab_stop = do(config, column: U32): U32
@@ -1057,7 +1367,7 @@ local replay = do(document: Ref Document, commands: Ref(Grow Command)): Unit
 end
 ```
 
-A description is often best written with a builder (§6.10): the block reads like the domain, and the builder hands the engine a Lua table. Do not maintain a second, hand-specialized implementation. Read the C to confirm the interpretation vanished. This is where binding time pays most (§3): an engine over a known description loses its whole interpretive overhead.
+A description is often best written with a builder (§6.10): the block reads like the domain, and the builder hands the engine keyed data (§6.11). Do not maintain a second, hand-specialized implementation. Read the C to confirm the interpretation vanished. This is where binding time pays most (§3): an engine over a known description loses its whole interpretive overhead.
 
 ## 18. Arithmetic and operators
 
@@ -1128,6 +1438,8 @@ end
 | outcome of a body | snake_case outcome | `commit`, `abort`, `retry` |
 | sum alternative | snake_case outcome | `found`, `missing`, `done`, `timed_out` |
 | library | snake_case domain | `io`, `posix` |
+| vocabulary describing a structure (interface, capability set, namespace) | PascalCase, like a type | `Editing`, `Moves`, `Storage` |
+| vocabulary holding data (configuration, fixture, values in flight) | snake_case, like a value | `config`, `span` |
 
 **Activity words say what completion means; contexts are nouns for what the body holds.** `transaction` commits after the body returns normally; `attempt` commits only on acceptance. The body holds a draft. When an opened parameter needs a name, use the context's noun: `Draft`, `do(draft..)`. Otherwise use `do(..)`. A gerund is the fallback when the context is the state of an ongoing process with no natural noun.
 
@@ -1181,7 +1493,7 @@ Check the files you changed with `luajit nua.lua fmt --check examples/guide.nua`
 
 ## 22. Files and libraries
 
-* **A file is a vocabulary or a program.** A program file defines its words and exports its edges. A library returns ordinary Lua values through `require`. Bundled vocabularies live in `lib/` and use names such as `require "nua.io"`; project modules use their own names. Lua's `require "io"` still names Lua's I/O library. See [module loading](architecture.md#13-modules-and-the-compilation-scope) for paths and compilation lifetimes.
+* **A file is a vocabulary or a program.** A program file defines its words and exports its edges. A library returns its vocabulary through `require`, usually `return define with ... end` after its locals (§9.2). Bundled vocabularies live in `lib/` and use names such as `require "nua.io"`; project modules use their own names. Lua's `require "io"` still names Lua's I/O library. See [module loading](architecture.md#13-modules-and-the-compilation-scope) for paths and compilation lifetimes.
 * **Readable dependency order:** `require`s first, then types and supporting words before their users. Put each `export` directly after the completed word or specialization. Give exported words a one-line promise. Drafting top-down does not make later local bindings visible earlier (§10).
 * **Dependencies point toward the domain.** Activities use entities; entities do not import every activity that can operate on them.
 
@@ -1199,10 +1511,14 @@ Explain why when the code says what. State what a signature cannot: an invariant
 | `dynamic e` to "help" the compiler | nothing; `dynamic` only makes a key repeat on purpose |
 | an extra word kept "for inlining" or avoided "for performance" | the word the meaning wants; evaluation inlines |
 | inserting `call` merely because a word is repeated | use the size report to choose an experiment, then measure compilation and runtime cost |
-| references, slices or text views stored in structs | `Id`s, `Chars n`, or a `Ptr` at a foreign boundary |
+| a stored reference, slice or text view that would outlive its owner | an `Id`, an owned copy (`Text`, `Chars n`), or a `Ptr` at a foreign boundary |
 | purpose-specific tentative verbs accumulated on the persistent entity | a context vocabulary and an activity that owns completion |
 | an activity configured by flags | stacked policy activities |
 | a builder that keeps a current-builder global, or an interface argument passed to every method | a block that opens the builder's vocabulary (§6.10) |
+| a nominal interface type introduced only to recognize a set of operations | a vocabulary the word takes or opens (§4.1) |
+| a `Struct` that groups compile-time names, constants or words | `define` (§4.1) |
+| a struct invented to carry two values between in-place words | a vocabulary of the values; promote it when it must be stored (§4.2) |
+| a vocabulary copied to change one entry | spread it and override the entry |
 | a block that writes a context's fields to get around its verbs | the verb that is missing (§6.9) |
 | naming every context to reach outer names | `do(..)`, and let names fall through (§6.8) |
 | an operator or `__member` with a meaning the reader must look up | a named word or a method |
@@ -1224,13 +1540,15 @@ Explain why when the code says what. State what a signature cannot: an invariant
 
 * **Frame and diagrams:** can a concrete success and failure be followed through the relevant views? Did the drawings expose or change a decision? Do retained views agree with the code and contracts?
 * **Binding time:** what is known while compiling, and at start-up? Is it still known where it is used? Would removing any remaining interpretation repay specialization cost?
+* **Structure:** which trigger (§4.2) justified each nominal type? Is anything grouped as a type that only names things while compiling?
 * **Names:** do calls read as sentences? Is the context a noun for what the body holds? Are unused opened receiver names omitted?
 * **Ownership:** who owns each mutable thing? Are copying, identity, borrowing and transfer distinguished, with valid lifetimes?
 * **Hooks:** does each hook mean what its operation already means? Are fields that carry an invariant written only by the type's methods and hooks?
 * **Activities:** who sets up, who completes, and how does a body abort?
+* **DSLs:** do the sentences read without parentheses? Is each phrase the right kind for its binding time? Are bad sentences rejected at their own line? Is the description data a compile-time assert can check, and is its size measured as it grows?
 * **Instructions:** does the context supply the verbs its purpose needs? Do instructions read clearly without a receiver, and are deliberately qualified calls clear? Does a builder return a description or type rather than hide runtime work?
 * **States:** are legal transitions and invalid combinations accounted for? Are sum matches exhaustive and ignored events deliberate?
-* **Outcomes:** are alternatives and payloads explicit where needed? Is each failure the right kind (§4.2), and is any discarded information justified by the caller's contract?
+* **Outcomes:** are alternatives and payloads explicit where needed? Is each failure the right kind (§4.3), and is any discarded information justified by the caller's contract?
 * **Concurrency:** does anything cross a task except copies and moves? Does each entity have one owner task, each scope an end, each channel a closer?
 * **Edges:** are effects opened at the outside and passed in? Is compile-time Lua deterministic?
 * **Cost:** have you read the C for the inner loops, and measured what step 0 requires? Is code size acceptable?
@@ -1242,4 +1560,4 @@ The forms and libraries in this guide are implemented in the prototype and exerc
 
 ## Maxim
 
-> **Decide what is known, and when. Model the values. Own the state. Name the words. Enter the activity: open the context, speak its instructions, bind a value to remember it, and let the activity complete. Describe with builders, run with words. Specialize what is known; share nothing between tasks; read the C.**
+> **Decide what is known, and when. Name structurally; lay out when the program demands it. Model the values. Own the state. Name the words. Enter the activity: open the context, speak its instructions, bind a value to remember it, and let the activity complete. Describe with builders, run with words. Specialize what is known; share nothing between tasks; read the C.**

@@ -149,9 +149,73 @@ local function significant_after(tokens, i)
     return tokens[i] and tokens[i][1] or nil
 end
 
+-- Keyed spread in any table constructor, `{ ..base, name = value }` (syntax §10.7): `..` never
+-- starts a table entry in valid Lua. The table becomes `__nua_keyed{ [__nua_spread(1)] = base,
+-- name = value }`, the same in plain Lua and in typed bodies; __nua_keyed applies the spread
+-- rules, to a record constructor's fields or to a compile-time table.
+local OPENERS, CLOSERS = { ['{'] = true, ['('] = true, ['['] = true }, { ['}'] = true, [')'] = true, [']'] = true }
+local function spread_tables(tokens)
+    local close_of, spreads, stack, named = {}, {}, {}, {}
+    for i, tk in ipairs(tokens) do
+        local t = tk[1]
+        if t == 'iden' and stack[#stack] and tokens[stack[#stack]][1] == '{'
+            and ENTRY_START[significant_before(tokens, i)] and significant_after(tokens, i) == '=' then
+            local open = stack[#stack]
+            named[open] = named[open] or {}
+            table.insert(named[open], tk)
+        end
+        if OPENERS[t] then
+            stack[#stack + 1] = i
+        elseif CLOSERS[t] then
+            local open = table.remove(stack)
+            if open then close_of[open] = i end
+        elseif t == '.' and tokens[i + 1] and tokens[i + 1][1] == '.'
+            and not (tokens[i + 2] and tokens[i + 2][1] == '.') then   -- `...` is varargs
+            local open = stack[#stack]
+            local before = significant_before(tokens, i)
+            if open and tokens[open][1] == '{' and ENTRY_START[before] then
+                spreads[open] = spreads[open] or {}
+                table.insert(spreads[open], i)
+            end
+        end
+    end
+    if not next(spreads) then return tokens end
+    local before, after, replace = {}, {}, {}
+    for open, list in pairs(spreads) do
+        -- a duplicated field would vanish in the Lua table the spread is collected in
+        local seen = {}
+        for _, tk in ipairs(named[open] or {}) do
+            if seen[tk[2]] then error(("line %d: duplicate field '%s'"):format(tk[3], tk[2]), 0) end
+            seen[tk[2]] = true
+        end
+        local line = tokens[open][3]
+        before[open] = { { '(', '(', line }, { 'iden', '__nua_keyed', line } }
+        after[close_of[open]] = { { ')', ')', line } }
+        for k, at in ipairs(list) do
+            local l = tokens[at][3]
+            replace[at] = { { '[', '[', l }, { 'iden', '__nua_spread', l }, { '(', '(', l },
+                            { 'number', tostring(k), l }, { ')', ')', l }, { ']', ']', l },
+                            { 'space', ' ', l }, { '=', '=', l }, { 'space', ' ', l } }
+        end
+    end
+    local out, i = {}, 1
+    while i <= #tokens do
+        for _, t in ipairs(before[i] or {}) do out[#out + 1] = t end
+        if replace[i] then
+            for _, t in ipairs(replace[i]) do out[#out + 1] = t end
+            i = i + 2
+        else
+            out[#out + 1] = tokens[i]
+            for _, t in ipairs(after[i] or {}) do out[#out + 1] = t end
+            i = i + 1
+        end
+    end
+    return out
+end
+
 local scan_lua_tokenlist = lexer.scan_lua_tokenlist
 function lexer.scan_lua_tokenlist(input)
-    local tokens = scan_lua_tokenlist(input)
+    local tokens = spread_tables(scan_lua_tokenlist(input))
     local out, i = {}, 1
     while i <= #tokens do
         local tk, nx = tokens[i], tokens[i + 1]

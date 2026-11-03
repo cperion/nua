@@ -7,18 +7,28 @@ local slice_parts, make_slice = __S.slice_parts, __S.make_slice
 layout.Store = cstruct("nua_store", h, {
         { "stack", U64 },
         { "base", U64 }, { "len", U32 }, { "live", U32 }, { "free_head", U32 }, { "token", U64 },
+        { "cap", U64 },
     })
-layout.Grow = cstruct("nua_grow", h, { { "stack", U64 }, { "base", U64 }, { "len", U64 } })
+layout.Grow = cstruct("nua_grow",
+    h, { { "stack", U64 }, { "base", U64 }, { "len", U64 }, { "cap", U64 } })
 layout.Id = cstruct("nua_id", h, { { "token", U64 }, { "slot", U32 }, { "gen", U32 } })
 layout.Map = cstruct("nua_map", h, {
         { "stack", U64 },
         { "base", U64 }, { "width", U64 }, { "len", U32 }, { "live", U32 }, { "free_head", U32 },
         { "index_stack", U64 }, { "index_base", U64 }, { "cap", U32 }, { "used", U32 },
+        { "slots_cap", U64 },
     })
 layout.StrMap = cstruct("nua_strmap", h, {
         { "entries", layout.Map },
         { "arena_stack", U64 }, { "arena_base", U64 }, { "arena_len", U64 }, { "dead", U64 },
+        { "arena_cap", U64 },
     })
+-- where an owner with no header of its own (a sum holding owners) began its stacks
+layout.Bookkeeping = Struct { stack: U64, base: U64 }
+layout.keep = do(h: Ptr layout.Bookkeeping, stack: U64, base: U64): Unit
+    h.stack = stack
+    h.base = base
+end
 local token = extern("nua_next_token", {}, U64, { header = h })
 local trap = extern("nua_trap", { CString }, Unit, { header = h })
 local maximum = U64 0xffffffffffffffffULL
@@ -44,10 +54,11 @@ layout.store_new = do(stack: U64): layout.Store
         live = 0
         free_head = 0xffffffff
         token = id
+        cap = 0
     end
 end
 layout.grow_new = do(stack: U64): layout.Grow
-    return layout.Grow { .stack, base = stacks.begin stack, len = 0 }
+    return layout.Grow { .stack, base = stacks.begin stack, len = 0, cap = 0 }
 end
 layout.map_new = do(stack: U64, index_stack: U64, width: U64): layout.Map
     if width < 8 or width % 8 ~= 0 or stack == index_stack then trap "Map: invalid entry layout" end
@@ -62,6 +73,7 @@ layout.map_new = do(stack: U64, index_stack: U64, width: U64): layout.Map
         index_base = stacks.begin index_stack
         cap = 0
         used = 0
+        slots_cap = 0
     end
 end
 layout.strmap_new = do(table_stack: U64, index_stack: U64, arena_stack: U64, width: U64): layout.StrMap
@@ -78,6 +90,7 @@ layout.strmap_new = do(table_stack: U64, index_stack: U64, arena_stack: U64, wid
         arena_base = base
         arena_len = 0
         dead = 0
+        arena_cap = 0
     end
 end
 -- A representation supplies its header and acquires its items: one stack
@@ -161,7 +174,13 @@ local function project(value, path)
     for field in path:gmatch "[^.]+" do value = value[field] end
     return value
 end
-function layout.releaser(Meta, stack, base)
+function layout.releaser(Meta, stack, base, offset)
+    if offset then
+        -- an arena: the stack at its offset from the owner's first, ended at the owner's base
+        return do(owner: Ptr Meta): Unit
+            stacks.close_arena (project(owner, stack) + offset) project(owner, base)
+        end
+    end
     return do(owner: Ptr Meta): Unit
         stacks.reset(project(owner, stack), project(owner, base))
     end

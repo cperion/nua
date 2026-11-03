@@ -66,6 +66,51 @@ owners.Array = owner_type with
     end
 end
 
+-- Array(T, n) whose elements hold owners: the array is an owner holding its elements' arenas
+-- (design memory.md §5.9); Array(T, n) of plain values stays a value
+local Mem = require "nua.memory"
+owners.FixedArray = owner_type with
+    name = "FixedArray"
+    label = "Array"
+    sized = true
+    header = layout.Grow
+    stacks = {}
+    display = function(key, elem, n) return "Array(" .. elem.display .. ", " .. n .. ")" end
+    setup = function(T)
+        local base = Mem.cname_of(T.elem):gsub("[^%w_]", "_")
+        local name = __S.unique_global("Array_" .. base .. "_" .. T.length)
+        rawset(T, "cname", name)
+        rawset(T, "representation", __S.struct(name .. "Owners", {
+                    { "e", __S.raw_array(T.elem, T.length) }, { "stack", U64 }, { "base", U64 },
+                }))
+    end
+    projection = function(T)
+        return storage.fixed_layout(T, function(x) return Mem.view(x, T.representation) end)
+    end
+    api = function(T, Id, p) return storage.fixed(T, p) end
+    init = function(api, owner, indices, from)
+        api.layout.init(owner, indices[1])
+        if from.copy_of then api.copy(owner, Ref from.copy_of) end
+        -- elements given to the constructor replace the empty ones
+        for i, value in ipairs(from.elements or {}) do
+            __S.cur():overwrite_element(__S.index(owner, i - 1), value)
+        end
+    end
+    methods = {}
+    arity = {}
+    construct = function(T)
+        return function(x)
+            if type x ~= "table" or __S.is_staged x then __S.fail(T.display .. " {...} takes its elements",
+                    2) end
+            if #x > T.length then __S.fail(T.display .. " takes at most " .. T.length .. " elements",
+                    2) end
+            local v = Mem.fresh T
+            if #x > 0 then rawset(v, "elements", x) end
+            return v
+        end
+    end
+end
+
 -- Map(K, V), Map(Str, V) (text keys copied into the map's arena) and Map.borrowing(Str, V)
 -- (the caller's keys are kept): three declarations of one family
 local map = require "nua.map"

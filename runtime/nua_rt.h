@@ -39,6 +39,7 @@ typedef struct nua_stack {
     size_t top;
     size_t cap;         /* the bytes reserved for this stack: top never passes it */
     size_t region;      /* nonzero on the first stack of a reservation: its size */
+    size_t dead;        /* an arena's abandoned bytes, reclaimed by compaction */
 } nua_stack;
 
 /* a failed runtime check: invalid ID, misuse of a growing value */
@@ -83,6 +84,7 @@ typedef struct nua_store {
     uint32_t live;      /* occupied slots */
     uint32_t free_head; /* first free slot, or NUA_NONE */
     uint64_t token;
+    uint64_t cap;       /* bytes reserved at base: the region the slots may fill */
 } nua_store;
 
 /* a generational ID: identifies, never owns */
@@ -121,6 +123,7 @@ typedef struct nua_grow {
     size_t stack;
     size_t base;
     uint64_t len;
+    uint64_t cap;       /* bytes reserved at base: the region the elements may fill */
 } nua_grow;
 
 nua_store nua_store_new(size_t stack);
@@ -149,6 +152,7 @@ typedef struct nua_map {
     uint32_t len, live, free_head;
     size_t index_stack, index_base;
     uint32_t cap, used;
+    size_t slots_cap;   /* bytes reserved for the slots at base */
 } nua_map;
 nua_map nua_map_new(size_t stack, size_t index_stack, size_t width);
 void *nua_map_at(const nua_map *m, uint32_t slot);
@@ -165,6 +169,7 @@ typedef struct nua_strkey { uint64_t hash; size_t offset; uint64_t len; } nua_st
 typedef struct nua_strmap {
     nua_map entries;
     size_t arena_stack, arena_base, arena_len, dead;
+    size_t arena_cap;   /* bytes reserved for the keys at arena_base */
 } nua_strmap;
 nua_strmap nua_strmap_new(size_t table_stack, size_t index_stack, size_t arena_stack, size_t width);
 

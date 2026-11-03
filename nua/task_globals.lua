@@ -141,6 +141,11 @@ function M.check(fns, walk_block)
             return exposed -- opaque code can return one of the supplied addresses
         end
         function call(e)
+            -- an owner global belongs to the main thread: a task may not use it (memory.md §5.10)
+            if e.op == 'call' and e.fn and inst.task and e.fn.word and rawget(e.fn.word, 'owner_global') then
+                error(("a task cannot use the owner global '%s': it belongs to the main thread; give the "
+                    .. "task a copy"):format(rawget(e.fn.word, 'owner_global')), 0)
+            end
             if e.op == 'call' and e.fn then return bind(context(e.fn, inst.task), e.args or {}) end
             if e.op == 'calli' then
                 local out, uncertain = {}, false

@@ -87,10 +87,12 @@ function U:ct(t)
             self.scope.names[name .. '_' .. a.name] = { const = a.tag, t = C.INT }
         end
         local fs = { { 'tag', C.UINT } }
+        -- a sum holding owners keeps where its stacks began (design memory.md §5.9)
+        if t.resizable then fs = { { 'stack', C.int(8, false) }, { 'base', C.int(8, false) }, { 'tag', C.UINT } } end
         if #members > 0 then
             local u = C.record('union', 'nua_' .. name .. '_as')
             u:set_fields(members)
-            fs[2] = { 'as', u }
+            fs[#fs + 1] = { 'as', u }
         end
         d:set_fields(fs)
         self.scope.types[name] = d
@@ -380,17 +382,22 @@ function Fn:expr(e)
         local tagv = ctx:int_const(C.UINT, tag)
         local J = C.lib()
         local ffi = require 'ffi'
+        -- a sum holding owners begins with its bookkeeping (stack, base)
+        local ti, ai = 1, 2
+        for i, f in ipairs(t.fields) do
+            if f[1] == 'tag' then ti = i elseif f[1] == 'as' then ai = i end
+        end
         if e.e then
-            local ut = t.fields[2][2]
+            local ut = t.fields[ai][2]
             local fi = ut.byname[e.alt]
             ctx:jt(t)
             local uv = J.gcc_jit_context_new_union_constructor(ctx.c, nil, ctx:jt(ut), ctx:field(ut, fi),
                 ctx:rv(ctx:conv(self:expr(e.e), ut.fields[fi][2])))
-            local fs = ffi.new('gcc_jit_field*[2]', ctx:field(t, 1), ctx:field(t, 2))
+            local fs = ffi.new('gcc_jit_field*[2]', ctx:field(t, ti), ctx:field(t, ai))
             local vs = ffi.new('gcc_jit_rvalue*[2]', ctx:rv(tagv), uv)
             return C.val(t, J.gcc_jit_context_new_struct_constructor(ctx.c, nil, ctx:jt(t), 2, fs, vs))
         end
-        local fs = ffi.new('gcc_jit_field*[1]', ctx:field(t, 1))
+        local fs = ffi.new('gcc_jit_field*[1]', ctx:field(t, ti))
         local vs = ffi.new('gcc_jit_rvalue*[1]', ctx:rv(tagv))
         return C.val(t, J.gcc_jit_context_new_struct_constructor(ctx.c, nil, ctx:jt(t), 1, fs, vs))
     elseif op == 'null' then
@@ -728,7 +735,7 @@ function U:emit_function(fn)
     local base = fn.gs and 1 or 0
     for i, p in ipairs(fn.params) do f.param_index[p.name] = i + base end
     if fn.gs then f.gs_sp_v = ctx:param(d, 1)
-    elseif fn.needs_gs then f.gs_sp_v = ctx:int_const(C.SIZE, 0) end
+    elseif fn.needs_gs then f.gs_sp_v = ctx:int_const(C.SIZE, fn.gs_base or 0) end
     if fn.waits or fn.needs_self then
         local tk = f.fb:var(C.ptr(self.scope:find('types', 'nua_task')), 'nua_tk')
         f.fb:assign(tk, ctx:call(self:rt_fn('nua_self'), {}))
@@ -822,6 +829,8 @@ end
 function JG.build(mod, opts)
     opts = opts or {}
     local fns = G.prepare(mod)
+    -- an entry's stacks begin past the ones its owner globals reserve (design memory.md §5.10)
+    for _, fn in ipairs(fns) do fn.gs_base = mod.owner_global_stacks or 0 end
     -- Code generation belongs to this module: per-compilation caches (layout
     -- representations) must be looked up for the module being emitted, even if
     -- another compilation (the runtime policy) ran after it. Staging of the

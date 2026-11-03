@@ -101,6 +101,15 @@ function T.element(elem)
     return not (k == 'unit' or k == 'opaque' or k == 'atomic' or k == 'group' or elem.resizable)
 end
 
+-- An element of a container (Grow, Array T, Store) or a map value: an element type, or an
+-- owner, or a struct holding owners (design memory.md §5.9): its owners live in the
+-- container's arenas.
+function T.owner_element(elem)
+    local k = elem.kind
+    if k == 'owner' or ((k == 'struct' or k == 'sum') and elem.resizable) then return true end
+    return T.element(elem)
+end
+
 function T.id(elem)
     check_type(elem, 'Id')
     return memoized('id', elem, function()
@@ -113,16 +122,20 @@ end
 -- from the family, the optional key type and the element. What a family admits is its
 -- declaration's rule (T.element, T.map_key and T.map_value are the predicates).
 local owner_memo = {}
-function T.owner(family, elem, display, key)
+-- `length`: a family whose owners hold a number of elements fixed in the type (Array(T, n)
+-- of elements that hold owners).
+function T.owner(family, elem, display, key, length)
     check_type(elem, family)
     if key ~= nil then check_type(key, family) end
     local by_family = owner_memo[family]
     if not by_family then by_family = {}; owner_memo[family] = by_family end
-    local by_key = by_family[key or false]
-    if not by_key then by_key = setmetatable({}, { __mode = 'k' }); by_family[key or false] = by_key end
+    local id = key or length or false
+    local by_key = by_family[id]
+    if not by_key then by_key = setmetatable({}, { __mode = 'k' }); by_family[id] = by_key end
     local t = by_key[elem]
     if not t then
-        t = new { kind = 'owner', family = family, elem = elem, key = key, display = display, resizable = true }
+        t = new { kind = 'owner', family = family, elem = elem, key = key, display = display, resizable = true,
+                  length = length }
         by_key[elem] = t
     end
     return t
@@ -226,13 +239,14 @@ end
 -- T e[n], so arrays copy and pass by value as structs do.
 
 local arrays = {}
-function T.array(elem, n)
+function T.array(elem, n, raw)
     if not T.is_type(elem) then error('Array expects an element type, got ' .. tostring(elem), 2) end
     if type(n) ~= 'number' or n ~= math.floor(n) or n < 1 or n > 0x7fffffff then
         error(('Array(%s, n): n must be a positive integer known while compiling, got %s'):format(
             elem.display, tostring(n)), 2)
     end
-    if not T.element(elem) then
+    -- raw: the elements of a FixedArray, storage inside its header (they may be owners)
+    if not T.element(elem) and not (raw and T.owner_element(elem)) then
         error(('Array holds fixed-size values, not %s'):format(elem.display), 2)
     end
     arrays[elem] = arrays[elem] or {}
@@ -429,7 +443,7 @@ function T.sum(name, alts)
         if not T.is_type(at) then
             error(("Sum: alternative '%s' needs a type, got %s"):format(an, tostring(at)), 2)
         end
-        if at.resizable then
+        if at.resizable and not T.owner_element(at) then
             error(("Sum: alternative '%s' is resizable storage; payloads are fixed-size"):format(an), 2)
         end
         list[#list + 1] = { name = an, type = at }
@@ -453,6 +467,8 @@ function T.sum(name, alts)
     for i, a in ipairs(list) do
         a.tag = i - 1
         t.index[a.name] = a
+        -- a payload holding owners makes the sum an owner (design memory.md §5.9)
+        if a.type.resizable then t.resizable = true end
     end
     candidates[#candidates + 1] = t
     sums[key] = candidates

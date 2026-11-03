@@ -3,7 +3,7 @@
 -- mechanism; placement, growth, limits and lifetime bookkeeping are Nua.
 local h = '"nua_rt.h"'
 local Stack = cstruct("nua_stack", h, {
-        { "data", Ptr U8 }, { "top", U64 }, { "cap", U64 }, { "region", U64 },
+        { "data", Ptr U8 }, { "top", U64 }, { "cap", U64 }, { "region", U64 }, { "dead", U64 },
     })
 local Set = cstruct("nua_stackset", h, { { "stacks", Ptr Stack }, { "n", U64 } })
 -- the stack set in use on this thread: a task's while a worker runs it, otherwise
@@ -27,6 +27,9 @@ local move = extern("memmove", { Ptr U8, Ptr U8, U64 }, Ptr U8, { header = "<str
 local trap = extern("nua_trap", { CString }, Unit, { header = h })
 local maximum = U64 0xffffffffffffffffULL
 local stacks = { .Stack, .Set }
+-- the stacks of a thread's own set below this index hold owner globals (design memory.md
+-- §5.10): trap recovery leaves them
+local owner_floor = global(U64, { name = "nua_owner_global_stacks" })
 -- Growing the set of stacks is the cold path. The new stacks' address space is
 -- one reservation, so a set costs a few kernel mappings however many tasks run;
 -- a task's stacks reserve less than a thread's own.
@@ -89,6 +92,61 @@ stacks.begin = do(index: U64): U64
     reserve s top
     s.top = top
     return top
+end
+-- An owner with arenas begins at one offset on each of its n consecutive stacks (design
+-- memory.md §5.9), so releasing it resets every one of them to its base. The stacks below
+-- that offset are untouched address space: raising a top commits nothing.
+stacks.level = do(index: U64, n: U64): U64
+    local top = U64 0
+    local i = U64 0
+    while i < n do
+        local s = stacks.claim(index + i)
+        local at = band (s.top + 15) bnot(U64 15)
+        if at > top then top = at end
+        i = i + 1
+    end
+    i = 0
+    while i < n do
+        local s = stacks.at(index + i)
+        reserve s top
+        s.top = top
+        i = i + 1
+    end
+    return top
+end
+-- An arena (design memory.md §5.9) counts the bytes its owners abandoned. Its root begins
+-- it with a record of the count it found, so a recursion's levels on the same stack each
+-- count their own, and ending the root gives the count back.
+local arena_record = U64 16
+stacks.arena_record = arena_record
+stacks.open_arena = do(index: U64, base: U64): Unit
+    local s = stacks.at index
+    if s.top ~= base then trap "an arena begins at its root's base" end
+    stacks.push index arena_record
+    local saved = Ptr U64 stacks.region(index, base, U64 8)
+    saved[0] = s.dead
+    s.dead = 0
+end
+stacks.close_arena = do(index: U64, base: U64): Unit
+    local s = stacks.at index
+    local saved = Ptr U64 stacks.region(index, base, U64 8)
+    s.dead = saved[0]
+    stacks.reset index base
+end
+-- the arena's contents end at once (its root was cleared): only the record stays
+stacks.empty_arena = do(index: U64, base: U64): Unit
+    local s = stacks.at index
+    stacks.reset index (base + arena_record)
+    s.dead = 0
+end
+stacks.abandon = do(index: U64, n: U64): Unit
+    local s = stacks.at index
+    s.dead = s.dead + n
+end
+-- the stack set this thread owns, whatever it is running
+stacks.own_set = do(): Ptr Set return own end
+stacks.keep_owner_globals = do(n: U64): Unit
+    if n > owner_floor[0] then owner_floor[0] = n end
 end
 -- Pushing allocates, so it may claim. It never moves the bytes below the top.
 stacks.push = do(index: U64, n: U64): U64
@@ -164,6 +222,11 @@ stacks.free = do(set: Ptr Set): Unit
 end
 stacks.clear = do(set: Ptr Set): Unit
     local i = U64 0
-    while i < set.n do set.stacks[i].top = 0; i = i + 1 end
+    if set == own then i = owner_floor[0] end
+    while i < set.n do
+        set.stacks[i].top = 0
+        set.stacks[i].dead = 0
+        i = i + 1
+    end
 end
 return stacks

@@ -19,8 +19,15 @@ function map.each(T, storage, body)
         local slot = U32 0
         while slot < count do
             local table = storage.acquire m
-            local entry = table.entries[slot]
-            if band entry.hash 0x8000000000000000ULL == 0 then storage.lend(table, entry, body) end
+            if T.elem.resizable then
+                -- a value holding owners is lent in place, inside the map (design memory.md §5.9)
+                local entry = Ptr table.entries[slot]
+                if band entry.hash 0x8000000000000000ULL == 0 then storage.lend_owner(m,
+                        table, entry, body) end
+            else
+                local entry = table.entries[slot]
+                if band entry.hash 0x8000000000000000ULL == 0 then storage.lend(table, entry, body) end
+            end
             slot = slot + 1
         end
     end
@@ -35,6 +42,40 @@ local stacks = require "nua.stacks"
 local trap = extern("nua_trap", { CString }, Unit)
 local slice_parts = __S.slice_parts
 local retire, restructure, grows, borrows = __S.retire, __S.restructure, __S.grows, __S.borrows
+local store_owner, element_ref, shared_position = __S.store_owner, __S.element_ref, __S.shared_position
+local owners_storage = require "nua.storage"
+local own_stack_count, stack_count = __S.own_stack_count, __S.owner_stack_count
+
+-- A map inside an element (design memory.md §5.9) has each of its stacks at a shared position:
+-- a region grows within its capacity, at the top when it ends there, or moves to the top with
+-- doubled capacity, leaving the old region dead (R3, R5). Returns where the new bytes begin.
+local region_room = do(stack: U64, base: Ptr U64, cap: Ptr U64, used: U64, n: U64): U64
+    local need = used + n
+    if need <= cap[0] then return base[0] + used end
+    local s = stacks.at stack
+    if s.top == base[0] + cap[0] then
+        stacks.push stack (need - cap[0])
+        cap[0] = need
+        return base[0] + used
+    end
+    local fresh_cap = cap[0] * 2
+    if fresh_cap < need then fresh_cap = need end
+    stacks.abandon stack cap[0]
+    local at = stacks.begin stack
+    stacks.push stack fresh_cap
+    stacks.move (stacks.span s at used) (stacks.span s base[0] used) used
+    base[0] = at
+    cap[0] = fresh_cap
+    return at + used
+end
+-- a region of bytes moved up during compaction (lib/storage.nua): it lands at its final offset
+local move_region = do(stack: U64, base: Ptr U64, bytes: U64, cursor: U64, start: U64, fresh: U64): U64
+    local at = band (cursor + 15) bnot(U64 15)
+    stacks.push stack (at + bytes - cursor)
+    stacks.move (stacks.region stack at bytes) (stacks.region stack base[0] bytes) bytes
+    base[0] = at - fresh + start
+    return at + bytes
+end
 local none = U32 0xffffffff
 local libraries = {}
 
@@ -50,6 +91,8 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
     if libraries[T] then return libraries[T] end
     local K, V = T.key, T.elem
     local EP, View = Ptr Entry, storage.View
+    -- values that hold owners: theirs live in the map's arenas (design memory.md §5.9)
+    local nested = V.resizable
     local equal = borrowed_keys and str.equals or keys.equal K
     local text_digest = hash.text
     local key_digest = keys.hash K
@@ -129,6 +172,26 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         end
         local bytes = U64 capacity * 4
         local used = U64 old_capacity * 4
+        if shared_position m then
+            -- inside an element: the new index is built at its arena's top; the old one is dead
+            stacks.abandon h.index_stack used
+            local at = stacks.begin h.index_stack
+            stacks.push h.index_stack bytes
+            local index = stacks.span (stacks.at h.index_stack) at bytes
+            stacks.fill index bytes
+            local cells = Ptr U32 index
+            local table = acquire m
+            local slot = U32 0
+            while slot < table.len do
+                local entry = Ptr table.entries[slot]
+                if band entry.hash free_bit == 0 then place cells capacity entry.hash slot end
+                slot = slot + 1
+            end
+            h.index_base = at
+            h.cap = capacity
+            h.used = h.live
+            return
+        end
         local fresh = stacks.extend(h.index_stack, h.index_base, used, bytes,
             "Map index grew while it was not at the top of its data stack")
         local s = stacks.at h.index_stack
@@ -148,7 +211,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         h.cap = capacity
         h.used = h.live
     end
-    local append
+    local append, compact_keys
     if string_keys then
         -- key's bytes at target. The key may lie in this arena: stacks never
         -- move, and compaction writes above the arena, so its bytes are intact.
@@ -158,52 +221,69 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
             local ptr, len = slice_parts key
             stacks.move destination ptr n
         end
-        append = do(m: Ref T, key: Str): U64
+        -- the live keys packed at the arena's start; offsets follow. It runs in a removal, which
+        -- already ends borrows: an insertion never moves keys (design memory.md §5.1, R5)
+        compact_keys = do(m: Ref T): Unit
             local a = storage.strmap m
             local stack = a.arena_stack
             local base = a.arena_base
             local length = a.arena_len
-            local dead = a.dead
-            local n = U64 key.length
-            local offset = length
-            if dead >= 4096 and dead >= length / 2 then
-                local live = length - dead
-                if n > maximum() - live then trap "Map(Str, V) key arena is full" end
-                local bytes = live + n
-                local fresh = stacks.extend(stack, base, length, bytes,
-                    "Map(Str, V) grew while its arena was not at the top of its data stack")
-                -- compact the live keys above the arena, then move them down
-                local s = stacks.at stack
-                local keys_now = stacks.span s base length
-                local compacted = stacks.span s fresh bytes
-                local table = acquire m
-                local out = U64 0
-                local slot = U32 0
-                while slot < table.len do
-                    local entry = Ptr table.entries[slot]
-                    if band entry.hash free_bit == 0 then
-                        local size = U64 entry.key.len
-                        stacks.move(Ptr compacted[out], Ptr keys_now[entry.key.offset], size)
-                        entry.key.offset = out
-                        out = out + size
-                    end
-                    slot = slot + 1
-                end
-                offset = out
-                place_key s (fresh + out) key
-                stacks.move (stacks.span s base bytes) compacted bytes
-                local end_at = base + bytes
-                stacks.reset stack end_at
-                a.arena_len = bytes
-                a.dead = n
+            local live = length - a.dead
+            local s = stacks.at stack
+            local fresh = U64 0
+            if shared_position m then
+                -- inside an element: the live keys move to a region at the arena's top
+                stacks.abandon stack a.arena_cap
+                fresh = stacks.begin stack
+                stacks.push stack live
             else
-                stacks.extend(stack, base, length, n,
+                fresh = stacks.extend(stack, base, length, live,
                     "Map(Str, V) grew while its arena was not at the top of its data stack")
-                place_key (stacks.at stack) (base + offset) key
-                a.arena_len = length + n
-                a.dead = dead + n
             end
-            return offset
+            local keys_now = stacks.span s base length
+            local compacted = stacks.span s fresh live
+            local table = acquire m
+            local out = U64 0
+            local slot = U32 0
+            while slot < table.len do
+                local entry = Ptr table.entries[slot]
+                if band entry.hash free_bit == 0 then
+                    local size = U64 entry.key.len
+                    stacks.move(Ptr compacted[out], Ptr keys_now[entry.key.offset], size)
+                    entry.key.offset = out
+                    out = out + size
+                end
+                slot = slot + 1
+            end
+            if shared_position m then
+                a.arena_base = fresh
+            else
+                stacks.move (stacks.span s base live) compacted live
+                stacks.reset stack (base + live)
+            end
+            a.arena_cap = live
+            a.arena_len = live
+            a.dead = 0
+        end
+        -- key's bytes appended to the arena; returns their offset
+        append = do(m: Ref T, key: Str): U64
+            local a = storage.strmap m
+            local stack = a.arena_stack
+            local length = a.arena_len
+            local n = U64 key.length
+            if shared_position m then
+                -- the key may lie in the region it leaves: a moved region's old bytes stay
+                local at = region_room(stack, Ptr a.arena_base, Ptr a.arena_cap, length, n)
+                place_key (stacks.at stack) at key
+            else
+                stacks.extend(stack, a.arena_base, length, n,
+                    "Map(Str, V) grew while its arena was not at the top of its data stack")
+                place_key (stacks.at stack) (a.arena_base + length) key
+                a.arena_cap = length + n
+            end
+            a.arena_len = length + n
+            a.dead = a.dead + n
+            return length
         end
     end
     api.put = do(m: Ref T, key: K, value: V, only_missing): Unit
@@ -217,11 +297,22 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
             if not only_missing then
                 -- written through the owner's pointer: a stored borrow is checked against it
                 local owned = borrows(m, table.entries)
-                owned[table.cells[cell] - 1].value = value
+                if nested then
+                    -- the old value's owners end: borrows of them, and their bytes (R5)
+                    retire(m, "an entry of '%s' was replaced", key)
+                    local slot = table.cells[cell] - 1
+                    owners_storage.abandon(V, element_ref(m, Ptr owned[slot].value))
+                    store_owner(m, Ptr owned[slot].value, Ref value)
+                    owners_storage.compact_root m
+                else
+                    owned[table.cells[cell] - 1].value = value
+                end
             end
             return
         end
-        check_index_top m
+        -- inside an element, an insertion may move the map's regions: borrows of it end (R4)
+        if shared_position m then retire(m, "a map in '%s' grew, so its entries may have moved")
+        else check_index_top m end
         local text_offset = U64 0
         if string_keys then text_offset = append m key end
         local h = header m
@@ -229,7 +320,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         if h.cap == 0 or (U64 h.used + 1) * 4 > U64 h.cap * 3 then
             rebuild m (h.live + 1)
         end
-        check_slots_top m
+        if not shared_position m then check_slots_top m end
         local slot = h.free_head
         if slot ~= none then
             local at = acquire m
@@ -238,16 +329,21 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         else
             slot = h.len
             if slot >= 0xfffffffe then trap "Map is full" end
-            stacks.extend(h.stack, h.base, slot_bytes slot, size_of Entry,
-                "Map grew while it was not at the top of its data stack")
+            if shared_position m then
+                region_room(h.stack, Ptr h.base, Ptr h.slots_cap, slot_bytes slot, size_of Entry)
+            else
+                stacks.extend(h.stack, h.base, slot_bytes slot, size_of Entry,
+                    "Map grew while it was not at the top of its data stack")
+                h.slots_cap = slot_bytes slot + size_of Entry
+            end
             h.len = slot + 1
         end
         local at = acquire m
         local entry = Ptr at.entries[slot]
-        entry[0] = zero Entry
+        if nested then stacks.fill(Ptr U8 entry, size_of Entry) else entry[0] = zero Entry end
         entry.hash = hashed
         local owned = borrows(m, at.entries)
-        owned[slot].value = value
+        if nested then store_owner(m, Ptr owned[slot].value, Ref value) else owned[slot].value = value end
         if string_keys then
             entry.key.offset = text_offset
             entry.key.len = key.length
@@ -268,13 +364,16 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         local cell = probe table key hashed
         return cell ~= none
     end
-    api.find = do(m: Ref T, key: K): Result
-        local hashed = digest key
-        local table = acquire m
-        local cell = probe table key hashed
-        if cell == none then return Result.missing() end
-        local entry = Ptr table.entries[table.cells[cell] - 1]
-        return Result.found entry.value
+    -- a value holding owners is reached in place (m[k]), not returned
+    if not nested then
+        api.find = do(m: Ref T, key: K): Result
+            local hashed = digest key
+            local table = acquire m
+            local cell = probe table key hashed
+            if cell == none then return Result.missing() end
+            local entry = Ptr table.entries[table.cells[cell] - 1]
+            return Result.found entry.value
+        end
     end
     api.locate = do(m: Ref T, key: K): Ptr V
         local hashed = digest key
@@ -298,7 +397,9 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         if string_keys then removed_bytes = U64 entry.key.len end
         table.cells[cell] = removed_cell
         local h = header m
-        entry[0] = zero Entry
+        -- its owners' bytes are dead in the arenas (R5)
+        if nested then owners_storage.abandon(V, element_ref(m, Ptr entry.value)) end
+        if nested then stacks.fill(Ptr U8 entry, size_of Entry) else entry[0] = zero Entry end
         entry.hash = bor free_bit (U64 h.free_head)
         h.free_head = slot
         local live = h.live - 1
@@ -307,19 +408,35 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
             local a = storage.strmap m
             a.dead = a.dead + removed_bytes
             if live == 0 then
-                stacks.reset a.arena_stack a.arena_base
+                if not shared_position m then
+                    stacks.reset a.arena_stack a.arena_base
+                    a.arena_cap = 0
+                end
                 a.arena_len = 0
                 a.dead = 0
+            elseif a.dead >= 4096 and a.dead >= a.arena_len / 2 then
+                -- removed keys' bytes are reclaimed here, where borrows already end (R5)
+                compact_keys m
             end
         end
         if live == 0 then
             -- nothing is borrowed from an empty map: start over
-            stacks.reset h.stack h.base
+            if not shared_position m then
+                stacks.reset h.stack h.base
+                h.slots_cap = 0
+            end
             h.len = 0
             h.free_head = none
             stacks.fill (stacks.span (stacks.at h.index_stack) h.index_base (U64 h.cap * 4)) (U64 h.cap * 4)
             h.used = 0
+            -- a root's arenas end with its last entry
+            if nested and not shared_position m then
+                for o = own_stack_count T, stack_count T - 1 do stacks.empty_arena (h.stack + o) h.base end
+            end
         end
+        -- a removal ends borrows: the root compacts what its owners left dead (R5), including
+        -- the old index and key regions of a map inside an element
+        if (nested and live ~= 0) or shared_position m then owners_storage.compact_root m end
         return true
     end
     api.length = do(m: Ref T): U64 return U64 header(m).live end
@@ -333,6 +450,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
             local at = stacks.extend(h.stack, h.base, U64 0, bytes,
                 "Map copy target was not at the top of its data stack")
             stacks.move (stacks.region h.stack at bytes) (stacks.region source.stack source.base bytes) bytes
+            h.slots_cap = bytes
         end
         if source.cap ~= 0 then
             local bytes = U64 source.cap * 4
@@ -347,6 +465,19 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         h.free_head = source.free_head
         h.cap = source.cap
         h.used = source.used
+        -- the owners inside occupied entries are built anew in this map's arenas
+        if nested then
+            local entries = acquire(m).entries
+            local from_entries = acquire(from).entries
+            local slot = U32 0
+            while slot < h.len do
+                if band entries[slot].hash free_bit == 0 then
+                    store_owner(m,
+                        Ptr entries[slot].value, element_ref(from, Ptr from_entries[slot].value))
+                end
+                slot = slot + 1
+            end
+        end
         if string_keys then
             local a = storage.strmap m
             local b = storage.strmap from
@@ -357,7 +488,43 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
                 stacks.move (stacks.region a.arena_stack at n) (stacks.region b.arena_stack b.arena_base n) n
             end
             a.arena_len = n
+            a.arena_cap = n
             a.dead = b.dead
+        end
+    end
+    -- a map inside an element: its regions' bytes are dead in the arenas (R5)
+    api.abandon_region = do(m: Ref T): Unit
+        local h = header m
+        stacks.abandon h.stack h.slots_cap
+        stacks.abandon h.index_stack (U64 h.cap * 4)
+        if string_keys then
+            local a = storage.strmap m
+            stacks.abandon a.arena_stack a.arena_cap
+        end
+    end
+    -- compaction moves one of its regions: 0 the slots, 1 the index, 2 the keys
+    api.move_up = do(m: Ref T, cursor: U64, start: U64, fresh: U64, which): U64
+        local h = header m
+        if which == 0 then
+            local bytes = slot_bytes h.len
+            h.slots_cap = bytes
+            return move_region(h.stack, Ptr h.base, bytes, cursor, start, fresh)
+        end
+        if which == 1 then return move_region(h.index_stack,
+                Ptr h.index_base, U64 h.cap * 4, cursor, start, fresh) end
+        local a = storage.strmap m
+        a.arena_cap = a.arena_len
+        return move_region(a.arena_stack, Ptr a.arena_base, a.arena_len, cursor, start, fresh)
+    end
+    if nested then
+        api.each_element = do(m: Ref T, body): Unit
+            local count = header(m).len
+            local slot = U32 0
+            while slot < count do
+                local entry = Ptr acquire(m).entries[slot]
+                if band entry.hash free_bit == 0 then body element_ref(m, Ptr entry.value) end
+                slot = slot + 1
+            end
         end
     end
     libraries[T] = api
@@ -438,7 +605,7 @@ function map.family(name)
         if not text_keys and not types.map_key key then
             return "Map key must have fixed semantic equality, not " .. key.display
         end
-        if not types.map_value elem then
+        if not types.map_value elem and not types.owner_element elem then
             if is_str then return "Map(Str, V) value must be fixed-size owned data, not " .. elem.display end
             if borrowing then return "Map.borrowing value must be fixed-size data, not " .. elem.display end
             return "Map value must be fixed-size owned data, not " .. elem.display
@@ -455,7 +622,10 @@ function map.family(name)
         rawset(t,
             "entry",
             __S.struct(n .. "Entry", { { "hash", U64 }, { "key", stored }, { "value", t.elem } }))
-        rawset(t, "lookup", __S.oneof(n .. "Lookup", { { "found", t.elem }, { "missing", Unit } }))
+        if not t.elem.resizable then
+            rawset(t,
+                "lookup", __S.oneof(n .. "Lookup", { { "found", t.elem }, { "missing", Unit } }))
+        end
         rawset(t, "representation", Mem.layouts_module()[is_str and "StrMap" or "Map"])
         rawset(t, "iteration_owners", {})
     end
@@ -505,6 +675,21 @@ function map.family(name)
             else body(k, v) end
         end
         __S.arity[storage.lend] = 3
+        -- a value holding owners: lent as a Ref to it in the map, where it lives (§5.9)
+        storage.lend_owner = function(m, table, entry, body)
+            local owner = iterating[#iterating]
+            local k = storage.key(table, __S.dot(entry, "key"))
+            if owner then __S.set_iteration_key(owner, __S.expr_key(__S.ex(__S.value_of k))) end
+            local v = __S.element_ref(m, __S.Ptr(__S.dot(entry, "value")))
+            if is_str then
+                local ptr, len = __S.slice_parts k
+                local token = __S.activity_token()
+                k = __S.make_slice(Str, ptr, len, token)
+                local ok, err = pcall(body, k, v)
+                if not ok then token.ended = true; error(err, 0) end
+                __S.end_view(token, nil, "a Map(Str, V) key cannot outlive its iteration")
+            else body(k, v) end
+        end
         return storage
     end
     decl.api = function(T, Id, p)

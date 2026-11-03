@@ -2,7 +2,7 @@
 -- Every lua block in the guide is an excerpt of this file (tests/guide.lua).
 local io = require "nua.io"
 
--- §4.1 Values first ---------------------------------------------------------------------------------
+-- §4.2 Values: laid out because they exist at run time --------------------------------------------
 -- (step 2 of the guide's process)
 
 local Direction = Sum { left: Unit, right: Unit }
@@ -31,6 +31,78 @@ local outline_demo = do(n: U32): U32
     return add_words(Ref outline, body, 2 * n)
 end
 export outline_demo
+
+-- an owner inside an element: each note's title lives in the store's arena
+local Note = Struct { title: Text, words: U32 }
+local notes_demo = do(n: U32): U64
+    local notes = Store(Note) {}
+    local first = notes:add Note { words = n }
+    notes[first].title:write "draft "
+    notes[first].title:write n
+    return notes[first].title:str().length
+end
+export notes_demo
+
+-- §4.1 Name first; §4.2 lay out on demand ---------------------------------------------------------
+
+-- vocabularies: names bound while compiling, with no layout
+local Moves = define with
+    left = do(document: Ref Document): Unit
+        if document.cursor > 0 then document.cursor = document.cursor - 1 end
+    end
+    right = do(document: Ref Document): Unit
+        if document.cursor < document.length then document.cursor = document.cursor + 1 end
+    end
+end
+local Edits = define with
+    insert = do(document: Ref Document, n: U32): Unit
+        document.length = document.length + n
+        document.cursor = document.cursor + n
+    end
+end
+
+-- capabilities compose by spread; two that both offer a name are rejected
+local Editing = define with
+    ..Moves
+    ..Edits
+end
+
+-- a word that takes a vocabulary specializes against its members
+local type_and_step_back = do(ops, document: Ref Document, n: U32): Unit
+    ops.insert document n
+    ops.left document
+end
+local type_back = do(document: Ref Document, n: U32): Unit
+    type_and_step_back Editing document n
+end
+export type_back
+
+-- opening a vocabulary brings its names into scope
+local type_twice = do(document: Ref Document, n: U32): Unit
+    local Editing..
+    insert document n
+    insert document n
+end
+export type_twice
+
+-- discovered as names: two runtime values that travel together through in-place words
+local remaining = do(document: Ref Document): U32
+    local span = define { start = document.cursor, stop = document.length }
+    return span.stop - span.start
+end
+export remaining
+
+-- a structural type carries its defaults; an instance is the type spread with overrides
+local Margins = define { left = 4, right = 4 }
+local wide = define { ..Margins, right = 12 }
+local text_width = do(document: Ref Document): U32
+    return document.length - wide.left - wide.right
+end
+export text_width
+
+-- promoted when it must be stored: now it needs a layout
+local Span = Struct { start: U32, stop: U32 }
+local Selections = Struct { spans: Grow Span }
 
 -- §12 Words: subject first, body last ---------------------------------------------------------------
 
@@ -241,14 +313,14 @@ end
 -- a builder: the block declares, the builder returns a description
 local keymap = function(body)
     local bindings = {}
-    local vocabulary = {
+    local Keys = define with
         bind = function(key)
             return function(command)
                 bindings[#bindings + 1] = { code = key:byte(), .command }
             end
-        end,
-    }
-    body vocabulary
+        end
+    end
+    body Keys
     return bindings
 end
 
@@ -267,6 +339,73 @@ local on_key = do(document: Ref Document, key: U8): Unit
     end
 end
 export on_key
+
+-- §6.11 Designing a DSL ------------------------------------------------------------------------------
+
+local Request = Struct { method: U8, path: Str }
+
+-- the methods a router speaks: a structural vocabulary of known values
+local Methods = define { get = 1, post = 2 }
+
+-- the builder: one verb per method; sentences in, a checked description out
+local router = function(Verbs)
+    return function(body)
+        local routes, seen = {}, {}
+        local Routing = {}
+        for name, code in pairs Verbs do
+            Routing[name] = function(path)
+                -- level 3: the error names the line that spoke the route
+                if type path ~= "string" or path:sub(1, 1) ~= "/" then
+                    __S.fail(name .. ": a path starts with '/', got " .. tostring path, 3)
+                end
+                if seen[name .. path] then __S.fail(name .. " " .. path .. " is declared twice", 3) end
+                seen[name .. path] = true
+                return function(handler) routes[#routes + 1] = { method = code, .path, .handler } end
+            end
+        end
+        body Routing
+        return routes
+    end
+end
+local routes = router Methods
+
+-- the engine over the description: one test per route, each handler inlined
+local dispatch = do(table, request: Request): U32
+    for _, r in ipairs table do
+        if request.method == r.method and request.path:equals r.path then
+            return r.handler request
+        end
+    end
+    return 404
+end
+
+-- the sentences: each handler opens the request it is given
+local site = routes:
+    get "/":
+        return 200
+    end
+    post "/notes":
+        return 200 + U32 path.length
+    end
+end
+
+local handle = do(method: U8, path: Str): U32
+    return dispatch site Request { .method, .path }
+end
+export handle
+
+-- the description is data: test it while compiling
+assert(#site == 2 and site[2].path == "/notes")
+
+-- a dialect: the same builder over a vocabulary extended by spread
+local Dav = define { ..Methods, propfind = 7 }
+local dav_routes = router Dav
+local share = dav_routes:
+    propfind "/":
+        return 207
+    end
+end
+assert(share[1].method == 7)
 
 -- a known description: the interpreter dissolves
 local greeting = { Command.insert 5, Command.move(Direction.left()), Command.insert 1 }

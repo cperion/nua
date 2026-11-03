@@ -40,6 +40,9 @@ function nua.prelude()
     local env = setmetatable({}, { __index = _G })
     for _, n in ipairs(T.scalars) do env[n] = T[n] end
     env.__S = S
+    -- keyed spread in a table constructor (macro/nua.lua): the spreads are marked keys
+    env.__nua_spread = S.spread_mark
+    env.__nua_keyed = S.keyed_table
     env.with = S.contextual    -- `with` where an expression starts (nua.colon)
     env.__ENV = env
     env.Ref = S.Ref
@@ -81,6 +84,8 @@ function nua.prelude()
     env.fence = S.fence
     env.trap = S.trap
     env.TODO = S.trap    -- TODO "message": work not written yet; it traps with the message
+    -- define with ... end: a compile-time table (a vocabulary), extended by keyed spread
+    env.define = function(t) return t end
     env.atomic_ptr = S.atomic_ptr
     env.bytes = S.bytes
     env.size_of = S.size_of

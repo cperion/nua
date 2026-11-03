@@ -64,7 +64,14 @@ function Reader:fetch()
         end
         if t == 'space' or t == 'comment' then
             ws[#ws + 1] = v
-            if v:find '\n' then nl = true end
+            if v:find '\n' then
+                nl = true
+                -- pushed-back tokens carry no line: their line breaks still count
+                if not line then
+                    local _, breaks = v:gsub('\n', '')
+                    self.last_line = self.last_line + breaks
+                end
+            end
         elseif t == 'iden' and v == APPLY then
             -- macro.let's application mark: this parser sees application itself
         else

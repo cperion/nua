@@ -1213,8 +1213,8 @@ Scalars, structs without owner fields, references and IDs are fixed-size. They l
 `Grow T`, `Array T`, `Store T`, `Map(K, V)` (including `Map(Str, V)`) and `Text` are owners: they have storage of their own on a data stack. A struct holding owner fields, any number of them and in any order, is an owner too.
 
 - **Created in place.** An owner is constructed where it lives: `local xs = Grow(U32) {}`, a field of an owner struct, or the place a word's owner result is built in. Declared without a value, it starts empty: `local s: Store Node`. An owner struct's omitted owner fields start empty and its omitted value fields start zeroed: `Graph {}`, `Graph { name = Chars(32) "roads" }`.
-- **One data stack each.** Creation takes the lowest free data-stack index of the function. An owner occupies the top of its stack, and no other live owner of the function shares it. A recursion is the exception that keeps the number of stacks fixed: its levels share stack indices, each level's owners above the previous level's (§9.10).
-- **Moved at its last use.** Using a named owner as a value moves it: assigning it, passing it to an owner-typed parameter, returning it, or giving it to a field (`Graph { .nodes, .edges }`). Nothing is copied: its storage stays where it is, and the destination takes over releasing it. A later use is rejected: `'nodes' was moved into 'g.nodes'`. A move on some paths only is exact: the paths that do not move it release it before they join.
+- **One data stack each.** Creation takes the lowest free data-stack indices of the function: one per stack of the owner, consecutive (an owner holding owners has an arena for each owner position, §9.13). An owner occupies the top of its stack, and no other live owner of the function shares it. A recursion is the exception that keeps the number of stacks fixed: its levels share stack indices, each level's owners above the previous level's (§9.10).
+- **Moved at its last use.** Using a named owner as a value moves it: assigning it, passing it to an owner-typed parameter, returning it, or giving it to a field (`Graph { .nodes, .edges }`). Nothing is copied: its storage stays where it is, and the destination takes over releasing it. A move into an element copies the bytes once into the container's arenas (§9.13). A later use is rejected: `'nodes' was moved into 'g.nodes'`. A move on some paths only is exact: the paths that do not move it release it before they join.
 - **Moved out through a `Ref` parameter.** A word may move an owner out of a `Ref` argument: in place, the caller's place is moved; compiled on its own (`call`, recursion), its summary says which part of which argument it moves, and the caller's place counts as moved after the call. An exported word may not. Through a `Ref` whose target is not known while compiling (a field, an element, a local chosen at run time), moving out is rejected.
 - **Replaced by assignment.** Assigning a new owner to an owner place ends the old one there: its storage returns, and borrows of it end (`'g' was replaced`).
 - **Copied only by `copy`.** `copy x` builds a duplicate in its destination: owner structs deeply (owner fields copied, value fields as values), a `Store` with the same token (its `Id`s name the same entities in the copy). `copy` of a `Str` builds a `Text`, of a `Slice T` an `Array T`; `copy` of a value is the value.
@@ -1292,7 +1292,7 @@ in it is checked against the container's owner, and a borrow of an element (`Ref
 g[i]`, `g:all()`) borrows the container's contents, which `clear` ends. A global
 outlives every owner, so it holds only borrows of static data or of other globals.
 Values crossing a task boundary (spawn copies, channel messages) hold no borrow at
-all (§20.5), and map entries hold none (§15.1). Store an owned copy (`Chars(n)`, a
+all (§20.5); a borrow stored in a map value is checked like any stored borrow (§15.1). Store an owned copy (`Chars(n)`, a
 `Text`) or an `Id` instead. A long-lived relationship between entities is an `Id`
 (§9.8).
 
@@ -1300,7 +1300,8 @@ all (§20.5), and map entries hold none (§15.1). Store an owned copy (`Chars(n)
 
 Data stacks never move (§9.10), so growing invalidates nothing: a `Grow` or a
 `Text` may grow while a borrow of it is live, and the borrow keeps the length it
-was taken with. Only freeing storage invalidates. `clear` ends every borrow of the
+was taken with. An owner inside an element is the exception: its bytes may move
+when it grows (§9.13). Only freeing storage invalidates. `clear` ends every borrow of the
 owner's contents taken so far (its views, references to its elements); borrows
 taken afterwards are new. A reference to the owner itself (`Ref g`) survives:
 the owner still exists. The check is made where a
@@ -1372,7 +1373,31 @@ Cycles are ordinary relationships; they create no ownership cycles. Objects are 
 
 Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`Slice(p, n)`, `view_of(p, n, body)`, `Array(T, n)`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
 
-`Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4), `g:pop()` (the last element, removed; an empty `Grow` traps), `g:truncate(n)` (keep the first `n`; more than `g.length` traps) and `g:clear()`. `pop`, `truncate` and `clear` free the storage above the new end, so borrows of the contents end there. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any fixed-size type that is neither an owner nor an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots.
+`Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4), `g:pop()` (the last element, removed; an empty `Grow` traps), `g:truncate(n)` (keep the first `n`; more than `g.length` traps) and `g:clear()`. `pop`, `truncate` and `clear` free the storage above the new end, so borrows of the contents end there. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any type that is not an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots, and owners or values holding them (§9.13).
+
+### 9.13 Owners inside owners
+
+An owner may sit anywhere a value can: an element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)`, a field of such an element, a map value, a sum payload, a global (design memory.md §5.9, §5.10).
+
+```lua
+local Player = Struct { score: U32, name: Text, items: Grow Item }
+local lines = Grow(Text) {}
+local players = Store(Player) {}
+local names = Map(U64, Text) {}
+local Doc = Sum { empty: Unit, text: Text }
+```
+
+- **Positions.** Each place in an owner's type where an owner sits is a position, with one data stack. A position under an element (of a container, of an `Array(T, n)`, a map value) is shared by every element there: it is that position's arena. `Grow Text` holds 2 stacks, `Store Player` 3, `Grow(Grow Text)` 3. The number is fixed while compiling, so a type that contains itself through an owner is rejected; a tree goes through `Id`s into a `Store` (§9.11).
+- **Growth.** An owner inside an element grows within its capacity, at its arena's top when it ends there, or by moving its bytes to the top with doubled capacity. A top-level owner never moves.
+- **Borrows.** Growing an owner inside an element ends the borrows of its contents (`a text in 'lines' grew, so its bytes may have moved`); when the compiler cannot tell two elements apart (unknown indices), the borrows of the contents of every element at that position. A word compiled on its own says so in its summary (`the call to append, which may grow or clear it`). Borrows of the elements themselves, and of top-level owners, are unaffected.
+- **Moving in and out.** Storing a named owner into an element (`lines:push t`, `lines[i] = t`, `players[id].name = t`) copies its bytes once into the arenas and ends it; a constructor (`lines:push(Text {})`) builds the element where it lands. Moving an owner out of an element is rejected; `copy lines[i]` and `lines:pop()` (a new owner) are the ways out.
+- **Reclaiming.** Removing, popping, truncating, clearing or replacing an element leaves its owners' bytes dead in the arenas. These operations, which already end borrows, compact an arena when its dead bytes reach its live bytes (and 4096), and compaction ends the borrows of the contents at the root's positions. A word that removes owners inside an argument's elements says so in its summary, and its caller compacts. `clear` of the outermost container empties every arena at once.
+- **Elements one at a time.** A container whose elements hold owners offers no `all` or `sub`: a slice would read their headers as values.
+- **`copy`** of a container is deep: every element's owners are built anew in the copy's arenas.
+- **Sums.** A sum whose payload holds owners is an owner. Its alternatives share its stacks, and it keeps where they began. Its payload is matched by reference (`d { text = do(t: Ref Text) ... end, ... }`); a handler taking it by value is rejected. Assigning another variant ends the old payload. A payload given by a named owner is copied into the sum's stacks; one built by a constructor is built there.
+- **Globals.** A global may be an owner (`global(Grow Text, { name = "journal" })`), with only a name. Its stacks are the first of the main thread's, reserved for it; it is set up at its first use, by the thread that uses it first, and a later use by another thread traps. A task may not use one (`a task cannot use the owner global 'journal'`). Trap recovery leaves it.
+- **Maps.** A map may sit inside an element or a map value (`Map(U32, Map(U32, U32))`, `Grow(Map(Str, U32))`): each of its stacks (slots, index, keys) is a position. Its slots and keys grow like any owner inside an element, its index is rebuilt at its arena's top, and an insertion ends the borrows of its entries (`a map in 'outer' grew, so its entries may have moved`).
+- **Not yet.** A sum holding owners as a global is rejected.
 
 ## 10. Activities, opening and spread
 
@@ -1632,7 +1657,20 @@ Then the next use looks again. The C compiler cannot do this merging itself, bec
 local moved_x = do(p: Point, dx: I32): Point = Point { ..p, x = p.x + dx }
 ```
 
-A spread contributes a record's data fields (from a value, place or reference); the result is ordinary construction. Explicit fields override spread fields regardless of position; duplicate explicit fields are rejected; two spreads contributing the same field are rejected (`spread-overlap`), even if an explicit field overrides it; unknown fields are rejected, including overridden ones. All operands evaluate in source order.
+A spread contributes a record's data fields (from a value, place or reference); the result is ordinary construction. A spread of a compile-time table contributes its string keys, and when every spread is one, the result is a compile-time table: this is how vocabularies (for DSLs, and for any Lua code) are built and extended. `define` returns its argument, so a `with` block reads as a definition:
+
+```lua
+local base = define with
+    add = do(a: U32, b: U32): U32 return a + b end
+    scale = 2
+end
+local more = define with
+    ..base
+    scale = 3
+end
+```
+
+`{ ..base, extra = true }` works in plain Lua code too. The same rules apply to both forms: explicit fields override spread fields regardless of position; duplicate explicit fields are rejected; two spreads contributing the same field are rejected (`spread-overlap`), even if an explicit field overrides it; unknown fields are rejected, including overridden ones. All operands evaluate in source order.
 
 ### 10.8 Rest requirements, packs and ordered spread
 
@@ -1730,7 +1768,7 @@ local Rect = Struct { width: U32, height: U32 }
 local Shape = Sum { circle: Circle, rect: Rect, dot: Unit }
 ```
 
-A sum is a finite set of named alternatives, each with a payload type (`Unit` for none). Alternative order is canonical (by name), so two spellings of the same alternatives are the same type. A `Sum` needs at least one alternative. Payloads are fixed-size: no resizable storage and, as everywhere in Nua, no references (*Let's recursive sums go through `Ref`; in Nua they go through `Id`s into a store, as graphs do*).
+A sum is a finite set of named alternatives, each with a payload type (`Unit` for none). Alternative order is canonical (by name), so two spellings of the same alternatives are the same type. A `Sum` needs at least one alternative. A payload may hold owners (§9.13), never references (*Let's recursive sums go through `Ref`; in Nua they go through `Id`s into a store, as graphs do*).
 
 Member selection on the sum type names a constructor. A record payload is built by keyed supply, another payload is applied to one value, and a `Unit` alternative to nothing:
 
@@ -1989,7 +2027,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 
 **A check that a branch already proved is dropped.** On each arm of a dynamic branch the compiler records what an integer comparison proves (the loop exit `if (i >= n) break;` proves `i < n` on the path that continues), over values that cannot change behind its back: constants, parameters, temporaries, versioned reads of tracked locals, and a view's length. When `i` changes, its version changes and the fact stops matching. `s[i]` and `a[i]` (§13) emit no check when such a fact proves `i < length`.
 
-A view is read-only: `s[i] = v` is rejected (`not-a-place`); writes go through the storage or a `Ptr`. Slices cannot be compared. Slices are borrows, like `Ref`, so they cannot be stored in structs (*Let admits slices in records; Nua keeps its rule that aggregates hold no borrows*).
+A view is read-only: `s[i] = v` is rejected (`not-a-place`); writes go through the storage or a `Ptr`. Slices cannot be compared. Slices are borrows, like `Ref`: a struct field, an element or a payload may hold one, checked by the lifetime rule (§9.4, §9.5).
 
 **Checks and binding times.** Internally a slice is a two-field struct, so the evaluator tracks its length apart from its pointer. A **known index against a known length is checked at compile time** (`index-range`) and costs nothing at run time; anything else is one check when it runs (the `slice.index` word of [lib/slice.nua](../lib/slice.nua), a trap on failure). `s:sub(a, b)` with known bounds produces a slice whose **length is known**, after one range check. So the idiom for formats is to take the whole header once, then read at constant offsets with no further checks.
 
@@ -2107,7 +2145,7 @@ establish the scoped loan around the user callback and perform invalidating work
 
 ## 13. Fixed-length arrays
 
-`Array(T, n)` holds `n` elements of a fixed-size `T`, with `n` known while compiling. It is a value: a typed local, a struct field, a parameter, a pool's slot type. In C it is a struct wrapping `T e[n]`, so it copies and passes by value as structs do.
+`Array(T, n)` holds `n` elements of a fixed-size `T`, with `n` known while compiling. It is a value: a typed local, a struct field, a parameter, a pool's slot type. In C it is a struct wrapping `T e[n]`, so it copies and passes by value as structs do. An `Array(T, n)` whose elements hold owners is an owner instead (§9.13): its elements' owners live in its arenas, it is indexed like a container (`a[i]`, `a.length`), moved and copied like any owner.
 
 ```lua
 local fixed = do(): U32
@@ -2135,7 +2173,7 @@ uint32_t fixed(void) {
 * Fully known array contents are immutable aggregate values in the evaluator. A typed local keeps its whole pending value; known-index reads and known writes can fold. Copies keep independent snapshots, including nested arrays and structs. Compact zero contents do not require one compiler cell per element.
 * A dynamic write or a read requiring runtime indexing materializes the array conservatively; the implementation does not maintain a partly known element map afterward. Different branch results materialize on their respective paths, and loops widen as other tracked values do. Equal known contents may stay known.
 * `a:slice()` is a live read-only view of the owner, not a snapshot of its contents. It can read known elements without creating an address. Once a raw address or foreign boundary requires memory, pending values are written and affected knowledge is invalidated. Explicit `Ptr(...)` remains the runtime boundary of §12.1; this is not a compile-time heap.
-* Elements are fixed-size: scalars, structs, sums, arrays, channels, references and views. An array holding a borrow follows the lifetime rule as a whole (§9.5). An array is sendable when its elements are.
+* Elements are scalars, structs, sums, arrays, channels, references and views, or owners (§9.13). An array holding a borrow follows the lifetime rule as a whole (§9.5). An array is sendable when its elements are.
 
 ## 14. Text
 
@@ -2384,13 +2422,15 @@ A map is an owner like `Store` and `Grow`, so the decisions that shaped it
 were mostly decisions about the Goose model it already had: two data stacks for a
 `Map` (slots and index) and three for a `Map(Str, V)` (slots, index, and an arena of copied key bytes), created in
 place, released at the end of the owning block, never captured by a task. Holding
-maps in a struct needed no new rule, only the existing ownership accounting; maps of maps need
-a representation decision that is still open, because a store slot holds fixed-size
-payloads and an `Id` does not settle where the nested storage lives.
+maps in a struct needed no new rule, only the existing ownership accounting. A map value
+may hold owners (`Map(U64, Text)`, `Map(Str, Grow U32)`): they live in the map's arenas
+(§9.13), `m[k]` reaches them in place, `put` on an existing key replaces the old value's
+owners, and `find` is not offered (it would return the value). A map may itself be a map
+value or a container element (§9.13).
 
 **Key and value restrictions are recursive, not judged by the outer type's size.** A
-key must have semantic equality that ignores padding, and a value must be fixed-size
-owned data. That is why `Chars(n)` is a key despite its internal array, why a struct
+key must have semantic equality that ignores padding, and a value must be owned data:
+fixed-size, or holding owners (§9.13). That is why `Chars(n)` is a key despite its internal array, why a struct
 of allowed keys is a key, and why a borrowed view, a pointer, a channel, an atomic or
 a resizable field is refused at any depth. Checking only the outermost type would
 admit a struct whose padding makes two equal values hash differently.
@@ -2426,9 +2466,9 @@ strong.
 
 **A `Map(Str, V)` arena is addressed by offset.** Entries keep byte offsets into their
 movable arena, never pointers, so growth can relocate it. Removal marks bytes
-reclaimable, and a bounded dead-byte threshold triggers compaction before further
-growth, so insert/remove churn cannot accumulate historical key storage without
-bound. A key view supplied by the caller is borrowed, never silently copied: the
+reclaimable, and the removal itself compacts the arena once the dead bytes reach the
+live bytes (and 4096), so insert/remove churn cannot accumulate historical key storage
+without bound; an insertion never moves keys. A key view supplied by the caller is borrowed, never silently copied: the
 owner must outlive the lookup, and each resolution observes the current bytes.
 
 The contract is §15.1–§15.4; what each part is checked by is named in the acceptance
@@ -3569,7 +3609,7 @@ uint32_t bump(uint32_t n) {
 | `exported` | external linkage: another unit, or a header, can name it |
 | `imported`, `header` | defined elsewhere and declared by `header`, which the program includes |
 
-A global cannot be Unit, opaque, a reference, an owner or a view. It may be a channel or a pool: handles are generational, so a stale one traps at its next use and never reaches freed memory. Both backends emit it from the same IR (`gccjit` creates an internal, exported or imported global, with the TLS model for `thread_local`). An imported and an exported global of one name are one object.
+A global cannot be Unit, opaque, a reference or a view; an owner global is §9.13's. It may be a channel or a pool: handles are generational, so a stale one traps at its next use and never reaches freed memory. Both backends emit it from the same IR (`gccjit` creates an internal, exported or imported global, with the TLS model for `thread_local`). An imported and an exported global of one name are one object.
 
 Tasks cannot write ordinary globals through compiler-visible addresses. The rule follows aliases, aggregate-held pointers, parameters, returns, known function pointers and blocking bodies. Direct reads and calls proved to read only are permitted. Actual atomic operations, thread-local storage and `global(T, { shared = true })` are exceptions. Declaring an Atomic global does not permit non-atomic writes through a cast.
 
@@ -3614,15 +3654,14 @@ The core language does not provide:
 - Implicit runtime closure allocation.
 - General-purpose heap ownership, reference counting or tracing garbage collection.
 - Automatic heap promotion.
-- References stored in aggregates.
+- References that outlive their owners: a stored borrow is checked by the lifetime rule (§9.5).
 - Arbitrary independently owned objects, or automatic collection of unreachable graph nodes.
 - Unrestricted speculation of compile-time side effects.
 - A runtime object model for generic types, or dynamic method dispatch by default.
 - Shared mutable memory between tasks, and the lock and ownership type disciplines that would police it (tasks communicate over channels and move pool slots, §20).
 
-Planned and not implemented: owners nested in containers, payloads and map values,
-and owner globals ([the memory design](design/memory.md) §5.9, §5.10). Pointer
-arithmetic beyond `p[i]` is excluded by design (§12).
+Not implemented: a sum holding owners as a global (§9.13). Pointer arithmetic beyond
+`p[i]` is excluded by design (§12).
 
 ## 23. The defining contracts
 

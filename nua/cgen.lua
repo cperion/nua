@@ -1492,7 +1492,8 @@ local function emit_function(fn, out)
     plan_jumps(fn, f)
     local order = plan_declarations(f, fn)
     out[#out + 1] = signature(fn) .. ' {'
-    if fn.needs_gs and fn.exported then f:line('size_t gs_sp = 0;') end
+    -- an entry's stacks begin past the ones its owner globals reserve (design memory.md §5.10)
+    if fn.needs_gs and fn.exported then f:line('size_t gs_sp = ' .. (fn.gs_base or 0) .. ';') end
     if fn.waits or fn.needs_self then
         -- plain code waits by blocking, as a party the runtime can wake
         f:line('nua_task *nua_tk = nua_self();')
@@ -1770,6 +1771,7 @@ end
 local function module_parts(mod, opts)
     opts = opts or {}
     local fns = G.prepare(mod)
+    for _, fn in ipairs(fns) do fn.gs_base = mod.owner_global_stacks or 0 end
     if opts.split then for _, fn in ipairs(fns) do fn.external = true end end
     local p = { banner = {}, macros = {}, includes = {}, types = {}, types_task = {},
                 strings = {}, externs = {}, globals = {}, protos = {}, functions = {},
@@ -1863,6 +1865,8 @@ local function module_parts(mod, opts)
             for _, a in ipairs(t.alts) do tags[#tags + 1] = name .. '_' .. a.name .. ' = ' .. a.tag end
             add('types', 'enum { ' .. table.concat(tags, ', ') .. ' };')
             add('types', 'typedef struct ' .. name .. ' {')
+            -- a sum holding owners keeps where its stacks began (design memory.md §5.9)
+            if t.resizable then add('types', '    uint64_t stack;'); add('types', '    uint64_t base;') end
             add('types', '    uint32_t tag;')
             local members = {}
             for _, a in ipairs(t.alts) do

@@ -23,8 +23,10 @@ local function fail(msg) S.fail(msg, 2) end
 local function fresh(t) return setmetatable({ T = t, k = 'fresh' }, S.V) end
 
 -- C names supplied by the backend: NodeStore, NodeId, U8Grow
+local cname_of
 local function elem_name(t)
     if t.kind == 'struct' then return require('nua.cgen').ctype(t) end
+    if t.kind == 'owner' or t.kind == 'id' then return cname_of(t) end
     if t.kind == 'ref' then return elem_name(t.elem) .. 'Ref' end
     return t.name
 end
@@ -35,7 +37,7 @@ end
 local families = {}
 local function family_of(t) return rawget(t, 'family') and families[t.family] end
 
-local function cname_of(t)
+function cname_of(t)
     if rawget(t, 'cname') then return t.cname end    -- a family that names its own types (setup)
     local f = family_of(t)
     if f then return elem_name(t.elem) .. f.suffix end
@@ -87,6 +89,7 @@ Mem.layouts_module = layouts_module
 
 local function layout_of(t)
     if t.representation then return { layout = t.representation } end
+    if t.kind == 'sum' then return { layout = layouts_module().Bookkeeping } end
     local cache = derived[S.module]
     if not cache then cache = {}; derived[S.module] = cache end
     local r = cache[t]
@@ -116,15 +119,27 @@ local serials = 0
 -- says which stack and where the owner began, so releasing reads the header:
 -- a moved owner is released through whichever place holds it now.
 local function releaser_for(t, fields)
+    -- a sum: its first stack's slot releases the live payload and resets them all
+    if t.kind == 'sum' then
+        if fields and fields.offset ~= 0 then return function() end end
+        return function(place) Mem.release_sum(place) end
+    end
     local representation = layout_of(t).layout
     fields = fields or { 'stack', 'base' }
-    local cleanup = require('nua.storage_layout').releaser(representation, fields[1], fields[2])
+    local cleanup = require('nua.storage_layout').releaser(representation, fields[1], fields[2], fields.offset)
     return function(place) cleanup(Mem.view(place, representation)) end
 end
 Mem.releaser_for = releaser_for
 
 -- the residual block whose end releases an owner held by place p: the block
 -- its root local was declared in
+-- which stack of an owner's header a slot releases: a field pair, and for an arena (an
+-- owner position of its elements, §5.9) its offset from the owner's first stack
+local function fields_key(fields)
+    if not fields then return 'stack/base' end
+    return table.concat(fields, '/') .. (fields.offset and ('+' .. fields.offset) or '')
+end
+
 local function owning_block(b, p)
     local root = S.root_of(p)
     return rawget(root, 'block') or b.block
@@ -204,21 +219,42 @@ function Builder:register_slot(slot)
     return slot
 end
 
-function Builder:gs_alloc(p, release)
+-- An owner's stacks, one per entry of its release fields, as one allocation: a run of
+-- consecutive indices (or result stacks), so the stack of each owner position of its
+-- elements is its first stack plus a fixed offset (design memory.md §5.9, R2).
+function Builder:gs_alloc(p, list)
     if not self.fn then
         fail('a ' .. p.T.display .. ' is runtime storage; it cannot be created at compile time')
     end
     local ordinal, j = self:next_allocation()
-    local free = releaser_for(p.T, release)
+    local n = #list
+    if n > 1 then
+        self.alloc_spans = self.alloc_spans or {}
+        self.alloc_spans[ordinal] = math.max(self.alloc_spans[ordinal] or 0, n)
+    end
+    local out = {}
     if j then
-        self:register_slot { place = p, res = j, ordinal = ordinal, free = free, fields = release }
-        return { res = j }
+        for i, fields in ipairs(list) do
+            self:register_slot { place = p, res = j + i - 1, ordinal = ordinal, free = releaser_for(p.T, fields),
+                                 fields = fields }
+            out[i] = { res = j + i - 1 }
+        end
+        return out
     end
     self.gs_live = self.gs_live or {}
     local k = 0
-    while self.gs_live[k] do k = k + 1 end
-    self:register_slot { place = p, k = k, ordinal = ordinal, free = free, fields = release }
-    return k
+    while true do
+        local free = true
+        for i = 0, n - 1 do if self.gs_live[k + i] then free = false break end end
+        if free then break end
+        k = k + 1
+    end
+    for i, fields in ipairs(list) do
+        self:register_slot { place = p, k = k + i - 1, ordinal = ordinal, free = releaser_for(p.T, fields),
+                             fields = fields }
+        out[i] = k + i - 1
+    end
+    return out
 end
 
 -- every slot this builder holds
@@ -250,7 +286,7 @@ function Builder:slots_of(p)
     local by_fields, order = {}, {}
     for _, slot in ipairs(self:all_slots()) do
         if slot.place == p then
-            local key = slot.fields and table.concat(slot.fields, '/') or 'stack/base'
+            local key = fields_key(slot.fields)
             if not by_fields[key] then order[#order + 1] = key end
             by_fields[key] = slot
         end
@@ -280,7 +316,7 @@ function Builder:release_slots(slots, why)
     local done = {}
     for _, slot in ipairs(slots) do
         if not moved_here(self, slot.place) then
-            local key = tostring(rawget(slot.place, 'id')) .. ':' .. (slot.fields and table.concat(slot.fields, '/') or '')
+            local key = tostring(rawget(slot.place, 'id')) .. ':' .. (slot.fields and fields_key(slot.fields) or '')
             if not done[key] and not self.dead then slot.release() end
             done[key] = true
             if why then
@@ -291,9 +327,51 @@ function Builder:release_slots(slots, why)
     end
 end
 
--- the stack fields of an owner type's header, as (stack, base) pairs
-function Mem.release_fields(t)
+-- the stack fields of an owner type's own header, as (stack, base) pairs
+function Mem.own_fields(t)
+    -- a sum holding owners has none of its own: its payloads' (design memory.md §5.9)
+    if t.kind == 'sum' then return {} end
     return rawget(t, 'release_fields') or { { 'stack', 'base' } }
+end
+
+-- Owner positions (design memory.md §5.9, R2). An owner holds its own stacks, then one
+-- stack per owner position of its elements (or map values): their arenas, shared by every
+-- element. The count is static; the order is the elements' owners, depth first.
+function Mem.position_count(u)
+    if u.kind == 'struct' then
+        local n = 0
+        for _, f in ipairs(u.fields) do if f.type.resizable then n = n + Mem.position_count(f.type) end end
+        return n
+    end
+    if not u.resizable then return 0 end
+    -- a sum's alternatives share its stacks: as many as its largest needs
+    if u.kind == 'sum' then
+        local n = 0
+        for _, a in ipairs(u.alts) do n = math.max(n, Mem.position_count(a.type)) end
+        return n
+    end
+    local elem = rawget(u, 'elem')
+    return #Mem.own_fields(u) + ((elem and elem.resizable) and Mem.position_count(elem) or 0)
+end
+
+-- every stack an owner type holds, as (stack, base) pairs: its own, then its arenas. A
+-- root owner begins at one offset on all of its stacks, so an arena is released to the
+-- owner's own base, on the stack at its offset from the first.
+function Mem.release_fields(t)
+    if t.kind == 'sum' then
+        local out = {}
+        for i = 1, Mem.position_count(t) do out[i] = { 'stack', 'base', offset = i - 1, sum = true } end
+        return out
+    end
+    local own = Mem.own_fields(t)
+    local elem = rawget(t, 'elem')
+    if not (elem and elem.resizable) then return own end
+    local out = { unpack(own) }
+    local first = own[1] or { 'stack', 'base' }
+    for i = 1, Mem.position_count(elem) do
+        out[#out + 1] = { first[1], first[2], offset = #own + i - 1 }
+    end
+    return out
 end
 
 -- the owners inside a place: itself, or an owner struct's owner fields, with
@@ -339,7 +417,7 @@ function Builder:adopt_owner(p, v, placement)
             local at = placement[position] or {}
             self:register_slot { place = q, free = at.free or releaser_for(q.T, fields), k = at.k, res = at.res,
                                  ordinal = at.ordinal, param = at.param, reserved = at.reserved,
-                                 fields = fields[1] ~= 'stack' and fields or nil }
+                                 fields = (fields[1] ~= 'stack' or fields.offset) and fields or nil }
         end
     end
     adopt(p, S.ex(v))
@@ -442,6 +520,13 @@ end
 -- An owner place receives an owner: a fresh one is created in place; a named
 -- one moves (design memory.md §5.4). An owner it held before ends here.
 function Builder:init_resizable(p, v)
+    -- an owner inside an element: its holder's arenas hold the contents (§5.9)
+    if Mem.element_of(p) then return self:overwrite_element(p, v) end
+    local global = rawget(S.root_of(p), 'owner_global')
+    if global then return self:init_global(p, global, v) end
+    if p.T.kind == 'sum' and S.is_value(v) and (v.k == 'sumv' or (v.k == 'fresh' and rawget(v, 'copy_of'))) then
+        return self:init_sum(p, v)
+    end
     if S.is_place(v) and v.T == p.T then return self:move_owner(p, v) end
     if S.is_value(v) and v.k == 'dyn' and v.T == p.T then
         -- an owner parameter: its stacks are the caller's; the slots remember
@@ -468,14 +553,191 @@ function Builder:init_resizable(p, v)
     local source, text = rawget(v, 'copy_of'), rawget(v, 'copy_text')
     local count, items = rawget(v, 'length'), rawget(v, 'copy_slice')
     -- one slot per stack the owner holds, then its init word over their indices
-    local indices, first = {}, nil
-    for i, fields in ipairs(Mem.release_fields(p.T)) do
-        local k = self:gs_alloc(p, fields)
-        first = first or k
-        indices[i] = Mem.stack_index(k)
+    local all = Mem.release_fields(p.T)
+    local indices, ks = {}, self:gs_alloc(p, all)
+    for i, k in ipairs(ks) do indices[i] = Mem.stack_index(k) end
+    rawset(p, 'gs_k', ks[1])
+    local elements = rawget(v, 'elements')
+    -- an owner with arenas begins at one offset on all of its stacks, each arena with
+    -- its record (§5.9)
+    if #all > #Mem.own_fields(p.T) then
+        local stacks = require('nua.stacks')
+        local base = Mem.capture(stacks.level(indices[1], #all), "an owner's base")
+        for i, fields in ipairs(all) do
+            if fields.offset then stacks.open_arena(indices[i], base) end
+        end
     end
-    rawset(p, 'gs_k', first)
-    p.T.init_word(p, indices, { copy_of = source, text = text, length = count, items = items })
+    p.T.init_word(p, indices, { copy_of = source, text = text, length = count, items = items, elements = elements })
+end
+
+-- Build the owners of a value into a place on the stacks `indices` (one-tenant: a sum's
+-- payload). Each owner takes its run of them, arenas opened at `base`; a named owner is
+-- copied and ends here, a fresh one is built there; other fields are stored as values.
+function Builder:init_on(dst, indices, base, value, copying)
+    local stacks = require('nua.stacks')
+    local offset = 0
+    local named = {}
+    local function put(d, q)
+        if d.T.kind == 'struct' then
+            for _, f in ipairs(d.T.fields) do
+                local dd = S.field_place(d, f.name)
+                local qq
+                if S.is_place(q) then qq = S.field_place(q, f.name) else qq = q.f[f.name] end
+                if f.type.resizable then put(dd, qq) else self:store(dd, S.is_place(qq) and self:read(qq) or qq) end
+            end
+            return
+        end
+        local all = Mem.release_fields(d.T)
+        local sub = {}
+        for i = 1, #all do sub[i] = indices[offset + i] end
+        offset = offset + #all
+        for i, fields in ipairs(all) do
+            if fields.offset then stacks.open_arena(sub[i], base) end
+        end
+        if S.is_place(q) then
+            S.check_usable(q)
+            d.T.init_word(d, sub, { copy_of = q })
+            if not copying then named[#named + 1] = q end
+        else
+            d.T.init_word(d, sub, { copy_of = rawget(q, 'copy_of'), text = rawget(q, 'copy_text'),
+                                    length = rawget(q, 'length'), items = rawget(q, 'copy_slice') })
+        end
+    end
+    put(dst, value)
+    for _, q in ipairs(named) do
+        self:release_owner(q, ("'%s' was moved into '%s'"):format(tostring(q.name), tostring(dst.name)))
+        S.mark_moved(q, dst, {})
+    end
+end
+
+-- A sum holding owners receives a variant (design memory.md §5.9): the old payload ends, the
+-- sum takes its stacks (as many as its largest alternative needs) at one base, keeps where
+-- they began, and its payload's owners are built on them.
+function Builder:init_sum(p, v)
+    S.check_usable(p, true)
+    self:release_owner(p, ("'" .. tostring(p.name) .. "' was given another variant"))
+    S.clear_moved(p)
+    local layouts = layouts_module()
+    local source = rawget(v, 'copy_of')
+    local alt = not source and p.T.index[rawget(v, 'tag')]
+    local all = Mem.release_fields(p.T)
+    local indices, ks = {}, self:gs_alloc(p, all)
+    for i, k in ipairs(ks) do indices[i] = Mem.stack_index(k) end
+    rawset(p, 'gs_k', ks[1])
+    local base = Mem.capture(require('nua.stacks').level(indices[1], #all), "a sum's base")
+    if source then
+        -- `copy s`: whichever variant it holds, its payload's owners copied onto these stacks
+        source = S.resolve_checked(source)
+        for _, a in ipairs(p.T.alts) do
+            S.when_variant(source, a, function()
+                if a.type.resizable then
+                    self:emit { op = 'store', place = p, what = 'a variant',
+                                e = { op = 'sum', T = p.T, alt = a.name, e = { op = 'zero', T = a.type } } }
+                    layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base)
+                    self:init_on(S.payload_place(p, a), indices, base, S.payload_place(source, a), true)
+                else
+                    self:emit { op = 'store', place = p, e = S.read_expr(source), what = 'a variant' }
+                    layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base)
+                end
+            end)
+        end
+        return
+    end
+    if not alt.type.resizable then
+        if not self.dead then self:emit { op = 'store', place = p, e = S.ex(v), what = 'a variant' } end
+    else
+        if not self.dead then
+            self:emit { op = 'store', place = p, what = 'a variant',
+                        e = { op = 'sum', T = p.T, alt = alt.name, e = { op = 'zero', T = alt.type } } }
+        end
+    end
+    layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base)
+    if alt.type.resizable then self:init_on(S.payload_place(p, alt), indices, base, rawget(v, 'p')) end
+end
+
+-- A sum's stacks end: its live payload's owners first (their arenas), then every stack of
+-- the sum returns to its base
+function Mem.release_sum(place)
+    local layouts = layouts_module()
+    local stacks = require('nua.stacks')
+    for _, alt in ipairs(place.T.alts) do
+        if alt.type.resizable then
+            S.when_variant(place, alt, function() S.release_place(S.payload_place(place, alt)) end)
+        end
+    end
+    local h = Mem.view(place, layouts.Bookkeeping)
+    local first, base = S.dot(h, 'stack'), S.dot(h, 'base')
+    local b = S.cur()
+    if S.is_place(first) then first = b:read(first) end
+    if S.is_place(base) then base = b:read(base) end
+    for i = 0, Mem.position_count(place.T) - 1 do stacks.reset(first + i, base) end
+end
+
+-- An owner global receives an owner (design memory.md §5.10): on its reserved stacks, which
+-- never move to another owner. `fresh` is the setup at its first use; afterwards the old
+-- contents end first. A named owner is copied and ends here.
+function Builder:init_global(p, g, v, first_use)
+    local stacks = require('nua.stacks')
+    if not first_use then
+        S.check_usable(p, true)
+        S.end_borrows(p, ("'" .. tostring(g.name) .. "' was replaced"))
+        S.release_place(p)
+    end
+    local offset = g.first
+    local named = {}
+    local function put(d, q)
+        if d.T.kind == 'struct' then
+            for _, f in ipairs(d.T.fields) do
+                local dd = S.field_place(d, f.name)
+                local qq = S.is_place(q) and S.field_place(q, f.name) or (q and q.f and q.f[f.name])
+                if f.type.resizable then put(dd, qq)
+                elseif qq ~= nil then self:store(dd, S.is_place(qq) and self:read(qq) or qq) end
+            end
+            return
+        end
+        local all = Mem.release_fields(d.T)
+        local indices = {}
+        for i = 1, #all do indices[i] = S.known(types.U64, offset + i - 1) end
+        offset = offset + #all
+        if #all > #Mem.own_fields(d.T) then
+            local base = Mem.capture(stacks.level(indices[1], #all), "an owner global's base")
+            for i, fields in ipairs(all) do
+                if fields.offset then stacks.open_arena(indices[i], base) end
+            end
+        end
+        if S.is_place(q) then
+            S.check_usable(q)
+            d.T.init_word(d, indices, { copy_of = q })
+            named[#named + 1] = q
+        else
+            q = q or {}
+            d.T.init_word(d, indices, { copy_of = rawget(q, 'copy_of'), text = rawget(q, 'copy_text'),
+                                        length = rawget(q, 'length'), items = rawget(q, 'copy_slice'),
+                                        elements = rawget(q, 'elements') })
+        end
+    end
+    put(p, v)
+    stacks.keep_owner_globals(S.known(types.U64, offset))
+    for _, q in ipairs(named) do
+        self:release_owner(q, ("'%s' was moved into '%s'"):format(tostring(q.name), tostring(g.name)))
+        S.mark_moved(q, p, {})
+    end
+end
+local ensures = setmetatable({}, { __mode = 'k' })
+function S.ensure_owner_global(g)
+    local per = ensures[S.module]
+    if not per then per = {}; ensures[S.module] = per end
+    local ensure = per[g]
+    if not ensure then
+        local name = S.global_cname(g)
+        ensure = require('nua.storage').owner_global(name, function()
+            S.cur():init_global(S.global_place(g), g, nil, true)
+        end)
+        per[g] = ensure
+    end
+    local b = S.cur()
+    if not b.fn then fail("'" .. tostring(g.name) .. "' is an owner global: it is runtime storage, used where it runs") end
+    ensure()
 end
 
 -- `copy x`: the visible O(n) duplicate of an owner, built in its destination.
@@ -549,6 +811,11 @@ function Builder:move_owner(dst, src)
                 self:adopt_owner(d, dyn(d.T, S.read_expr(q)))
                 return
             end
+            if Mem.shared_position(q) then
+                fail(("an owner inside an element cannot be moved out of it (its bytes live in its "
+                    .. "container's arena); copy it (copy %s), or pop it out of the container"):format(
+                    tostring(rawget(rawget(root, 'owner_place') or root, 'name')) .. '[...]'))
+            end
             if root.pk == 'deref' then
                 fail(("'%s' is reached through a Ref whose target is not known while compiling, so it "
                     .. "cannot be moved out (the place it leaves would not be known); copy it, or pass the "
@@ -597,11 +864,182 @@ end
 
 local function addr(p) return { op = 'addr', place = p, T = types.ref(p.T) } end
 
+-- Is an owner place at a shared position (design memory.md §5.9, R2): inside an element
+-- of a container, whose arena it shares with the other elements? Known while compiling:
+-- an element is a checked place of its container, and a word compiled on its own is
+-- specialized on whether each Ref argument is one.
+-- the payload of a sum is reached like an element (its borrows are the sum's contents), but
+-- a sum holds one payload at a time: inside a one-tenant sum it is one-tenant too
+local function payload_place(q)
+    local name = rawget(q, 'fname')
+    return type(name) == 'string' and name:sub(1, 3) == 'as.'
+end
+function Mem.shared_position(x)
+    x = S.through(x)
+    if S.is_value(x) and x.k == 'ref' then x = x.place end
+    if not S.is_place(x) then return false end
+    local q = x
+    while q do
+        if (rawget(q, 'owner_place') and not payload_place(q)) or rawget(q, 'shared') then return true end
+        q = rawget(q, 'parent')
+    end
+    return false
+end
+S.one_tenant_payload = function(q) return payload_place(q) and not Mem.shared_position(rawget(q, 'parent')) end
+S.shared_position = Mem.shared_position
+
+-- Build owners into a place inside an element of the holder hp: `offset` is the position of
+-- the place's first owner, counted from the holder's first stack. The source is a named owner
+-- (copied: bytes always live on their position's stack), a fresh owner (built in place), or
+-- a struct value holding them; value fields are stored as values.
+local function put_owner(hp, dst, offset, value)
+    local b = S.cur()
+    local header = storage_library(hp.T).layout.header(S.Ref(hp))
+    local first = S.dot(header, 'stack')
+    if S.is_place(first) then first = b:read(first) end
+    first = Mem.capture(first, "the holder's first stack")
+    local put
+    -- a sum: its variant, and its payload's owners at its positions (shared by the alternatives)
+    local function put_sum(d, q)
+        local start = offset
+        local function variant(alt, payload)
+            if not b.dead then
+                b:emit { op = 'store', place = d, what = 'a variant',
+                         e = { op = 'sum', T = d.T, alt = alt.name, e = { op = 'zero', T = alt.type } } }
+            end
+            offset = start
+            put(S.payload_place(d, alt), payload)
+        end
+        if S.is_value(q) and q.k == 'sumv' then
+            local alt = d.T.index[rawget(q, 'tag')]
+            if alt.type.resizable then variant(alt, rawget(q, 'p'))
+            elseif not b.dead then b:emit { op = 'store', place = d, e = S.ex(q), what = 'a variant' } end
+        else
+            q = S.resolve_checked(q)
+            for _, alt in ipairs(d.T.alts) do
+                S.when_variant(q, alt, function()
+                    if alt.type.resizable then variant(alt, S.payload_place(q, alt))
+                    else b:emit { op = 'store', place = d, e = S.read_expr(q), what = 'a variant' } end
+                end)
+            end
+        end
+        offset = start + Mem.position_count(d.T)
+    end
+    function put(d, q)
+        if d.T.kind == 'sum' then return put_sum(d, q) end
+        if d.T.kind == 'struct' then
+            for _, f in ipairs(d.T.fields) do
+                local dd = S.field_place(d, f.name)
+                local qq
+                if S.is_place(q) then qq = S.field_place(q, f.name)
+                elseif S.is_value(q) and q.k == 'agg' then qq = q.f[f.name]
+                else fail('storing a ' .. d.T.display .. ' into an element needs a value of it') end
+                if f.type.resizable then put(dd, qq) else b:store(dd, S.is_place(qq) and b:read(qq) or qq) end
+            end
+            return
+        end
+        local indices = {}
+        for i = 1, #Mem.release_fields(d.T) do indices[i] = first + (offset + i - 1) end
+        offset = offset + #Mem.release_fields(d.T)
+        if S.is_place(q) then
+            d.T.init_word(d, indices, { copy_of = q })
+        elseif S.is_value(q) and q.k == 'fresh' then
+            d.T.init_word(d, indices, { copy_of = rawget(q, 'copy_of'), text = rawget(q, 'copy_text'),
+                                        length = rawget(q, 'length'), items = rawget(q, 'copy_slice') })
+        else
+            fail('storing a ' .. d.T.display .. ' into an element needs an owner, got ' .. S.describe(q))
+        end
+    end
+    put(dst, value)
+end
+
+-- An owner stored into an element (design memory.md §5.9, R3): the element's owners begin
+-- on the holder's arenas, each at its position's offset from the holder's first stack, and
+-- take a copy of the value's contents; its other fields are stored as values. The value
+-- is an owner the calling word holds (its parameter), released where it ends: bytes always
+-- live on their position's stack, so a move into an element copies them once.
+Mem.put_owner = put_owner
+function S.store_owner(holder, ptr, value)
+    local hp = receiver(holder, 'storing an owner into an element')
+    local src = receiver(value, 'storing an owner into an element')
+    local v = S.value_of(ptr)
+    put_owner(hp, S.element_place(v.T.elem, S.ex(v), hp), #Mem.own_fields(hp.T), src)
+end
+
+-- the element a place lies in, its holder, and the field path from the element to it
+local function element_of(p)
+    local path, q = {}, p
+    while q and not (rawget(q, 'owner_place') and not payload_place(q)) do
+        table.insert(path, 1, rawget(q, 'fname'))
+        q = rawget(q, 'parent')
+    end
+    if not q then return nil end
+    return q, rawget(q, 'owner_place'), path
+end
+Mem.element_of = element_of
+-- a fresh value built into the element e refers to: its owners in the holder's arenas
+S.build_into = function(e, value)
+    local place = receiver(e, 'an element')
+    local hp = rawget(place, 'owner_place')
+    put_owner(hp, place, #Mem.own_fields(hp.T), value)
+end
+-- the outermost holder of an owner inside elements, as a Ref, when it is known while
+-- compiling: a root's arenas are compacted from the root (design memory.md §5.9, R5)
+S.root_holder = function(x)
+    local q = receiver(x, 'an owner')
+    while true do
+        local _, holder = element_of(q)
+        if not holder then break end
+        q = holder
+    end
+    if Mem.shared_position(q) then return nil end
+    return S.Ref(q)
+end
+-- the position of the owner at `path` inside an element of a holder of type t
+local function position_at(t, path)
+    local offset = #Mem.own_fields(t)
+    local u = t.elem
+    for _, name in ipairs(path) do
+        for _, f in ipairs(u.fields) do
+            if f.name == name then break end
+            if f.type.resizable then offset = offset + Mem.position_count(f.type) end
+        end
+        u = u.index[name].type
+    end
+    return offset
+end
+
+-- An owner place inside an element receives an owner (`lines[i] = t`, `players[id].name = t`):
+-- the old contents end (their borrows, and their bytes in the arenas, R5), the new ones are
+-- built there, and a named source ends here: it was moved, and its bytes were copied.
+function Builder:overwrite_element(p, v)
+    local element, hp, path = element_of(p)
+    local src = S.through(v)
+    if S.is_value(src) and src.k == 'ref' then src = src.place end
+    if S.is_place(src) then
+        S.check_usable(src)
+        if Mem.shared_position(src) then
+            fail(("an owner inside an element cannot be moved out of it; copy it (copy %s), or pop it"):format(
+                tostring(rawget(element_of(src) or src, 'name'))))
+        end
+    end
+    local storage = require('nua.storage')
+    S.end_borrows(p, ("an element of '%s' was replaced"):format(tostring(rawget(S.root_of(hp), 'name'))))
+    storage.abandon(p.T, S.Ref(p))
+    put_owner(hp, S.resolve_checked(p), position_at(hp.T, path), src)
+    if S.is_place(src) then
+        self:release_owner(src, ("'%s' was moved into an element"):format(tostring(src.name)))
+        S.mark_moved(src, p, {})
+    end
+    storage.compact_root(S.Ref(hp))
+end
+
 -- Internal native representation projection: no owner checks or algorithms.
 -- Public Ptr still rejects resizable owners; library adapters use this only
 -- inside the compiler's existing ownership/checked-place integration.
 function Mem.view(x, representation)
-    local p = receiver(x, 'native representation')
+    -- an owner inside a container is a checked place: found again where it is used
+    local p = S.resolve_checked(receiver(x, 'native representation'))
     local pt = types.ptr(representation)
     return dyn(pt, { op = 'conv', a = addr(p), T = pt })
 end
@@ -680,6 +1118,36 @@ storage_library = function(t)
 end
 
 Mem.storage_library = storage_library
+S.storage_library = storage_library
+-- an array type whose elements are storage inside a header (FixedArray, design §5.9)
+S.raw_array = function(elem, n) return types.array(elem, n, true) end
+-- an empty value of a type that may hold owners: its owners fresh, its values zero
+local function empty_value(t)
+    if t.kind == 'owner' then return fresh(t) end
+    if t.kind == 'struct' and t.resizable then
+        local fields = {}
+        for _, f in ipairs(t.fields) do fields[f.name] = empty_value(f.type) end
+        return S.agg(t, fields)
+    end
+    return S.zero_value(t)
+end
+-- an element at ptr of the holder starts empty, its owners in the holder's arenas
+S.init_element = function(holder, ptr)
+    local hp = receiver(holder, 'an element')
+    local v = S.value_of(ptr)
+    Mem.put_owner(hp, S.element_place(v.T.elem, S.ex(v), hp), #Mem.own_fields(hp.T), empty_value(v.T.elem))
+end
+-- for the library's walks over owners inside elements (lib/storage.nua, design §5.9)
+S.own_stack_count = function(t) return #Mem.own_fields(t) end
+-- a Ref to an element at ptr of the holder: an owner inside it is at a shared position
+S.element_ref = function(holder, ptr)
+    local v = S.value_of(ptr)
+    return S.Ref(S.element_place(v.T.elem, S.ex(v), receiver(holder, 'an element')))
+end
+-- a Ref to a field of the place a Ref names
+S.ref_field = function(r, name)
+    return S.Ref(S.field_place(receiver(r, 'a field'), name))
+end
 
 -- The arguments of a container operation, by what they are (a declaration's `args`):
 --   index       any unsigned integer, checked as U64 (design memory.md §15 D2)
@@ -691,6 +1159,8 @@ local arg_kinds = {
     key = function(t, f, x) return f.key(t, x) end,
     stored_key = function(t, f, x) return f.capture_key(t, f.key(t, x)) end,
     value = function(t, f, x)
+        -- an owner moves (or is built) into the word's owner parameter, then into the element
+        if t.elem.resizable then return x end
         local given = S.coerce(x, t.elem, (f.label or f.name) .. ' value')
         local view = S.value_view(given)
         local v = capture(given, 'capturing a ' .. string.lower(f.label or f.name) .. ' value')
@@ -722,7 +1192,14 @@ local function adapter(t, f, name)
         local args = { ... }
         for i, kind in ipairs(kinds) do args[i] = arg_kinds[kind](t, f, args[i]) end
         if has_value then S.bump_checked() end
-        return storage_library(t)[name](S.Ref(p), (table.unpack or unpack)(args, 1, count))
+        -- a fresh owner pushed or added is built in its new element (design memory.md §5.3)
+        local lib = storage_library(t)
+        local value = args[1]
+        if t.elem.resizable and lib[name .. '_built'] and S.is_value(value)
+            and (value.k == 'fresh' or value.k == 'sumv' or value.k == 'agg') then
+            return lib[name .. '_built'](S.Ref(p), function(e) S.build_into(e, value) end)
+        end
+        return lib[name](S.Ref(p), (table.unpack or unpack)(args, 1, count))
     end
 end
 -- for a family's `extra` operations that are still one library word
@@ -778,6 +1255,8 @@ local function index_hook(t, f)
         -- stored in it, are checked against the container's owner
         rawset(place, 'owner_place', p)
         if keyed then rawset(place, 'element_key', { text = text, known = S.is_known(k) }) end
+        -- which element, for the borrows of owners inside it (design memory.md §5.9, R4)
+        rawset(place, 'index_key', { text = text, known = S.is_known(k) })
         return place
     end
 end
@@ -824,7 +1303,15 @@ local function decorate(t)
     end)
     if f.stacks then rawset(t, 'release_fields', f.stacks) end
     local ms = library_methods(t, f)
-    if f.views then
+    if f.views and t.elem.resizable then
+        -- a slice would read the elements' headers as values: two owners of the same bytes
+        local function refuse()
+            fail(('%s holds owners: its elements are reached one at a time (g[i]), not as a slice'):format(
+                t.display))
+        end
+        ms.all, ms.sub = refuse, refuse
+    end
+    if f.views and not t.elem.resizable then
         -- the elements are borrowed like a Grow's (g:all(), g:sub(a, b))
         local views = view_methods(t)
         ms.all, ms.sub = views.all, views.sub
@@ -832,6 +1319,15 @@ local function decorate(t)
     end
     -- operations that are not one library word over converted arguments
     for name, fn in pairs(f.extra and f.extra(t, ms) or {}) do ms[name] = fn end
+    -- a container whose elements hold owners compacts its root's arenas on request (§5.9)
+    if rawget(t, 'elem') and t.elem.resizable then
+        ms.compact = function(self)
+            local p = owner_receiver(t, f, self, cname_of(t) .. ':compact')
+            if S.cur().fn then S.cur().fn.uses_rt = true end
+            return require('nua.storage').compact_now(S.Ref(p))
+        end
+        f.arity.compact = 1
+    end
     for name, fn in pairs(ms) do S.arity[fn] = f.arity[name] end
     rawset(t, 'builtin_methods', merge_methods(t, ms))
     rawset(t, '__index', index_hook(t, f))
@@ -855,9 +1351,6 @@ local function checked(make, what)
     return function(elem)
         local ok, t = pcall(make, elem)
         if not ok then fail(tostring(t):gsub('^[^:]+:%d+: ', '')) end
-        if t.elem.kind == 'struct' and t.elem.resizable then
-            fail(what .. ' holds fixed-size values; ' .. t.elem.display .. ' contains resizable storage')
-        end
         return decorate(t)
     end
 end
@@ -904,19 +1397,26 @@ function S.owner_type(decl)
     decl.methods, decl.args, decl.arity = decl.methods or {}, decl.args or {}, decl.arity or {}
     families[decl.name] = decl
     local constructor = function(...)
-        local key, elem
-        if decl.keyed then key, elem = ... else elem = ... end
+        local key, elem, length
+        if decl.keyed then key, elem = ... elseif decl.sized then elem, length = ... else elem = ... end
         for _, x in ipairs(decl.keyed and { key, elem } or { elem }) do
             if not types.is_type(x) then fail((decl.label or decl.name) .. ' expects a type, got ' .. tostring(x)) end
         end
+        -- a struct still being defined holds this owner: the type would contain itself, and
+        -- its owner positions would have no end (design memory.md §5.9, R2)
+        if rawget(elem, 'incomplete') then
+            fail(('%s of %s, which is still being defined: a recursive owner type has unboundedly many '
+                .. 'owner positions; build the tree in a Store and link it with Id %s'):format(
+                decl.label or decl.name, elem.display, elem.display))
+        end
         local message
         if decl.admit then message = decl.admit(key, elem)
-        elseif not types.element(elem) then
+        elseif not types.owner_element(elem) then
             message = decl.name .. ' holds fixed-size values, not ' .. elem.display
         end
         if message then fail(message) end
-        local display = decl.display and decl.display(key, elem) or (decl.name .. ' ' .. elem.display)
-        return decorate(types.owner(decl.name, elem, display, key))
+        local display = decl.display and decl.display(key, elem, length) or (decl.name .. ' ' .. elem.display)
+        return decorate(types.owner(decl.name, elem, display, key, length))
     end
     Mem.owners[decl.name] = constructor
     return constructor
@@ -969,6 +1469,8 @@ function Mem.prelude(env)
             end })
         end
         if S.is_staged(n) then n = tonumber(S.value_of(n).v) end
+        -- elements that hold owners: the array is an owner holding its elements' arenas (§5.9)
+        if types.is_type(elem) and elem.resizable then return Mem.owners.FixedArray(elem, n) end
         return S.Array(elem, n)
     end
     S.arity[Mem.copy] = 1

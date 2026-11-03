@@ -108,12 +108,117 @@ export f
 ]] },
     { name = 'floating map keys', expect = 'Map key must have fixed semantic equality',
       src = [[local M = Map(F64, U32)]] },
-    { name = 'nested mutable maps', expect = 'Map value must be fixed-size owned data',
-      src = [[local M = Map(U32, Map(U32, U32))]] },
-    { name = 'owners as text-keyed map values', expect = 'Map(Str, V) value must be fixed-size owned data',
-      src = [[local M = Map(Str, Grow U32)]] },
-    { name = 'owners as borrowing map values', expect = 'Map.borrowing value must be fixed-size data',
-      src = [[local M = Map.borrowing(Str, Grow U32)]] },
+    { name = 'a borrow of an entry of a map inside a map across an insertion',
+      expect = "a map in 'outer' grew, so its entries may have moved",
+      src = [[local f = do(): U32
+    local outer = Map(U32, Map(U32, U32)) {}
+    outer:put(1, Map(U32, U32) {})
+    outer[1]:put(5, 50)
+    local r = Ref outer[1][5]
+    outer[1]:put(6, 60)
+    return r
+end
+export f]] },
+    -- owners inside elements (design memory.md §5.9)
+    { name = 'a borrow of an element owner across its growth', expect = "grew, so its bytes may have moved",
+      src = [[local f = do(): U64
+    local lines = Grow(Text) {}
+    lines:push(Text {})
+    local s = lines[0]:str()
+    lines[0]:write "more"
+    return s.length
+end
+export f]] },
+    { name = 'a borrow of an element owner across growth of an unknown element',
+      expect = "grew, so its bytes may have moved",
+      src = [[local f = do(i: U64): U64
+    local lines = Grow(Text) {}
+    lines:push(Text {})
+    local s = lines[0]:str()
+    lines[i]:write "more"
+    return s.length
+end
+export f]] },
+    { name = 'a borrow of an element owner across a word that grows it',
+      expect = "the call to append, which may grow or clear it",
+      src = [[local append = do(t: Ref Text): Unit
+    t:write "x"
+end
+append.boundary = true
+local f = do(): U64
+    local lines = Grow(Text) {}
+    lines:push(Text {})
+    local s = lines[0]:str()
+    append(Ref lines[0])
+    return s.length
+end
+export f]] },
+    { name = 'a borrow of an element owner across its replacement', expect = "was replaced",
+      src = [[local f = do(): U64
+    local lines = Grow(Text) {}
+    lines:push(Text {})
+    local s = lines[0]:str()
+    lines[0] = Text {}
+    return s.length
+end
+export f]] },
+    { name = 'a recursive owner type', expect = 'a recursive owner type has unboundedly many owner positions',
+      src = [[local Node = __S.struct("Node", function(self) return { { "children", Grow(self) } } end)]] },
+    { name = 'an owner payload matched by value', expect = 'its handler takes it by reference',
+      src = [[local Doc = Sum { empty: Unit, text: Text }
+local f = do(): U64
+    local d = Doc.text(Text {})
+    return d { empty = do(): U64 return 0 end, text = do(t: Text): U64 return 1 end }
+end
+export f]] },
+    { name = 'a task writing an owner global', expect = "a task cannot use the owner global 'log'",
+      src = [[local log = global(Text, { name = "log" })
+local run = do(n: U32): U32
+    tasks do(..)
+        spawn do
+            log[0]:write "x"
+        end
+    end
+    return n
+end
+export run]] },
+    { name = 'a task reading an owner global', expect = "a task cannot use the owner global 'log'",
+      src = [[local log = global(Text, { name = "log" })
+local run = do(n: U32): U32
+    tasks do(..)
+        spawn do
+            local k = log[0]:str().length
+        end
+    end
+    return n
+end
+export run]] },
+    { name = 'an exported owner global', expect = 'an owner global takes only a name',
+      src = [[local log = global(Text, { name = "log", exported = true })]] },
+    { name = 'a borrow of an element owner across compact', expect = "its container was compacted",
+      src = [[local f = do(): U64
+    local lines = Grow(Text) {}
+    lines:push(Text {})
+    local s = lines[0]:str()
+    lines:compact()
+    return s.length
+end
+export f]] },
+    { name = 'moving an owner out of an element', expect = 'an owner inside an element cannot be moved out of it',
+      src = [[local f = do(): U64
+    local lines = Grow(Text) {}
+    lines:push(Text {})
+    local t = lines[0]
+    return 0
+end
+export f]] },
+    { name = 'a slice of elements holding owners', expect = "its elements are reached one at a time",
+      src = [[local f = do(): U64
+    local lines = Grow(Text) {}
+    local s = lines:all()
+    return s.length
+end
+export f]] },
     { name = 'a map created while compiling', expect = 'runtime storage',
       src = [[local M = Map(U32, U32)
 local f = do(): U32
