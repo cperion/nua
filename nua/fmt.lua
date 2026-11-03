@@ -1045,6 +1045,7 @@ function format(source, options, filename)
     end
     if options.data_style == 'with' then result = colon.mark_tables(result) end
     result = colon.withize(result, (' '):rep(options.indent_width))
+    if options.spine_style ~= 'none' then result = colon.foldends(result, (' '):rep(options.indent_width)) end
     if options.block_style == 'colon' then result = colon.colonize(result) end
     return prefix .. result
 end

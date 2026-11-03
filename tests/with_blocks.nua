@@ -52,3 +52,24 @@ local area = do(n: U32): U32
     end
 end
 export area
+
+-- `endall` closes every open Nua block, handlers and data alike
+local pair = do(n: U32): U32
+    local a = Shape.circle n
+    local b = Shape.rect Point with x = 7, y = 3 end
+    local total: U32 = 0
+    a with
+        rect =: r
+            total = r.x
+        end
+    circle =: r
+    b with
+        circle =: q
+            total = r + q
+        end
+    rect =: p
+        total = r + p.x + p.y
+    endall
+    return total + 1
+end
+export pair

@@ -162,6 +162,17 @@ kept where the reader would not recover it, before an entry that starts with a
 bracket or a literal. Each table is converted on its own, and only when expanding
 the result gives the same program as the braces.
 
+## End chains
+
+A trailing run of `end` lines that closes Nua blocks (`do`, colon, `=:` and `with`)
+back to Lua control, three or more of them and including a `with` block, is folded
+into one `endall` and laid out flat (syntax §10.9): the wrappers (`tasks:`, `spawn:`)
+at one indent, the content after them indented once, the handler chain flat in the
+content, sibling entries one level in under their `with`, and the innermost body one
+level in. Blocks that stand between two others (an entry after the deep one) end the
+run, so put the deepest handler last. The fold is accepted only when expanding the
+result gives the same program. `spine_style = "none"` keeps the staircase of handlers.
+
 ## Default style
 
 ```lua

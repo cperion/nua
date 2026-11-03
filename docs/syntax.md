@@ -1671,7 +1671,23 @@ local import_rows = do(doc: Ref Document, n: U32): Unit
 end
 ```
 
-`endall` closes the innermost trailing block lambda and each enclosing block lambda whose body ends there. It stops at any other block, so the word's body stays open. It returns nothing, calls nothing and cleans nothing up: its effects are exactly those of the expanded program.
+`endall` closes **every open Nua block** (`do`, colon, `=:` and `with` blocks) back to the nearest enclosing Lua control block or word body: `if`, `while`, `for`, `function`, `repeat`, a bare `do … end`, or the typed word the code sits in. Those keep their own `end`, so the word's body stays open. Nothing may follow `endall` inside the blocks it closes, which is what makes the rule simple: put the deepest handler last, and one closer ends a whole pyramid. It returns nothing, calls nothing and cleans nothing up: its effects are exactly those of the expanded program.
+
+```lua
+tasks:
+spawn:
+    io.listen(0) with
+        failed = do(e) end
+    done =: l
+    io.accept(l) with
+        failed = do(e) end
+    done =: c
+        go c
+endall
+return n
+```
+
+`endall` there closes seven blocks. It is also how a chain is written flat: the wrappers (`tasks:`, `spawn:`) sit at one indent, the content after them is indented once, the handler chain (`done =: l`, `io.accept(l) with`, `done =: c`) is flat within the content, sibling entries (`failed = …`) are one level in under their `with`, and the innermost body is one level in again. `nua fmt` writes this layout and folds a trailing run of three or more `end` lines that close Nua blocks into an `endall` (a run that holds a `with`; `spine_style = "none"` keeps the staircase).
 
 ```c
 void import_rows(Document *doc, uint32_t n) {

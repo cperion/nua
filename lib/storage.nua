@@ -182,7 +182,7 @@ function storage.grow(T, p)
     -- growing keeps it valid (stacks never move); clear, pop and truncate end it
     api.all = do(g: Ref T): Slice T.elem
         local h = p.header g
-        local view = Slice(p.items(g), h.len)
+        local view = Slice(p.items g, h.len)
         return borrows(g, view)
     end
     -- an empty owner takes n zeroed elements (Array(T, n) {} with a runtime n)

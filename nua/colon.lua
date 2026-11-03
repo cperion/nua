@@ -105,6 +105,20 @@ local function block_head(names, line)
     return out
 end
 
+-- `do ( ... ) :` a typed lambda: a word's body, which `endall` never closes
+local function typed_lambda(tokens, i)
+    local n, j, depth = #tokens, i + 1, 0
+    while j <= n and (tokens[j][1] == 'space' or tokens[j][1] == 'comment') do j = j + 1 end
+    if not tokens[j] or tokens[j][1] ~= '(' then return false end
+    repeat
+        local t = tokens[j][1]
+        if t == '(' then depth = depth + 1 elseif t == ')' then depth = depth - 1 end
+        j = j + 1
+    until depth == 0 or j > n
+    while j <= n and (tokens[j][1] == 'space' or tokens[j][1] == 'comment') do j = j + 1 end
+    return tokens[j] ~= nil and tokens[j][1] == ':'
+end
+
 -- `do ( ... )` at index i followed by `=` (an expression lambda has no `end`),
 -- also with a result type: `do(x: U32): U32 = ...`
 local function expression_lambda(tokens, i)
@@ -164,8 +178,9 @@ end
 -- where a colon may open a block (statement level: not inside brackets, not
 -- directly inside a `with`, where a colon is an annotation) and which `end` closes
 -- a `with` (`T with k = v k = v end` is `T { k = v, k = v }`).
-function M.rewrite(tokens, mark)
+function M.rewrite(tokens, mark, full)
     local out, stack = {}, {}
+    local loops = {}                           -- stack depth -> loop headers waiting for their `do`
     local closer_of, openers = {}, {}
     for i, tk in ipairs(tokens) do
         local t = tk[1]
@@ -217,25 +232,54 @@ function M.rewrite(tokens, mark)
                 push('bracket', tk[3])
             elseif t == ')' or t == '}' or t == ']' then
                 if top() and top().kind == 'bracket' then stack[#stack] = nil end
+            elseif t == 'keyword' and (v == 'while' or v == 'for') then
+                loops[#stack] = (loops[#stack] or 0) + 1       -- its `do` is Lua's own
             elseif (t == 'keyword' or t == 'iden') and v == 'do' then
-                if not expression_lambda(tokens, i) then push('block', tk[3]) end
+                if (loops[#stack] or 0) > 0 then
+                    loops[#stack] = loops[#stack] - 1
+                    push('control', tk[3])
+                elseif not expression_lambda(tokens, i) then
+                    -- after an operand or `=`, `(`, `,`, `{`, `return`: a lambda; where a statement starts: Lua's block
+                    local p = skip_back(tokens, i)
+                    local before = p >= 1 and tokens[p]
+                    local lambda = before and (OPERAND[before[1]] or EXPRESSION_START[before[1]]
+                        or (before[1] == 'keyword' and (before[2] == 'return' or LITERAL[before[2]])))
+                    push(lambda and not typed_lambda(tokens, i) and 'lambda' or 'control', tk[3])
+                end
             elseif t == 'keyword' and (v == 'function' or v == 'if') then
-                push('block', tk[3])
+                push('control', tk[3])
             elseif t == 'keyword' and v == 'repeat' then
                 push('repeat', tk[3])
             elseif t == 'keyword' and v == 'until' then
                 if top() and top().kind == 'repeat' then stack[#stack] = nil end
             elseif t == 'keyword' and v == 'end' or (t == 'iden' and v == 'endall') then
                 local f = top()
-                if f and f.kind == 'with' then
+                if v == 'endall' then
+                    -- every open Nua block, back to Lua control (design: `endall` closes a spine)
+                    local chain, depth = {}, #stack
+                    while depth >= 1 and (stack[depth].kind == 'lambda' or stack[depth].kind == 'with') do
+                        chain[#chain + 1] = stack[depth].kind
+                        depth = depth - 1
+                    end
+                    local has_with = false
+                    for _, kind in ipairs(chain) do if kind == 'with' then has_with = true end end
+                    for _ = 1, #chain do stack[#stack] = nil end
+                    if has_with or full then
+                        -- a data block is not a lambda: write the closers out, innermost first
+                        for k, kind in ipairs(chain) do
+                            -- (source tools get each closer on a line of its own, to lay them out)
+                            if k > 1 then emit({ 'space', mark and '\n' or ' ', tk[3] }) end
+                            if kind == 'with' then emit({ '}', '}', tk[3] })
+                            else emit({ 'keyword', 'end', tk[3] }) end
+                        end
+                        handled = true
+                    end
+                elseif f and f.kind == 'with' then
                     stack[#stack] = nil
                     emit({ '}', '}', tk[3] })
                     handled = true
-                elseif f and f.kind == 'block' then
+                elseif f and (f.kind == 'lambda' or f.kind == 'control') then
                     stack[#stack] = nil
-                    if v == 'endall' then
-                        while top() and top().kind == 'block' do stack[#stack] = nil end
-                    end
                 end
             elseif t == 'iden' and v == 'with' and contextual_with(tokens, i) then
                 -- `with` in expression position (after `return`, `=`, `(`, `,`, `{`): its type
@@ -266,7 +310,7 @@ function M.rewrite(tokens, mark)
                 local p = skip_back(tokens, i)
                 local f = top()
                 local assigned = p >= 1 and tokens[p][1] == '='
-                local statement = not f or f.kind == 'block' or f.kind == 'repeat'
+                local statement = not f or f.kind == 'lambda' or f.kind == 'control' or f.kind == 'repeat'
                 local prev, nxt = tokens[i - 1], tokens[i + 1]
                 local label = (prev and prev[1] == ':') or (nxt and nxt[1] == ':')
                 if (statement or assigned) and not label and p >= 1 then
@@ -278,7 +322,7 @@ function M.rewrite(tokens, mark)
                         local names, stop = parameters(tokens, i)
                         if names then
                             for _, h in ipairs(block_head(names, tk[3])) do emit(h) end
-                            push('block', tk[3])
+                            push('lambda', tk[3])
                             i = stop + 1
                             handled, tk = true, nil
                         end
@@ -311,8 +355,8 @@ local function text_of(tokens)
     return table.concat(parts)
 end
 
-function M.expand(source, mark)
-    return text_of(M.rewrite(lexer.scan_raw_tokenlist(source), mark))
+function M.expand(source, mark, full)
+    return text_of(M.rewrite(lexer.scan_raw_tokenlist(source), mark, full))
 end
 
 -- `do ( name, name.. )` at index i, followed by the end of its line: the
@@ -639,6 +683,230 @@ function M.withize(source, unit)
         if accepted({ block }) then chosen[#chosen + 1] = block end
     end
     return accepted(chosen) or braces
+end
+
+-- Nua blocks found without rewriting: for text that has `with` blocks and do-forms
+-- (the formatter's output before the colon pass). Frames are { kind, open, close, parent }.
+local function scan_blocks(tokens)
+    local stack, frames, close_frame, depth_at, loops = {}, {}, {}, {}, {}
+    local function push(kind, i)
+        local f = { kind = kind, open = i, parent = stack[#stack] }
+        frames[#frames + 1] = f
+        stack[#stack + 1] = f
+    end
+    for i, tk in ipairs(tokens) do
+        depth_at[i] = #stack
+        local t, v = tk[1], tk[2]
+        if t == '(' or t == '{' or t == '[' then push('bracket', i)
+        elseif t == ')' or t == '}' or t == ']' then
+            if stack[#stack] and stack[#stack].kind == 'bracket' then stack[#stack] = nil end
+        elseif t == 'keyword' and (v == 'while' or v == 'for') then
+            loops[#stack] = (loops[#stack] or 0) + 1
+        elseif (t == 'keyword' or t == 'iden') and v == 'do' then
+            if (loops[#stack] or 0) > 0 then
+                loops[#stack] = loops[#stack] - 1
+                push('control', i)
+            elseif not expression_lambda(tokens, i) then
+                local p = skip_back(tokens, i)
+                local before = p >= 1 and tokens[p]
+                local lambda = before and (OPERAND[before[1]] or EXPRESSION_START[before[1]]
+                    or (before[1] == 'keyword' and (before[2] == 'return' or LITERAL[before[2]])))
+                push(lambda and not typed_lambda(tokens, i) and 'lambda' or 'control', i)
+            end
+        elseif t == 'keyword' and (v == 'function' or v == 'if') then push('control', i)
+        elseif t == 'keyword' and v == 'repeat' then push('repeat', i)
+        elseif t == 'keyword' and v == 'until' then
+            if stack[#stack] and stack[#stack].kind == 'repeat' then stack[#stack] = nil end
+        elseif t == 'keyword' and v == 'end' then
+            local f = stack[#stack]
+            if f and f.kind ~= 'bracket' then
+                f.close = i
+                close_frame[i] = { f }
+                stack[#stack] = nil
+            end
+        elseif t == 'iden' and v == 'endall' then
+            -- an `endall` already written closes the lambdas on top of the stack
+            local popped = {}
+            while stack[#stack] and (stack[#stack].kind == 'lambda' or stack[#stack].kind == 'with') do
+                local f = stack[#stack]
+                f.close = i
+                popped[#popped + 1] = f
+                stack[#stack] = nil
+            end
+            close_frame[i] = popped
+        elseif t == 'iden' and v == 'with' then
+            local p = skip_back(tokens, i)
+            local operand = p >= 1 and (OPERAND[tokens[p][1]]
+                or (tokens[p][1] == 'keyword' and LITERAL[tokens[p][2]]))
+            local nx = tokens[significant_after(tokens, i)]
+            local adjacent = tokens[i + 1] and (tokens[i + 1][1] == '.' or tokens[i + 1][1] == '(')
+            if (operand and not adjacent and not (nx and nx[1] == '=')) or contextual_with(tokens, i) then
+                push('with', i)
+            end
+        end
+    end
+    return frames, close_frame, depth_at
+end
+
+-- the token that ends a lambda's header: its parameter list's `)`, or `do` itself
+local function header_end(tokens, frame)
+    local i = frame.open
+    local j = significant_after(tokens, i)
+    if tokens[j] and tokens[j][1] == '(' then
+        local depth = 0
+        repeat
+            local t = tokens[j][1]
+            if t == '(' then depth = depth + 1 elseif t == ')' then depth = depth - 1 end
+            j = j + 1
+        until depth == 0 or j > #tokens
+        return j - 1
+    end
+    return i
+end
+
+-- Fold the trailing `end` lines that close Nua blocks into one `endall`, and lay the chain
+-- out flat: the wrappers (`tasks:`, `spawn:`), then the content indented once, with the
+-- links of the handler chain at the content's indent, sibling entries one level in, and the
+-- innermost body one level in. A chain is folded only if it has a `with` (lambda-only
+-- chains keep the spine style) and the macro would read the result back as the same program.
+function M.foldends(source, unit)
+    unit = unit or '    '
+    local tokens = lexer.scan_raw_tokenlist(source)
+    local frames, close_frame = scan_blocks(tokens)
+    local lines = {}
+    for l in (source .. '\n'):gmatch('([^\n]*)\n') do lines[#lines + 1] = l end
+    if lines[#lines] == '' then lines[#lines] = nil end
+    local sig_on, comment_on = {}, {}
+    for i, tk in ipairs(tokens) do
+        local line = tk[3]
+        if tk[1] == 'comment' then comment_on[line] = true
+        elseif tk[1] ~= 'space' then
+            sig_on[line] = sig_on[line] or {}
+            table.insert(sig_on[line], i)
+        end
+    end
+    local function indent_of(line) return #(lines[line]:match('^ *')) end
+    -- lines holding only an `end` that closes a block
+    local closer_line = {}
+    for line, list in pairs(sig_on) do
+        local i = list[1]
+        if #list == 1 and not comment_on[line] and close_frame[i] then closer_line[line] = i end
+    end
+    local runs, ordered = {}, {}
+    for line in pairs(closer_line) do ordered[#ordered + 1] = line end
+    table.sort(ordered)
+    for _, line in ipairs(ordered) do
+        local run = runs[#runs]
+        if run and run.last == line - 1 then run[#run + 1] = line; run.last = line
+        else runs[#runs + 1] = { line, last = line } end
+    end
+    local edits = {}
+    for r = #runs, 1, -1 do
+        local run = runs[r]
+        -- the closers of the run, innermost first, one frame each (an `endall` line has several)
+        local entries = {}
+        for _, line in ipairs(run) do
+            for _, f in ipairs(close_frame[closer_line[line]]) do entries[#entries + 1] = { line = line, frame = f } end
+        end
+        -- skip the explicit closers of Lua control blocks that come first (innermost)
+        local k = 1
+        while entries[k] and entries[k].frame.kind == 'control' do k = k + 1 end
+        local chain, first_line = {}, entries[k] and entries[k].line
+        local prev, last_chain_line
+        while entries[k] do
+            local f = entries[k].frame
+            if f.kind ~= 'lambda' and f.kind ~= 'with' then break end
+            if prev and prev.parent ~= f then break end
+            chain[#chain + 1] = f
+            last_chain_line = entries[k].line
+            prev = f
+            k = k + 1
+        end
+        local outer = chain[#chain]
+        local ok = #chain >= 3 and outer.parent and outer.parent.kind == "control"
+        local has_with = false
+        for _, f in ipairs(chain) do if f.kind == 'with' then has_with = true end end
+        if ok and has_with then
+            -- C[1] is the outermost link
+            local C, m = {}, #chain
+            for j = 1, m do C[j] = chain[m - j + 1] end
+            local opener_line, header_line = {}, {}
+            for j = 1, m do
+                local o = C[j].kind == 'with' and C[j].open or header_end(tokens, C[j])
+                header_line[j] = tokens[o][3]
+                -- the header must end its line, and the line must start the statement
+                local list = sig_on[header_line[j]]
+                if list[#list] ~= o then ok = false end
+                opener_line[j] = tokens[C[j].open][3]
+                if opener_line[j] ~= header_line[j] and C[j].kind == 'with' then ok = false end
+            end
+            local last_line = last_chain_line
+            if ok then
+                -- bodies: a lambda link holds nothing but the next link
+                for j = 1, m - 1 do
+                    if C[j].kind == 'lambda' then
+                        for l = header_line[j] + 1, opener_line[j + 1] - 1 do
+                            if lines[l]:match('%S') then ok = false end
+                        end
+                    end
+                end
+            end
+            if ok then
+                local base = indent_of(opener_line[1])
+                local level, seen_with = { base }, C[1].kind == 'with'
+                for j = 2, m do
+                    local step = 0
+                    if C[j].kind == 'with' and not seen_with and C[j - 1].kind == 'lambda' then step = #unit end
+                    if C[j].kind == 'with' then seen_with = true end
+                    level[j] = level[j - 1] + step
+                end
+                local first_closer = first_line
+                local new_indent = {}                -- line -> target indent of the first line of its segment
+                local segments = {}
+                local function segment(from, to, target)
+                    if from > to then return end
+                    local lead
+                    for l = from, to do if lines[l]:match('%S') then lead = l; break end end
+                    if not lead then return end
+                    segments[#segments + 1] = { from = from, to = to, shift = target - indent_of(lead) }
+                end
+                for j = 1, m do
+                    segment(header_line[j], header_line[j], level[j])   -- the link's own line
+                    local stop = (j < m) and (opener_line[j + 1] - 1) or (first_closer - 1)
+                    segment(header_line[j] + 1, stop, level[j] + #unit)  -- siblings or the innermost body
+                end
+                edits[#edits + 1] = { segments = segments, closers = { first_line, last_line }, base = base }
+            end
+        end
+    end
+    if #edits == 0 then return source end
+    local result = {}
+    for i, l in ipairs(lines) do result[i] = l end
+    for _, e in ipairs(edits) do                     -- bottom-up, so earlier line numbers hold
+        for _, sgm in ipairs(e.segments) do
+            for l = sgm.from, sgm.to do
+                if result[l]:match('%S') then
+                    local width = math.max(0, #(result[l]:match('^ *')) + sgm.shift)
+                    result[l] = (' '):rep(width) .. result[l]:gsub('^ *', '')
+                end
+            end
+        end
+        for l = e.closers[1], e.closers[2] do result[l] = false end
+        result[e.closers[1]] = (' '):rep(e.base) .. 'endall'
+    end
+    local out = {}
+    for _, l in ipairs(result) do if l then out[#out + 1] = l end end
+    local folded = table.concat(out, '\n') .. '\n'
+    -- the macro must read the folded text back as the same program
+    local function normal(text)
+        local parts = {}
+        for _, tk in ipairs(lexer.scan_raw_tokenlist(text)) do
+            if tk[1] ~= 'space' and tk[1] ~= 'comment' then parts[#parts + 1] = tk[2] end
+        end
+        return table.concat(parts, '\0')
+    end
+    if normal(M.expand(folded, true, true)) ~= normal(M.expand(source, true, true)) then return source end
+    return folded
 end
 
 return M

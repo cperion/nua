@@ -181,6 +181,23 @@ end)
 ]], 'a with block takes its type from the context')
 local contextual_sexpr = contextual:root():sexpr()
 assert(select(2, contextual_sexpr:gsub('%(table_constructor', '')) == 3, 'contextual with blocks are not table constructors: ' .. contextual_sexpr)
+parse([[
+local g = do(n: U32): U32
+    a with
+        rect =: r
+            total = r
+        end
+    circle =: r
+    b with
+        circle =: q
+            total = r + q
+        end
+    rect =: p
+        total = r + p
+    endall
+    return total
+end
+]], 'endall closes handlers and data blocks')
 local plain = parse([[
 local s: Store Node
 local a, b: U32

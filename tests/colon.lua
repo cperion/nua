@@ -95,6 +95,20 @@ assert(loadstring(translated(variable, 'variable.nua'), '@variable.nua'))()
 check('a variable named with is still a variable', true)
 check('an unclosed with block is an error', not pcall(translated, 'local p = T with x = 1\n', 'open'))
 
+-- `endall` closes every open Nua block (colon, do, =: and with) back to Lua control
+local endall_pairs = {
+    { 'a chain of data and handlers',
+      'a with\n    y =: v\n        b with\n            z =: w\n                go w\nendall\nafter()\n',
+      'a with\n    y =: v\n        b with\n            z =: w\n                go w\n            end\n        end\n    end\nend\nafter()\n' },
+    { 'it stops at a Lua block',
+      'x:\n    if c then\n        y:\n            go\n        endall\n    end\nend\n',
+      'x:\n    if c then\n        y:\n            go\n        end\n    end\nend\n' },
+}
+for _, case in ipairs(endall_pairs) do
+    check('endall: ' .. case[1], normal(translated(case[2], case[1])) == normal(translated(case[3], case[1])),
+        translated(case[2], case[1]))
+end
+
 -- annotation colons, labels and method calls are not blocks
 local unchanged = {
     { 'local annotation', 'local s: Store Node\n' },
@@ -189,6 +203,18 @@ formatted('fmt: a short table stays braces inside a with', 'local c = App {\n   
     'local c = App with\n    counter = Counter { count = 1, up = 2 }\nend\n')
 formatted('fmt: contextual with kept', 'return with\nx = 1\nend\n', 'return with\n    x = 1\nend\n')
 formatted('fmt: contextual with on one line', 'local p: Point = with x = 1, y = 2 end\n', 'local p: Point = with x = 1, y = 2 end\n')
+-- trailing runs of `end` that close Nua blocks fold into one `endall`, flat: the wrappers,
+-- then the content indented once, the handler chain flat, siblings and the body one level in
+local pyramid = 'local f = do(n: U32): U32\n    tasks:\n        spawn:\n            io.listen(0) with\n                failed = do(e) end\n                done =: l\n                    io.accept(l) with\n                        failed = do(e) end\n                        done =: c\n                            go c\n                        end\n                    end\n                end\n            end\n        end\n    end\n    return n\nend\n'
+local folded = 'local f = do(n: U32): U32\n    tasks:\n    spawn:\n        io.listen 0 with\n            failed = do(e) end\n        done =: l\n        io.accept(l) with\n            failed = do(e) end\n        done =: c\n            go c\n    endall\n    return n\nend\n'
+formatted('fmt: a pyramid of handlers folds into endall', pyramid, folded)
+formatted('fmt: a folded chain stays folded', folded, folded)
+formatted('fmt: a short chain keeps its ends', 'a with\n    x = do end\n    y =: v\n        go v\n    end\nend\n',
+    'a with\n    x = do end\n    y =: v\n        go v\n    end\nend\n')
+-- spine_style none keeps the staircase: the handlers' ends stay (the lambda wrappers still fold)
+formatted('fmt: spine_style none keeps the staircase', pyramid,
+    'local f = do(n: U32): U32\n    tasks:\n        spawn:\n            io.listen 0 with\n                failed = do(e) end\n                done =: l\n                    io.accept(l) with\n                        failed = do(e) end\n                        done =: c\n                            go c\n                        end\n                    end\n                end\n            end\n        endall\n    return n\nend\n',
+    { spine_style = 'none' })
 check('fmt: bad data style', not pcall(fmt.format, 'x = 1\n', { data_style = 'pretty' }))
 check('fmt: bad block style', not pcall(fmt.format, 'x = 1\n', { block_style = 'ruby' }))
 

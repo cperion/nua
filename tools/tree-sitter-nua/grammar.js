@@ -55,7 +55,7 @@ module.exports = grammar({
     colon_parameter: $ => prec.right(choice(seq(alias($._header_name, $.identifier), optional(alias($._header_dots, '..'))), alias($._header_dots, '..'))),
     function_expression: $ => seq('function', $.parameters, optional($.block), 'end'),
     // `T with entries end` is `T { entries }`: entries need no separators.
-    with_block: $ => seq(alias($._with, 'with'), repeat(choice(seq(alias($.with_entry, $.field), choice(',', ';')), alias($.with_entry, $.field))), 'end'),
+    with_block: $ => seq(alias($._with, 'with'), repeat(choice(seq(alias($.with_entry, $.field), choice(',', ';')), alias($.with_entry, $.field))), choice('end', alias($._endall, 'endall'), $._implicit_end)),
     // A named entry never starts a call, so a colon after the name is its annotation
     // (`x: U32`), not a block. Positional entries are literals, tables and lambdas.
     with_entry: $ => choice($.handler, seq('.', $.identifier), seq($.identifier, ':', $._expression), seq($.identifier, '=', $._value),
