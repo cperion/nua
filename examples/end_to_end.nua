@@ -2,9 +2,7 @@
 
 -- Generic compile-time type generator
 local Box =: T
-    local B = Struct with
-        value: T
-    end
+    local B = Struct { value: T }
 
     function B:get(): T
         return self.value
@@ -35,9 +33,7 @@ local process = do(
     x: U32
 ): U32
 
-    local box = NumberBox with
-        value = transform x
-    end
+    local box = NumberBox { value = transform x }
 
     if enabled then
         box:set(box:get() * 2)

@@ -417,13 +417,16 @@ function map.family(name)
     decl.suffix = name
     decl.iterates = true
     decl.header = require("nua.storage_layout")[is_str and "StrMap" or "Map"]
-    decl.stacks = is_str and { { "entries.stack", "entries.base" }, { "entries.index_stack", "entries.index_base" },
-        { "arena_stack", "arena_base" } } or { { "stack", "base" }, { "index_stack", "index_base" } }
+    decl.stacks = is_str and { { "entries.stack", "entries.base" },
+        { "entries.index_stack", "entries.index_base" },
+        { "arena_stack", "arena_base" } } or { { "stack", "base" },
+        { "index_stack", "index_base" } }
     decl.index = "key"
     decl.index_stable = function(t) return not is_str end
     decl.newindex = "put"
     decl.methods = { "has", "find", "remove", "put", "ensure" }
-    decl.args = { has = { "key" }, find = { "key" }, remove = { "key" }, put = { "stored_key", "value" },
+    decl.args = { has = { "key" },
+        find = { "key" }, remove = { "key" }, put = { "stored_key", "value" },
         ensure = { "stored_key", "value" } }
     decl.arity = { has = 2, find = 2, remove = 2, put = 3, ensure = 3, each = 2 }
     decl.display = function(key, elem)
@@ -432,10 +435,10 @@ function map.family(name)
         return "Map(" .. key.display .. ", " .. elem.display .. ")"
     end
     decl.admit = function(key, elem)
-        if not text_keys and not types.map_key(key) then
+        if not text_keys and not types.map_key key then
             return "Map key must have fixed semantic equality, not " .. key.display
         end
-        if not types.map_value(elem) then
+        if not types.map_value elem then
             if is_str then return "Map(Str, V) value must be fixed-size owned data, not " .. elem.display end
             if borrowing then return "Map.borrowing value must be fixed-size data, not " .. elem.display end
             return "Map value must be fixed-size owned data, not " .. elem.display
@@ -443,28 +446,30 @@ function map.family(name)
     end
     -- the names, entry types and native representation of this compilation's type
     decl.setup = function(t)
-        keys.check_key(t.key)
-        local prefix = is_str and "StrMap" or borrowing and "MapBorrowing" or ("Map_" .. sanitize(codegen.ctype(t.key)))
-        local n = __S.unique_global(prefix .. "_" .. sanitize(codegen.ctype(t.elem)))
+        keys.check_key t.key
+        local prefix = is_str and "StrMap" or borrowing and "MapBorrowing" or ("Map_" .. sanitize(codegen.ctype t.key))
+        local n = __S.unique_global(prefix .. "_" .. sanitize(codegen.ctype t.elem))
         local stored = t.key
         if is_str then stored = __S.struct(n .. "Bytes", { { "offset", U64 }, { "len", U64 } }) end
         rawset(t, "cname", n)
-        rawset(t, "entry", __S.struct(n .. "Entry", { { "hash", U64 }, { "key", stored }, { "value", t.elem } }))
+        rawset(t,
+            "entry",
+            __S.struct(n .. "Entry", { { "hash", U64 }, { "key", stored }, { "value", t.elem } }))
         rawset(t, "lookup", __S.oneof(n .. "Lookup", { { "found", t.elem }, { "missing", Unit } }))
         rawset(t, "representation", Mem.layouts_module()[is_str and "StrMap" or "Map"])
         rawset(t, "iteration_owners", {})
     end
     decl.receive = function(t, p)
         -- the keys it compares against are borrows
-        if borrowing then __S.check_stored(p) end
+        if borrowing then __S.check_stored p end
     end
     decl.key = function(t, x)
         if text_keys then return require("nua.strings").as_str(x, "Map(Str, V) key") end
         return __S.coerce(x, t.key, "Map key")
     end
     decl.capture_key = function(t, kv)
-        if __S.is_known(kv) then return kv end
-        local text = __S.expr_key(__S.ex(__S.value_of(kv)))
+        if __S.is_known kv then return kv end
+        local text = __S.expr_key(__S.ex(__S.value_of kv))
         local captured
         if not text_keys then
             captured = Mem.fix_index(kv, "capturing a map key")
@@ -474,24 +479,24 @@ function map.family(name)
             if view then rawset(captured, "view", view) end
         end
         -- the captured temporary stands for the key it came from (iteration and removal compare keys)
-        if __S.is_value(captured) then rawset(captured, "key_text", text) end
+        if __S.is_value captured then rawset(captured, "key_text", text) end
         return captured
     end
     -- the slot and index projections; an entry's key and value go to an activity, and a text
     -- key is a view of the arena that ends when the activity returns
     decl.projection = function(t)
         local storage = require("nua.storage_layout").maps(t, t.entry, function(x)
-            local p = Mem.receiver(x, t.display)
-            decl.receive(t, p)
-            return Mem.view(p, t.representation)
-        end)
+                local p = Mem.receiver(x, t.display)
+                decl.receive(t, p)
+                return Mem.view(p, t.representation)
+            end)
         local iterating = t.iteration_owners
         storage.lend = function(table, entry, body)
             local k, v = storage.key(table, __S.dot(entry, "key")), __S.dot(entry, "value")
             local owner = iterating[#iterating]
-            if owner then __S.set_iteration_key(owner, __S.expr_key(__S.ex(__S.value_of(k)))) end
+            if owner then __S.set_iteration_key(owner, __S.expr_key(__S.ex(__S.value_of k))) end
             if is_str then
-                local ptr, len = __S.slice_parts(k)
+                local ptr, len = __S.slice_parts k
                 local token = __S.activity_token()
                 k = __S.make_slice(Str, ptr, len, token)
                 local ok, err = pcall(body, k, v)
@@ -505,7 +510,7 @@ function map.family(name)
     decl.api = function(T, Id, p)
         local words = map.library(T, p, T.entry, T.lookup, is_str, borrowing)
         local api = {}
-        for name, word in pairs(words) do api[name] = word end
+        for name, word in pairs words do api[name] = word end
         api.put = function(m, key, value) return words.put(m, key, value, false) end
         api.ensure = function(m, key, value) return words.put(m, key, value, true) end
         return api
@@ -514,32 +519,32 @@ function map.family(name)
     decl.init = function(api, owner, indices, from)
         api.layout.init(owner, indices[1], indices[2], indices[3] or indices[1])
         if from.copy_of then
-            api.copy(owner, __S.Ref(from.copy_of))
+            api.copy(owner, __S.Ref from.copy_of)
             -- borrowed keys and values the source holds are held by the copy too
             if borrowing then __S.hold_stored(rawget(owner, "place"), from.copy_of) end
         end
     end
     decl.construct = function(t)
         return function(x)
-            if type(x) ~= "table" or __S.is_staged(x) or next(x) then fail(t.display .. " {} takes no fields") end
-            return Mem.fresh(t)
+            if type x ~= "table" or __S.is_staged x or next x then fail(t.display .. " {} takes no fields") end
+            return Mem.fresh t
         end
     end
     -- m:each body: the map's structure is fixed inside the body, which is checked while compiling
     decl.extra = function(t)
         local methods = {}
         methods.each = function(self, body)
-            if type(body) ~= "function" and not __S.is_word(body) then fail(t.display .. ":each needs an activity") end
+            if type body ~= "function" and not __S.is_word body then fail(t.display .. ":each needs an activity") end
             local p = Mem.receiver(self, t.display)
             decl.receive(t, p)
             local storage = Mem.storage_library(t).layout
             local iterating = t.iteration_owners
-            __S.fixed(__S.Ref(p), function()
-                iterating[#iterating + 1] = p
-                local ok, err = pcall(function() map.each(t, storage, body)(__S.Ref(p)) end)
-                iterating[#iterating] = nil
-                if not ok then error(err, 0) end
-            end)
+            __S.fixed(__S.Ref p, function()
+                    iterating[#iterating + 1] = p
+                    local ok, err = pcall(function() map.each(t, storage, body)(__S.Ref p) end)
+                    iterating[#iterating] = nil
+                    if not ok then error(err, 0) end
+                end)
         end
         return methods
     end
@@ -549,12 +554,12 @@ end
 -- Map.known(K, V) {...}: an immutable map description. Known keys execute the words while
 -- specializing; dynamic keys emit the same ordinary comparisons.
 function map.describe_known(t, entries)
-    if type(entries) ~= "table" or __S.is_staged(entries) then fail("known map needs an entry list") end
+    if type entries ~= "table" or __S.is_staged entries then fail "known map needs an entry list" end
     local count = #entries
-    if count > 0xffffffff then fail("known map is full") end
-    for index in pairs(entries) do
-        if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > count then
-            fail("known map needs a dense entry list")
+    if count > 0xffffffff then fail "known map is full" end
+    for index in pairs entries do
+        if type index ~= "number" or index % 1 ~= 0 or index < 1 or index > count then
+            fail "known map needs a dense entry list"
         end
     end
     local str = t.family == "StrMap"
@@ -564,43 +569,43 @@ function map.describe_known(t, entries)
         return __S.coerce(x, t.key, "known Map key")
     end
     local copied = {}
-    local equal = keys.equal(t.key)
+    local equal = keys.equal t.key
     for i = 1, count do
         local pair = entries[i]
-        if type(pair) ~= "table" or __S.is_staged(pair) or pair[1] == nil or pair[2] == nil then
+        if type pair ~= "table" or __S.is_staged pair or pair[1] == nil or pair[2] == nil then
             fail("known map entry " .. i .. " needs a key and value")
         end
-        local k, v = key(pair[1]), __S.coerce(pair[2], t.elem, "known map value")
-        if not __S.is_known(k) or not __S.is_known(v) then fail("known map keys and values must be known") end
+        local k, v = key pair[1], __S.coerce(pair[2], t.elem, "known map value")
+        if not __S.is_known k or not __S.is_known v then fail "known map keys and values must be known" end
         -- A known owner-backed text view must become immutable bytes, not a
         -- retained view of a local that may subsequently change.
-        if str then k = strings.as_str(__S.known_text(k), "known Map(Str, V) key") end
+        if str then k = strings.as_str(__S.known_text k, "known Map(Str, V) key") end
         for j = 1, i - 1 do
             if __S.host(equal(k, copied[j][1])) then fail("duplicate semantic key in known map at entry " .. i) end
         end
         copied[i] = { k, v }
     end
     local api = map.known(t.key, t.elem, t.lookup, copied)
-    local object = newproxy(true)
+    local object = newproxy true
     local function checked(_, k)
-        k = key(k)
-        if __S.is_known(k) and not __S.host(api.has(k)) then fail("map-key: missing key in known map") end
-        return api.get(k)
+        k = key k
+        if __S.is_known k and not __S.host(api.has k) then fail "map-key: missing key in known map" end
+        return api.get k
     end
     local methods = {}
-    methods.find = function(_, k) return api.find(key(k)) end
-    methods.has = function(_, k) return api.has(key(k)) end
-    methods.each = function(_, body) return api.each(body) end
-    for _, fn in pairs(methods) do __S.arity[fn] = 2 end
-    local mt = getmetatable(object)
+    methods.find = function(_, k) return api.find(key k) end
+    methods.has = function(_, k) return api.has(key k) end
+    methods.each = function(_, body) return api.each body end
+    for _, fn in pairs methods do __S.arity[fn] = 2 end
+    local mt = getmetatable object
     mt.__nua_index = checked
     mt.__index = function(_, name)
         if name == "length" then return __S.known(U64, count) end
         if methods[name] then return methods[name] end
-        if name == "put" or name == "ensure" or name == "remove" then fail("known maps are immutable") end
+        if name == "put" or name == "ensure" or name == "remove" then fail "known maps are immutable" end
         return checked(object, name)
     end
-    mt.__newindex = function() fail("known maps are immutable; indexing yields a value, not a place") end
+    mt.__newindex = function() fail "known maps are immutable; indexing yields a value, not a place" end
     mt.__tostring = function() return "known " .. t.display end
     return object
 end

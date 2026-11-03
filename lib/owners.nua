@@ -13,57 +13,58 @@ local owners = {}
 -- `Text`, `Slice` or length builds it from
 local function build(api, owner, indices, from)
     api.layout.init(owner, indices[1])
-    if from.copy_of then api.copy(owner, Ref(from.copy_of)) end
+    if from.copy_of then api.copy(owner, Ref from.copy_of) end
     if from.text then api.append(owner, from.text) end
     if from.length then api.allocate(owner, from.length) end
     if from.items then
-        local ptr, len = __S.slice_parts(from.items)
+        local ptr, len = __S.slice_parts from.items
         api.fill_from(owner, ptr, len)
     end
 end
 
-owners.Store = owner_type {
-    name = "Store",
-    header = layout.Store,
-    slot = true,
-    ids = true,
-    api = function(T, Id, p) return storage.store(T, Id, p) end,
-    init = build,
-    methods = { "add", "remove", "has" },
-    arity = { add = 2, remove = 2, has = 2 },
-}
+owners.Store = owner_type with
+    name = "Store"
+    header = layout.Store
+    slot = true
+    ids = true
+    api = function(T, Id, p) return storage.store(T, Id, p) end
+    init = build
+    methods = { "add", "remove", "has" }
+    arity = { add = 2, remove = 2, has = 2 }
+end
 
-owners.Grow = owner_type {
-    name = "Grow",
-    header = layout.Grow,
-    views = true,
-    api = function(T, Id, p) return storage.grow(T, p) end,
-    init = build,
-    methods = { "push", "pop", "truncate", "clear" },
-    args = { truncate = { "index" } },
-    arity = { push = 2, all = 1, sub = 3, clear = 1, pop = 1, truncate = 2 },
+owners.Grow = owner_type with
+    name = "Grow"
+    header = layout.Grow
+    views = true
+    api = function(T, Id, p) return storage.grow(T, p) end
+    init = build
+    methods = { "push", "pop", "truncate", "clear" }
+    args = { truncate = { "index" } }
+    arity = { push = 2, all = 1, sub = 3, clear = 1, pop = 1, truncate = 2 }
     -- Text is Grow U8: its text words come with the element type
     extra = function(T, offered)
         if T.elem == U8 then return text.methods(T, offered) end
-    end,
-}
+    end
+end
 owners.Chars = require("nua.chars").Chars
 
 -- an Array T: its length is fixed when it is built, so it has no push and no clear
-owners.Array = owner_type {
-    name = "Array",
-    header = layout.Grow,
-    views = true,
-    api = function(T, Id, p) return storage.grow(T, p) end,
-    init = build,
-    methods = {},
-    arity = { all = 1, sub = 3 },
+owners.Array = owner_type with
+    name = "Array"
+    header = layout.Grow
+    views = true
+    api = function(T, Id, p) return storage.grow(T, p) end
+    init = build
+    methods = {}
+    arity = { all = 1, sub = 3 }
     construct = function(T)
         return function()
-            __S.fail(T.display .. " is built with its length: Array(" .. T.elem.display .. ", n) {}", 2)
+            __S.fail(T.display .. " is built with its length: Array(" .. T.elem.display .. ", n) {}",
+                2)
         end
-    end,
-}
+    end
+end
 
 -- Map(K, V), Map(Str, V) (text keys copied into the map's arena) and Map.borrowing(Str, V)
 -- (the caller's keys are kept): three declarations of one family
@@ -72,19 +73,19 @@ local general = owner_type(map.family "Map")
 local text = owner_type(map.family "StrMap")
 local borrowing = owner_type(map.family "BorrowingMap")
 owners.Map = setmetatable({
-    known = function(k, v, entries)
-        local T = k == Str and text(Str, v) or general(k, v)
-        return map.describe_known(T, entries)
-    end,
-    borrowing = function(k, v)
-        if k ~= Str then __S.fail("Map.borrowing keeps Str keys: Map.borrowing(Str, V)", 2) end
-        return borrowing(Str, v)
-    end,
-}, { __call = function(_, k, v)
-    -- text keys are copied into the map's own arena: Map(Str, V) is the text-keyed map
-    if k == Str then return text(Str, v) end
-    return general(k, v)
-end })
+        known = function(k, v, entries)
+            local T = k == Str and text(Str, v) or general(k, v)
+            return map.describe_known(T, entries)
+        end,
+        borrowing = function(k, v)
+            if k ~= Str then __S.fail("Map.borrowing keeps Str keys: Map.borrowing(Str, V)", 2) end
+            return borrowing(Str, v)
+        end,
+    }, { __call = function(_, k, v)
+            -- text keys are copied into the map's own arena: Map(Str, V) is the text-keyed map
+            if k == Str then return text(Str, v) end
+            return general(k, v)
+        end })
 __S.arity[owners.Map] = 2
 __S.arity[owners.Map.known], __S.arity[owners.Map.borrowing] = 3, 2
 

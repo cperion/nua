@@ -167,13 +167,13 @@ function storage.grow(T, p)
         local value_of, known_text = __S.value_of, strings.known_text
         -- a host number or boolean is the typed value Nua would give it
         local function normalize(part)
-            if type(part) == "boolean" then return __S.known(Bool, part) end
-            if type(part) == "number" then
+            if type part == "boolean" then return __S.known(Bool, part) end
+            if type part == "number" then
                 -- negative zero stays a float
-                if part == math.floor(part) and math.abs(part) < 2 ^ 53 and not (part == 0 and 1 / part == -math.huge) then
-                    return I64(part)
+                if part == math.floor part and math.abs part < 2 ^ 53 and not (part == 0 and 1 / part == -math.huge) then
+                    return I64 part
                 end
-                return F64(part)
+                return F64 part
             end
             return part
         end
@@ -196,7 +196,7 @@ function storage.grow(T, p)
             if v.k == "known" and v.T.kind == "cstr" then return v.v end
         end
         local function append(g, text)
-            __S.bump_checked()
+            __S.bump_checked
             api.append(g, text)
         end
         -- the text written so far that is known goes out as one literal
@@ -206,7 +206,7 @@ function storage.grow(T, p)
         end
         -- known text joins what is pending; anything else is written after it
         local function put(g, pending, text)
-            local known = known_text(text)
+            local known = known_text text
             if known then return pending .. known end
             flush(g, pending)
             append(g, text)
@@ -216,13 +216,13 @@ function storage.grow(T, p)
             grows g
             local pending = ""
             for i = 1, parts.length do
-                local part = normalize(parts[i])
-                if type(part) == "string" then
+                local part = normalize parts[i]
+                if type part == "string" then
                     pending = pending .. part
                 else
-                    local kind = kind_of(part)
+                    local kind = kind_of part
                     if kind == "bool" then
-                        pending = put(g, pending, format.boolean(part))
+                        pending = put(g, pending, format.boolean part)
                     elseif kind == "signed" then
                         local digits = format.i64(I64 part)
                         pending = put(g, pending, digits:str())
@@ -236,11 +236,11 @@ function storage.grow(T, p)
                     elseif kind == "str" then
                         pending = put(g, pending, part)
                     elseif kind == "cstring" then
-                        local known = known_cstring(part)
+                        local known = known_cstring part
                         if known then pending = pending .. known
-                        else pending = put(g, pending, strings.of(part)) end
+                        else pending = put(g, pending, strings.of part) end
                     else
-                        reject(part)
+                        reject part
                     end
                 end
             end
@@ -249,7 +249,7 @@ function storage.grow(T, p)
         -- the text as a Str borrowing it, of the length it has now: the text may grow while
         -- the Str is used; clearing it ends the Str
         api.str = do(g: Ref T): Str
-            return strings.of(api.all(g))
+            return strings.of(api.all g)
         end
     end
     api.push = do(g: Ref T, value: T.elem): Unit
