@@ -114,7 +114,7 @@ bool tree_sitter_nua_external_scanner_scan(void *p, TSLexer *l, const bool *vali
     // `T with entries end`: scanned here so it wins over a statement starting with the name
     if (valid[WITH] && !strcmp(name, "with")) { l->mark_end(l); l->result_symbol = WITH; return true; }
     if (!valid[NAME_ARGUMENT] || !same_line || !space) return false;
-    const char *keywords[] = {"and", "break", "continue", "do", "else", "elseif", "end", "endall", "export", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "struct", "then", "true", "until", "while", "with"};
+    const char *keywords[] = {"and", "break", "continue", "do", "else", "elseif", "end", "endall", "export", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "with"};
     for (unsigned i = 0; i < sizeof(keywords)/sizeof(*keywords); ++i) if (!strcmp(name, keywords[i])) return false;
     l->mark_end(l); l->result_symbol = NAME_ARGUMENT; return true;
   }

@@ -5,18 +5,18 @@ local io = require "nua.io"
 -- §4.1 Values first ---------------------------------------------------------------------------------
 -- (step 2 of the guide's process)
 
-local Direction = oneof { left: Unit, right: Unit }
-local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
+local Direction = Sum { left: Unit, right: Unit }
+local Command = Sum { move: Direction, insert: U32, undo: Unit, quit: Unit }
 
 -- an outcome a caller acts on is a sum
-local Found = oneof { found: U64, missing: Unit }
+local Found = Sum { found: U64, missing: Unit }
 
 -- §5 Ownership: trees are fields, graphs are stores ------------------------------------------------
 
-local Document = struct { length: U32, cursor: U32, edits: U32 }
+local Document = Struct { length: U32, cursor: U32, edits: U32 }
 
-local Heading = struct { level: U32, words: U32 }
-local Outline = struct { headings: Store Heading }
+local Heading = Struct { level: U32, words: U32 }
+local Outline = Struct { headings: Store Heading }
 
 local add_words = do(outline: Ref Outline, id: Id Heading, n: U32): U32
     outline.headings[id].words = outline.headings[id].words + n
@@ -77,7 +77,7 @@ assert(host(tab_stop({ tab_width = 8 }, U32 3)) == 8)
 
 -- §6 Step 4: activities ----------------------------------------------------------------------------
 
-local Draft = struct { length: U32, cursor: U32, edits: U32 }
+local Draft = Struct { length: U32, cursor: U32, edits: U32 }
 
 function Draft:insert(n: U32): Unit
     self.length = self.length + n
@@ -111,7 +111,7 @@ end
 export type_word
 
 -- the body decides, the activity completes: the body returns an outcome
-local Outcome = oneof { commit: Unit, abort: U32 }
+local Outcome = Sum { commit: Unit, abort: U32 }
 
 local attempt = do(document: Ref Document, body): Bool
     local draft = Draft { ..document }
@@ -137,7 +137,7 @@ end
 export type_capped
 
 -- stack activities instead of adding options
-local Stats = struct { entered: U32, left: U32 }
+local Stats = Struct { entered: U32, left: U32 }
 
 local counted = do(stats: Ref Stats, body): Unit
     stats.entered = stats.entered + 1
@@ -164,7 +164,7 @@ end
 export import_capped
 
 -- nested activities compose: a name the inner context lacks reaches the outer one
-local Log = struct { notes: U32 }
+local Log = Struct { notes: U32 }
 
 function Log:note(count: U32): Unit
     self.notes = self.notes + count
@@ -189,8 +189,8 @@ export type_logged
 -- §7 Step 5: states ---------------------------------------------------------------------------------
 
 -- a lifecycle as a sum, and one word per transition
-local Conn = oneof { reading: U32, rejected: U32, closed: Unit }
-local Event = oneof { bytes: U32, bad_line: Unit, hang_up: Unit }
+local Conn = Sum { reading: U32, rejected: U32, closed: Unit }
+local Event = Sum { bytes: U32, bad_line: Unit, hang_up: Unit }
 
 local step = do(c: Conn, e: Event): Conn = c {
     reading(n) = e {
@@ -289,7 +289,7 @@ export replay
 
 -- §18.1 Type hooks: a number that knows what + and < mean --------------------------------
 
-local Fixed = struct { raw: I32 }  -- a number with 16 fractional bits
+local Fixed = Struct { raw: I32 }  -- a number with 16 fractional bits
 
 function Fixed.__cast(v, T)  -- a Lua number where a Fixed is expected
     if type v == 'number' then
@@ -310,7 +310,7 @@ export below
 
 -- §8 Step 6: concurrency ----------------------------------------------------------------------------
 
-local Chunk = struct { n: U32, bytes: Array(U8, 64) }
+local Chunk = Struct { n: U32, bytes: Array(U8, 64) }
 
 -- lines, not words: a word can straddle two chunks, a newline cannot
 local count_lines = do(c: Ref Chunk): U32

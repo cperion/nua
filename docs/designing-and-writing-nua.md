@@ -16,7 +16,7 @@ Every `lua` block below is an excerpt of [`examples/guide.nua`](../examples/guid
 |---|---|
 | `local f = do(x: T): R ... end`, `do(x: T): R = e` | typed words: compiled to native code |
 | `function T:m(...): R ... end` | methods: the receiver is `self`, a reference |
-| `struct { ... }`, `oneof { ... }` | records and sums |
+| `Struct { ... }`, `Sum { ... }` | records and sums |
 | `s { name = do(p) ... end, name(p) = e }` | matching a sum: one handler per alternative |
 | untyped parameters, `f known` | compile-time parameters, partial application |
 | `f "lit"`, `f 1 2`, `f x do ... end` | literal application and saturating chains |
@@ -176,8 +176,8 @@ flowchart LR
 Use scenarios to find the values: what must be stored, replayed, logged, undone or tested independently of the action that produced it? Model those things as data, and revise the records and sums as their behavior becomes clearer:
 
 ```lua
-local Direction = oneof { left: Unit, right: Unit }
-local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
+local Direction = Sum { left: Unit, right: Unit }
+local Command = Sum { move: Direction, insert: U32, undo: Unit, quit: Unit }
 ```
 
 Commands as data give replay and tests a shared input, and (§17) they give specialization something to work with. Undo also needs enough history to reverse an operation; naming an `undo` command alone does not provide it. In this guide, `Document` tracks counts rather than actual text or undo history.
@@ -187,7 +187,7 @@ Commands as data give replay and tests a shared input, and (§17) they give spec
 Use a sum when alternatives carry different data or require distinct handling, and match it exhaustively. A predicate can return `Bool`; a named sum makes a richer protocol explicit. Do not encode absence as a magic value:
 
 ```lua
-local Found = oneof { found: U64, missing: Unit }
+local Found = Sum { found: U64, missing: Unit }
 ```
 
 ```lua
@@ -203,7 +203,7 @@ local find_nonzero = do(xs: Slice U32): Found
 end
 ```
 
-The libraries follow the same rule: a receive is `oneof { value: T, closed: Unit }`, and a read/write I/O result is `oneof { done: U32, failed: I32 }`. In the bounded edit (§2.2), the body returns a `commit`/`abort` sum so completion can choose a path; the outer caller receives `Bool` because it needs only acceptance or rejection.
+The libraries follow the same rule: a receive is `Sum { value: T, closed: Unit }`, and a read/write I/O result is `Sum { done: U32, failed: I32 }`. In the bounded edit (§2.2), the body returns a `commit`/`abort` sum so completion can choose a path; the outer caller receives `Bool` because it needs only acceptance or rejection.
 
 **Which kind of failure is which:**
 
@@ -224,7 +224,7 @@ A compile-time error is reported even in an arm that dynamic control may never r
 
 | Role | What it is | Nua forms |
 |---|---|---|
-| **value** | copied freely; owned by whoever holds it | `struct`, `oneof`, `Array`, `Chars n` |
+| **value** | copied freely; owned by whoever holds it | `Struct`, `Sum`, `Array`, `Chars n` |
 | **entity** | has identity across operations; independently recyclable entities can live in a store | a scope-owned record, or a struct in a `Store T` named by an `Id` |
 | **owned** | resizable storage, created in place, accessed through `Ref`, not copied or moved by value | `Store`, `Grow`, `Text`, `Map`; a struct holding one (a ring buffer) |
 | **view** | a window on someone else's storage, valid within its owner's lifetime and borrowing rules | `Slice`, `Str` |
@@ -240,7 +240,7 @@ A compile-time error is reported even in an arm that dynamic control may never r
 | **borrow** | uses for a valid bounded lifetime | a `Ref T` parameter, or borrowed access supplied by an activity |
 | **message** | crosses a task boundary | a channel (copies) or a pool slot (moves) |
 
-These labels prevent a vague UML association from hiding ownership. Add other domain dependencies when useful, but do not mistake them for storage edges. Use a `oneof` for alternatives where a class hierarchy would otherwise encode variants; shared behavior can be a vocabulary of words rather than inheritance. A reference may be returned from a received reference when its owner's lifetime permits it; a reference to temporary activity-owned storage cannot escape with it. Persistent identity may need an `Id`, and task boundaries need messages.
+These labels prevent a vague UML association from hiding ownership. Add other domain dependencies when useful, but do not mistake them for storage edges. Use a `Sum` for alternatives where a class hierarchy would otherwise encode variants; shared behavior can be a vocabulary of words rather than inheritance. A reference may be returned from a received reference when its owner's lifetime permits it; a reference to temporary activity-owned storage cannot escape with it. Persistent identity may need an `Id`, and task boundaries need messages.
 
 ```mermaid
 classDiagram
@@ -277,8 +277,8 @@ classDiagram
 * **Trees are fields; graphs are stores.** A `Store T` holds objects with stable identity, and an `Id T` names one without owning it:
 
 ```lua
-local Heading = struct { level: U32, words: U32 }
-local Outline = struct { headings: Store Heading }
+local Heading = Struct { level: U32, words: U32 }
+local Outline = Struct { headings: Store Heading }
 
 local add_words = do(outline: Ref Outline, id: Id Heading, n: U32): U32
     outline.headings[id].words = outline.headings[id].words + n
@@ -351,7 +351,7 @@ sequenceDiagram
 ### 6.3 Enter an activity and speak its instructions
 
 ```lua
-local Draft = struct { length: U32, cursor: U32, edits: U32 }
+local Draft = Struct { length: U32, cursor: U32, edits: U32 }
 
 function Draft:insert(n: U32): Unit
     self.length = self.length + n
@@ -425,7 +425,7 @@ uint32_t type_word(Document *document, uint32_t n) {
 A body cannot leave its activity, so it cannot abort by jumping out. **It returns an outcome, and the activity matches on it to choose its completion:**
 
 ```lua
-local Outcome = oneof { commit: Unit, abort: U32 }
+local Outcome = Sum { commit: Unit, abort: U32 }
 
 local attempt = do(document: Ref Document, body): Bool
     local draft = Draft { ..document }
@@ -515,7 +515,7 @@ Nested activities do not need to know about each other. A name the inner context
 
 ```lua
 -- nested activities compose: a name the inner context lacks reaches the outer one
-local Log = struct { notes: U32 }
+local Log = Struct { notes: U32 }
 
 function Log:note(count: U32): Unit
     self.notes = self.notes + count
@@ -648,12 +648,12 @@ stateDiagram-v2
     closed --> [*]
 ```
 
-A `oneof` is a natural representation when states carry different data. A word from state and event to next state makes the transition rules testable while compiling. Here `rejected` deliberately consumes the next event only to reset; even a `hang_up` in that state resets rather than closes. That is this example's policy, not a consequence of using sums:
+A `Sum` is a natural representation when states carry different data. A word from state and event to next state makes the transition rules testable while compiling. Here `rejected` deliberately consumes the next event only to reset; even a `hang_up` in that state resets rather than closes. That is this example's policy, not a consequence of using sums:
 
 ```lua
 -- a lifecycle as a sum, and one word per transition
-local Conn = oneof { reading: U32, rejected: U32, closed: Unit }
-local Event = oneof { bytes: U32, bad_line: Unit, hang_up: Unit }
+local Conn = Sum { reading: U32, rejected: U32, closed: Unit }
+local Event = Sum { bytes: U32, bad_line: Unit, hang_up: Unit }
 
 local step = do(c: Conn, e: Event): Conn = c {
     reading(n) = e {
@@ -1065,7 +1065,7 @@ Native arithmetic follows the width, wraparound and conversion rules in [syntax 
 
 ### 18.1 Type hooks
 
-A type's layout is a `struct`; what the language's operations mean on it is a hook stored on the type under a `__` name ([syntax §16](syntax.md#16-library-defined-types)): `__index` and `__newindex` for `x[k]`, `__cast` for a value given where the type is expected, `__add` and the other arithmetic hooks, `__eq`, `__lt` and `__le`, and `__member` for `x.name`. Hooks run while specializing, so whatever they build folds and residualizes with the caller. Hook selection adds no runtime dispatch; the operations selected can still have runtime cost. The built-in types use the same hooks.
+A type's layout is a `Struct`; what the language's operations mean on it is a hook stored on the type under a `__` name ([syntax §16](syntax.md#16-library-defined-types)): `__index` and `__newindex` for `x[k]`, `__cast` for a value given where the type is expected, `__add` and the other arithmetic hooks, `__eq`, `__lt` and `__le`, and `__member` for `x.name`. Hooks run while specializing, so whatever they build folds and residualizes with the caller. Hook selection adds no runtime dispatch; the operations selected can still have runtime cost. The built-in types use the same hooks.
 
 **A hook gives an operation the meaning the reader already expects.** If the meaning needs explaining, it is a named word.
 
@@ -1079,7 +1079,7 @@ A type's layout is a `struct`; what the language's operations mean on it is a ho
 | `__member` | a family whose members follow from its parameters | members a method would declare: methods keep a type's vocabulary listable |
 
 ```lua
-local Fixed = struct { raw: I32 }  -- a number with 16 fractional bits
+local Fixed = Struct { raw: I32 }  -- a number with 16 fractional bits
 
 function Fixed.__cast(v, T)  -- a Lua number where a Fixed is expected
     if type v == 'number' then

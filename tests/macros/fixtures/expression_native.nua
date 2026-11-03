@@ -1,5 +1,5 @@
 -- Expression-body factories must preserve the native words they contain.
-local Record = struct { value: U32 }
+local Record = Struct { value: U32 }
 
 local expression_factory = do(name) = do(body)
     local word = do(record: Ref Record): U32 = body record

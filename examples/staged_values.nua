@@ -49,7 +49,7 @@ end
 assert(host(stage_shorter()))
 export stage_shorter
 
-local Holder = struct { text: Chars 4, tag: U32 }
+local Holder = Struct { text: Chars 4, tag: U32 }
 local stage_nested = do(): Bool
     local h = Holder { text = constant, tag = 9 }
     local view: Str = h.text:str()

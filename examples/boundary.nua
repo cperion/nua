@@ -17,7 +17,7 @@ local known = do(): U32
 end
 export known
 
-local Counter = struct { total: U32 }
+local Counter = Struct { total: U32 }
 function Counter:add(n: U32): U32
     self.total = self.total + n
     return self.total

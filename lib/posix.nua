@@ -52,13 +52,13 @@ local c_epoll_ctl = extern("epoll_ctl", { I32, I32, I32, Ptr Event }, I32, { hea
 local c_epoll_wait = extern("epoll_wait", { I32, Ptr Event, I32, I32 }, I32, { header = epoll_h })
 
 -- an activity's outcome: done, or the errno it failed with
-local Outcome = oneof { done: Unit, failed: I32 }
+local Outcome = Sum { done: Unit, failed: I32 }
 
 -- file descriptors -------------------------------------------------------------------------------
 
 -- the vocabulary inside with_fd; `error` holds the first failure, which the
 -- activity reports as its outcome
-local Fd = struct { fd: I32, error: I32 }
+local Fd = Struct { fd: I32, error: I32 }
 
 -- record a failed call's errno
 function Fd:checked(n: I64): I64
@@ -135,7 +135,7 @@ local with_eventfd = do(body): Outcome
 end
 
 -- the vocabulary inside with_epoll
-local Poll = struct { epfd: I32 }
+local Poll = Struct { epfd: I32 }
 
 function Poll:watch(fd: I32): I32
     local ev = Event { events = EPOLLIN, .fd }

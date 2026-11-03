@@ -2,7 +2,7 @@
 
 -- Generic compile-time type generator
 local Box =: T
-    local B = struct {
+    local B = Struct {
         value: T,
     }
 

@@ -103,8 +103,8 @@ function layout.maps(T, Entry, view)
     local Stored = Entry.index.key.type
     -- One acquisition of a table: its buckets and, for text keys, the live
     -- arena bytes the stored keys point into.
-    local View = struct { entries: EP, cap: U32 }
-    if str then View = struct { entries: EP, cap: U32, arena: Ptr U8 } end
+    local View = Struct { entries: EP, cap: U32 }
+    if str then View = Struct { entries: EP, cap: U32, arena: Ptr U8 } end
     local header = do(self: Ref T): Ptr layout.Map
         local h = view self
         if str then return Ptr h.entries end

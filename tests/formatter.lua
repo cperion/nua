@@ -402,7 +402,7 @@ local function normalized(c)
     return c:gsub('([%w_./%-]+%.nua):%d+:', '%1:<line>:')
 end
 local opening_program = [[
-local View = struct { value: U32 }
+local View = Struct { value: U32 }
 local apply = do(ctx: Ref View, body): U32 = body(ctx)
 local read = do(ctx: Ref View): U32
     return apply ctx do(unused..)

@@ -56,7 +56,7 @@ local strtod = extern("strtod", { CP, Ptr CP }, F64, { header = "<stdlib.h>" })
 local FloatDigits = Chars 32
 local float_is_known = __S.float_is_known
 local float_text = __S.float_text
-local Trial = struct { text: FloatDigits, parsed: F64 }
+local Trial = Struct { text: FloatDigits, parsed: F64 }
 local function trial(value: F64, precision: I32): Trial
     local text = FloatDigits {}
     local p = CP(Ptr text.bytes)

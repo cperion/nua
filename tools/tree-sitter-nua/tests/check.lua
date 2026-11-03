@@ -30,7 +30,7 @@ for id, node in query:iter_captures(tree:root(), 0) do
   captured[name .. ':' .. text] = true
 end
 for _, pair in ipairs({
-  {'keyword', 'struct'}, {'keyword', 'export'}, {'keyword.function', 'do'},
+  {'type.builtin', 'Struct'}, {'keyword', 'export'}, {'keyword.function', 'do'},
   {'keyword.function', 'endall'}, {'type.builtin', 'U32'}, {'variable.parameter', 'x'},
   {'function', 'inc'}, {'function.call', 'print'}, {'function', 'ok'},
   {'number', '2'}, {'operator', '+'}, {'string.escape', '\\n'},
@@ -142,7 +142,7 @@ end
 local assigned_sexpr = assigned:root():sexpr()
 assert(select(2, assigned_sexpr:gsub('%(lambda', '')) == 4, '=: blocks are not lambdas: ' .. assigned_sexpr)
 local with_tree = parse([[
-local Point = struct with
+local Point = Struct with
     x: U32
     y: U32
 end
@@ -170,7 +170,7 @@ local a, b: U32
 local f = do(x: U32): U32
     return x
 end
-local Pair = struct {
+local Pair = Struct {
     first: U32,
     last: U32
 }

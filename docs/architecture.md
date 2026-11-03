@@ -550,7 +550,7 @@ NodeId insert_double(Graph *graph, uint32_t value) {
 ```lua
 -- Generic compile-time type generator
 local Box = do(T)
-    local B = struct {
+    local B = Struct {
         value: T,
     }
 
@@ -635,11 +635,11 @@ No generic abstraction, partial-application environment, closure, method dispatc
 A computation that genuinely needs dynamic native storage:
 
 ```lua
-local Node = struct {
+local Node = Struct {
     value: U32,
 }
 
-local Graph = struct {
+local Graph = Struct {
     nodes: Store Node,
 }
 

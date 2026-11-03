@@ -1,11 +1,11 @@
 -- syntax §9.8, architecture §10.1 and architecture §10.3: managed stores,
 -- generational IDs, data stacks.
 
-local Node = struct {
+local Node = Struct {
     value: U32,
 }
 
-local Graph = struct {
+local Graph = Struct {
     nodes: Store Node,
 }
 

@@ -1,7 +1,7 @@
 -- References as data: fields, payloads, elements, locals and container elements,
 -- rebound by a reference and written through by a value (assignment by type).
 
-local Holder = struct { r: Ref U32, n: U32 }
+local Holder = Struct { r: Ref U32, n: U32 }
 local bump = do(h: Ref Holder): Unit
     h.r = h.r + h.n
 end
@@ -50,7 +50,7 @@ end
 export array_refs
 
 -- a sum carrying a reference: the payload denotes the place again
-local Target = oneof { some: Ref U32, none: Unit }
+local Target = Sum { some: Ref U32, none: Unit }
 local pick = do(flag: Bool, a: Ref U32): Target
     if flag then return Target.some a end
     return Target.none()
@@ -63,7 +63,7 @@ end
 export sum_payload
 
 -- a Grow of records holding references, declared after their targets
-local Cell = struct { target: Ref U32 }
+local Cell = Struct { target: Ref U32 }
 local grow_refs = do(n: U32): U32
     local a: U32 = 0
     local cells = Grow(Cell) {}
@@ -74,7 +74,7 @@ end
 export grow_refs
 
 -- a Store of tokens whose text borrows a source declared before the store
-local Token = struct { text: Str, kind: U32 }
+local Token = Struct { text: Str, kind: U32 }
 local store_tokens = do(n: U32): U32
     local source = Chars 16 "hello world"
     local tokens = Store(Token) {}

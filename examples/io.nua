@@ -159,7 +159,7 @@ end
 export echo
 
 -- read straight into a pool slot, then move the slot: no copy
-local Chunk = struct { n: U32, bytes: Array(U8, 16) }
+local Chunk = Struct { n: U32, bytes: Array(U8, 16) }
 
 local zero_copy = do(chunks: U32): U32
     local total: U32 = 0

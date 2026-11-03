@@ -25,7 +25,7 @@ export text_doubles
 
 -- a Store grows while a Grow on another stack is borrowed
 local store_during_view = do(n: U32): U32
-    local Node = struct { value: U32 }
+    local Node = Struct { value: U32 }
     local nodes = Store(Node) {}
     local g = Grow(U32) {}
     g:push 5

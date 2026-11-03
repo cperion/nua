@@ -17,7 +17,7 @@ function host_receiver:tick() self.count = self.count + 1 end
 host_receiver:tick
 assert(host_count == 3 and host_receiver.count == 1)
 
-local Counter = struct { count: U32 }
+local Counter = Struct { count: U32 }
 function Counter:tick(): Unit
     self.count = self.count + 1
 end

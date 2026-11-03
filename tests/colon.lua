@@ -50,7 +50,7 @@ local with_pairs = {
     { 'with block', 'local p = Point with\n    x = 1\n    y = 2\nend\n', 'local p = Point {\n    x = 1,\n    y = 2\n}\n' },
     { 'with on one line', 'local p = Point with x = 1 y = 2 end\n', 'local p = Point { x = 1, y = 2 }\n' },
     { 'shorthand entries', 'local p = Point with\n    .x\n    .y\nend\n', 'local p = Point {\n    .x,\n    .y\n}\n' },
-    { 'struct with', 'local P = struct with\n    x: F32\n    y: F32\nend\n', 'local P = struct {\n    x: F32,\n    y: F32\n}\n' },
+    { 'Struct with', 'local P = Struct with\n    x: F32\n    y: F32\nend\n', 'local P = Struct {\n    x: F32,\n    y: F32\n}\n' },
     { 'continued entry', 'local p = T with\n    x = a +\n        b\n    y = 2\nend\n', 'local p = T {\n    x = a +\n        b,\n    y = 2\n}\n' },
     { 'handlers', 'local r = s with\n    a =: v\n        go v\n    end\n    b = do(x) = x\nend\n',
       'local r = s {\n    a = do(v)\n        go v\n    end,\n    b = do(x) = x\n}\n' },
@@ -144,7 +144,7 @@ formatted('fmt: braces stay braces', 'local p = Point { x = 1, y = 2 }\n', 'loca
 formatted('fmt: with commas written out go', 'local p = Point with x = 1, y = 2 end\n', 'local p = Point with x = 1 y = 2 end\n')
 formatted('fmt: with and a block entry', 'local r = s with\n  a =: v\n    local x, y = v, v\n    go x y\n  end\n  b = 2\nend\n',
     'local r = s with\n    a =: v\n        local x, y = v, v\n        go x y\n    end\n    b = 2\nend\n')
-formatted('fmt: struct with', 'local P = struct with\nx: F32\ny: F32\nend\n', 'local P = struct with\n    x: F32\n    y: F32\nend\n')
+formatted('fmt: Struct with', 'local P = Struct with\nx: F32\ny: F32\nend\n', 'local P = Struct with\n    x: F32\n    y: F32\nend\n')
 formatted('fmt: positional entries keep commas', 'local a = Array(U32, 2) with 1, 2 end\n', 'local a = Array(U32, 2) with 1, 2 end\n')
 check('fmt: bad block style', not pcall(fmt.format, 'x = 1\n', { block_style = 'ruby' }))
 

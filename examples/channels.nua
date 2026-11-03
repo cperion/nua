@@ -34,8 +34,8 @@ export sum_squares
 
 -- fan-out, fan-in: workers share a job channel and a result channel ------------------------------
 
-local Job = struct { id: U32, n: U32 }
-local Done = struct { id: U32, steps: U32 }
+local Job = Struct { id: U32, n: U32 }
+local Done = Struct { id: U32, steps: U32 }
 
 local collatz = do(n: U32): U32
     local steps: U32 = 0
@@ -163,7 +163,7 @@ export late_reply
 
 -- channels carry channels: a request names where its reply goes ------------------------------------
 
-local Request = struct { x: U32, reply: Chan U64 }
+local Request = Struct { x: U32, reply: Chan U64 }
 
 local server = do(requests: Chan Request): Unit
     requests:each: r
@@ -192,7 +192,7 @@ export ask
 
 -- sums as messages: an accumulator task owns its state ---------------------------------------------
 
-local Msg = oneof { add: U32, sub: U32, stop: Unit }
+local Msg = Sum { add: U32, sub: U32, stop: Unit }
 
 local accumulator = do(inbox: Chan Msg, out: Chan I64): Unit
     local acc: I64 = 0
@@ -304,7 +304,7 @@ export grow_in_task
 
 -- pools: buffers move between tasks instead of being copied --------------------------------------
 
-local Block = struct { n: U32, data: Array(U8, 64) }
+local Block = Struct { n: U32, data: Array(U8, 64) }
 
 local fill = do(b: Ref Block, k: U32): Unit
     b.n = k % 64
@@ -411,7 +411,7 @@ export parallel_sleeps
 -- run-time checks ------------------------------------------------------------------------------------
 
 -- a channel kept past its scope is a stale handle: using it traps
-local Holder = struct { ch: Chan U32 }
+local Holder = Struct { ch: Chan U32 }
 
 local use_after_scope = do(h: Ref Holder): Unit
     tasks:

@@ -1,5 +1,5 @@
 -- A block-only activity in return position supplies a compile-time callback.
-local Log = struct { notes: U32 }
+local Log = Struct { notes: U32 }
 function Log:note(count: U32): Unit
     self.notes = self.notes + count
 end

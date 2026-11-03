@@ -1,5 +1,5 @@
 -- An editor fixture, not an executable program.
-local Point = struct { x: F32, y: F32 }
+local Point = Struct { x: F32, y: F32 }
 local inc = do(x: U32): U32 = x + 1
 local greet = do(name: Str): Unit
     print "hello\n"

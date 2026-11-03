@@ -346,7 +346,7 @@ local function holds_slot_inside(t, inside)
         end
     elseif t.kind == 'sum' then
         for _, a in ipairs(t.alts) do
-            local w = holds_slot_inside(a.type, 'a oneof')
+            local w = holds_slot_inside(a.type, 'a Sum')
             if w then return w end
         end
     elseif t.kind == 'array' then
@@ -451,17 +451,17 @@ end
 local sums = {}
 
 function T.sum(name, alts)
-    if #alts == 0 then error('oneof needs at least one named alternative', 2) end
+    if #alts == 0 then error('Sum needs at least one named alternative', 2) end
     local list, seen = {}, {}
     for _, a in ipairs(alts) do
         local an, at = a[1], a[2]
-        if seen[an] then error(("oneof: duplicate alternative '%s'"):format(an), 2) end
+        if seen[an] then error(("Sum: duplicate alternative '%s'"):format(an), 2) end
         seen[an] = true
         if not T.is_type(at) then
-            error(("oneof: alternative '%s' needs a type, got %s"):format(an, tostring(at)), 2)
+            error(("Sum: alternative '%s' needs a type, got %s"):format(an, tostring(at)), 2)
         end
         if at.resizable then
-            error(("oneof: alternative '%s' is resizable storage; payloads are fixed-size"):format(an), 2)
+            error(("Sum: alternative '%s' is resizable storage; payloads are fixed-size"):format(an), 2)
         end
         list[#list + 1] = { name = an, type = at }
     end

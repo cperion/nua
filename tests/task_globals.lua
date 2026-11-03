@@ -29,8 +29,8 @@ check('fnptr', program('local f = fnptr bump\nf(hits)', bump), error_text)
 check('returned', program('local p = call address()\np[0] = 1',
     'local address = do(): Ptr U32 = hits\n'), error_text)
 check('aggregate_alias', program('local box = Box { p = hits }\nbox.p[0] = 1',
-    'local Box = struct { p: Ptr U32 }\n'), error_text)
-local pointer_sum = [[local Choice = oneof { address: Ptr U32, none: Unit }
+    'local Box = Struct { p: Ptr U32 }\n'), error_text)
+local pointer_sum = [[local Choice = Sum { address: Ptr U32, none: Unit }
 local choose = do(n: U32): Choice
     if n > 0 then return Choice.address hits end
     return Choice.none()
@@ -46,7 +46,7 @@ check('stored_before_spawn', program('alias[0][0] = 1',
     'local alias = global(Ptr U32, { name = "alias" })\n', nil, 'alias[0] = hits\n'), error_text)
 check('opaque', program('opaque(hits)',
     'local opaque = extern("opaque", { Ptr U32 }, Unit)\n'), "opaque code may write global 'hits'")
-check('opaque_record_address', program('local box = Box { p = hits }\nopaque(Ptr box)', [[local Box = struct { p: Ptr U32 }
+check('opaque_record_address', program('local box = Box { p = hits }\nopaque(Ptr box)', [[local Box = Struct { p: Ptr U32 }
 local opaque = extern("opaque", { Ptr Box }, Unit)
 ]]), "opaque code may write global 'hits'")
 check('shared_pointer_is_not_shared_pointee', program('alias[0] = hits\nalias[0][0] = 1',

@@ -3,28 +3,28 @@
 -- become drawing records entirely in Nua. There are no foreign operations.
 -- Fixed geometry isolates event specialization and loop fields; this is not a
 -- font renderer, SDL host, or implementation of the proposed builders.
-local Input = struct { kind: U32, x: U32, y: U32 }
-local Draw = struct {
+local Input = Struct { kind: U32, x: U32, y: U32 }
+local Draw = Struct {
     control: U32, x: U32, y: U32, width: U32, height: U32,
     color: U32, value: U32, enabled: Bool,
 }
-local Frame = struct { length: U32, commands: Array(Draw, 5) }
-local Observation = struct {
+local Frame = Struct { length: U32, commands: Array(Draw, 5) }
+local Observation = Struct {
     consumed: U32, frames: U32, count: U32, enabled: Bool, modal: Bool, frame: Frame,
 }
 
-local Button = struct { x: U32, y: U32, width: U32, height: U32, color: U32, enabled: Bool }
-local Number = struct { x: U32, y: U32, width: U32, height: U32, color: U32, value: U32 }
-local Confirmation = struct { visible: Bool, reset_button: Button, keep_button: Button }
-local Counter = struct { count: Number,
+local Button = Struct { x: U32, y: U32, width: U32, height: U32, color: U32, enabled: Bool }
+local Number = Struct { x: U32, y: U32, width: U32, height: U32, color: U32, value: U32 }
+local Confirmation = Struct { visible: Bool, reset_button: Button, keep_button: Button }
+local Counter = Struct { count: Number,
     increment_button: Button, reset_button: Button, confirm: Confirmation }
-local App = struct { counter: Counter }
+local App = Struct { counter: Counter }
 
-Confirmation.Event = oneof { reset_button: Unit, keep_button: Unit }
-Confirmation.Outcome = oneof { reset: Unit, keep: Unit }
-Counter.Event = oneof { increment_button: Unit, reset_button: Unit, confirm: Confirmation.Outcome }
-App.Event = oneof { close_requested: Unit }
-local Reply = oneof { stay: Unit, quit: Unit }
+Confirmation.Event = Sum { reset_button: Unit, keep_button: Unit }
+Confirmation.Outcome = Sum { reset: Unit, keep: Unit }
+Counter.Event = Sum { increment_button: Unit, reset_button: Unit, confirm: Confirmation.Outcome }
+App.Event = Sum { close_requested: Unit }
+local Reply = Sum { stay: Unit, quit: Unit }
 
 function Button:contains(x: U32, y: U32): Bool
     return self.enabled and x >= self.x and x < self.x + self.width

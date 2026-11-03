@@ -1,5 +1,5 @@
 -- Reference-written loop state shares the original local, including aliases.
-local Counting = struct { count: U32, step: U32 }
+local Counting = Struct { count: U32, step: U32 }
 function Counting:hit(): Unit
     self.count = self.count + self.step
 end
@@ -114,8 +114,8 @@ end
 export spin
 
 -- Widening a sum must forget its tag, even when the initial payload is Unit.
-local Choice = oneof { none: Unit, some: U32 }
-local SumState = struct { choice: Choice, step: U32 }
+local Choice = Sum { none: Unit, some: U32 }
+local SumState = Struct { choice: Choice, step: U32 }
 local sum_field = do(n: U32): U32
     local state = SumState { choice = Choice.none(), step = 3 }
     local i = U32 0

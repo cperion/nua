@@ -49,7 +49,7 @@ its block contains `visible on`.
 
 ```lua
 local Confirmation = ui.component "Confirmation" do(..)
-    outcome oneof { reset: Unit, keep: Unit }
+    outcome Sum { reset: Unit, keep: Unit }
     modal do(..)
         w 80
         p 4
@@ -72,7 +72,7 @@ Its font path is explicit, not an implicit replacement font.
 Reading it:
 
 - `Counter.Event` is generated as
-  `oneof { increment_button: Unit, reset_button: Unit, confirm: Confirmation.Outcome }`.
+  `Sum { increment_button: Unit, reset_button: Unit, confirm: Confirmation.Outcome }`.
   The `row` adds no level: the control is `self.increment_button` and its event
   alternative is `Counter.Event.increment_button`.
 - `Counter` declares no outcome, so it contributes no alternative to `App.Event`.
@@ -103,7 +103,7 @@ before matching:
 | `column do(..) ... end`, `row do(..) ... end`, `modal do(..) ... end` | Declare a layout container without adding a control-name scope |
 | `label "name" do(..) ... end`, `number "name" do(..) ... end`, `button "name" do(..) ... end` | Declare a named control; instructions set its properties |
 | `part "name" (T)` | Declare a child component |
-| `outcome oneof { ... }` | Declare the owning component's outward sum |
+| `outcome Sum { ... }` | Declare the owning component's outward sum |
 | `fields { revision = U64 0 }` | Declare ordinary native fields with initial values |
 
 **Each block opens a Lua vocabulary table.** Its applicable instructions and the
@@ -125,7 +125,7 @@ Each scope appends declarations to its own parent tree and completes on return.
 The result is the known tree and native type—not a retained construction callback,
 a global current-builder variable, or an `interface` argument on application methods.
 
-Tables remain data: theme scales, native initializers, `oneof` declarations and
+Tables remain data: theme scales, native initializers, `Sum` declarations and
 event matches. Shared styles are `ui.style do(..) ... end` blocks. They do not enumerate UI children. This is
 one authoring surface, not two parallel tree APIs. Grouping parentheses remain where
 ordinary Nua grammar requires them, such as `part "confirm" (Confirmation)`.
@@ -224,15 +224,15 @@ sum-matching rule.
 
 ### 4.2 Outcomes
 
-`outcome oneof { ... }` declares `T.Outcome`; its `handle` returns that type.
+`outcome Sum { ... }` declares `T.Outcome`; its `handle` returns that type.
 Without a declared outcome, `handle` returns `Unit` and ends delivery to parents.
 
 A component that sometimes reports nothing says so explicitly, for example
-`oneof { nothing: Unit, chose: Color }`. `nothing` is still a real outcome that the
+`Sum { nothing: Unit, chose: Color }`. `nothing` is still a real outcome that the
 parent must match. It is not silently filtered out. An explicit empty arm documents
 that an event is intentionally ignored.
 
-The window root returns `ui.Reply = oneof { stay: Unit, quit: Unit }`. Only `quit`
+The window root returns `ui.Reply = Sum { stay: Unit, quit: Unit }`. Only `quit`
 requests normal completion of the activity. An event handled by a descendant that
 returns `Unit` implicitly leaves the window running; it need not call the root.
 
@@ -317,7 +317,7 @@ A fixed component shape can contain a dynamic collection of instances:
 
 ```lua
 local TodoRow = component "TodoRow" do(..)
-    outcome oneof { toggled: Bool, removed: Unit }
+    outcome Sum { toggled: Bool, removed: Unit }
 
     row { gap = 8 } do(..)
         checkbox "done" { report = { "changed" } }
@@ -468,7 +468,7 @@ C is limited to necessary platform/runtime mechanisms.
 
 `ui.run` is an activity: construct the root once, open resources, process turns,
 draw, and close resources on quit or failure. Its result is
-`oneof { quit: Unit, failed: Failure }` with an owned diagnostic. It handles resource
+`Sum { quit: Unit, failed: Failure }` with an owned diagnostic. It handles resource
 cleanup, not application close policy. An ordinary window close request is an input
 for the root to interpret.
 

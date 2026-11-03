@@ -1,8 +1,8 @@
 -- Sums and matching (Let syntax §8.1) in nua.
 
-local Circle = struct { radius: U32 }
-local Rect = struct { width: U32, height: U32 }
-local Shape = oneof { circle: Circle, rect: Rect, dot: Unit }
+local Circle = Struct { radius: U32 }
+local Rect = Struct { width: U32, height: U32 }
+local Shape = Sum { circle: Circle, rect: Rect, dot: Unit }
 
 -- matching is keyed application: one handler per alternative
 local area = do(s: Shape): U32 = s {
@@ -21,7 +21,7 @@ local strip = do(k: U32): U32 = area Shape.rect { width = k, height = 1 }
 export strip
 
 -- `name(params) = body` is `name = do(params) = body`; Unit alternatives take nothing
-local Opt = oneof { none: Unit, some: U32 }
+local Opt = Sum { none: Unit, some: U32 }
 local unwrap_or = do(o: Opt, d: U32): U32 = o { some(v) = v, none() = d }
 local pick = do(flag: Bool, x: U32): U32
     local o: Opt = Opt.none()
@@ -33,9 +33,9 @@ end
 export pick
 
 -- an interpreter: commands as data
-local Direction = oneof { left: Unit, right: Unit }
-local Command = oneof { move: Direction, insert: U32, undo: Unit }
-local Editor = struct { cursor: U32, length: U32, undos: U32 }
+local Direction = Sum { left: Unit, right: Unit }
+local Command = Sum { move: Direction, insert: U32, undo: Unit }
+local Editor = Struct { cursor: U32, length: U32, undos: U32 }
 
 local apply = do(e: Ref Editor, c: Command): Unit
     c {
@@ -97,13 +97,13 @@ end
 export demo
 
 -- a sum as a struct field
-local Token = struct { kind: Opt, at: U32 }
+local Token = Struct { kind: Opt, at: U32 }
 local token_value = do(t: Token): U32 = t.kind { some(v) = v + t.at, none() = t.at }
 export token_value
 
 -- result types do not depend on alternative order: a Lua number takes its type
 -- from another handler, and handlers that agree on a Lua number fold
-local Small = oneof { dot: Unit, num: U32 }
+local Small = Sum { dot: Unit, num: U32 }
 local num_or_zero = do(s: Small): U32 = s { num(v) = v, dot() = 0 }
 local always_one = do(s: Small): U32 = s { num(v) = 1, dot() = 1 }
 export num_or_zero

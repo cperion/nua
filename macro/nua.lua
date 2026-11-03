@@ -4,7 +4,7 @@ macro.nua: the staged Lua -> C language as LuaMacro macros, on top of macro.let.
     do(x: U32): U32 = x + 1         a native word (it declares a result type)
     function T:m(n: U32): Unit ...  a method: a native word attached to struct T
     local function f(...): T ...    a recursive native word
-    struct { x: F32, y: F32 }       a struct type (annotations live only here,
+    Struct { x: F32, y: F32 }       a struct type (annotations live only here,
                                     in parameter lists, typed locals and typed for)
     export name                     materialize a word as an exported C function
 
@@ -104,8 +104,8 @@ local function type_macro(kind)
     end
 end
 
-M.define('struct', type_macro('struct'))
-M.define('oneof', type_macro('oneof'))
+M.define('Struct', type_macro('Struct'))
+M.define('Sum', type_macro('Sum'))
 
 -- `export name` or `export name as "cname"`
 M.define('export', function (get)

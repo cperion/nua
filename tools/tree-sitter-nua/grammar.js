@@ -54,21 +54,20 @@ module.exports = grammar({
     colon_parameters: $ => repeat1(alias($.colon_parameter, $.parameter)),
     colon_parameter: $ => prec.right(choice(seq(alias($._header_name, $.identifier), optional(alias($._header_dots, '..'))), alias($._header_dots, '..'))),
     function_expression: $ => seq('function', $.parameters, optional($.block), 'end'),
-    struct_expression: $ => seq('struct', choice($.table_constructor, alias($.with_block, $.table_constructor))),
     // `T with entries end` is `T { entries }`: entries need no separators.
     with_block: $ => seq(alias($._with, 'with'), repeat(choice(seq(alias($.with_entry, $.field), choice(',', ';')), alias($.with_entry, $.field))), 'end'),
     // A named entry never starts a call, so a colon after the name is its annotation
     // (`x: U32`), not a block. Positional entries are literals, tables and lambdas.
     with_entry: $ => choice($.handler, seq('.', $.identifier), seq($.identifier, ':', $._expression), seq($.identifier, '=', $._value),
       seq('[', $._expression, ']', '=', $._value), $.number, $.string, $.boolean, $.nil, $.table_constructor,
-      $.parenthesized_expression, $.struct_expression, $.lambda),
+      $.parenthesized_expression, $.lambda),
     table_constructor: $ => seq('{', optional(seq(sep($.field, choice(',', ';')), optional(choice(',', ';')))), '}'),
     // `.name` is the shorthand for `name = name`.
     field: $ => choice($.handler, seq('.', $.identifier), seq($.identifier, ':', $._expression), seq($.identifier, '=', $._value),
       seq('[', $._expression, ']', '=', $._value), $._expression),
     // A keyed handler is a lambda without the leading `do`.
     handler: $ => seq(field('name', $.identifier), $.parameters, optional($.type_annotation), choice(seq('=', $._expression), seq(optional($.block), 'end'))),
-    _expression: $ => choice($.identifier, $.number, $.string, $.boolean, $.nil, $.vararg_expression, $.parenthesized_expression, $.table_constructor, $.struct_expression, $.lambda, $.function_expression, $.binary_expression, $.unary_expression, $.call_expression, $.member_expression, $.index_expression, $.spread_expression),
+    _expression: $ => choice($.identifier, $.number, $.string, $.boolean, $.nil, $.vararg_expression, $.parenthesized_expression, $.table_constructor, $.lambda, $.function_expression, $.binary_expression, $.unary_expression, $.call_expression, $.member_expression, $.index_expression, $.spread_expression),
     // A loop's `do` is a delimiter, not a trailing lambda argument. Parentheses
     // and argument lists still admit ordinary expressions, including lambdas.
     _header_expression: $ => choice($.identifier, $.number, $.string, $.boolean, $.nil, $.parenthesized_expression, $.table_constructor, $.header_binary, $.header_unary, $.header_call, $.header_member, $.header_index),

@@ -5,8 +5,8 @@ local nua = require 'nua'
 local stage = require 'nua.stage'
 local passed, failed = 0, 0
 local prefix = [[
-local Optional = oneof { some: Str, none: Unit }
-local Box = struct { text: Optional }
+local Optional = Sum { some: Str, none: Unit }
+local Box = Struct { text: Optional }
 local identity = do(text: Str): Str = text
 local length = do(text: Str): U64 = text.length
 local stash = do(text: Str, target: Ref Str): Unit
@@ -32,7 +32,7 @@ local function tail_length(text: Str, count: U32): U64
     if count == 0 then return text.length end
     return tail_length(text, count - 1)
 end
-local Token = struct { text: Str, kind: U32 }
+local Token = Struct { text: Str, kind: U32 }
 local leak = do(): Str
     local c = Chars(8) "ab"
     return c:str()
@@ -52,7 +52,7 @@ local fill_token = do(target: Ref Token, whole: Bool): Unit
     local c = Chars(8) "ab"
     if whole then target = Token { text = c:str(), kind = 1 } else target.text = c:str() end
 end
-local RefBox = struct { r: Ref U32 }
+local RefBox = Struct { r: Ref U32 }
 local hold_local = do(target: Ref RefBox): Unit
     local v: U32 = 1
     target.r = Ref v

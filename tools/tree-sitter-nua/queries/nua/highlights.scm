@@ -7,7 +7,7 @@
 (boolean) @boolean
 (nil) @constant.builtin
 
-["local" "struct" "with" "export" "goto"] @keyword
+["local" "with" "export" "goto"] @keyword
 ["do" "function" "end" "endall"] @keyword.function
 ["if" "then" "elseif" "else"] @keyword.conditional
 ["for" "in" "while" "repeat" "until" "break" "continue"] @keyword.repeat
@@ -41,4 +41,4 @@
 (local_declaration (binding name: (identifier) @function) "=" (lambda))
 
 ((identifier) @type.builtin
- (#any-of? @type.builtin "I8" "I16" "I32" "I64" "U8" "U16" "U32" "U64" "F32" "F64" "Bool" "Unit" "Str" "CString" "Chars" "Text" "Array" "Ref" "Ptr" "Slice" "Store" "Id" "Grow" "Atomic"))
+ (#any-of? @type.builtin "I8" "I16" "I32" "I64" "U8" "U16" "U32" "U64" "F32" "F64" "Bool" "Unit" "Str" "CString" "Chars" "Text" "Array" "Ref" "Ptr" "Slice" "Store" "Id" "Grow" "Atomic" "Struct" "Sum"))

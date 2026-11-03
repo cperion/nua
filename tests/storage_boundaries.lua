@@ -8,7 +8,7 @@ return function(nua, with_direct)
     local checks = 0
     local function check(ok, message) assert(ok, message); checks = checks + 1 end
     local source = [[
-local Record = struct { prefix: U32, value: U32, suffix: U32 }
+local Record = Struct { prefix: U32, value: U32, suffix: U32 }
 local private_count = do(n: U32): U32
     local r = Record { prefix = 101, value = 0, suffix = 303 }
     while r.value < n do r.value = r.value + 1 end

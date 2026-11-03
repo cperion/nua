@@ -17,7 +17,7 @@ end
 local prefix = 'local ui = require "nua.ui"\n'
 check('native component, methods, outcome and root properties', prefix .. [[
 local Confirmation = ui.component "Confirmation" do(..)
-    outcome oneof { reset: Unit, keep: Unit }
+    outcome Sum { reset: Unit, keep: Unit }
     modal do(..)
         w 80
         p 4
@@ -77,7 +77,7 @@ local C = ui.component "Lexical" do(..)
             gap 2
             button "a" do(..)
                 gap 3
-                outcome oneof { done: Unit }
+                outcome Sum { done: Unit }
                 caption "A"
             end
         end

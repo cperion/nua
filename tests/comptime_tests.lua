@@ -29,7 +29,7 @@ test "addition" do(): Unit
     assert(call add 40 2 == 42)
 end
 
-local Counter = struct { value: U32 }
+local Counter = Struct { value: U32 }
 local bump = do(counter: Ref Counter): Unit
     counter.value = counter.value + 1
 end
@@ -123,7 +123,7 @@ test "foreign effect" do(): Unit
 end
 ]], { 'test "foreign effect"', 'cannot evaluate at compile time', 'test_effect_must_not_run' })
 reject('runtime storage', [[
-local Node = struct { value: U32 }
+local Node = Struct { value: U32 }
 test "runtime storage" do(): Unit
     local nodes = (Store Node) {}
     nodes:add Node { value = 1 }

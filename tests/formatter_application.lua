@@ -99,7 +99,7 @@ local multi = do(x: U32, y: U32): U32
     return nested(x, y) + alias(x, y) + partial(x, y) + count(x, y, 42)
 end
 local adjusted = do(y: U32): U32 = add(pair(), y)
-local Outcome = oneof { ok: U32 }
+local Outcome = Sum { ok: U32 }
 local producer = do(x: U32): Outcome = Outcome.ok(x)
 local handled = do(x: U32): U32 = producer(x) { ok(v) = v + 1 }
 local through_alias = do(x: U32, y: U32): U32

@@ -7,8 +7,8 @@
 
 local str = {}
 
-str.Found = oneof { at: U64, missing: Unit }
-str.Order = oneof { less: Unit, same: Unit, greater: Unit }
+str.Found = Sum { at: U64, missing: Unit }
+str.Order = Sum { less: Unit, same: Unit, greater: Unit }
 
 -- equal bytes; the loop runs over b, so a known b unrolls
 str.equals = do(a: Str, b: Str): Bool
@@ -199,11 +199,11 @@ end
 local utf8 = require "nua.utf8"
 str.runes = do(s: Str, body): Unit = utf8.runes s body
 
--- numbers: s:parse(T) gives oneof { value: T, bad: Unit }
+-- numbers: s:parse(T) gives Sum { value: T, bad: Unit }
 local parsed = {}
 function str.parsed(t)
     if not parsed[t] then
-        local Parsed = oneof { value: t, bad: Unit }
+        local Parsed = Sum { value: t, bad: Unit }
         Parsed.name, Parsed.display = 'Parsed' .. t.name, 'Parsed' .. t.name
         parsed[t] = Parsed
     end

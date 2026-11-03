@@ -1,6 +1,6 @@
 -- Fixed-length arrays: values, checked like slices, viewed as slices.
 
-local Packet = struct { len: U32, data: Array(U8, 8) }
+local Packet = Struct { len: U32, data: Array(U8, 8) }
 
 local checksum = do(xs: Slice U8): U32
     local s: U32 = 0

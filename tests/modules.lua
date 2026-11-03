@@ -170,7 +170,7 @@ local receive = do(..)
     end
     nested { md = 10 }
     assert(md == 8)
-    outcome oneof { done: Unit }
+    outcome Sum { done: Unit }
     return { value = md }
 end
 local calls = 0

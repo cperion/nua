@@ -1,7 +1,7 @@
 -- nua.syntax: the typed-body language, parsed and translated to staged Lua.
 --
 -- LuaMacro hands this module the token stream at a typed lambda (`do(...): T`),
--- a typed `function` statement, a `struct { ... }` or an `export`. Ordinary Lua
+-- a typed `function` statement, a `Struct { ... }` or an `export`. Ordinary Lua
 -- metamethods cannot stage comparisons, `and`/`or`, conditions, local
 -- assignment or `return`, so typed bodies are parsed properly (a recursive
 -- descent parser with Lua's precedence) and every such construct becomes a call
@@ -653,13 +653,12 @@ function P:table_body()
     return { k = 'table', items = items, line = open.line }
 end
 
--- `struct { name: Type, ... }`
--- `struct { name: Type, ... }` and `oneof { name: Type, ... }`
+-- `Struct { name: Type, ... }` and `Sum { name: Type, ... }`
 function P:struct(hint)
     local r = self.r
     local s = r:next()
     local kind = s.v
-    local what = kind == 'oneof' and 'alternative' or 'field'
+    local what = kind == 'Sum' and 'alternative' or 'field'
     r:expect('{', 'after ' .. kind)
     local fields = {}
     while not r:is('}') do
@@ -670,14 +669,14 @@ function P:struct(hint)
         if not (r:accept(',') or r:accept(';')) then break end
     end
     r:expect('}', 'to close the ' .. kind)
-    return { k = 'struct', sum = kind == 'oneof', fields = fields, name = hint, line = s.line }
+    return { k = 'struct', sum = kind == 'Sum', fields = fields, name = hint, line = s.line }
 end
 
 function P:primary(hint, in_type)
     local r = self.r
     local tk = r:peek(1)
     if tk.t == 'iden' then
-        if (tk.v == 'struct' or tk.v == 'oneof') and r:peek(2).t == '{' then return self:struct(hint), 'struct' end
+        if (tk.v == 'Struct' or tk.v == 'Sum') and r:peek(2).t == '{' then return self:struct(hint), 'struct' end
         r:next()
         return { k = 'name', name = tk.v, line = tk.line }, 'name'
     end
@@ -1651,7 +1650,7 @@ function M.translate_function(reader, is_local, start_line)
     return text, reader:leftovers()
 end
 
--- `struct { ... }` (the struct token is next)
+-- `Struct { ... }` (the Struct token is next)
 function M.translate_struct(reader, name, start_line, kind)
     local p = M.parser(reader)
     local e = p:struct(name)

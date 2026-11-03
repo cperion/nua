@@ -1,7 +1,7 @@
 local hash = require "nua.hash"
 local keys = require "nua.key"
-local Choice = oneof { empty: Unit, number: U32 }
-local Key = struct { n: I64, flag: Bool, text: Chars 4, choice: Choice }
+local Choice = Sum { empty: Unit, number: U32 }
+local Key = Struct { n: I64, flag: Bool, text: Chars 4, choice: Choice }
 local feed = keys.encoder Key
 local digest = do(key: Key): U64
     local h = hash.init(U64 0)(U64 1)

@@ -4,7 +4,7 @@ local tokens = require "nua.ui.theme"
 local properties = require "nua.ui.properties"
 local ui = { theme = tokens.theme, colors = tokens.colors, palettes = tokens.palettes,
     Color = tokens.Color, pixels = tokens.pixels, fr = tokens.fr }
-ui.Reply = oneof { stay: Unit, quit: Unit }
+ui.Reply = Sum { stay: Unit, quit: Unit }
 local default_theme = tokens.theme {}
 local descriptions = {}
 local function sorted_keys(values)

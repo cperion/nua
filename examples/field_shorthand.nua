@@ -1,5 +1,5 @@
 -- `.name` in a table constructor is `name = name`.
-local Point = struct { x: U32, y: U32 }
+local Point = Struct { x: U32, y: U32 }
 
 local make = do(x: U32, y: U32): Point
     return Point { .x, .y }

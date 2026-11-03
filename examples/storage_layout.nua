@@ -1,6 +1,6 @@
 -- Configuration values stay known; only changing fields need native storage.
-local CompactCounter = struct { scale: U32, bias: U32, count: U32 }
-local CompactEnvelope = struct { counter: CompactCounter, step: U32 }
+local CompactCounter = Struct { scale: U32, bias: U32, count: U32 }
+local CompactEnvelope = Struct { counter: CompactCounter, step: U32 }
 
 local compact_count = do(n: U32): U32
     local c = CompactCounter { scale = 3, bias = 7, count = 0 }
@@ -20,7 +20,7 @@ end
 export compact_nested
 
 -- A write in any reachable function retains the field for every instance.
-local SharedCounter = struct { config: U32, count: U32, unused: U32 }
+local SharedCounter = Struct { config: U32, count: U32, unused: U32 }
 local shared_constant = do(n: U32): U32
     local c = SharedCounter { config = 9, count = 0, unused = 6 }
     while c.count < n do c.count = c.count + 1 end
@@ -38,8 +38,8 @@ end
 export shared_write
 
 -- Even unread fields in a nested exported type keep their declared offsets.
-local PublicCounter = struct { config: U32, count: U32 }
-local PublicEnvelope = struct { prefix: U32, counter: PublicCounter, suffix: U32 }
+local PublicCounter = Struct { config: U32, count: U32 }
+local PublicEnvelope = Struct { prefix: U32, counter: PublicCounter, suffix: U32 }
 local public_increment = do(e: Ref PublicEnvelope): Unit
     e.counter.count = e.counter.count + 1
 end

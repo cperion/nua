@@ -154,7 +154,7 @@ accepted only when expanding it gives the same program.
 ## Default style
 
 ```lua
-local Point = struct { x: U32, y: U32 }
+local Point = Struct { x: U32, y: U32 }
 local move = do(x: U32): U32
     local p = Point { x = x, y = 2 }
     local r = Ref p
