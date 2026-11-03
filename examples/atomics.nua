@@ -72,7 +72,7 @@ local drain = do(r: Ref Ring, n: U32): U64
     while got < n do
         pop(r) {
             empty = do end,
-            value = do(v)
+            value =: v
                 sum = sum + U64 v
                 got = got + 1
             end,

@@ -716,7 +716,7 @@ The scope body opens the file (a path is a `CString`, which no spawned task may 
 local line_count = do(workers, path: CString): U32
     local total: U32 = 0
     io.open(path, io.READ) {
-        done = do(file)
+        done =: file
             tasks do(..)
                 local chunks = pool(Chunk, 8)
                 local filled = channel(Slot Chunk, 8)
@@ -1000,7 +1000,7 @@ When a problem has structure (a grammar, a key map, a protocol), write the struc
 ```lua
 local apply = do(document: Ref Document, c: Command): Unit
     c {
-        move = do(d)
+        move =: d
             d {
                 left() = document:move_left(),
                 right = do
@@ -1010,7 +1010,7 @@ local apply = do(document: Ref Document, c: Command): Unit
                 end,
             }
         end,
-        insert = do(n)
+        insert =: n
             document.length = document.length + n
             document.cursor = document.cursor + n
         end,

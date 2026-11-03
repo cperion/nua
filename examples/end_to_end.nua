@@ -1,7 +1,7 @@
 -- architecture §10.2: a complete end-to-end example
 
 -- Generic compile-time type generator
-local Box = do(T)
+local Box =: T
     local B = struct {
         value: T,
     }

@@ -1,6 +1,6 @@
 -- A bounded ring buffer written as a library: a layout (counters and a Grow)
 -- plus hooks. Nothing in the compiler knows about it.
-local Ring = do(E, capacity)
+local Ring =: E capacity
     local R = struct { head: U32, len: U32, items: Grow E }
 
     function R:push(v: E): Unit

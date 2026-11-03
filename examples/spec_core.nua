@@ -2,7 +2,7 @@
 -- program.
 
 -- syntax §3.1 ordinary Lua builds native words
-local make_multiplier = do(k)
+local make_multiplier =: k
     return do(x: U32): U32 =
     x * k
 end
@@ -82,7 +82,7 @@ end
 export typed_local
 
 -- syntax §6.1 generation-time loops
-local make_sum = do(n)
+local make_sum =: n
     return do(x: U32): U32
         local total = x
 

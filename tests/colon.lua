@@ -34,6 +34,10 @@ local pairs_of = {
     { 'trailing comment', 'xs:each: x -- note\n    go x\nend\n', 'xs:each do(x) -- note\n    go x\nend\n' },
     { 'in an initializer', 'local total = view_of(p, n): bytes\n    go\nend\n',
       'local total = view_of(p, n) do(bytes)\n    go\nend\n' },
+    { 'assigned', 'local f =: x\n    go x\nend\n', 'local f = do(x)\n    go x\nend\n' },
+    { 'assigned in a table', 'local t = {\n    found =: v\n        go v\n    end,\n    other =: ..\n        go\n    end,\n}\n',
+      'local t = {\n    found = do(v)\n        go v\n    end,\n    other = do(..)\n        go\n    end,\n}\n' },
+    { 'assigned opened', 'g.h =:\n    go\nend\n', 'g.h = do(..)\n    go\nend\n' },
     { 'nested', 'a:\n    b: x\n        go x\n    end\nend\n', 'a do(..)\n    b do(x)\n        go x\n    end\nend\n' },
 }
 for _, case in ipairs(pairs_of) do
@@ -94,6 +98,10 @@ end
 formatted('fmt: do-form becomes colon', 'with_buffer n do(..)\n    go\nend\n', 'with_buffer n:\n    go\nend\n')
 formatted('fmt: names', 'xs:each do(key, value)\n    go\nend\n', 'xs:each: key value\n    go\nend\n')
 formatted('fmt: opened name', 'tasks do(scope..)\n    use scope\nend\n', 'tasks: scope..\n    use scope\nend\n')
+formatted('fmt: assigned block', 'local t = {\n    found = do(v)\n        go v\n    end,\n}\n',
+    'local t = {\n    found =: v\n        go v\n    end,\n}\n')
+formatted('fmt: assigned block, anonymous', 'local f = do(..)\n    go\nend\n', 'local f =:\n    go\nend\n')
+formatted('fmt: expression lambda untouched', 'local f = do(x) = x + 1\n', 'local f = do(x) = x + 1\n')
 formatted('fmt: colon form kept', 'xs:each: x\n    go x\nend\n', 'xs:each: x\n    go x\nend\n')
 formatted('fmt: typed lambda untouched', 'local f = do(a: U32): U32\n    return a\nend\n',
     'local f = do(a: U32): U32\n    return a\nend\n')

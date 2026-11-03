@@ -8,11 +8,11 @@ local count_file = do(path: CString): U32
     local lines: U32 = 0
     local buf: Array(U8, 4096)
     io.open(path, io.READ) {
-        done = do(file)
+        done =: file
             local more: Bool = true
             while more do
                 io.read(file, buf) {
-                    done = do(n)
+                    done =: n
                         local i: U32 = 0
                         while i < n do
                             if buf[i] == 10 then lines = lines + 1 end

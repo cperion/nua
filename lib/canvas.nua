@@ -55,7 +55,7 @@ function View:frame(body): Result
     local result = with_frame self.renderer body
     return result {
         done() = Result.done(),
-        failed = do(frame_error)
+        failed =: frame_error
             self.session_error = frame_error
             self.stopped = true
             return Result.failed frame_error

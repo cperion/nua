@@ -199,7 +199,7 @@ local accumulator = do(inbox: Chan Msg, out: Chan I64): Unit
     local running: Bool = true
     while running do
         inbox:recv() {
-            value = do(m)
+            value =: m
                 m {
                     add = do(x) acc = acc + I64 x end,
                     sub = do(x) acc = acc - I64 x end,

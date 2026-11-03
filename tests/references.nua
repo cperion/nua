@@ -8,7 +8,7 @@ end
 
 -- a field is written through, then rebound
 local field_rebind = do(x: U32): U32
-    local a: U32 = x
+    local a = x
     local b: U32 = 100
     local holder = Holder { r = Ref a, n = 2 }
     bump(Ref holder)
@@ -20,7 +20,7 @@ export field_rebind
 
 -- the same through a function compiled on its own: the target becomes memory
 local field_call = do(x: U32): U32
-    local a: U32 = x
+    local a = x
     local holder = Holder { r = Ref a, n = 3 }
     call bump(Ref holder)
     call bump(Ref holder)
@@ -30,8 +30,8 @@ export field_call
 
 -- a Ref local chooses its target at run time, then writes through it
 local local_choice = do(flag: Bool, x: U32): U32
-    local a: U32 = x
-    local b: U32 = x
+    local a = x
+    local b = x
     local r: Ref U32 = Ref a
     if flag then r = Ref b end
     r = r + 1
@@ -41,7 +41,7 @@ export local_choice
 
 -- an array of references, written through each
 local array_refs = do(x: U32): U32
-    local a: U32 = x
+    local a = x
     local b: U32 = x + 1
     local refs = Array(Ref U32, 2) { Ref a, Ref b }
     for i: U32 = 0, 1 do refs[i] = refs[i] * 2 end
@@ -56,8 +56,8 @@ local pick = do(flag: Bool, a: Ref U32): Target
     return Target.none()
 end
 local sum_payload = do(flag: Bool, x: U32): U32
-    local a: U32 = x
-    pick(flag, Ref a) { some = do(r) r = r + 5 end, none = do end }
+    local a = x
+    pick flag (Ref a) { some = do(r) r = r + 5 end, none = do end }
     return a
 end
 export sum_payload
@@ -76,7 +76,7 @@ export grow_refs
 -- a Store of tokens whose text borrows a source declared before the store
 local Token = struct { text: Str, kind: U32 }
 local store_tokens = do(n: U32): U32
-    local source = Chars(16) "hello world"
+    local source = Chars 16 "hello world"
     local tokens = Store(Token) {}
     local id = tokens:add Token { text = source:str():sub(0, 5), kind = n }
     return U32 tokens[id].text.length + tokens[id].kind
@@ -96,8 +96,8 @@ export global_ref
 
 -- containers of references: a Grow and a Store whose elements are references
 local grow_of_refs = do(x: U32): U32
-    local a: U32 = x
-    local b: U32 = x
+    local a = x
+    local b = x
     local refs = Grow(Ref U32) {}
     refs:push(Ref a)
     refs:push(Ref b)
@@ -109,7 +109,7 @@ end
 export grow_of_refs
 
 local store_of_refs = do(x: U32): U32
-    local a: U32 = x
+    local a = x
     local refs = Store(Ref U32) {}
     local id = refs:add(Ref a)
     refs[id] = refs[id] * 3

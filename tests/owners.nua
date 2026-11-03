@@ -38,7 +38,7 @@ local nested = do(n: U32): U32
     fill(Ref w, n)
     call fill(Ref w, n)
     return U32 w.graph.nodes.length + U32 w.index.names.length * 100 + U32 w.index.counts.length * 10000
-        + w.ticks * 1000000 + w.index.words["x"] * 100000000
+    + w.ticks * 1000000 + w.index.words["x"] * 100000000
 end
 export nested
 
@@ -74,7 +74,7 @@ local pick = do(flag: Bool, n: U32): Grow U64
     return b
 end
 local picked = do(flag: Bool, n: U32): U64
-    local xs = pick(flag, n)
+    local xs = pick flag n
     return sum(Ref xs) * 10 + U64 xs.length
 end
 export picked
@@ -183,8 +183,8 @@ local copies = do(n: U32): U32
     local t = copy "abc"
     t:write "de"
     return xs[0] + ys[0] * 10 + U32 ys.length * 100 + U32 g.order.length * 1000 + U32 h.order.length * 10000
-        + h.label * 100000 + g.label * 1000000 + U32 other.length * 10000000 + U32 words.length * 100000000
-        + U32 t.length
+    + h.label * 100000 + g.label * 1000000 + U32 other.length * 10000000 + U32 words.length * 100000000
+    + U32 t.length
 end
 export copies
 
@@ -261,8 +261,8 @@ export payloads
 -- previous level's on the same stacks
 local N = struct { v: U32 }
 local function walk(n: U32): U32
-    local s: Store N = Store(N) {}
-    s:add(N { v = n })
+    local s = Store(N) {}
+    s:add N { v = n }
     if n == 0 then
         return U32 s.length
     end
@@ -278,11 +278,11 @@ local function gather(n: U32, acc: Ref (Grow U32)): U32
     mine:push n
     acc:push n
     if n == 0 then return U32 mine.length end
-    return gather(n - 1, acc) + U32 mine.length
+    return gather (n - 1) acc + U32 mine.length
 end
 local gathered = do(n: U32): U32
     local acc = Grow(U32) {}
-    local levels = gather(n, Ref acc)
+    local levels = gather n (Ref acc)
     local total = U32 0
     for i: U64 = 0, acc.length - 1 do total = total + acc[i] end
     return levels * 1000 + total
@@ -317,11 +317,11 @@ local function drain(n: U32, g: Ref Graph): U32
         return U32 order.length
     end
     g.order:push n
-    return drain(n - 1, g)
+    return drain (n - 1) g
 end
 local recursive_move = do(n: U32): U32
     local g = Graph {}
-    local m = drain(n, Ref g)
+    local m = drain n (Ref g)
     g.order = Grow(U32) {}
     return m
 end
@@ -357,7 +357,7 @@ local function leaves_of(n: U32): Grow U32
     local right = leaves_of(n - 1)
     local out = Grow(U32) {}
     for i: U64 = 0, left.length - 1 do out:push(left[i] + 1) end
-    for i: U64 = 0, right.length - 1 do out:push(right[i]) end
+    for i: U64 = 0, right.length - 1 do out:push right[i] end
     return out
 end
 local tree = do(n: U32): U32
@@ -407,7 +407,7 @@ local function drain_a(n: U32, g: Ref Graph): U32
     g.order:push n
     return drain_b(n - 1, g)
 end
-drain_b = do(n: U32, g: Ref Graph): U32 = drain_a(n, g)
+drain_b = do(n: U32, g: Ref Graph): U32 = drain_a n g
 local mutual_move = do(n: U32): U32
     local g = Graph {}
     local m = drain_b(n, Ref g)
@@ -458,17 +458,17 @@ end
 export mutual_move_calls
 
 return {
-    mutual_calls = mutual_calls, mutual_move_calls = mutual_move_calls,
-    mutual = mutual, mutual_move = mutual_move,
-    counted = counted, tree = tree,
-    ref_moves = ref_moves, recursive_move = recursive_move,
-    walked = walked, gathered = gathered,
-    payloads = payloads,
-    views = views,
-    arrays = arrays,
-    copies = copies,
-    call_returned = call_returned, call_picked = call_picked, call_consume = call_consume,
-    call_through = call_through,
-    two_fields = two_fields, nested = nested, returned = returned, picked = picked,
-    build = build, consume = consume, replace = replace, partial = partial,
+    .mutual_calls, .mutual_move_calls,
+    .mutual, .mutual_move,
+    .counted, .tree,
+    .ref_moves, .recursive_move,
+    .walked, .gathered,
+    .payloads,
+    .views,
+    .arrays,
+    .copies,
+    .call_returned, .call_picked, .call_consume,
+    .call_through,
+    .two_fields, .nested, .returned, .picked,
+    .build, .consume, .replace, .partial,
 }

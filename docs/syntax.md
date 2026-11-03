@@ -253,6 +253,8 @@ tasks: scope..               -- tasks do(scope..)
 end
 ```
 
+`=:` assigns a block, with the same parameter forms: `local f =: x`, and in a table `found =: v` and `other =: ..` are `found = do(v)` and `other = do(..)`. It works inside brackets, because `=:` occurs nowhere else; the plain colon does not, since inside brackets a colon is an annotation (`struct { x: F32 }`).
+
 `:` alone opens whatever the activity hands over, exactly as `do(..)` does. An activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. The names are untyped; a typed parameter list keeps `do(x: U32)`. A colon is a block opener only where Nua has no annotation colon, so these are unchanged: the result type after a parameter list (`do(x: U32): U32`, `function f(x): T`), the names of a `local` (`local s: Store Node`), fields inside brackets, `::label::`, and a method call, where the name follows the colon directly (`xs:each`). It is a token rewrite below every other rule, so the block is translated as the `do(..)` it stands for, and line numbers do not move. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
 
 ### 2.5 Words and host functions

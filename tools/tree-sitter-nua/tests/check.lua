@@ -123,6 +123,24 @@ endall
 local colon_sexpr = colon_tree:root():sexpr()
 assert(select(2, colon_sexpr:gsub('%(lambda', '')) == 5, 'colon blocks are not lambdas: ' .. colon_sexpr)
 assert(select(2, colon_sexpr:gsub('%(parameter%s', '')) == 4, 'colon block parameters missing: ' .. colon_sexpr)
+local assigned = parse([[
+local f =: x
+    go x
+end
+local handlers = {
+    found =: v
+        go v
+    end,
+    other =: ..
+        go
+    end,
+}
+g.h =:
+    go
+end
+]], '=: assigns a block')
+local assigned_sexpr = assigned:root():sexpr()
+assert(select(2, assigned_sexpr:gsub('%(lambda', '')) == 4, '=: blocks are not lambdas: ' .. assigned_sexpr)
 local plain = parse([[
 local s: Store Node
 local a, b: U32

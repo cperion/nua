@@ -86,7 +86,7 @@ function Counter:handle(event: Counter.Event): Unit
     event {
         increment_button = do() self:increment end,
         reset_button = do() self.confirm:open end,
-        confirm = do(decision)
+        confirm =: decision
             decision { reset = do() self:reset end, keep = do() end }
         end,
     }

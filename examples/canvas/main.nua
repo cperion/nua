@@ -9,7 +9,7 @@ local main = do(): I32
         width = 800, height = 600, resizable = true,
     }:
         return interact {
-            key = do(..)
+            key =:
                 if pressed then
                     if code == canvas.Key.escape then stop end
                     if code == canvas.Key.left then x = x - 10 end
@@ -18,7 +18,7 @@ local main = do(): I32
                     if code == canvas.Key.down then y = y + 10 end
                 end
             end,
-            draw = do(..)
+            draw =:
                 clear canvas.Color.black
                 fill_rect x y 80 60 canvas.Color.orange
                 -- The output-pixel dimensions are refreshed for every frame.
@@ -29,7 +29,7 @@ local main = do(): I32
         }
     end {
         done() = I32 0,
-        failed = do(error)
+        failed =: error
             c.say("canvas failed at operation ", error.operation, "\n")
             local i: U32 = 0
             local putchar = extern("putchar", { I32 }, I32, { header = "<stdio.h>" })

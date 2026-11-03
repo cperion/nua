@@ -126,7 +126,7 @@ change. Set `opening_style = "preserve"` to retain named openings.
 ## Trailing colon
 
 With `block_style = "colon"`, an untyped `do(names)` that ends a line, after an
-operand and outside brackets, is written `: names` (`do(..)` as `:`, `do(scope..)`
+operand and outside brackets, is written `: names`; after an `=` (also inside brackets) it is written `=: names` (`do(..)` as `:`, `do(scope..)`
 as `: scope..`). Typed lambdas, inline blocks, blocks that open a new argument
 inside brackets and parameterless `do` blocks keep their spelling. The colon form
 is read back as the `do(..)` it means before anything else is analysed, and the

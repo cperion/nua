@@ -99,14 +99,16 @@ function M.rewrite(tokens)
             if o then closer_of[i] = o end
         end
         local block = false
-        if t == ':' and #openers == 0 then
+        local p = t == ':' and skip_back(tokens, i)
+        -- `=:` assigns a block (`key =: x`, `local f =: x`); it works inside brackets too
+        local assigned = p and p >= 1 and tokens[p][1] == '='
+        if t == ':' and (#openers == 0 or assigned) then
             local prev, nxt = tokens[i - 1], tokens[i + 1]
             local label = (prev and prev[1] == ':') or (nxt and nxt[1] == ':')
             if not label then
-                local p = skip_back(tokens, i)
                 local after_params = p >= 1 and tokens[p][1] == ')' and closer_of[p]
                     and parameter_list(tokens, closer_of[p])
-                local operand = p >= 1 and (OPERAND[tokens[p][1]]
+                local operand = p >= 1 and (OPERAND[tokens[p][1]] or tokens[p][1] == '='
                     or (tokens[p][1] == 'keyword' and LITERAL[tokens[p][2]]))
                 if operand and not after_params and not local_annotation(tokens, i) then
                     local names, last = parameters(tokens, i)
@@ -210,9 +212,9 @@ function M.colonize(source)
         if t == '(' or t == '{' or t == '[' then openers[#openers + 1] = i
         elseif t == ')' or t == '}' or t == ']' then table.remove(openers) end
         local done = false
-        if is_do(tk) and #openers == 0 then
-            local p = skip_back(tokens, i)
-            local operand = p >= 1 and (OPERAND[tokens[p][1]]
+        local p = is_do(tk) and skip_back(tokens, i)
+        if is_do(tk) and (#openers == 0 or (p >= 1 and tokens[p][1] == '=')) then
+            local operand = p >= 1 and (OPERAND[tokens[p][1]] or tokens[p][1] == '='
                 or (tokens[p][1] == 'keyword' and LITERAL[tokens[p][2]]))
             local after_params = p >= 1 and tokens[p][1] == ')' and closer_of[p]
                 and parameter_list(tokens, closer_of[p])

@@ -7,7 +7,7 @@ local Shape = oneof { circle: Circle, rect: Rect, dot: Unit }
 -- matching is keyed application: one handler per alternative
 local area = do(s: Shape): U32 = s {
     circle = do(c) = c.radius * c.radius * 3,
-    rect = do(r)
+    rect =: r
         local w = r.width
         return w * r.height
     end,
@@ -39,7 +39,7 @@ local Editor = struct { cursor: U32, length: U32, undos: U32 }
 
 local apply = do(e: Ref Editor, c: Command): Unit
     c {
-        move = do(d)
+        move =: d
             d {
                 left = do
                     if e.cursor > 0 then e.cursor = e.cursor - 1 end
@@ -49,7 +49,7 @@ local apply = do(e: Ref Editor, c: Command): Unit
                 end,
             }
         end,
-        insert = do(n)
+        insert =: n
             e.length = e.length + n
             e.cursor = e.cursor + n
         end,

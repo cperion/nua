@@ -26,7 +26,7 @@ local exercise = do(mode: I32): U32
             return canvas.Result.done()
         end
         return interact {
-            key = do(..)
+            key =:
                 key_seen(code, pressed, repeated)
                 if pressed then
                     if code == canvas.Key.escape then stop end
@@ -34,7 +34,7 @@ local exercise = do(mode: I32): U32
                 end
                 return
             end,
-            draw = do(..)
+            draw =:
                 observe(width, height, x)
                 clear canvas.Color.black
                 fill_rect x 20 80 60 canvas.Color.orange
@@ -44,7 +44,7 @@ local exercise = do(mode: I32): U32
         }
     end {
         done() = U32 0,
-        failed = do(problem)
+        failed =: problem
             local message = problem.message
             local bytes = (Ptr U8)(Ptr message.bytes)
             report problem.operation bytes message.len problem.truncated

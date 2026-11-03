@@ -65,7 +65,7 @@ end
 export use
 
 -- syntax §4.5 / syntax §6.2: rebinding in known branches and host loops is fine
-local gen = do(mode)
+local gen =: mode
     return do(x: U32): U32
         local scale = 1
         if mode == "double" then
