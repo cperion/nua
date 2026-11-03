@@ -5353,6 +5353,13 @@ h.call_word = function(w, opts, ...)
     return h.apply_word(w, opts, ...)
 end
 W.__call = function(w, ...) return h.call_word(w, nil, ...) end
+-- `f -1` is subtraction (syntax 2.4, rule 4), and a word is not a number: say what was
+-- probably meant instead of leaving Lua's arithmetic error
+W.__sub = function(w, n)
+    local name = rawget(w, 'name') or rawget(w, 'cname') or 'a word'
+    fail(("'%s' is a word, so `%s - n` subtracts from it; to apply it to a negative value write "
+        .. "%s(-n) or %s (-n)"):format(name, name, name, name), 2)
+end
 
 -- foreign C functions: always residual effects ------------------------------------------------
 

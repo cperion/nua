@@ -76,6 +76,18 @@ local churn = do(n: U32): U32
 end
 export churn
 
+-- shrinking a Grow: `pop` returns the last element, `truncate n` keeps the first n;
+-- both free the storage above the new end, so borrows of the contents end
+local shrink = do(n: U32): U32
+    local g = Grow(U32) {}
+    for i: U32 = 0, n - 1 do g:push(i * 2) end
+    local last = g:pop()
+    g:truncate 3
+    g:push 100
+    return last + g[0] + g[2] + g[3] + U32 g.length
+end
+export shrink
+
 -- a Grow array, and a recursive word that keeps no data stack live across
 -- its recursive call
 local Bytes = Grow U8

@@ -663,7 +663,8 @@ local function name_headed(e)
     return e.k == 'name'
 end
 
-local HOST_SAFE = { name = true, num = true, str = true, ['true'] = true, ['false'] = true, table = true }
+local HOST_SAFE = { name = true, num = true, str = true, ['true'] = true, ['false'] = true, table = true,
+    field = true, index = true }
 
 local function decide_calls(info, column_width)
     local ts, facts, group_of = info.tokens, info.facts, info.group_of

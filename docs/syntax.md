@@ -223,10 +223,10 @@ self.nodes:add(Node { value = 42 })
 
 The rules:
 
-1. **What can be an argument.** After a callable expression, these start an argument: a number, a string, `true` or `false`, a table constructor, a `do` lambda — on any line — and a **name**, only on the same line and only directly after a name, a name argument or a spaced group (rule 3).
+1. **What can be an argument.** After a callable expression, these start an argument: a number, a string, `true` or `false`, a table constructor, a `do` lambda — on any line — and a **name**, only on the same line and only directly after a name, a name argument (with its member chain: `f a.b x` is `f(a.b)(x)`), a number, string or boolean argument (`f 1 x` is `f(1)(x)`) or a spaced group (rule 3). A name does not continue an application after an attached call (`f a(b) x` is `f(a(b))` followed by `x`, rule 8) or after a table.
 2. **The newline rule.** A newline ends an application chain before any token that can begin a statement. Names and `(` can begin statements, so `local y: U32 = x` followed by `y = y + 1` on the next line stays two statements. Literals, tables and lambdas cannot begin statements, so they still attach across lines.
 3. **What an argument is.** A primary expression with its postfix chain, as Lua parses it: `.name`, `[i]`, `:m args`, `(args)`, and for a name, a table constructor or string. So `f a.b` is `f(a.b)`, `f a(b)` is `f(a(b))`, and `add Node { ... }` is `add(Node { ... })`. A literal's chain stops at a table or string (`f 21 {}` is `f(21)({})`). Only an attached `(` continues an argument's chain: a `(` with whitespace before it on the same line is the **next argument group**, so `f a (b + 1)` is `f(a)(b + 1)` and `f 21 (2)` is `f(21)(2)`. Such a spaced group is itself an argument, so names after it go on applying: `f (g x) y` is `f(g(x))(y)`. On a word these groups saturate as one supply (rule 7): `add3 x (y * 2) (twice y)` is `add3(x, y * 2, twice(y))`. After the callee itself the spacing makes no difference: `f (x)` and `f(x)` are the same call.
-4. **Left associativity.** `f a b` is `f(a)(b)`. Application binds more tightly than infix operators: `f a + 1` is `f(a) + 1`, and `f -1` is subtraction.
+4. **Left associativity.** `f a b` is `f(a)(b)`. Application binds more tightly than infix operators: `f a + 1` is `f(a) + 1`, and `f -1` is subtraction (a word is not a number, so with a word for `f` the compiler says so and suggests `f(-1)` or `f (-1)`).
 5. **Brackets** group, delimit argument lists and resolve ambiguity: an empty store is `Store(Node) {}` or `(Store Node) {}`; `Store Node {}` would apply `Store` to `Node {}`. A compound argument is written as a spaced group: `f (x + 1) y`, `f a (b * 2)`.
 6. **Loop headers.** The `do` of a `while` or `for` header ends the header; a lambda inside a header goes in brackets: `for x in each(xs, do(x) = x > 0) do`.
 7. **Saturating chains.** `f(a) do ... end` on a word accumulates arguments until the word is saturated (§10.4).
@@ -1302,7 +1302,7 @@ arguments it may clear. A call that may clear an owner ends that owner's borrows
 at the call; a call that only reads or appends leaves them valid. A function still
 being built, within a recursive cycle, is assumed to do both.
 
-A store slot is not borrowed: it is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). A removed slot is detected by its generation.
+A store slot is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). A removed slot is detected by its generation. A borrow of an element (`Ref s[id]`) ends at `s:remove`: the slot is reused, so a borrow used afterwards is rejected while compiling.
 
 ### 9.8 Managed stores and generational IDs
 
@@ -1352,7 +1352,7 @@ Cycles are ordinary relationships; they create no ownership cycles. Objects are 
 
 Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`Slice(p, n)`, `view_of(p, n, body)`, `Array(T, n)`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
 
-`Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4) and `g:clear()`. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any fixed-size type that is neither an owner nor an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots.
+`Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4), `g:pop()` (the last element, removed; an empty `Grow` traps), `g:truncate(n)` (keep the first `n`; more than `g.length` traps) and `g:clear()`. `pop`, `truncate` and `clear` free the storage above the new end, so borrows of the contents end there. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any fixed-size type that is neither an owner nor an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots.
 
 ## 10. Activities, opening and spread
 
@@ -2003,8 +2003,8 @@ The description, the loop over it and the reader's own loop are gone; one range 
 
 `g:all()` is a slice of a `Grow`'s elements, borrowing the `Grow` (§9.4), of the
 length it has when the slice is taken; `g:sub(a, b)` is `g:all():sub(a, b)`. The
-`Grow` may grow while the slice is used, since its bytes never move; `g:clear()`
-ends the slice (§9.7).
+`Grow` may grow while the slice is used, since its bytes never move; `g:clear()`,
+`g:pop()` and `g:truncate(n)` end it (§9.7).
 
 ```lua
 return sum32 g:all()

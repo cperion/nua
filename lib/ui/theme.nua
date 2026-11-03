@@ -146,7 +146,7 @@ function M.theme(config)
     end
     for _, scale in ipairs { "radii",
         "shadows", "text_sizes", "widths", "line_heights", "tracking" } do
-        for name, value in pairs(theme[scale]) do
+        for name, value in pairs theme[scale] do
             assert(type value == "number" and value == value,
                 "theme " .. scale .. ": invalid " .. name)
             add("size", name, name)

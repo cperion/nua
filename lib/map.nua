@@ -20,7 +20,7 @@ function map.each(T, storage, body)
         while slot < count do
             local table = storage.acquire m
             local entry = table.entries[slot]
-            if band(entry.hash, 0x8000000000000000ULL) == 0 then storage.lend(table, entry, body) end
+            if band entry.hash 0x8000000000000000ULL == 0 then storage.lend(table, entry, body) end
             slot = slot + 1
         end
     end
@@ -142,7 +142,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         local slot = U32 0
         while slot < table.len do
             local entry = Ptr table.entries[slot]
-            if band(entry.hash, free_bit) == 0 then place target capacity entry.hash slot end
+            if band entry.hash free_bit == 0 then place target capacity entry.hash slot end
             slot = slot + 1
         end
         stacks.move (stacks.span s h.index_base bytes) spare bytes
@@ -184,7 +184,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
                 local slot = U32 0
                 while slot < table.len do
                     local entry = Ptr table.entries[slot]
-                    if band(entry.hash, free_bit) == 0 then
+                    if band entry.hash free_bit == 0 then
                         local size = U64 entry.key.len
                         stacks.move(Ptr compacted[out], Ptr keys_now[entry.key.offset], size)
                         entry.key.offset = out
@@ -227,7 +227,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
         local h = header m
         -- the index keeps its load factor: removed cells count as used
         if h.cap == 0 or (U64 h.used + 1) * 4 > U64 h.cap * 3 then
-            rebuild(m, h.live + 1)
+            rebuild m (h.live + 1)
         end
         check_slots_top m
         local slot = h.free_head
@@ -252,7 +252,7 @@ function map.library(T, storage, Entry, Result, string_keys, borrowed_keys)
             entry.key.len = key.length
         else entry.key = key end
         local capacity = h.cap
-        local previous = place(at.cells, capacity, hashed, slot)
+        local previous = place at.cells capacity hashed slot
         if previous == 0 then h.used = h.used + 1 end
         h.live = h.live + 1
         if string_keys then

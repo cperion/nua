@@ -638,6 +638,47 @@ export f
 end
 export f
 ]] },
+    { name = 'a word followed by -1 is a subtraction', expect = "is a word, so `inc - n` subtracts from it",
+      src = [[local inc = do(x: U32): U32 = x + 1
+local f = do(n: U32): U32
+    return inc -1
+end
+export f
+]] },
+    { name = 'a Grow borrow used after pop', expect = "a borrow of 'g' is used after 'g' was popped",
+      src = [[local f = do(n: U32): U32
+    local g = Grow(U32) {}
+    g:push 1
+    g:push 2
+    local r = Ref g[0]
+    local last = g:pop()
+    return r + last
+end
+export f
+]] },
+    { name = 'a Grow borrow used after truncate', expect = "a borrow of 'g' is used after 'g' was truncated",
+      src = [[local f = do(n: U32): U32
+    local g = Grow(U32) {}
+    g:push 1
+    g:push 2
+    local r = Ref g[0]
+    g:truncate 1
+    return r
+end
+export f
+]] },
+    { name = 'a Store element borrow used after a removal', expect = "is used after an element of 'nodes' was removed",
+      src = [[local Node = Struct { value: U32 }
+local f = do(n: U32): U32
+    local nodes = Store(Node) {}
+    local a = nodes:add(Node { value = 1 })
+    local b = nodes:add(Node { value = 2 })
+    local r = Ref nodes[a]
+    nodes:remove b
+    return r.value
+end
+export f
+]] },
     { name = 'a Text borrow used after clearing', expect = "a borrow of 't' is used after 't' was cleared",
       src = [[local f = do(n: U32): U32
     local t = Text {}

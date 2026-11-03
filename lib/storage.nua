@@ -115,6 +115,24 @@ function storage.grow(T, p)
         stacks.reset h.stack h.base
         h.len = 0
     end
+    -- keep the first n elements: the storage above them is released
+    api.truncate = do(g: Ref T, n: U64): Unit
+        local h = p.header g
+        if n > h.len then trap "Grow truncate beyond its length" end
+        stacks.reset h.stack (h.base + n * p.width())
+        h.len = n
+    end
+    -- the last element, removed
+    api.pop = do(g: Ref T): T.elem
+        local h = p.header g
+        if h.len == 0 then trap "Grow pop of an empty Grow" end
+        local last = h.len - 1
+        local items = p.items g
+        local value = items[last]
+        stacks.reset h.stack (h.base + last * p.width())
+        h.len = last
+        return value
+    end
     if T.elem == U8 then
         api.append = do(g: Ref T, text: Str): Unit
             local n = text.length

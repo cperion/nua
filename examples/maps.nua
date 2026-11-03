@@ -69,7 +69,7 @@ local borrowed_keys = do(n: U32): U32
     local source = Text {}
     source:write "alpha beta gamma beta alpha beta"
     local seen = Tokens {}
-    source:str():split(U8 32) do(word)
+    source:str():split(U8 32): word
         local count = seen:find(word) { found(c) = c, missing() = U32 0 }
         seen[word] = count + 1
     end

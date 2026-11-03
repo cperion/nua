@@ -272,6 +272,9 @@ check('Map iteration across task suspension', maps.map_task_each(100) == 5051)
 -- stores and Grow arrays: helpers read from the same C the C backend prints
 local st = nua.load(root .. '/examples/stores.nua')
 check('stores run', type(st.churn) == 'function')
+check('Grow pop and truncate', st.shrink(10) == 126)
+ok, err = pcall(st.shrink, 1)
+check('Grow pop of an empty Grow traps', not ok and tostring(err):find('Grow', 1, true), err)
 
 -- Fixed-array values and owner-backed text views at both binding times.
 local sv = nua.load(root .. '/examples/staged_values.nua')

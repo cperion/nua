@@ -179,7 +179,7 @@ function M.vocabulary(node, t, output, predicates)
             for name, field in pairs { cols = "columns", rows = "rows" } do
                 instruction(name, function(...)
                         local tracks = { ... }
-                        if #tracks == 1 and type(tracks[1]) == "number" then
+                        if #tracks == 1 and type tracks[1] == "number" then
                             local count = number(name, tracks[1], 1)
                             assert(count == math.floor count, name .. " takes a positive integer")
                             put(field, count)

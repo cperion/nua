@@ -392,7 +392,7 @@ are used afterwards matter:
 | Operation | Ends borrows of | Status |
 |---|---|---|
 | `xs:push v`, `xs:append s`, text writes on a top-level owner | nothing | implemented |
-| `xs:pop()`, `xs:clear()`, `xs:truncate n` | `xs`'s contents | `clear` implemented |
+| `xs:pop()`, `xs:clear()`, `xs:truncate n` | `xs`'s contents | implemented |
 | `s:remove id` (Store), `m:remove k` (Map) | the store's or map's elements; only the removed one when the compiler proves the others differ | proposed: today a borrow of a removed element sees the next entity put in its slot |
 | `m:put k v` (Map) | nothing; for `Map(Str, V)`, the keys (arena compaction) | proposed |
 | growing a nested owner (§5.9) | that owner's contents | proposed |

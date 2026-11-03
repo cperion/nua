@@ -28,6 +28,20 @@ call('partial word alias', 'local sum = do(a: U32, b: U32, c: U32): U32 = a + b 
 call('local typed function', 'local function f(a: U32, b: U32): U32 return a + b end', 'f(x, y)', 'f x y')
 call('rest word collects every group', 'local f = do(a: U32, ..rest): U32 = a + U32(rest.length)',
     'f(x, y, 3)', 'f x y 3')
+-- a member or index argument keeps its whole chain (syntax 2.4, rule 3): no parentheses needed
+local function host(name, input, expected)
+    local out = fmt.format(input .. '\n', nil, name)
+    check(name, out == expected .. '\n', out)
+    check(name .. ': idempotent', fmt.format(out, nil, name) == out)
+end
+host('host member argument', 'f(a.b)', 'f a.b')
+host('host index argument', 'f(a[i + 1])', 'f a[i + 1]')
+host('host chained member and index', 'f(a.b[i].c)', 'f a.b[i].c')
+host('host member after a call', 'f(g(x).y)', 'f g(x).y')
+host('host member arguments in a chain', 'f(a.b)(c.d)', 'f a.b c.d')
+host('several arguments keep their parentheses', 'f(a.b, c)', 'f(a.b, c)')
+host('a name after the call keeps the parentheses', 'f(a.b) g(x)', 'f(a.b) g x')
+host('a string after the call keeps the parentheses', 'f(a.b) "s"', 'f(a.b) "s"')
 call('multiline arguments', add, 'f(\n        x,\n        y\n    )', 'f x y')
 call('argument comment', add, 'f(x, --[[ keep ]] y)', 'f x  --[[ keep ]] y')
 call('compound argument becomes a spaced group', add, 'f(x + 1, y)', 'f (x + 1) y')

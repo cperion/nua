@@ -13,7 +13,8 @@ layout.Id = cstruct("nua_id", h, { { "token", U64 }, { "slot", U32 }, { "gen", U
 layout.Map = cstruct("nua_map", h, {
         { "stack", U64 },
         { "base", U64 }, { "width", U64 }, { "len", U32 }, { "live", U32 }, { "free_head", U32 },
-        { "iterating", U32 }, { "index_stack", U64 }, { "index_base", U64 }, { "cap", U32 }, { "used", U32 },
+        { "iterating", U32 },
+        { "index_stack", U64 }, { "index_base", U64 }, { "cap", U32 }, { "used", U32 },
     })
 layout.StrMap = cstruct("nua_strmap", h, {
         { "entries", layout.Map },

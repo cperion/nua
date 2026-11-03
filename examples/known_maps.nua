@@ -2,7 +2,7 @@ local source = { { 1, 10 }, { 2, 20 } }
 local numbers = Map.known(U32, U32, source)
 source[1][2] = 999
 source[2][1] = 9
-assert(host(numbers[U32 1]) == 10)
+assert(host numbers[U32 1] == 10)
 assert(host numbers.length == 2)
 local words = Map.known(Str, U32, { { "if", 1 }, { "a\0b", 2 }, { "length", 3 }, { "", 4 } })
 local empty = Map.known(Str, U32, {})
