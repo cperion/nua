@@ -164,6 +164,23 @@ local with_name = 3
 ]], 'with blocks supply keyed data')
 local with_sexpr = with_tree:root():sexpr()
 assert(select(2, with_sexpr:gsub('%(table_constructor', '')) == 4, 'with blocks are not table constructors: ' .. with_sexpr)
+local contextual = parse([[
+local make = do(n: U32): Point
+    return with
+        x = n
+        y = 2
+    end
+end
+local q: Point = with
+    x = 1
+    y = 2
+end
+local r = f(with
+    a = 1
+end)
+]], 'a with block takes its type from the context')
+local contextual_sexpr = contextual:root():sexpr()
+assert(select(2, contextual_sexpr:gsub('%(table_constructor', '')) == 3, 'contextual with blocks are not table constructors: ' .. contextual_sexpr)
 local plain = parse([[
 local s: Store Node
 local a, b: U32

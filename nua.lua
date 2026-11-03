@@ -41,6 +41,7 @@ function nua.prelude()
     local env = setmetatable({}, { __index = _G })
     for _, n in ipairs(T.scalars) do env[n] = T[n] end
     env.__S = S
+    env.with = S.contextual    -- `with` where an expression starts (nua.colon)
     env.__ENV = env
     env.Ref = S.Ref
     env.opaque = T.opaque

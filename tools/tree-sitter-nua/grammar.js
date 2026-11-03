@@ -72,7 +72,7 @@ module.exports = grammar({
       seq('[', $._expression, ']', '=', $._value), $._expression),
     // A keyed handler is a lambda without the leading `do`.
     handler: $ => seq(field('name', $.identifier), $.parameters, optional($.type_annotation), choice(seq('=', $._expression), seq(optional($.block), 'end'))),
-    _expression: $ => choice($.identifier, $.number, $.string, $.boolean, $.nil, $.vararg_expression, $.parenthesized_expression, $.table_constructor, $.lambda, $.function_expression, $.binary_expression, $.unary_expression, $.call_expression, $.member_expression, $.index_expression, $.spread_expression),
+    _expression: $ => choice($.identifier, $.number, $.string, $.boolean, $.nil, $.vararg_expression, $.parenthesized_expression, $.table_constructor, alias($.with_block, $.table_constructor), $.lambda, $.function_expression, $.binary_expression, $.unary_expression, $.call_expression, $.member_expression, $.index_expression, $.spread_expression),
     // A loop's `do` is a delimiter, not a trailing lambda argument. Parentheses
     // and argument lists still admit ordinary expressions, including lambdas.
     _header_expression: $ => choice($.identifier, $.number, $.string, $.boolean, $.nil, $.parenthesized_expression, $.table_constructor, $.header_binary, $.header_unary, $.header_call, $.header_member, $.header_index),

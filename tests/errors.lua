@@ -751,6 +751,13 @@ export f
 end
 export f
 ]] },
+    { name = 'a with block with no type in its context', expect = "`with` here has no type",
+      src = [[local f = do(n: U32): U32
+    local p = with x = n end
+    return p.x
+end
+export f
+]] },
     { name = 'a Text borrow used after clearing', expect = "a borrow of 't' is used after 't' was cleared",
       src = [[local f = do(n: U32): U32
     local t = Text {}

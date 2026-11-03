@@ -2043,7 +2043,20 @@ h.lend_view = function(x, t, what)
 end
 
 -- coerce for binding into a requirement / storage of type t
+-- `with` where no type precedes it: a keyed construction whose type its context supplies
+-- (a declared result, a typed local, a typed parameter, a field of a record). coerce
+-- builds it when the expected type is known.
+h.Contextual = { __name = 'with' }
+h.Contextual.__index = function(_, key)
+    fail("`with` here has no type: it takes its type from a declared result, a typed local or a "
+        .. "typed parameter (use `T with ... end` when the context does not supply one)", 2)
+end
+S.contextual = function(fields) return setmetatable({ fields = fields }, h.Contextual) end
 local function coerce(x, t, what)
+    if getmetatable(x) == h.Contextual then
+        if not is_type(t) then fail(('%s: `with` needs a type from its context'):format(what), 3) end
+        return t(rawget(x, 'fields'))
+    end
     if t.kind == 'ref' then
         -- a place holding a reference, or a pointer value read back, is the
         -- reference it holds

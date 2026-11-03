@@ -284,6 +284,26 @@ end
 
 Every table-shaped form takes it: constructors, `Struct`, `Sum`, matches and any constructor-headed argument (`f x with k = 1 end` is `f(x { k = 1 })`, rule 3). Lua's own `{ }` tables are untouched, so no Lua table semantics change; `with` is the Nua spelling for keyed data and `{ }` stays for Lua tables and compact one-liners.
 
+*Contextual `with`.* Where an expression starts (after `return`, `=`, `(`, `,` or `{`), `with` takes no type before it, and the **context supplies the constructor**: a declared result, a typed local, a typed parameter or a field of a record. It is the same construction as `T with`, without repeating `T`.
+
+```lua
+local make = do(n: U32): Point
+    return with
+        x = n
+        y = n + 1
+    end
+end
+
+local pair: Pair = with
+    left = with x = 3, y = 4 end      -- a field of a record: its type is Pair's field type
+    right = origin
+end
+
+total(with x = 1, y = 2 end)          -- a typed parameter
+```
+
+The type is found by the coercion that every typed position already performs, so it works wherever an expected type is known and nowhere else: `local p = with x = 1 end`, with no type in the context, is rejected (`with` here has no type) rather than guessed. A variable named `with` is still a variable (`with + 1`, `t.with`, `pass(with)`); `with` begins a block only before an entry (`name =`, `.name`, `[`, a literal).
+
 *Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`Struct with x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
 
 ### 2.5 Words and host functions

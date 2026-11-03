@@ -72,6 +72,27 @@ assert(x == 4 and t.with == 5)
 ]]
 assert(loadstring(translated(ordinary, 'ordinary.nua'), '@ordinary.nua'))()
 check('with is an ordinary name elsewhere', true)
+
+-- `with` where an expression starts takes its type from the context
+local contextual = {
+    { 'return with', 'return with\n    x = 1\nend\n', 'return with {\n    x = 1\n}\n' },
+    { 'typed local', 'local p: Point = with x = 1, y = 2 end\n', 'local p: Point = with { x = 1, y = 2 }\n' },
+    { 'argument', 'f(with x = 1 end)\n', 'f(with { x = 1 })\n' },
+    { 'field value', 'local p = T with\n    left = with x = 1 end\nend\n', 'local p = T {\n    left = with { x = 1 }\n}\n' },
+}
+for _, case in ipairs(contextual) do
+    check('contextual with: ' .. case[1], normal(translated(case[2], case[1])) == normal(translated(case[3], case[1])),
+        translated(case[2], case[1]))
+end
+local variable = [[
+local with = 3
+local t = { with = 5 }
+assert(with + t.with == 8)
+local function pass(with) return with end
+assert(pass(4) == 4)
+]]
+assert(loadstring(translated(variable, 'variable.nua'), '@variable.nua'))()
+check('a variable named with is still a variable', true)
 check('an unclosed with block is an error', not pcall(translated, 'local p = T with x = 1\n', 'open'))
 
 -- annotation colons, labels and method calls are not blocks
@@ -166,6 +187,8 @@ formatted('fmt: a table wrapped by width puts every entry on its own line, end o
     'local c = App with\n    counter = Counter with\n        count = Number with\n            x = 20\n            y = 20\n            width = 208\n            height = 24\n            color = 66051\n            value = 7\n        end\n        up = Button { x = 20, y = 60, width = 100, height = 30 }\n    end\nend\n')
 formatted('fmt: a short table stays braces inside a with', 'local c = App {\n    counter = Counter { count = 1, up = 2 },\n}\n',
     'local c = App with\n    counter = Counter { count = 1, up = 2 }\nend\n')
+formatted('fmt: contextual with kept', 'return with\nx = 1\nend\n', 'return with\n    x = 1\nend\n')
+formatted('fmt: contextual with on one line', 'local p: Point = with x = 1, y = 2 end\n', 'local p: Point = with x = 1, y = 2 end\n')
 check('fmt: bad data style', not pcall(fmt.format, 'x = 1\n', { data_style = 'pretty' }))
 check('fmt: bad block style', not pcall(fmt.format, 'x = 1\n', { block_style = 'ruby' }))
 

@@ -9,6 +9,22 @@ local Shape = Sum with
     rect: Point
 end
 
+-- a `with` with no type before it takes its type from the context
+local origin = do(n: U32): Point
+    local y = n + 1
+    return with
+        x = n
+        .y
+    end
+end
+
+local shifted = do(n: U32): U32
+    local p = origin n
+    local q: Point = with x = 1, y = 2 end
+    return p.x + p.y + q.x + q.y
+end
+export shifted
+
 local sum = do(n: U32): U32
     local p = Point with
         x = n

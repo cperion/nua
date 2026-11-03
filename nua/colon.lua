@@ -141,6 +141,22 @@ local function significant_after(tokens, i)
     return i
 end
 
+-- does the `with` at i stand where an expression starts, and begin entries (not a variable)?
+local EXPRESSION_START = { ['='] = true, ['('] = true, [','] = true, ['{'] = true, [';'] = true }
+local function contextual_with(tokens, i)
+    local p = skip_back(tokens, i)
+    if p < 1 then return false end
+    local before = tokens[p]
+    if not (EXPRESSION_START[before[1]] or (before[1] == 'keyword' and before[2] == 'return')) then return false end
+    local nx = tokens[significant_after(tokens, i)]
+    if not nx then return false end
+    if nx[1] == '.' or nx[1] == '[' or nx[1] == 'iden' or nx[1] == 'string' or nx[1] == 'number' then
+        return not (tokens[i + 1] and (tokens[i + 1][1] == '.' or tokens[i + 1][1] == '('))
+    end
+    return false
+end
+
+
 -- Rewrite every block colon and every `with` block in a token list. Tokens are
 -- { type, text, line }.
 --
@@ -221,6 +237,16 @@ function M.rewrite(tokens, mark)
                         while top() and top().kind == 'block' do stack[#stack] = nil end
                     end
                 end
+            elseif t == 'iden' and v == 'with' and contextual_with(tokens, i) then
+                -- `with` in expression position (after `return`, `=`, `(`, `,`, `{`): its type
+                -- comes from the context, so it is a table the type-directed coercion consumes
+                push('with', tk[3])
+                -- `with { entries }`: an ordinary application of the prelude's `with` to a table
+                if not mark then emit({ 'iden', 'with', tk[3] }); emit({ 'space', ' ', tk[3] }) end
+                emit({ '{', '{', tk[3] })
+                top().opener = out[#out]
+                if mark then emit({ 'comment', MARK, tk[3] }) end
+                handled = true
             elseif t == 'iden' and v == 'with' and last then
                 -- `T with` (after an operand, not followed by `=`) opens a data block
                 local p = skip_back(tokens, i)
@@ -603,7 +629,7 @@ function M.withize(source, unit)
     local want = normal(braces)
     local function accepted(selected)
         local text = build(selected)
-        return normal(M.expand(text)) == want and text
+        return normal(M.expand(text, true)) == want and text
     end
     local all = accepted(blocks)
     if all then return all end
