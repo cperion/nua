@@ -108,7 +108,7 @@ function T.store(elem)
     end
 
     return memoized('store', elem, function()
-        return { kind = 'store', elem = elem, display = 'Store ' .. elem.display,
+        return { kind = 'owner', family = 'store', elem = elem, display = 'Store ' .. elem.display,
                  resizable = true }
     end)
 end
@@ -127,7 +127,7 @@ function T.grow(elem)
     end
 
     return memoized('grow', elem, function()
-        return { kind = 'grow', elem = elem, display = 'Grow ' .. elem.display,
+        return { kind = 'owner', family = 'grow', elem = elem, display = 'Grow ' .. elem.display,
                  resizable = true }
     end)
 end
@@ -140,7 +140,7 @@ function T.rtarray(elem)
         error('Array holds fixed-size values, not ' .. elem.display, 2)
     end
     return memoized('rtarray', elem, function()
-        return { kind = 'rtarray', elem = elem, display = 'Array ' .. elem.display,
+        return { kind = 'owner', family = 'rtarray', elem = elem, display = 'Array ' .. elem.display,
                  resizable = true }
     end)
 end

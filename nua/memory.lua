@@ -29,11 +29,16 @@ local function elem_name(t)
     return t.name
 end
 
+-- The families of library owner types (design memory.md §10.1): each is a declaration
+-- (its C name, native header, algorithms, operations), and the generic code below reads
+-- it. A new owner type is a new entry, not a new branch in the compiler.
+local families = {}
+local function family_of(t) return rawget(t, 'family') and families[t.family] end
+
 local function cname_of(t)
-    if t.kind == 'store' then return elem_name(t.elem) .. 'Store' end
+    local f = family_of(t)
+    if f then return elem_name(t.elem) .. f.suffix end
     if t.kind == 'id' then return elem_name(t.elem) .. 'Id' end
-    if t.kind == 'grow' then return elem_name(t.elem) .. 'Grow' end
-    if t.kind == 'rtarray' then return elem_name(t.elem) .. 'Array' end
     if rawget(t, 'ctype') then return t.ctype() end
 end
 Mem.cname_of = cname_of
@@ -86,9 +91,9 @@ local function layout_of(t)
     local r = cache[t]
     if r then return r end
     local layouts = layouts_module()
-    r = { layout = t.kind == 'store' and layouts.Store
-        or (t.kind == 'grow' or t.kind == 'rtarray') and layouts.Grow or layouts.Id }
-    if t.kind == 'store' then
+    local f = family_of(t)
+    r = { layout = f and layouts[f.layout] or layouts.Id }
+    if f and f.slot then
         r.slot = S.struct(cname_of(t) .. 'Slot', { { 'gen', types.U32 }, { 'next', types.U32 }, { 'value', t.elem } })
     end
     cache[t] = r
@@ -674,14 +679,15 @@ storage_library = function(t)
     if storage_libraries[t] then return storage_libraries[t] end
     local layout = require('nua.storage_layout')
     layout_of(t)
-    local id = t.kind == 'store' and Mem.Id(t.elem)
+    local f = family_of(t)
+    local id = f.ids and Mem.Id(t.elem)
     if id then layout_of(id) end
     local representation = layout_of(t)
     local p = layout.storage(t, representation.layout, t.elem, representation.slot,
         function(x) return Mem.view(x, representation.layout) end,
         function(fields) return Mem.record(id, fields) end, S.id_components)
     local library = require('nua.storage')
-    local api = t.kind == 'store' and library.store(t, id, p) or library.grow(t, p)
+    local api = f.api(library, t, id, p)
     api.layout = p
     storage_libraries[t] = api
     return api
@@ -710,14 +716,10 @@ local function library_methods(t, names, index_args)
     return methods
 end
 
-local function store_methods(t)
-    return library_methods(t, { 'add', 'remove', 'has' }, {})
-end
-
-local function grow_methods(t)
+local function view_methods(t)
     local n = cname_of(t)
-    local methods = library_methods(t, { 'push', 'pop', 'truncate', 'clear' }, { truncate = { 1 } })
-    -- the elements as a read-only slice borrowing the Grow, of the length it has now:
+    local methods = {}
+    -- the elements as a read-only slice borrowing the owner, of the length it has now:
     -- growing keeps the slice valid (stacks never move); clear, pop and truncate end it
     methods.all = function(self)
         local p = receiver(self, n .. ':all')
@@ -731,15 +733,32 @@ local function grow_methods(t)
     return methods
 end
 
+-- the declarations
+families.store = { suffix = 'Store', layout = 'Store', slot = true, ids = true,
+    api = function(library, t, id, p) return library.store(t, id, p) end,
+    methods = { 'add', 'remove', 'has' }, index_args = {}, arity = { add = 2, remove = 2, has = 2 } }
+families.grow = { suffix = 'Grow', layout = 'Grow', views = true,
+    api = function(library, t, id, p) return library.grow(t, p) end,
+    methods = { 'push', 'pop', 'truncate', 'clear' }, index_args = { truncate = { 1 } },
+    arity = { push = 2, all = 1, sub = 3, clear = 1, pop = 1, truncate = 2 } }
+-- an Array T: its length is fixed when it is built, so it has no push and no clear
+families.rtarray = { suffix = 'Array', layout = 'Grow', views = true,
+    api = function(library, t, id, p) return library.grow(t, p) end,
+    methods = {}, index_args = {}, arity = { all = 1, sub = 3 },
+    construct = function(t)
+        return function() fail(t.display .. ' is built with its length: Array(' .. t.elem.display .. ', n) {}') end
+    end }
+
 -- s[id] and g[i]: an element as a checked place. Its address is computed (and
 -- checked: the Id is current, the index in range) when used, and reused for the
 -- same index until something could change the storage, which is found again then
 local function index_hook(t)
     local n = cname_of(t)
     return function(x, key)
-        local p = receiver(x, t.kind == 'store' and n .. '[id]' or n .. '[i]')
+        local f = family_of(t)
+        local p = receiver(x, f.ids and n .. '[id]' or n .. '[i]')
         -- an index is any unsigned integer, checked as U64 (design memory.md §15 D2)
-        local k = t.kind == 'store' and S.coerce(key, types.id(t.elem), 'Id') or S.index_value(key)
+        local k = f.ids and S.coerce(key, types.id(t.elem), 'Id') or S.index_value(key)
         k = fix_index(k, 'capturing a storage index')
         local function resolve() return S.ex(storage_library(t).locate(S.Ref(p), k)) end
         local b = S.cur()
@@ -784,49 +803,27 @@ local function decorate(t)
     rawset(t, 'ctype', function() return cname_of(t) end)
     rawset(t, 'native_layout', function() return layout_of(t).layout end)
     rawset(t, 'cdecl', function() return 'typedef ' .. layout_of(t).layout.cname .. ' ' .. cname_of(t) .. ';' end)
-    if t.kind == 'store' then
-        local ms = store_methods(t)
-        local ar = { add = 2, remove = 2, has = 2 }
-        for k, f in pairs(ms) do S.arity[f] = ar[k] end
-        rawset(t, 'builtin_methods', merge_methods(t, ms))
-        rawset(t, '__index', index_hook(t))
-        rawset(t, 'properties', merge_properties(t, { length = length }))
-        S.member_tables(t)
-        rawset(t, 'construct', function(x)
-            if type(x) ~= 'table' or S.is_staged(x) or next(x) ~= nil then
-                fail(t.display .. ' {} takes no fields')
-            end
-            return fresh(t)
-        end)
-    elseif t.kind == 'rtarray' then
-        -- the elements of an Array T are borrowed like a Grow's; its length is
-        -- fixed, so it has no push and no clear
-        local all = grow_methods(t)
-        local ms = { all = all.all, sub = all.sub }
-        S.arity[ms.all], S.arity[ms.sub] = 1, 3
-        rawset(t, 'builtin_methods', merge_methods(t, ms))
-        rawset(t, '__index', index_hook(t))
-        rawset(t, 'properties', merge_properties(t, { length = length }))
-        S.member_tables(t)
-        rawset(t, 'construct', function(x)
-            fail(t.display .. ' is built with its length: Array(' .. t.elem.display .. ', n) {}')
-        end)
-    elseif t.kind == 'grow' then
-        local ms = grow_methods(t)
-        local ar = { push = 2, all = 1, sub = 3, clear = 1, pop = 1, truncate = 2 }
-        for k, f in pairs(ms) do S.arity[f] = ar[k] end
-        rawset(t, 'builtin_methods', merge_methods(t, ms))
-        rawset(t, '__index', index_hook(t))
-        rawset(t, 'properties', merge_properties(t, { length = length }))
-        S.member_tables(t)
-        rawset(t, 'construct', function(x)
-            if type(x) ~= 'table' or S.is_staged(x) or next(x) ~= nil then
-                fail(t.display .. ' {} takes no fields')
-            end
-            return fresh(t)
-        end)
-
+    local f = family_of(t)
+    if not f then return t end    -- an Id has a name and a layout, nothing more
+    local ms = library_methods(t, f.methods, f.index_args)
+    if f.views then
+        -- the elements are borrowed like a Grow's (g:all(), g:sub(a, b))
+        local views = view_methods(t)
+        ms.all, ms.sub = views.all, views.sub
+        rawset(t, 'viewed_elem', t.elem)
     end
+    for name, fn in pairs(ms) do S.arity[fn] = f.arity[name] end
+    rawset(t, 'builtin_methods', merge_methods(t, ms))
+    rawset(t, '__index', index_hook(t))
+    rawset(t, 'properties', merge_properties(t, { length = length }))
+    S.member_tables(t)
+    rawset(t, 'construct', f.construct and f.construct(t) or function(x)
+        if type(x) ~= 'table' or S.is_staged(x) or next(x) ~= nil then
+            fail(t.display .. ' {} takes no fields')
+        end
+        return fresh(t)
+    end)
+    if f.ids then rawset(t, 'visit_types', function(visit) visit(Mem.Id(t.elem)) end) end
     return t
 end
 

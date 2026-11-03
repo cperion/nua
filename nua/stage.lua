@@ -2026,7 +2026,7 @@ h.lend_view = function(x, t, what)
     end
     if not is_place(q) then return nil end
     local qt = q.T
-    local elem = qt.kind == 'array' and qt.elem or ((qt.kind == 'grow' or qt.kind == 'rtarray') and qt.elem)
+    local elem = qt.kind == 'array' and qt.elem or rawget(qt, 'viewed_elem')
     if not elem or elem ~= t.slice_elem then return nil end
     if mut and not marked then
         fail(('%s: a Slice.mut lends %s for writing; mark it at the call: Ref %s'):format(

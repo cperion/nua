@@ -1659,15 +1659,15 @@ local function collect_structs(fns)
     local seen, order = {}, {}
     local function visit(t)
         if not t or seen[t] then return end
-        if t.kind == 'ref' or t.kind == 'ptr' or t.kind == 'id' or t.kind == 'store'
-            or t.kind == 'grow' or t.kind == 'rtarray' or t.kind == 'map' or t.kind == 'strmap' then
+        if t.kind == 'ref' or t.kind == 'ptr' or t.kind == 'id' or t.kind == 'owner'
+            or t.kind == 'map' or t.kind == 'strmap' then
             if t.kind ~= 'ref' and t.kind ~= 'ptr' then
                 seen[t] = true
                 local native = t.native_layout and t.native_layout() or t.representation
                 if native then visit(native) end
                 if t.elem then visit(t.elem) end
                 if t.kind == 'map' or t.kind == 'strmap' then visit(t.key); visit(t.lookup); visit(t.entry) end
-                if t.kind == 'store' then visit(require('nua.memory').Id(t.elem)) end
+                if rawget(t, 'visit_types') then t.visit_types(visit) end
                 order[#order + 1] = t
                 return
             end
