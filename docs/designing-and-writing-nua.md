@@ -715,9 +715,9 @@ The scope body opens the file (a path is a `CString`, which no spawned task may 
 ```lua
 local line_count = do(workers, path: CString): U32
     local total: U32 = 0
-    io.open(path, io.READ) {
+    io.open(path, io.READ) with
         done =: file
-            tasks do(..)
+            tasks:
                 local chunks = pool(Chunk, 8)
                 local filled = channel(Slot Chunk, 8)
                 local counts = channel(U32, 8)
@@ -725,10 +725,10 @@ local line_count = do(workers, path: CString): U32
                     local more: Bool = true
                     while more do
                         local slot = chunks:take()
-                        io.read(file, chunks[slot].bytes) {
-                            done = do(n) chunks[slot].n = n end,
-                            failed = do(e) chunks[slot].n = 0 end,
-                        }
+                        io.read(file, chunks[slot].bytes) with
+                            done = do(n) chunks[slot].n = n end
+                            failed = do(e) chunks[slot].n = 0 end
+                        end
                         if chunks[slot].n == 0 then
                             chunks:release slot
                             more = false
@@ -740,10 +740,10 @@ local line_count = do(workers, path: CString): U32
                 end
                 -- the workers run in a scope of their own: when it ends, counts can close
                 spawn do
-                    tasks do(crew)
+                    tasks: crew
                         for _ = 1, workers do
                             crew.spawn do
-                                filled:each do(slot)
+                                filled:each: slot
                                     counts:send(count_lines chunks[slot])
                                     chunks:release slot
                                 end
@@ -752,14 +752,14 @@ local line_count = do(workers, path: CString): U32
                     end
                     counts:close
                 end
-                counts:each do(lines)
+                counts:each: lines
                     total = total + lines
                 end
             end
             io.close(file) { done = do() end, failed = do(e) end }
-        end,
-        failed = do(e) end,
-    }
+        end
+        failed = do(e) end
+    end
     return total
 end
 ```
@@ -773,11 +773,11 @@ For a complete-file contract, revise the outcome and task protocol together: the
 `first_of` takes whichever operation completes first. It admits operations the runtime can take back: receives, sends, takes and timers:
 
 ```lua
-        first_of {
-            recv replies do(v) answer = v end,
-            after(seconds 1) do answer = 0 end,
-            closed = do end,
-        }
+        first_of with
+            recv replies do(v) answer = v end
+            after(seconds 1) do answer = 0 end
+            closed = do end
+        end
 ```
 
 I/O is never a case, because the kernel's work cannot be taken back. Give an I/O operation a deadline, or spawn a task for it. A call into C that may block goes in `blocking do ... end`, so it never holds a worker.
@@ -999,26 +999,26 @@ When a problem has structure (a grammar, a key map, a protocol), write the struc
 
 ```lua
 local apply = do(document: Ref Document, c: Command): Unit
-    c {
+    c with
         move =: d
-            d {
-                left() = document:move_left(),
+            d with
+                left() = document:move_left()
                 right = do
                     if document.cursor < document.length then
                         document.cursor = document.cursor + 1
                     end
-                end,
-            }
-        end,
+                end
+            end
+        end
         insert =: n
             document.length = document.length + n
             document.cursor = document.cursor + n
-        end,
+        end
         undo = do
             document.edits = document.edits + 1
-        end,
-        quit = do end,
-    }
+        end
+        quit = do end
+    end
 end
 ```
 

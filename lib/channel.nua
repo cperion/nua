@@ -10,10 +10,10 @@ function channel.each(T, body)
     local each = do(ch: Chan T): Unit
         local open = Bool true
         while open do
-            ch:recv() {
-                value = do(value) body value end,
-                closed = do open = false end,
-            }
+            ch:recv() with
+                value = do(value) body value end
+                closed = do open = false end
+            end
         end
     end
     by_body[body] = each

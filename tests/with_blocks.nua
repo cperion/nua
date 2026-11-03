@@ -14,7 +14,7 @@ local sum = do(n: U32): U32
         x = n
         y = n * 2
     end
-    local q = Point with x = 1 y = 2 end
+    local q = Point with x = 1, y = 2 end
     local x = 5
     local r = Point with
         .x
@@ -26,7 +26,7 @@ export sum
 
 -- matching is keyed application: the handlers are the entries
 local area = do(n: U32): U32
-    local s = Shape.rect(Point with x = n y = 3 end)
+    local s = Shape.rect Point with x = n, y = 3 end
     return s with
         circle = do(r) = r * r
         rect =: p

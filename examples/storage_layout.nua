@@ -11,9 +11,10 @@ export compact_count
 
 -- Known values need not be equal across instances of the same source type.
 local compact_nested = do(n: U32): U32
-    local e = CompactEnvelope {
-        counter = CompactCounter { scale = 5, bias = 11, count = 0 }, step = 1
-    }
+    local e = CompactEnvelope with
+        counter = CompactCounter { scale = 5, bias = 11, count = 0 }
+        step = 1
+    end
     while e.counter.count < n do e.counter.count = e.counter.count + e.step end
     return e.counter.bias + e.counter.scale * e.counter.count
 end

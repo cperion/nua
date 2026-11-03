@@ -42,10 +42,13 @@ local with_frame = do(renderer: Ptr sdl.Renderer, body): Result
     return Result.done()
 end
 
-local View = Struct {
-    renderer: Ptr sdl.Renderer, window_id: U32, stopped: Bool,
-    frame_delay_ms: U32, session_error: Failure,
-}
+local View = Struct with
+    renderer: Ptr sdl.Renderer
+    window_id: U32
+    stopped: Bool
+    frame_delay_ms: U32
+    session_error: Failure
+end
 function View:stop(): Unit
     self.stopped = true
 end
@@ -53,19 +56,24 @@ function View:frame(body): Result
     if self.session_error.operation ~= 0 then return Result.failed self.session_error end
     if self.stopped then return Result.done() end
     local result = with_frame self.renderer body
-    return result {
-        done() = Result.done(),
+    return result with
+        done() = Result.done()
         failed =: frame_error
             self.session_error = frame_error
             self.stopped = true
             return Result.failed frame_error
-        end,
-    }
+        end
+    end
 end
 function View:interact(handlers): Result
-    local event = sdl.Event {
-        kind = 0, timestamp = 0, window_id = 0, code = 0, pressed = false, repeated = false,
-    }
+    local event = sdl.Event with
+        kind = 0
+        timestamp = 0
+        window_id = 0
+        code = 0
+        pressed = false
+        repeated = false
+    end
     while not self.stopped do
         while not self.stopped and sdl.poll(Ptr event) do
             if event.kind == sdl.quit_event then
@@ -75,8 +83,11 @@ function View:interact(handlers): Result
             elseif event.kind == sdl.key_down or event.kind == sdl.key_up then
                 if event.window_id == self.window_id then
                     if handlers.key then
-                        local key = KeyEvent { code = event.code,
-                            pressed = event.pressed, repeated = event.repeated }
+                        local key = KeyEvent with
+                            code = event.code
+                            pressed = event.pressed
+                            repeated = event.repeated
+                        end
                         handlers.key(Ref key)
                     end
                 end
@@ -92,12 +103,13 @@ local open = do(config, body): Result
     local result = sdl.with_video do(): Result
         return sdl.with_window config do(window: Ptr sdl.Window): Result
             return sdl.with_renderer window do(renderer: Ptr sdl.Renderer): Result
-                local view = View {
-                    .renderer,
-                    window_id = sdl.window_id window,
-                    stopped = false, session_error = sdl.no_failure,
-                    frame_delay_ms = config.frame_delay_ms or 16,
-                }
+                local view = View with
+                    .renderer
+                    window_id = sdl.window_id window
+                    stopped = false
+                    session_error = sdl.no_failure
+                    frame_delay_ms = config.frame_delay_ms or 16
+                end
                 local result = body(Ref view)
                 -- A caller cannot accidentally discard a failed frame.
                 if view.session_error.operation ~= 0 then return Result.failed view.session_error end

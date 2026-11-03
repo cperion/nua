@@ -75,8 +75,12 @@ function Painter:text(text: Str, x: F32, y: F32, size: F32, color: ui.Color, opa
     if text.length > 0 and self.failure.operation == 0 then
         self:checked(set_font_size self.font size, Operation.font_size)
         if self.failure.operation == 0 then
-            local native_color = NativeColor { r = color.r,
-                g = color.g, b = color.b, a = U8(F32 color.a * opacity / 100) }
+            local native_color = NativeColor with
+                r = color.r
+                g = color.g
+                b = color.b
+                a = U8(F32 color.a * opacity / 100)
+            end
             local surface = text:cstring() do(c: CString): Ptr Surface
                 return render_text(self.font, c, U64 text.length, native_color)
             end
@@ -132,8 +136,14 @@ local run = function(T, config)
                     painter:checked(blend renderer blend_alpha, Operation.blend)
                     local app = ui.new T
                     local id = sdl.window_id window
-                    local event = Event { kind = 0,
-                        timestamp = 0, window_id = 0, button = 0, x = 0, y = 0 }
+                    local event = Event with
+                        kind = 0
+                        timestamp = 0
+                        window_id = 0
+                        button = 0
+                        x = 0
+                        y = 0
+                    end
                     local stopped: Bool = false
                     local frames = U32 0
                     local width, height = I32 0, I32 0

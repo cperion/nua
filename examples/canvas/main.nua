@@ -4,11 +4,13 @@ local c = require "nua.libc"
 local main = do(): I32
     local x: F32 = 100
     local y: F32 = 100
-    return canvas.open {
-        title = "Nua canvas — SDL3",
-        width = 800, height = 600, resizable = true,
-    }:
-        return interact {
+    return canvas.open with
+        title = "Nua canvas — SDL3"
+        width = 800
+        height = 600
+        resizable = true
+    end do(..)
+        return interact with
             key =:
                 if pressed then
                     if code == canvas.Key.escape then stop end
@@ -17,7 +19,7 @@ local main = do(): I32
                     if code == canvas.Key.up then y = y - 10 end
                     if code == canvas.Key.down then y = y + 10 end
                 end
-            end,
+            end
             draw =:
                 clear canvas.Color.black
                 fill_rect x y 80 60 canvas.Color.orange
@@ -25,8 +27,8 @@ local main = do(): I32
                 local right = F32 width
                 local bottom = F32 height
                 line 0 0 right bottom canvas.Color.white
-            end,
-        }
+            end
+        end
     end {
         done() = I32 0,
         failed =: error

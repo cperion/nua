@@ -2,11 +2,11 @@
 -- copies, runtime-length arrays and owner parameters (design memory.md §5).
 
 local Node = Struct { weight: U32 }
-local Graph = Struct {
-    nodes: Store Node,
-    label: U32,
-    order: Grow U32,
-}
+local Graph = Struct with
+    nodes: Store Node
+    label: U32
+    order: Grow U32
+end
 
 -- several owner fields in any order; omitted fields start empty or zeroed
 local two_fields = do(n: U32): U32
@@ -231,24 +231,24 @@ export views
 local Running = Struct { ticks: U32, limit: U32 }
 local State = Sum { running: Running, stopped: U32 }
 local tick = do(state: Ref State): Unit
-    state {
+    state with
         running = do(r: Ref Running): Unit
             r.ticks = r.ticks + 1
-        end,
-        stopped = do(code) end,
-    }
+        end
+        stopped = do(code) end
+    end
 end
 local payloads = do(n: U32): U32
     local state = State.running { ticks = 0, limit = n }
     for i: U32 = 1, n do tick(Ref state) end
     call tick(Ref state)
     local seen = U32 0
-    state {
+    state with
         running = do(r: Ref Running): Unit
             seen = r.ticks
-        end,
-        stopped = do(code) seen = code end,
-    }
+        end
+        stopped = do(code) seen = code end
+    end
     state = State.stopped 7
     tick(Ref state)
     local after = U32 0

@@ -474,8 +474,10 @@ return function(t)
         idler_enqueue(idlers, me)
         if timers.len ~= 0 then
             local deadline = timers.data[0].deadline
-            local ts = Timespec { tv_sec = I64(deadline / 1000000000),
-                tv_nsec = I64(deadline % 1000000000) }
+            local ts = Timespec with
+                tv_sec = I64(deadline / 1000000000)
+                tv_nsec = I64(deadline % 1000000000)
+            end
             cond_timedwait(Ptr me.cv, sched, Ptr ts)
         else
             cond_wait(Ptr me.cv, sched)

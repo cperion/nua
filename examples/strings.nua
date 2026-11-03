@@ -23,10 +23,10 @@ assert(host(word_count "the quick  brown fox") == 4)
 local line_sum = do(line: Str): I64
     local total: I64 = 0
     line:split ",": field
-        field:trim():parse(I64) {
-            value = do(v) total = total + v end,
-            bad = do() end,
-        }
+        field:trim():parse(I64) with
+            value = do(v) total = total + v end
+            bad = do() end
+        end
     end
     return total
 end
@@ -38,10 +38,10 @@ local port_of = do(config: Str): U32
     local port: U32 = 0
     config:lines(): line
         if line:starts_with "port=" then
-            line:sub(5, line.length):parse(U32) {
-                value = do(v) port = v end,
-                bad = do() end,
-            }
+            line:sub(5, line.length):parse(U32) with
+                value = do(v) port = v end
+                bad = do() end
+            end
         end
     end
     return port

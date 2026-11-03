@@ -45,9 +45,9 @@ end
 local walk = do(x: U32): U32 = steps(dynamic(U32 0), x)
 export walk
 
-local Counter = Struct {
-    value: U32,
-}
+local Counter = Struct with
+    value: U32
+end
 function Counter:add(n: U32): Unit
     self.value = self.value + n
 end

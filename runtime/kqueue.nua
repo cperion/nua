@@ -39,8 +39,14 @@ return function(t)
     local complete, try, abandon = t.complete, t.posix.try, t.posix.abandon
     local ReadOpPtr = Ptr t.posix.ReadOp
     local event = do(fd: U64, filter: I16, flags: U16, fflags: U32): Event
-        return Event { ident = fd,
-            .filter, .flags, .fflags, data = 0, udata = null Void }
+        return Event with
+            ident = fd
+            .filter
+            .flags
+            .fflags
+            data = 0
+            udata = null Void
+        end
     end
     local nua_kqueue_prepare = do(s: Ptr State): Unit
         s.kq = kqueue()
@@ -206,6 +212,14 @@ return function(t)
     export nua_kqueue_submit
     export nua_kqueue_run
     local backend = require "runtime.backend"
-    backend { .State, .Mutex, .Op, name = "kqueue", failure = "cannot start the kqueue poller",
-        prepare = nua_kqueue_prepare, submit = nua_kqueue_submit, run = nua_kqueue_run }
+    backend with
+        .State
+        .Mutex
+        .Op
+        name = "kqueue"
+        failure = "cannot start the kqueue poller"
+        prepare = nua_kqueue_prepare
+        submit = nua_kqueue_submit
+        run = nua_kqueue_run
+    end
 end

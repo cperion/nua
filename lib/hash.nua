@@ -1,10 +1,15 @@
 -- SipHash-2-4 as ordinary Nua, including streaming across arbitrary chunks.
 -- Explicit keys let the entire algorithm execute at compile time.
 local hash = {}
-local State = Struct {
-    v0: U64, v1: U64, v2: U64, v3: U64,
-    tail: U64, length: U64, used: U32,
-}
+local State = Struct with
+    v0: U64
+    v1: U64
+    v2: U64
+    v3: U64
+    tail: U64
+    length: U64
+    used: U32
+end
 hash.State = State
 local c0 = U64 0x736f6d6570736575ULL
 local c1 = U64 0x646f72616e646f6dULL
@@ -41,11 +46,15 @@ local block = do(h: Ref State, word: U64): Unit
 end
 
 hash.init = do(k0: U64, k1: U64): State
-    return State {
-        v0 = bxor k0 c0, v1 = bxor k1 c1,
-        v2 = bxor k0 c2, v3 = bxor k1 c3,
-        tail = 0, length = 0, used = 0,
-    }
+    return State with
+        v0 = bxor k0 c0
+        v1 = bxor k1 c1
+        v2 = bxor k0 c2
+        v3 = bxor k1 c3
+        tail = 0
+        length = 0
+        used = 0
+    end
 end
 
 local byte = do(h: Ref State, value: U8): Unit

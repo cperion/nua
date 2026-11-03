@@ -1,18 +1,18 @@
 -- syntax §9.8, architecture §10.1 and architecture §10.3: managed stores,
 -- generational IDs, data stacks.
 
-local Node = Struct {
-    value: U32,
-}
+local Node = Struct with
+    value: U32
+end
 
-local Graph = Struct {
-    nodes: Store Node,
-}
+local Graph = Struct with
+    nodes: Store Node
+end
 
 function Graph:add(value: U32): Id Node
-    return self.nodes:add Node {
-        .value,
-    }
+    return self.nodes:add Node with
+        .value
+    end
 end
 
 -- architecture §10.1: specialization removes the condition and the static multiplier; the
@@ -49,9 +49,9 @@ end
 local populate_double = populate 2
 
 local run = do(n: U32): U32
-    local g = Graph {
-        nodes = Store(Node) {},
-    }
+    local g = Graph with
+        nodes = Store(Node) {}
+    end
 
     populate_double(Ref g, n)
 

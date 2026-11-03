@@ -24,8 +24,12 @@ function M.expect(instruction, value, kind)
     return value.value
 end
 local function rgb(hex)
-    return Color { r = math.floor(hex / 65536), g = math.floor(hex / 256) % 256,
-        b = hex % 256, a = 255 }
+    return Color with
+        r = math.floor(hex / 65536)
+        g = math.floor(hex / 256) % 256
+        b = hex % 256
+        a = 255
+    end
 end
 M.colors = { black = rgb 0x000000,
     white = rgb 0xffffff, transparent = Color { r = 0, g = 0, b = 0, a = 0 } }

@@ -330,13 +330,28 @@ local recycle = do(r: Ptr Pool, index: U32): Unit
 end
 
 local bookkeeping = require "runtime.bookkeeping"
-bookkeeping { .Task,
-    .Op, .Heap, .claim, .remove, result = done_result }
+bookkeeping with
+    .Task
+    .Op
+    .Heap
+    .claim
+    .remove
+    result = done_result
+end
 
 local lifecycle = require "runtime.lifecycle"
-local lifetime = lifecycle { .Scope, .Task, .Op, .Channel, .Pool,
-    .SlotMeta, .PoolMeta, .Mutex,
-    .claim_waiter, .Waiters }
+local lifetime = lifecycle with
+    .Scope
+    .Task
+    .Op
+    .Channel
+    .Pool
+    .SlotMeta
+    .PoolMeta
+    .Mutex
+    .claim_waiter
+    .Waiters
+end
 
 -- process state: the data-stack set a thread uses, store tokens, hash entropy
 local process = require "runtime.process"
@@ -350,16 +365,51 @@ local pool_table = global(Ptr(Ptr Pool))
 local pool_metas = global(Ptr(Ptr PoolMeta), { name = "nua_pool_metas", exported = true })
 
 local protocol = require "runtime.protocol"
-protocol { .Task, .Op, .Channel, .Pool, .Slot, .lifetime,
-    .Handle, .Mutex, .Scope, .receive, .send,
-    .take, .enqueue, .unlink, .claim, .has_waiter,
-    .claim_waiter, .recycle, .done_result, .channel_table, .pool_table }
+protocol with
+    .Task
+    .Op
+    .Channel
+    .Pool
+    .Slot
+    .lifetime
+    .Handle
+    .Mutex
+    .Scope
+    .receive
+    .send
+    .take
+    .enqueue
+    .unlink
+    .claim
+    .has_waiter
+    .claim_waiter
+    .recycle
+    .done_result
+    .channel_table
+    .pool_table
+end
 
 local PoolHandle = cstruct("nua_pool", header, { { "idx", U32 }, { "gen", U32 } })
 local tasks = require "runtime.tasks"
-tasks { .Task, .Op, .Scope, .Queue, .Heap, .Channel, .Pool, .PoolMeta, .Mutex,
-    .Handle, .PoolHandle, .Waiters, .Set, .channel_table, .pool_table, .pool_metas,
-    .current_stacks }
+tasks with
+    .Task
+    .Op
+    .Scope
+    .Queue
+    .Heap
+    .Channel
+    .Pool
+    .PoolMeta
+    .Mutex
+    .Handle
+    .PoolHandle
+    .Waiters
+    .Set
+    .channel_table
+    .pool_table
+    .pool_metas
+    .current_stacks
+end
 
 local io_policy = require "runtime.io"
 local io = io_policy { .Op, .Task, .claim }

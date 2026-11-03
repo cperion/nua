@@ -4,10 +4,13 @@ local observe = extern("canvas_test_frame", { I32, I32, F32 }, Unit)
 local key_seen = extern("canvas_test_key", { U32, Bool, Bool }, Unit)
 local exercise = do(mode: I32): U32
     local x: F32 = 100
-    return canvas.open {
-        title = "canvas test", width = 640, height = 480,
-        resizable = true, frame_delay_ms = 0,
-    }:
+    return canvas.open with
+        title = "canvas test"
+        width = 640
+        height = 480
+        resizable = true
+        frame_delay_ms = 0
+    end do(..)
         if mode == 1 then return canvas.Result.done() end
         if mode == 2 then
             return frame:
@@ -25,7 +28,7 @@ local exercise = do(mode: I32): U32
             frame do(..) clear canvas.Color.black end
             return canvas.Result.done()
         end
-        return interact {
+        return interact with
             key =:
                 key_seen(code, pressed, repeated)
                 if pressed then
@@ -33,15 +36,15 @@ local exercise = do(mode: I32): U32
                     if code == canvas.Key.right then x = x + 10 end
                 end
                 return
-            end,
+            end
             draw =:
                 observe(width, height, x)
                 clear canvas.Color.black
                 fill_rect x 20 80 60 canvas.Color.orange
                 line 0 0 20 20 canvas.Color.white
                 if mode == 3 then stop end
-            end,
-        }
+            end
+        end
     end {
         done() = U32 0,
         failed =: problem

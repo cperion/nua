@@ -5,14 +5,14 @@ local Rect = Struct { width: U32, height: U32 }
 local Shape = Sum { circle: Circle, rect: Rect, dot: Unit }
 
 -- matching is keyed application: one handler per alternative
-local area = do(s: Shape): U32 = s {
-    circle = do(c) = c.radius * c.radius * 3,
+local area = do(s: Shape): U32 = s with
+    circle = do(c) = c.radius * c.radius * 3
     rect =: r
         local w = r.width
         return w * r.height
-    end,
-    dot = do() = 0,
-}
+    end
+    dot = do() = 0
+end
 export area
 
 -- a known tag selects its handler at compile time
@@ -38,25 +38,25 @@ local Command = Sum { move: Direction, insert: U32, undo: Unit }
 local Editor = Struct { cursor: U32, length: U32, undos: U32 }
 
 local apply = do(e: Ref Editor, c: Command): Unit
-    c {
+    c with
         move =: d
-            d {
+            d with
                 left = do
                     if e.cursor > 0 then e.cursor = e.cursor - 1 end
-                end,
+                end
                 right = do
                     if e.cursor < e.length then e.cursor = e.cursor + 1 end
-                end,
-            }
-        end,
+                end
+            end
+        end
         insert =: n
             e.length = e.length + n
             e.cursor = e.cursor + n
-        end,
+        end
         undo = do
             e.undos = e.undos + 1
-        end,
-    }
+        end
+    end
 end
 export apply
 

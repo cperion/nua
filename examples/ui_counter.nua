@@ -6,10 +6,16 @@ local no_metrics = do(caption: Ref Chars(256), size: F32, font: U32): ui.Size
     missing_metrics "this fixed-size example must not request font metrics"
     return ui.Size { width = 0, height = 0 }
 end
-local Observation = Struct {
-    count: U32, consumed: U32, modal: Bool, quit: Bool,
-    increment_x: F32, increment_y: F32, reset_x: F32, reset_y: F32,
-}
+local Observation = Struct with
+    count: U32
+    consumed: U32
+    modal: Bool
+    quit: Bool
+    increment_x: F32
+    increment_y: F32
+    reset_x: F32
+    reset_y: F32
+end
 local replay_counter = do(inputs: Ptr ui.Input, length: U32, observation: Ref Observation): Unit
     local app = ui.new App
     local index = U32 0

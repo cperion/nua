@@ -83,13 +83,13 @@ function Counter:reset(): Unit
     self.increment_button.enabled = true
 end
 function Counter:handle(event: Counter.Event): Unit
-    event {
-        increment_button = do() self:increment end,
-        reset_button = do() self.confirm:open end,
+    event with
+        increment_button = do() self:increment end
+        reset_button = do() self.confirm:open end
         confirm =: decision
             decision { reset = do() self:reset end, keep = do() end }
-        end,
-    }
+        end
+    end
 end
 local App = ui.window "CounterWindow":
     w 160

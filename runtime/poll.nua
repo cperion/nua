@@ -125,6 +125,14 @@ return function(t)
     export nua_poll_submit
     export nua_poll_run
     local backend = require "runtime.backend"
-    backend { .State, .Mutex, .Op, name = "poll", failure = "cannot start the I/O poller",
-        prepare = nua_poll_prepare, submit = nua_poll_submit, run = nua_poll_run }
+    backend with
+        .State
+        .Mutex
+        .Op
+        name = "poll"
+        failure = "cannot start the I/O poller"
+        prepare = nua_poll_prepare
+        submit = nua_poll_submit
+        run = nua_poll_run
+    end
 end

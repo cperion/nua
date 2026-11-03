@@ -4,20 +4,35 @@
 -- Fixed geometry isolates event specialization and loop fields; this is not a
 -- font renderer, SDL host, or implementation of the proposed builders.
 local Input = Struct { kind: U32, x: U32, y: U32 }
-local Draw = Struct {
-    control: U32, x: U32, y: U32, width: U32, height: U32,
-    color: U32, value: U32, enabled: Bool,
-}
+local Draw = Struct with
+    control: U32
+    x: U32
+    y: U32
+    width: U32
+    height: U32
+    color: U32
+    value: U32
+    enabled: Bool
+end
 local Frame = Struct { length: U32, commands: Array(Draw, 5) }
-local Observation = Struct {
-    consumed: U32, frames: U32, count: U32, enabled: Bool, modal: Bool, frame: Frame,
-}
+local Observation = Struct with
+    consumed: U32
+    frames: U32
+    count: U32
+    enabled: Bool
+    modal: Bool
+    frame: Frame
+end
 
 local Button = Struct { x: U32, y: U32, width: U32, height: U32, color: U32, enabled: Bool }
 local Number = Struct { x: U32, y: U32, width: U32, height: U32, color: U32, value: U32 }
 local Confirmation = Struct { visible: Bool, reset_button: Button, keep_button: Button }
-local Counter = Struct { count: Number,
-    increment_button: Button, reset_button: Button, confirm: Confirmation }
+local Counter = Struct with
+    count: Number
+    increment_button: Button
+    reset_button: Button
+    confirm: Confirmation
+end
 local App = Struct { counter: Counter }
 
 Confirmation.Event = Sum { reset_button: Unit, keep_button: Unit }
@@ -32,10 +47,16 @@ function Button:contains(x: U32, y: U32): Bool
 end
 
 function Button:draw(frame: Ref Frame, index: U32, control: U32): Unit
-    frame.commands[index] = Draw {
-        .control, x = self.x, y = self.y, width = self.width, height = self.height,
-        color = self.color, value = 0, enabled = self.enabled,
-    }
+    frame.commands[index] = Draw with
+        .control
+        x = self.x
+        y = self.y
+        width = self.width
+        height = self.height
+        color = self.color
+        value = 0
+        enabled = self.enabled
+    end
 end
 
 function Confirmation:open(): Unit
@@ -65,16 +86,16 @@ function Counter:reset(): Unit
 end
 
 function Counter:handle(event: Counter.Event): Unit
-    event {
-        increment_button = do() self:increment end,
-        reset_button = do() self.confirm:open end,
+    event with
+        increment_button = do() self:increment end
+        reset_button = do() self.confirm:open end
         confirm =: decision
-            decision {
-                reset = do() self:reset end,
-                keep = do() end,
-            }
-        end,
-    }
+            decision with
+                reset = do() self:reset end
+                keep = do() end
+            end
+        end
+    end
 end
 
 -- These are the statically known owner chains a builder emits, not callbacks
@@ -114,11 +135,16 @@ end
 
 function App:draw(frame: Ref Frame): Unit
     frame.length = 3
-    frame.commands[0] = Draw {
-        control = 1, x = self.counter.count.x, y = self.counter.count.y,
-        width = self.counter.count.width, height = self.counter.count.height,
-        color = self.counter.count.color, value = self.counter.count.value, enabled = true,
-    }
+    frame.commands[0] = Draw with
+        control = 1
+        x = self.counter.count.x
+        y = self.counter.count.y
+        width = self.counter.count.width
+        height = self.counter.count.height
+        color = self.counter.count.color
+        value = self.counter.count.value
+        enabled = true
+    end
     self.counter.increment_button:draw(frame, 1, 2)
     self.counter.reset_button:draw(frame, 2, 3)
     if self.counter.confirm.visible then
@@ -128,22 +154,46 @@ function App:draw(frame: Ref Frame): Unit
     end
 end
 
-local make_app = do(initial: U32): App = App {
-    counter = Counter {
-        count = Number { x = 20, y = 20, width = 208, height = 24, color = 66051, value = initial },
-        increment_button = Button { x = 20,
-            y = 60, width = 100, height = 30, color = 263430, enabled = initial < 999999 },
-        reset_button = Button { x = 128,
-            y = 60, width = 100, height = 30, color = 460809, enabled = true },
-        confirm = Confirmation {
-            visible = false,
-            reset_button = Button { x = 40,
-                y = 140, width = 80, height = 30, color = 658188, enabled = true },
-            keep_button = Button { x = 128,
-                y = 140, width = 100, height = 30, color = 855567, enabled = true },
-        },
-    },
-}
+local make_app = do(initial: U32): App = App with
+    counter = Counter with
+        count = Number { x = 20, y = 20, width = 208, height = 24, color = 66051, value = initial }
+        increment_button = Button with
+            x = 20
+            y = 60
+            width = 100
+            height = 30
+            color = 263430
+            enabled = initial < 999999
+        end
+        reset_button = Button with
+            x = 128
+            y = 60
+            width = 100
+            height = 30
+            color = 460809
+            enabled = true
+        end
+        confirm = Confirmation with
+            visible = false
+            reset_button = Button with
+                x = 40
+                y = 140
+                width = 80
+                height = 30
+                color = 658188
+                enabled = true
+            end
+            keep_button = Button with
+                x = 128
+                y = 140
+                width = 100
+                height = 30
+                color = 855567
+                enabled = true
+            end
+        end
+    end
+end
 
 local run_counter_generated = do(inputs: Ptr Input, length: U32, observation: Ref Observation): U32
     local application = make_app(U32 0)

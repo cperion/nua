@@ -36,16 +36,28 @@ end
 layout.store_new = do(stack: U64): layout.Store
     local base = stacks.begin stack
     local id = token()
-    return layout.Store { .stack,
-        .base, len = 0, live = 0, free_head = 0xffffffff, token = id }
+    return layout.Store with
+        .stack
+        .base
+        len = 0
+        live = 0
+        free_head = 0xffffffff
+        token = id
+    end
 end
 layout.grow_new = do(stack: U64): layout.Grow
     return layout.Grow { .stack, base = stacks.begin stack, len = 0 }
 end
 layout.map_new = do(stack: U64, width: U64): layout.Map
     if width < 8 or width % 8 ~= 0 then trap "Map: invalid entry layout" end
-    return layout.Map { .stack,
-        base = stacks.begin stack, .width, len = 0, cap = 0, iterating = 0 }
+    return layout.Map with
+        .stack
+        base = stacks.begin stack
+        .width
+        len = 0
+        cap = 0
+        iterating = 0
+    end
 end
 layout.strmap_new = do(table_stack: U64, arena_stack: U64, width: U64): layout.StrMap
     -- nua_strkey is the full fixed prefix, including native trailing padding.
@@ -53,8 +65,13 @@ layout.strmap_new = do(table_stack: U64, arena_stack: U64, width: U64): layout.S
     if table_stack == arena_stack or width < size_of Key then trap "StrMap: invalid storage layout" end
     local entries = layout.map_new table_stack width
     local base = stacks.begin arena_stack
-    return layout.StrMap { .entries,
-        .arena_stack, arena_base = base, arena_len = 0, dead = 0 }
+    return layout.StrMap with
+        .entries
+        .arena_stack
+        arena_base = base
+        arena_len = 0
+        dead = 0
+    end
 end
 layout.iter_new = do(stack: U64, map: Ptr layout.Map): layout.Grow
     local s = stacks.claim stack

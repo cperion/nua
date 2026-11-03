@@ -32,13 +32,13 @@ local state_join = do(n: U32): U32
         state.value = 20
         return Choice.yes(U32 22)
     end
-    local result = body() {
+    local result = body() with
         yes = do(p)
             state.value = state.value + 1
             return p + state.value
-        end,
-        no() = U32 0,
-    }
+        end
+        no() = U32 0
+    end
     return result + state.value * 1000
 end
 export state_join
@@ -105,16 +105,16 @@ local side_effects = do(n: U32): U32
         state.value = 20
         return Choice.no()
     end
-    local result = body() {
+    local result = body() with
         yes = do(p)
             state.value = state.value + 100
             return p + state.value
-        end,
+        end
         no = do()
             state.value = state.value + 200
             return state.value
-        end,
-    }
+        end
+    end
     return result + 1000 * state.value
 end
 export side_effects

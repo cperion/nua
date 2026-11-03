@@ -71,10 +71,10 @@ end
 
 local outcome_length = do(pointer: Ptr U8, length: U32, flag: Bool): U32
     return view_of(pointer, length): bytes
-        return select_optional(Str.of bytes, flag) {
-            some = do(text) return U32 text.length end,
-            none = do() return U32 0 end,
-        }
+        return select_optional(Str.of bytes, flag) with
+            some = do(text) return U32 text.length end
+            none = do() return U32 0 end
+        end
     end
 end
 export outcome_length
