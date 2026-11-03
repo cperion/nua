@@ -1,6 +1,6 @@
 # Handoff: continuing the memory-model milestones
 
-Written 2026-11-03 for a new session. It says where the work stands, what the rules of the
+Written 2026-11-03 for a new session (updated after milestone 4 closed). It says where the work stands, what the rules of the
 road are, what is left and how to run things. Read it first, then `docs/design/memory.md`.
 
 ## 1. Read in this order
@@ -31,13 +31,19 @@ road are, what is left and how to run things. Read it first, then `docs/design/m
 | `rrlqvrsr` | `with` takes its type from its context (`return with`, typed locals, arguments) |
 | `mmslrlpv` | step D1: Store/Grow/Array T are declarations the generic code reads |
 | `tyokvvxu` | `endall` closes every open Nua block; the formatter folds end pyramids flat |
+| `nwxwlqou` | the previous handoff |
+| `vxsuwlnz` | step D2: `owner_type` declares `Store`, `Grow`, `Array`, the three Map families and the `Text` words in Nua; `nua/maps.lua` is gone; `TODO` builtin |
+| `tqkvxqvk` | docs: code blocks of syntax.md and architecture.md in the current syntax (nua fmt) |
+| `smowttts` | `Chars` is a library type (`lib/chars.nua`); `types.chars` is gone |
+| `stlrwmkl` | `nua fmt`: `inline_with` (default 2) writes short tables on one line |
+| `xzxzwrlw` | the repository's Nua sources reformatted with it |
 | this change | this handoff |
 
 - `klplprxp` (empty-described change under `master`) is the user's own work: leave it alone.
-- **Last full-suite run** (before step D1): `make test` 472 passed, 0 failed; `make test-native`
-  975 checks; test-macros 19 + colon 102; test-format 29/109/388; tree-sitter 81. Since then
-  only **focused** checks ran: colon 112, native 976, rejection cases 153, tree-sitter 82,
-  listings/guide. Run the whole suite once before building on this (see §6).
+- **Last full-suite run** (end of milestone 4, on `xzxzwrlw`): `make test` **474 passed, 0 failed**, 2 skips
+  (canvas and UI SDL: SDL3 not installed). Focused: native 976, rejection cases 155, colon 112,
+  formatter 29/109/401, tree-sitter 84, map types, listings and guide. Milestone 4 is closed;
+  `master` has **not** been moved (the user's decision is pending: to this handoff change).
 
 ## 3. Rules the user has set (do not re-ask these)
 
@@ -69,15 +75,27 @@ replaces `StrMap`; `Map.borrowing(Str, V)` keeps the caller's keys.
 `__S.retire(owner, template, key?)`, `__S.restructure(owner, what, key?)`,
 `__S.borrows(owner, value)` and `__S.grows(owner)`, and `fixed` is the compile-time `each`
 lock. Effects are summarized across words (`fn.shrinks`, `fn.restructures`, `grow_sites`).
-`lib/storage.nua`, `lib/map.nua` call them; `nua/memory.lua` has `families` (declarations) and
-`library_methods` (one adapter); `nua/maps.lua` still decorates `Map`.
+`lib/storage.nua`, `lib/map.nua` call them. `__S.fixed(owner, body)` is the lock itself.
+
+**Library owner types are declarations (design §10.1, step D2):** `lib/owners.nua` calls
+`__S.owner_type{ name, header, stacks, api, init, methods, args, arity, index, extra, … }` for
+`Store`, `Grow`, `Array`, and (through `map.family` in `lib/map.nua`) `Map`, `Map(Str, V)`,
+`Map.borrowing`. `nua/memory.lua` is the one generic reader (`decorate`, `adapter` with argument
+kinds `index`/`key`/`stored_key`/`value`, `index_hook`, `length`); `types.owner` is the one type
+constructor. Declarations are made again by every compilation (`Mem.prelude` loads `nua.owners`
+inside the compilation). `Text` is `Grow U8`: its `write`/`str` are words in `lib/storage.nua`
+(`write` takes `..parts`, unrolls and joins known text); `Chars n` is `lib/chars.nua` (a struct
+with `chars_cap`, a `length` property word, a host `str` member and constructor). `Str` stays a
+compiler type by decision. `TODO "msg"` is a prelude builtin (an alias of `trap`).
 
 **Syntax added:** trailing colon (`f x:`, `xs:each: k v`, `tasks: scope..`), `key =: x`,
 `T with … end` (commas optional; entries by `name =`, `name:`, `.name`, a line of their own),
 contextual `with` (the expected type supplies the constructor), `Struct`/`Sum`, `endall` over
 every Nua block. All of these are **token rewrites** in `nua/colon.lua` (see §5). The formatter
 (`nua/fmt.lua`) round-trips them: it expands to braces, formats, then `withize`, `foldends`,
-`colonize`. Options: `block_style`, `data_style`, `spine_style`.
+`colonize`. Options: `block_style`, `data_style`, `spine_style`, `inline_with` (default 2: a head table of
+one or two plain entries that fits the column goes on one line in braces; `nua/colon.lua`
+`inline_tables`).
 
 **Diagnostics worth knowing:** `f -1` on a word explains the subtraction; unclear
 `push i * 10` still says `unexpected '*'` (not yet improved).
@@ -86,8 +104,9 @@ every Nua block. All of these are **token rewrites** in `nua/colon.lua` (see §5
 
 | Concern | Where |
 |---|---|
-| owner slots, moves, releases, families, adapters | `nua/memory.lua` |
-| map type decoration, `each` lock, key capture | `nua/maps.lua` |
+| owner slots, moves, releases, the generic reader of owner-type declarations | `nua/memory.lua` |
+| owner-type declarations; Map families, key capture, `each`, known maps | `lib/owners.nua`, `lib/map.nua` |
+| `Text` words; `Chars`; `Str` (compiler type) | `lib/storage.nua`, `lib/chars.nua`, `nua/strings.lua` |
 | container and map algorithms (Nua) | `lib/storage.nua`, `lib/map.nua`, `lib/storage_layout.nua`, `lib/stacks.nua` |
 | borrow tokens, effects, checked places | `nua/stage.lua` (`h.place_tokens`, `S.retire`, `S.borrows`, `S.note_structure`, `h.check_use`) |
 | token rewrites (colon, `=:`, `with`, `endall`) and the formatter passes | `nua/colon.lua` |
@@ -128,42 +147,47 @@ pass `-u </dev/null` or avoid commands that open an editor.
 - A word with a typed result (`do(n: U32): T`) is a **word body**: `endall` and the `with`
   rewrite treat it as a boundary. Expression lambdas (`do(x) = e`) have no `end`.
 - Do not `rawset` view attributes on shared values; copy first (`with_view`).
-- Editing the tree while a background `make test` runs corrupts the run.
+- Editing the tree while a background `make test` runs corrupts the run (docs too: the suite
+  compiles their examples).
+- `__S` is reserved inside typed `do` bodies: call host helpers defined outside the word.
+- The prelude loads Nua modules, so `nua.prelude()` only works inside a compilation.
+- A struct method word receives `self` as a `Ref`, and a spawned task refuses to capture a
+  reference to an outer local: that is why `Chars:str` is a member hook, not a method word.
+- `tests/colon.lua` pins `inline_with = 0` for its `with` cases; `tests/formatter.lua` has the
+  `inline_with` cases. `make test-format` takes about 5 minutes.
+- A stage of `make test` that fails stops `make`: later stages are unverified until it passes.
 
 ## 8. What is left (in order)
 
-**Milestone 4 remainder (the user chose to continue; D1 is done):**
-- **D2:** move the family declarations out of Lua into Nua library modules (an
-  `owner_type{…}` primitive: native header as a `cstruct`, stack list, init and copy words,
-  methods table, type constructor as a Nua function), then put `Store`, `Grow`, `Array T`,
-  `Map` on it. This is what design §10 says ("written in Nua"); today only the algorithms and
-  borrow effects are Nua. Do not edit design §10 to describe the Lua declarations as the goal.
-- Checked-place `__index` hooks and the `Text` methods in `nua/strings.lua` are still thin Lua
-  adapters; the text types (`Str`, `Text`, `Chars`) are still compiler-side Lua. Move them.
-- Ask the user whether to close milestone 4 after D1 (the recommendation made was to treat D2
-  as its own change once Map and the text types are on the declaration).
+**Milestone 4 is closed.** Deliberate remainder: `Chars:str` and the `Chars` constructor are host
+hooks (see §7); the checked-place index hook is the generic protocol in `nua/memory.lua`;
+`Str` is a compiler type.
 
 **Later milestones (memory.md §13):** 5 nested owners (arenas, `compact()`, owner globals;
 reuse the `Map(Str, V)` key-arena code); 6 capacity sizing per tasks scope; 7 task borrows with
 frozen owners (D1). Deferred by decision: D4 atomics in containers, D8 general last-use release.
 
-**Small leftovers:** clearer diagnostic for `push i * 10`; the obsolete
-`nua/experiments/binary/reject_mutate_borrow.nua` and the old `struct`/`oneof` spellings under
-`nua/experiments/` (raw evidence, intentionally untouched); stale `/tmp/nua_io_test.bin`;
-tree-sitter limits (entries of a `with` on one line need `,` or `;`; a `.name` entry on a new
-line after a value reads as member access); `spine_style` `"pure"` and `"all"` behave the same
-for `with` chains; `Store` ends every element borrow on `remove` (Ids are runtime values) while
-`Map` refines by known keys; `Map.known` and owner values in maps wait for milestone 5.
+**Small leftovers:** `docs/designing-and-writing-nua.md` still has the older spellings: its
+blocks are verbatim excerpts of `examples/guide.nua` (tests/guide.lua), so change both together;
+`docs/formatting.md` has a duplicated `block_style` row; clearer diagnostic for `push i * 10`;
+the obsolete `nua/experiments/binary/reject_mutate_borrow.nua` and the old `struct`/`oneof`
+spellings under `nua/experiments/` (raw evidence, intentionally untouched); stale
+`/tmp/nua_io_test.bin`; tree-sitter limits (entries of a `with` on one line need `,` or `;`; a
+`.name` entry on a new line after a value reads as member access); `spine_style` `"pure"` and
+`"all"` behave the same for `with` chains; `Store` ends every element borrow on `remove`
+while `Map` refines by known keys; `Map.known` and owner values in maps wait for milestone 5;
+the fixtures `tests/with_blocks.nua`, `tests/formatter/input.nua` and the tree-sitter sample are
+intentionally not reformatted.
 
-## 9. Decisions awaiting the user (not yet asked or answered)
+## 9. Decisions awaiting the user
 
-- Close milestone 4 here, or do D2 now.
-- The `endall` fold threshold is three blocks including a `with`; two blocks read badly flat.
+- Move `master` to the handoff change (stack above; nothing is pushed).
+- The `endall` fold threshold is three blocks including a `with`.
 - Whether the formatter should reorder `failed = …` entries so the deep handler comes last
   (it does not; folding needs the source order).
 
 ## 10. How to start the next session
 
 1. `jj status`, `jj log -r 'ancestors(@, 30)'`, read §2 above against it.
-2. Run the whole suite once (§6) and record the numbers.
+2. Run the whole suite once (§6) and record the numbers (expect 474 passed, 2 SDL skips).
 3. Ask the user which of §8/§9 to take, then follow the rules in §3.
