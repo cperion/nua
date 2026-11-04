@@ -2,4 +2,4 @@
 # does not contain it: this pin is the version Nua is built and tested against. Sourced by
 # tools/mua.sh; update deliberately (move the commit, then run `make mua`).
 MUA_URL=https://github.com/cperion/mua.git
-MUA_COMMIT=e5764bb101d142ea9bb1233ea0366296f7b6dce5
+MUA_COMMIT=0f91ae6b9bcde1a8f053fe90cce1fdbe146cef78
