@@ -134,11 +134,11 @@ written in the dialect (§11); a program compiled by Nua still goes through its 
 Inside an opened block, a name that is not bound lexically resolves to the innermost opened
 context that **introduces** it, else to the enclosing environment; assignment resolves the
 same way. Calls of an opened member are plain calls (a vocabulary entry takes no receiver).
-The emitter resolves names lexically (it knows the chunk's bindings) and emits
-`__dialect.oname/ocall/oset(opens, name, fallback)` only for free names inside opened
-blocks, as `G` does today. What a context introduces and how a member is read, written or
-called is the runtime's (§4.5): for a Lua table, its string keys when it is opened. Nua's
-override adds records (fields as places) and methods (with the receiver).
+The emitter resolves names lexically (it knows the chunk's bindings); only free names inside
+opened blocks are resolved at run time, through locals and a ternary chain, with no
+allocation (E1). What a context introduces and how a member is read, written or called is
+the runtime's `open` (§4.5): for a Lua table, its string keys when it is opened. Nua's override
+adds records (fields as places) and methods (with the receiver).
 
 ### 4.5 Runtime
 
@@ -154,13 +154,13 @@ override keep the defaults.
 | `finish(fields, names, sources)` | `fields` |
 | `with(t)` | `t` |
 | `define(t)` | `t` (also bound as the global `define` for dialect programs) |
-| `open(ctx)`, `introduces(ctx, name)`, `oname`, `ocall`, `oset` | §4.4 for Lua tables |
+| `open(ctx)` → `names, ctx` | §4.4 for Lua tables: the set of string keys it has when opened, and the table itself (E1) |
 | `closed`, `required`, `optional` | §4.6 |
 | `check(T, v)`, `Number`, `String`, `Boolean`, `Table`, `Function`, `Any`, `Unit`, `Optional(T)` | §4.7 |
 | `Struct`, `Sum` | §4.8 |
 
 Nua overrides `entries` and `finish` (records: `h.record_fields`, the `Keyed` constructor
-result), `with` (`S.contextual`), and the opening entries (`S.open`, `S.oname`, …). The
+result), `with` (`S.contextual`), and `open` (names and a proxy over `S.open`'s receiver). The
 compiler's `S.keyed` keeps only the record half.
 
 ### 4.6 Structural types
@@ -364,6 +364,10 @@ Focused checks in between (golden tests, `tests/colon.lua` until it is replaced,
 
 ## 11. Not in scope
 
+A LuaJIT backend for Nua (E3, decided as a later milestone): the residual program of the
+prepared IR written as Lua with FFI, JIT-compiled by LuaJIT, beside the C and libgccjit
+backends; designed after this restructure.
+
 Writing the compiler in the dialect: the next design, which this one makes possible (`Sum`
 and exhaustive matching for IR nodes instead of `op` strings, `Struct` and closed structural
 types for places, slots and summaries, contracts on its words, vocabularies instead of
@@ -421,6 +425,16 @@ syntax backport).
   assignment, `const` and short functions inside typed bodies are a later Nua language
   decision; until then the Nua host rejects them in typed bodies with a message naming the
   form.
+- **E1. Lean emission.** The emitter allocates nothing per access and emits no closures of its
+  own; what the runtime does is paid where a value is built (a keyed spread, a `Struct`
+  construction, a contract check), never per name access. Opening compiles to locals: each
+  opening is `local names, ctx = __dialect.open(v)`, and a free name reads through a
+  ternary chain over the openings newer than its nearest binding,
+  `(names2.x ? ctx2.x : names1.x ? ctx1.x : x)`; a write evaluates its value once and
+  assigns through the same chain. A host replaces `open` (Nua: names and a proxy for records
+  and methods); the emitted shape does not change.
+- **E2. No FFI-backed `Struct` in the dialect:** cdata cannot hold Lua values, so a layout in C
+  types is Nua's native world, not the dialect's.
 - **L4. Both lambda spellings stay:** `do(x) = e`, `do … end` and the colon form (the dialect's,
   and the only spelling of typed words `do(x: T): R`), and LuaJIT's short functions.
 
