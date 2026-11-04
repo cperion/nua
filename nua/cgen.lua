@@ -37,6 +37,24 @@ local function ctype(t)
 end
 G.ctype = ctype
 
+-- a zero initializer: `{ 0 }`, or, when the first member is an aggregate (an owner's
+-- header, a nested record), that member designated, which -Wall -Wextra accept
+function G.zero_init(t)
+    if t.kind == 'atomic' then return G.zero_init(t.elem) end
+    if t.kind == 'struct' then
+        local first = layout.fields(S.module, t)[1]
+        local inner = first and G.zero_init(first.type) or '0'
+        return inner == '0' and '{ 0 }' or ('{ .' .. first.name .. ' = ' .. inner .. ' }')
+    end
+    if t.kind == 'array' then
+        local inner = G.zero_init(t.elem)
+        return inner == '0' and '{ 0 }' or ('{ .e = { [0] = ' .. inner .. ' } }')
+    end
+    if t.kind == 'sum' then return '{ 0 }' end
+    if t.native_layout then return G.zero_init(t.native_layout()) end
+    return '0'
+end
+
 local function decl_of(t, name)
     if t.kind == 'fn' then
         local ps = {}
@@ -750,7 +768,8 @@ function Fn:expr(e, need)
         local member = e.a.T and G.cfield(e.a.T, e.name) or e.name
         return paren(self:expr(e.a, PREC.postfix) .. '.' .. member, PREC.postfix, need)
     elseif op == 'zero' then
-        return '(' .. ctype(e.T) .. '){ 0 }'
+        local z = G.zero_init(e.T)
+        return '(' .. ctype(e.T) .. ')' .. (z == '0' and '{ 0 }' or z)
     elseif op == 'array' then
         local indices, parts = {}, {}
         for i in pairs(e.fields) do indices[#indices + 1] = i end

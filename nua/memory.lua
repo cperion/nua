@@ -15,6 +15,8 @@ local types = require 'nua.types'
 local S = require 'nua.stage'
 
 local Mem = {}
+-- stage reaches the few memory hooks it calls back (arena events) through S.Mem
+S.Mem = Mem
 local Builder = S.Builder
 local dyn, known = S.dyn, S.known
 local storage_library
@@ -155,6 +157,8 @@ end
 -- The stack index an allocation lands on, as a value: one of this function's
 -- own stacks (gs_sp + k), or its result stack j (gs_res + j)
 function Mem.stack_index(k)
+    -- an arena tenant's stack: the holder's arena, an index value
+    if type(k) == 'table' and k.arena then return k.arena end
     if type(k) == 'table' then
         -- result stack j of this function: gs_res + its offset in its
         -- recursion's region + j; the backends read the offset once stacks
@@ -171,6 +175,119 @@ function Builder:next_allocation()
     self.alloc_count = (self.alloc_count or 0) + 1
     local at = self.fn and self.fn.result_allocs and self.fn.result_allocs[self.alloc_count]
     return self.alloc_count, at and at.first
+end
+
+-- Arena tenants (design memory.md §5.3, §5.9 R3). An owner this function allocates and then
+-- stores into a container's element is built, on the next build of the function, at the top
+-- of that container's arenas, where the element takes over its header: nothing is copied.
+-- It stays the top of those stacks for its whole life, so it keeps a one-tenant owner's
+-- growth and borrow rules: the placement holds only while nothing else touches the arenas
+-- (an arena event: an element growing, compaction, an element built there, the holder
+-- released or handed on, another tenant, a call that reaches the holder). Placements are
+-- found in one build and made in the next (fn.arena_allocs, by allocation ordinal, as
+-- result placements are); a placement whose quiet window turns out to be broken is
+-- revoked (false) and the owner is copied, as before. Behaviour never depends on it.
+local clock = 0
+function Mem.tick() clock = clock + 1; return clock end
+
+-- the storage an owner's own stacks are, as a key: its first index, its parameter, or the
+-- call result it adopted
+local function slot_key(slots)
+    local first, low = slots[1], nil
+    if not first then return nil end
+    for _, s in ipairs(slots) do
+        if s.k and not (s.fields and s.fields.offset) and (not low or s.k < low) then low = s.k end
+    end
+    if low then return 'k' .. low end
+    if first.param then return 'p' .. first.param end
+    if first.ordinal and not first.tenant then return 'o' .. first.ordinal end
+    return nil
+end
+function Builder:storage_key(p) return slot_key(self:slots_of(p)) end
+
+-- the outermost holder of a place inside elements (its arenas are that holder's)
+local function outer_holder(q)
+    while q do
+        local e = q
+        while e and not (rawget(e, 'owner_place') and not (rawget(e, 'fname') or ''):match('^as%.')) do
+            e = rawget(e, 'parent')
+        end
+        if not e then return q end
+        q = rawget(e, 'owner_place')
+    end
+    return q
+end
+
+function Builder:arena_event_key(key)
+    self.arena_events = self.arena_events or {}
+    self.arena_events[#self.arena_events + 1] = { key = key or '*', at = Mem.tick() }
+end
+-- an arena event at the storage of the holder x lies in (a place or a Ref)
+function Mem.arena_event(x)
+    local b = S.cur()
+    if not (b and b.fn) then return end
+    x = S.through(x)
+    if S.is_value(x) and x.k == 'ref' then x = x.place end
+    local key
+    if S.is_place(x) then
+        local q = outer_holder(x)
+        if q and q.T.resizable and not Mem.shared_position(q) then key = b:storage_key(q) end
+    end
+    b:arena_event_key(key)
+end
+-- nothing touched the storage `key` since `since`
+function Builder:arena_quiet(key, since)
+    for _, e in ipairs(self.arena_events or {}) do
+        if e.at > since and (e.key == key or e.key == '*') then return false end
+    end
+    return true
+end
+-- a placement to make, or to revoke, on the next build (signalled when the build ends)
+function Builder:pend_arena(ordinal, spec)
+    local fn = self.fn
+    fn.pending_arena = fn.pending_arena or {}
+    if fn.pending_arena[ordinal] == false then return end
+    fn.pending_arena[ordinal] = spec
+end
+function Builder:revoke_tenant(rec) self:pend_arena(rec.ordinal, false) end
+-- the holder a placement names, as it stands now: its newest slot over that storage
+function Builder:find_holder(desc)
+    local best
+    for _, s in ipairs(self:all_slots()) do
+        local hit = (desc.param and s.param == desc.param) or (desc.ordinal and s.ordinal == desc.ordinal)
+        if hit and not (s.fields and s.fields.offset) and not S.moved_on_path(self.state, s.place)
+            and S.held_on_path(self.state, s.place) then
+            if not best or s.serial > best.serial then best = s end
+        end
+    end
+    return best
+end
+-- the first stack of the holder, as an index value: static for one of this function's own
+-- owners, read from its header otherwise
+function Builder:holder_first(hs)
+    local low
+    for _, s in ipairs(self:slots_of(hs.place)) do
+        if s.k and not (s.fields and s.fields.offset) and (not low or s.k < low) then low = s.k end
+    end
+    if low then return low end
+    local header = Mem.storage_library(hs.place.T).layout.header(S.Ref(hs.place))
+    local first = S.dot(header, 'stack')
+    if S.is_place(first) then first = self:read(first) end
+    return Mem.capture(first, "the holder's first stack")
+end
+-- the index value of stack i (from 0) of a placement
+function Builder:arena_index(first, offset, i)
+    if type(first) == 'number' then return Mem.stack_index(first + offset + i) end
+    return first + (offset + i)
+end
+-- start a tenant of the placement `spec` for allocation `ordinal`: its record, or nil (revoked)
+function Builder:open_tenant(ordinal, spec, n)
+    local hs = self:find_holder(spec.holder)
+    if not hs or n ~= spec.n then self:pend_arena(ordinal, false); return nil end
+    local key = slot_key(self:slots_of(hs.place))
+    self:arena_event_key(key)
+    return { key = key, offset = spec.offset, ordinal = ordinal, at = Mem.tick(),
+             first = self:holder_first(hs) }
 end
 
 -- Slots. A slot is one data stack held by an owner place: one of this
@@ -198,7 +315,15 @@ function Builder:register_slot(slot)
     if not slot.serial then serials = serials + 1; slot.serial = serials end
     slot.aliases = slot.aliases or {}
     slot.block = slot.block or owning_block(self, slot.place)
-    slot.release = function() slot.free(slot.place) end
+    slot.release = function()
+        -- a tenant leaves the arenas' top here: its window must have stayed quiet
+        local rec = slot.tenant
+        if rec and not self:arena_quiet(rec.key, rec.at) then self:revoke_tenant(rec) end
+        -- a holder released: its arenas go with it
+        local key = not rec and slot_key({ slot })
+        if key then self:arena_event_key(key) end
+        slot.free(slot.place)
+    end
     for _, k in ipairs(slot.reserved or {}) do self:claim(k) end
     if slot.k then
         self:claim(slot.k)
@@ -241,6 +366,17 @@ function Builder:gs_alloc(p, list)
         end
         return out
     end
+    local spec = self.fn.arena_allocs and self.fn.arena_allocs[ordinal]
+    local rec = spec and self:open_tenant(ordinal, spec, n)
+    if rec then
+        for i, fields in ipairs(list) do
+            self:register_slot { place = p, ordinal = ordinal, tenant = rec, alloc_at = rec.at,
+                                 free = releaser_for(p.T, fields), fields = fields }
+            out[i] = { arena = self:arena_index(rec.first, rec.offset, i - 1) }
+        end
+        return out
+    end
+    local at = Mem.tick()
     self.gs_live = self.gs_live or {}
     local k = 0
     while true do
@@ -251,7 +387,7 @@ function Builder:gs_alloc(p, list)
     end
     for i, fields in ipairs(list) do
         self:register_slot { place = p, k = k + i - 1, ordinal = ordinal, free = releaser_for(p.T, fields),
-                             fields = fields }
+                             fields = fields, alloc_at = at }
         out[i] = k + i - 1
     end
     return out
@@ -417,6 +553,7 @@ function Builder:adopt_owner(p, v, placement)
             local at = placement[position] or {}
             self:register_slot { place = q, free = at.free or releaser_for(q.T, fields), k = at.k, res = at.res,
                                  ordinal = at.ordinal, param = at.param, reserved = at.reserved,
+                                 tenant = at.tenant, alloc_at = at.alloc_at,
                                  fields = (fields[1] ~= 'stack' or fields.offset) and fields or nil }
         end
     end
@@ -461,7 +598,12 @@ function Builder:hand_off(p)
             fail(("'%s' is a %s this word does not own (it is reached through a reference); "
                 .. "move only owners you hold, or copy it"):format(tostring(leaf.place.name), leaf.place.T.display))
         end
-        for _, slot in ipairs(slots) do releases[#releases + 1] = { place = leaf.place, free = slot.free } end
+        for _, slot in ipairs(slots) do
+            releases[#releases + 1] = { place = leaf.place, free = slot.free }
+            -- a callee may use its arenas, and a tenant handed on would leave them in use
+            if slot.tenant then self:revoke_tenant(slot.tenant) end
+        end
+        self:arena_event_key(slot_key(slots) or (slots[1] and slots[1].tenant and slots[1].tenant.key))
     end
     return releases
 end
@@ -617,42 +759,64 @@ function Builder:init_sum(p, v)
     S.check_usable(p, true)
     self:release_owner(p, ("'" .. tostring(p.name) .. "' was given another variant"))
     S.clear_moved(p)
-    local layouts = layouts_module()
-    local source = rawget(v, 'copy_of')
-    local alt = not source and p.T.index[rawget(v, 'tag')]
     local all = Mem.release_fields(p.T)
     local indices, ks = {}, self:gs_alloc(p, all)
     for i, k in ipairs(ks) do indices[i] = Mem.stack_index(k) end
     rawset(p, 'gs_k', ks[1])
     local base = Mem.capture(require('nua.stacks').level(indices[1], #all), "a sum's base")
+    self:sum_on(p, indices, base, v)
+end
+
+-- Build a variant into the sum place p, whose stacks are `indices` from `base`: a variant
+-- value, `copy s` (fresh, with copy_of), a named sum (copied: `copying` says it does not
+-- end here), or nothing (the first alternative, its owners empty). The sum keeps where its
+-- stacks began; its payload's owners are built on them.
+function Builder:sum_on(p, indices, base, v, copying)
+    local layouts = layouts_module()
+    local source = S.is_place(v) and v or (v and rawget(v, 'copy_of'))
+    local function keep() layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base) end
     if source then
-        -- `copy s`: whichever variant it holds, its payload's owners copied onto these stacks
+        -- whichever variant it holds, its payload's owners copied onto these stacks
+        S.check_usable(source)
+        local named = S.is_place(v) and not copying
         source = S.resolve_checked(source)
         for _, a in ipairs(p.T.alts) do
             S.when_variant(source, a, function()
                 if a.type.resizable then
                     self:emit { op = 'store', place = p, what = 'a variant',
                                 e = { op = 'sum', T = p.T, alt = a.name, e = { op = 'zero', T = a.type } } }
-                    layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base)
+                    keep()
                     self:init_on(S.payload_place(p, a), indices, base, S.payload_place(source, a), true)
                 else
                     self:emit { op = 'store', place = p, e = S.read_expr(source), what = 'a variant' }
-                    layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base)
+                    keep()
                 end
             end)
         end
+        if named then
+            self:release_owner(v, ("'%s' was moved into '%s'"):format(tostring(v.name), tostring(p.name)))
+            S.mark_moved(v, p, {})
+        end
         return
     end
-    if not alt.type.resizable then
-        if not self.dead then self:emit { op = 'store', place = p, e = S.ex(v), what = 'a variant' } end
-    else
-        if not self.dead then
+    if v == nil then
+        -- the first alternative, its owners empty
+        local first = p.T.alts[1]
+        v = first.type.resizable and S.constructor(p.T, first.name)(Mem.empty_value(first.type))
+            or S.zero_value(p.T)
+    end
+    local alt = p.T.index[rawget(v, 'tag')]
+    local payload = rawget(v, 'p')
+    if not self.dead then
+        if alt.type.resizable then
             self:emit { op = 'store', place = p, what = 'a variant',
                         e = { op = 'sum', T = p.T, alt = alt.name, e = { op = 'zero', T = alt.type } } }
+        else
+            self:emit { op = 'store', place = p, e = S.ex(v), what = 'a variant' }
         end
     end
-    layouts.keep(Mem.view(p, layouts.Bookkeeping), indices[1], base)
-    if alt.type.resizable then self:init_on(S.payload_place(p, alt), indices, base, rawget(v, 'p')) end
+    keep()
+    if alt.type.resizable then self:init_on(S.payload_place(p, alt), indices, base, payload) end
 end
 
 -- A sum's stacks end: its live payload's owners first (their arenas), then every stack of
@@ -699,6 +863,13 @@ function Builder:init_global(p, g, v, first_use)
         local indices = {}
         for i = 1, #all do indices[i] = S.known(types.U64, offset + i - 1) end
         offset = offset + #all
+        -- a sum: its variant, its payload's owners on its stacks; a named sum is copied
+        -- and ends in sum_on, nothing is the first alternative with its owners empty
+        if d.T.kind == 'sum' then
+            local base = Mem.capture(stacks.level(indices[1], #all), "an owner global's base")
+            self:sum_on(d, indices, base, q)
+            return
+        end
         if #all > #Mem.own_fields(d.T) then
             local base = Mem.capture(stacks.level(indices[1], #all), "an owner global's base")
             for i, fields in ipairs(all) do
@@ -836,6 +1007,7 @@ function Builder:move_owner(dst, src)
             for _, a in ipairs(slot.aliases or {}) do aliases[#aliases + 1] = a end
             self:register_slot { place = d, k = slot.k, res = slot.res, reserved = slot.reserved,
                                  ordinal = slot.ordinal, param = slot.param, fields = slot.fields,
+                                 tenant = slot.tenant, alloc_at = slot.alloc_at,
                                  free = releaser_for(d.T, slot.fields), serial = slot.serial,
                                  aliases = aliases }
         end
@@ -888,6 +1060,50 @@ end
 S.one_tenant_payload = function(q) return payload_place(q) and not Mem.shared_position(rawget(q, 'parent')) end
 S.shared_position = Mem.shared_position
 
+-- A named owner q stored into the element owner d of holder hp at position `at`: a tenant
+-- of that very placement is adopted (d takes its header; q ends without releasing). An owner
+-- this function allocated, whose life so far left hp's arenas quiet, is placed there on the
+-- next build. Returns whether q was adopted.
+function Builder:adopt_tenant(hp, d, q, at)
+    local slots = self:slots_of(q)
+    local first = slots[1]
+    if not (first and self.fn) or Mem.shared_position(hp) then return false end
+    local hkey = self:storage_key(hp)
+    local rec = first.tenant
+    if rec then
+        if rec.key ~= hkey or rec.offset ~= at then return false end
+        if not self:arena_quiet(rec.key, rec.at) then
+            self:revoke_tenant(rec)
+            return false
+        end
+        if not self.dead then
+            self:emit { op = 'store', place = d, e = S.read_expr(q), what = 'a tenant becomes the element' }
+        end
+        S.end_place(q, ("'%s' was moved into an element"):format(tostring(q.name)))
+        S.mark_moved(q, d, {})
+        return true
+    end
+    if not hkey or Mem.position_count(q.T) ~= #Mem.own_fields(q.T) then return false end
+    local o = first.ordinal
+    if not o or not first.alloc_at then return false end
+    for _, sl in ipairs(slots) do
+        if sl.ordinal ~= o or sl.res or sl.param or sl.tenant then return false end
+    end
+    if (self.fn.arena_allocs and self.fn.arena_allocs[o] ~= nil)
+        or (self.fn.result_allocs and self.fn.result_allocs[o]) then return false end
+    if not first.k then
+        -- a call result: built in place only from a call that cannot reach the holder
+        local rc = self.result_calls and self.result_calls[o]
+        if not (rc and rc.arena_ok and not rc.keys[hkey] and not rc.keys['*']) then return false end
+    end
+    local hs = self:slots_of(hp)[1]
+    if (hs.alloc_at or 0) >= first.alloc_at then return false end
+    if not self:arena_quiet(hkey, first.alloc_at) then return false end
+    self:pend_arena(o, { holder = { ordinal = not hs.param and hs.ordinal or nil, param = hs.param },
+                         offset = at, n = #slots })
+    return false
+end
+
 -- Build owners into a place inside an element of the holder hp: `offset` is the position of
 -- the place's first owner, counted from the holder's first stack. The source is a named owner
 -- (copied: bytes always live on their position's stack), a fresh owner (built in place), or
@@ -939,11 +1155,16 @@ local function put_owner(hp, dst, offset, value)
             return
         end
         local indices = {}
+        local at = offset
         for i = 1, #Mem.release_fields(d.T) do indices[i] = first + (offset + i - 1) end
         offset = offset + #Mem.release_fields(d.T)
-        if S.is_place(q) then
+        if S.is_place(q) and b:adopt_tenant(hp, d, q, at) then
+            -- built where it lands: the element takes over its header
+        elseif S.is_place(q) then
+            Mem.arena_event(hp)
             d.T.init_word(d, indices, { copy_of = q })
         elseif S.is_value(q) and q.k == 'fresh' then
+            Mem.arena_event(hp)
             d.T.init_word(d, indices, { copy_of = rawget(q, 'copy_of'), text = rawget(q, 'copy_text'),
                                         length = rawget(q, 'length'), items = rawget(q, 'copy_slice') })
         else
@@ -1131,6 +1352,7 @@ local function empty_value(t)
     end
     return S.zero_value(t)
 end
+Mem.empty_value = empty_value
 -- an element at ptr of the holder starts empty, its owners in the holder's arenas
 S.init_element = function(holder, ptr)
     local hp = receiver(holder, 'an element')

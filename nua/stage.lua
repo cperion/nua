@@ -420,6 +420,9 @@ local function tracked(p)
     local q = p
     while q do
         if rawget(q, 'array_owner') then return false end
+        -- a payload of a sum holding owners is in memory, its alternatives overlapping
+        if q.pk == 'field' and rawget(q, 'owner_place') and rawget(q, 'parent')
+            and q.parent.T.kind == 'sum' then return false end
         q = rawget(q, 'parent')
     end
     if p.T.resizable then return false end
@@ -1049,6 +1052,7 @@ end
 S.end_positions = function(ref, why)
     local b = cur()
     local place = h.effect_owner(ref, 'compaction')
+    S.Mem.arena_event(place)
     local croot = root_of(place)
     if croot.pk == 'deref' and rawget(croot, 'param_index') and b.fn then
         b.fn.shrinks = b.fn.shrinks or {}
@@ -1253,6 +1257,7 @@ end
 -- a key narrows it to the elements that may name that key.
 S.retire = function(ref, template, key)
     local place = h.effect_owner(ref, 'retire')
+    S.Mem.arena_event(place)
     -- an owner inside an element is named by its container
     local croot = place.T.resizable and h.position_of(place)
     local why = template:format(tostring(rawget(croot or root_of(place), 'name')))
@@ -1433,6 +1438,28 @@ S.result_region = function(fn)
     return { offset = offset, size = size }
 end
 
+-- The holders a materialized call's arguments reach, as storage keys, each an arena event:
+-- a place or a Ref reaches its outermost holder; a value holding a writable borrow may reach
+-- anything ('*'); read-only views and plain values reach nothing that can move.
+h.call_reach = function(b, args)
+    local keys = {}
+    if not b.fn then return keys end
+    for _, a in ipairs(args) do
+        local x = a
+        if is_value(x) and x.k == 'ref' then x = x.place end
+        if is_place(x) then
+            local before = b.arena_events and #b.arena_events or 0
+            S.Mem.arena_event(x)
+            keys[b.arena_events[before + 1].key] = true
+        elseif is_value(x) and types.holds_borrow(x.T) and not rawget(x.T, 'is_str')
+            and not (rawget(x.T, 'slice_elem') and not rawget(x.T, 'mutable')) then
+            b:arena_event_key('*')
+            keys['*'] = true
+        end
+    end
+    return keys
+end
+
 -- Where a materialized call's owner result is built (design memory.md §9):
 --   inside a recursion, on this word's own result stacks: every level's result
 --     lands there, a deeper one above a shallower one;
@@ -1441,12 +1468,24 @@ end
 --     where they stood before the call, which also reclaims what the callee
 --     left below its result.
 -- Returns where each of the result's stacks lies, for adopting it.
-h.result_destination = function(b, w, fn, done, call, args)
+h.result_destination = function(b, w, fn, done, call, args, reach)
     local n = w.ret.resizable and S.owner_stack_count(w.ret) or 0
     local ordinal, j0
     if w.ret.resizable then ordinal, j0 = b:next_allocation() end
     local placement, res = {}, nil
     local inside = (not done) or (b.fn and h.reaches(fn, b.fn))
+    local spec = ordinal and not inside and not j0 and b.fn and b.fn.arena_allocs and b.fn.arena_allocs[ordinal]
+    local rec = spec and b:open_tenant(ordinal, spec, n)
+    if rec then
+        -- an arena tenant (memory.lua): the callee builds its result at the top of the holder's
+        -- arenas, which an element then takes over
+        res = S.ex(b:arena_index(rec.first, rec.offset, 0))
+        for p = 1, n do placement[p] = { ordinal = ordinal, tenant = rec, alloc_at = rec.at } end
+        call.gs_off = b:gs_offset()
+        call.res_given = true
+        table.insert(call.args, 1, res)
+        return placement
+    end
     if inside then
         -- inside the recursion: every level passes the region down, so a
         -- deeper result lands above the shallower ones on the same stacks
@@ -1492,8 +1531,15 @@ h.result_destination = function(b, w, fn, done, call, args)
             -- no owner result: what the recursion left in the region goes now
             call.after_call = rewinders
         end
+        if ordinal and n > 0 then
+            -- a candidate arena tenant: one allocation per result stack, nothing returned
+            -- in place of an argument, and the holder out of the callee's reach
+            b.result_calls = b.result_calls or {}
+            b.result_calls[ordinal] = { arena_ok = m == n and not header, keys = reach or {} }
+        end
+        local at_clock = S.Mem.tick()
         for p = 1, n do
-            local at = { ordinal = ordinal }
+            local at = { ordinal = ordinal, alloc_at = at_clock }
             if p == 1 then
                 at.reserved = reserved
                 if not header then at.free = function() for _, r in ipairs(rewinders) do r() end end end
@@ -5159,6 +5205,8 @@ h.build_with_moves = function(w, args, key, cname, opts)
     for k2, v in pairs(opts or {}) do o[k2] = v end
     o.result_allocs = sig.result_allocs or (sig.nua_signal == 'rebuild_results' and mine.result_allocs)
         or o.result_allocs
+    o.arena_allocs = sig.arena_allocs or (sig.nua_signal == 'rebuild_results' and mine.arena_allocs)
+        or o.arena_allocs
     o.rebuilds = (o.rebuilds or 0) + 1
     if o.rebuilds > 16 then fail(('%s: placing its owner results does not settle'):format(w.name), 4) end
     return h.build_with_moves(w, args, key, cname, o)
@@ -5203,6 +5251,8 @@ function Builder:emit_call(w, fn, args)
         ::next_arg::
     end
     self:bump_checked()          -- the callee may change any storage it reaches
+    -- and the arenas of whatever holder an argument reaches (arena tenants, memory.lua)
+    local reach = h.call_reach(self, args)
     -- what each Ref to an owner refers to, for the recursion check: an owner
     -- of this function, or one passed on from a parameter
     if self.fn then
@@ -5253,7 +5303,7 @@ function Builder:emit_call(w, fn, args)
     fn.call_nodes = fn.call_nodes or {}
     table.insert(fn.call_nodes, call)
     local placement
-    if w.ret.resizable or fn.has_res then placement = h.result_destination(self, w, fn, done, call, args) end
+    if w.ret.resizable or fn.has_res then placement = h.result_destination(self, w, fn, done, call, args, reach) end
     local result
     if call.after_call then
         -- the value comes out first; then the region is rewound
@@ -5342,6 +5392,7 @@ end
 function build_function(w, args, key, cname, opts)
     local fn = h.new_fn(w.name, w, key)
     fn.result_allocs = opts and opts.result_allocs
+    fn.arena_allocs = opts and opts.arena_allocs
     -- the functions being built, outermost first, and where each began
     module.building = module.building or {}
     table.insert(module.building, { fn = fn, start = #module.functions })
@@ -5434,6 +5485,14 @@ function build_function(w, args, key, cname, opts)
         -- that moves it out on another path, release it there
         local ok2, err2 = pcall(h.finish_ref_moves, b, fn)
         if not ok2 then ok, err = false, err2 end
+    end
+    if ok and fn.pending_arena then
+        -- arena tenants found or revoked in this build: build it again with them (memory.lua)
+        local allocs = {}
+        for o, v in pairs(fn.arena_allocs or {}) do allocs[o] = v end
+        for o, v in pairs(fn.pending_arena) do allocs[o] = v end
+        ok, err = false, { nua_signal = 'rebuild_results', fn = fn, arena_allocs = allocs,
+                           result_allocs = fn.result_allocs }
     end
     pop_frame(b)
     pop_builder()
@@ -6514,7 +6573,6 @@ function S.global(t, opts)
     -- an owner global (design memory.md §5.10): its stacks are the first of the main
     -- thread's, reserved for it; it is set up where it is first used
     if t.resizable then
-        if t.kind == 'sum' then fail('global: a ' .. t.display .. ' (a sum holding owners) cannot be a global yet', 2) end
         if opts.exported or opts.imported or opts.thread_local or opts.shared or opts.init ~= nil then
             fail('global: an owner global takes only a name', 2)
         end
