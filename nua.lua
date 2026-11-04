@@ -87,8 +87,6 @@ function nua.prelude()
     env.fence = S.fence
     env.trap = S.trap
     env.TODO = S.trap    -- TODO "message": work not written yet; it traps with the message
-    -- define ... end (def with ... end): a compile-time table (a vocabulary), extended by keyed spread
-    env.def = function(t) return t end
     env.atomic_ptr = S.atomic_ptr
     env.bytes = S.bytes
     env.size_of = S.size_of

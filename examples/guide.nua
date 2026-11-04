@@ -87,14 +87,14 @@ export type_twice
 
 -- discovered as names: two runtime values that travel together through in-place words
 local remaining = do(document: Ref Document): U32
-    local span = def { start = document.cursor, stop = document.length }
+    local span = { start = document.cursor, stop = document.length }
     return span.stop - span.start
 end
 export remaining
 
 -- a structural type carries its defaults; an instance is the type spread with overrides
-local Margins = def { left = 4, right = 4 }
-local wide = def { ..Margins, right = 12 }
+local Margins = { left = 4, right = 4 }
+local wide = { ..Margins, right = 12 }
 local text_width = do(document: Ref Document): U32
     return document.length - wide.left - wide.right
 end
@@ -345,7 +345,7 @@ export on_key
 local Request = struct { method: U8, path: Str }
 
 -- the methods a router speaks: a structural vocabulary of known values
-local Methods = def { get = 1, post = 2 }
+local Methods = { get = 1, post = 2 }
 
 -- the builder: one verb per method; sentences in, a checked description out
 local router = function(Verbs)
@@ -398,7 +398,7 @@ export handle
 assert(#site == 2 and site[2].path == "/notes")
 
 -- a dialect: the same builder over a vocabulary extended by spread
-local Dav = def { ..Methods, propfind = 7 }
+local Dav = { ..Methods, propfind = 7 }
 local dav_routes = router Dav
 local share = dav_routes:
     propfind "/":

@@ -1643,7 +1643,7 @@ Spreading tables and `define` are Mua's (Mua's syntax doc, §5); records are Nua
 local moved_x = do(p: Point, dx: I32): Point = Point { ..p, x = p.x + dx }
 ```
 
-A spread contributes a record's data fields (from a value, place or reference); the result is ordinary construction. A spread of a compile-time table contributes its string keys, and when every spread is one, the result is a compile-time table: this is how vocabularies (for DSLs, and for any Lua code) are built and extended. `def` returns its argument, and `define` followed by entries and `end` is `def with … end`, so a definition reads as one:
+A spread contributes a record's data fields (from a value, place or reference); the result is ordinary construction. A spread of a compile-time table contributes its string keys, and when every spread is one, the result is a compile-time table: this is how vocabularies (for DSLs, and for any Lua code) are built and extended. `define` followed by entries and `end` is a plain table (never a contextual `with`), so a definition reads as one:
 
 ```lua
 local base = define

@@ -236,12 +236,12 @@ export f
 ]])
 check('define and keyed spread build compile-time tables', vocab_ok, vocab_err)
 reject('two spreads giving one key', [[
-local a, b = def { k = 1 }, def { k = 2 }
+local a, b = { k = 1 }, { k = 2 }
 local c = { ..a, ..b }
 ]], { "spread-overlap: field 'k' comes from two spreads" })
 
 reject('a duplicated field beside a spread', [[
-local a = def { k = 1 }
+local a = { k = 1 }
 local c = { ..a, x = 1, x = 2 }
 ]], { "duplicate field 'x'" })
 

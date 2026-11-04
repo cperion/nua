@@ -26,7 +26,7 @@ Every `lua` block below is an excerpt of [`examples/guide.nua`](../examples/guid
 | untyped parameters, `f known` | compile-time parameters, partial application |
 | `f "lit"`, `f 1 2`, `f x do ... end` | literal application and saturating chains |
 | `do(ctx..)`, `do(..)`, `local ctx.. = e` | opening a record or a vocabulary; `do(..)` leaves it unnamed |
-| `define ... end`, `def { ... }` | a vocabulary: names bound while compiling, with no layout (§4.1) |
+| `define ... end`, `{ ... }` | a vocabulary: names bound while compiling, with no layout (§4.1) |
 | `{ ..base, name = v }`, `..base` in a `with` block | keyed spread: a vocabulary or a record extended, entries overriding |
 | `insert n`, `note 1` inside an opened block | instructions: calls the innermost opened receiver resolves (§6.3) |
 | `keymap do(..) bind "h" (...) end` | a builder: an activity run while compiling that returns a description or a type (§6.10) |
@@ -211,7 +211,7 @@ local Editing = define
 end
 ```
 
-`def` is the identity and `define` is `def with`; what a definition means comes from where it sits. `with` supplies keyed entries, an untyped parameter is a compile-time parameter, and keyed spread composes (syntax §10.7): explicit entries override, and two spreads that offer the same name are rejected rather than silently shadowing. A word takes a vocabulary as an untyped parameter and specializes against its members, or opens it:
+`define` is a table written as a block; what a definition means comes from where it sits. `with` supplies keyed entries, an untyped parameter is a compile-time parameter, and keyed spread composes (syntax §10.7): explicit entries override, and two spreads that offer the same name are rejected rather than silently shadowing. A word takes a vocabulary as an untyped parameter and specializes against its members, or opens it:
 
 ```lua
 -- a word that takes a vocabulary specializes against its members
@@ -250,7 +250,7 @@ A vocabulary may hold runtime values too. It groups them by name without inventi
 ```lua
 -- discovered as names: two runtime values that travel together through in-place words
 local remaining = do(document: Ref Document): U32
-    local span = def { start = document.cursor, stop = document.length }
+    local span = { start = document.cursor, stop = document.length }
     return span.stop - span.start
 end
 export remaining
@@ -266,8 +266,8 @@ A structural type carries its defaults: its values are the default of each membe
 
 ```lua
 -- a structural type carries its defaults; an instance is the type spread with overrides
-local Margins = def { left = 4, right = 4 }
-local wide = def { ..Margins, right = 12 }
+local Margins = { left = 4, right = 4 }
+local wide = { ..Margins, right = 12 }
 local text_width = do(document: Ref Document): U32
     return document.length - wide.left - wide.right
 end
@@ -313,7 +313,7 @@ local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
 
 Commands as data give replay and tests a shared input, and (§17) they give specialization something to work with. Undo also needs enough history to reverse an operation; naming an `undo` command alone does not provide it. In this guide, `Document` tracks counts rather than actual text or undo history.
 
-**Closed sets and open sets.** A `oneof` is a closed set: its alternatives are fixed where it is declared, a match handles each one, and adding an alternative makes the compiler point to every match that must learn it. Use it where completeness is part of the meaning: a connection's states, an operation's outcomes, the commands an editor understands. A vocabulary of known values is an open set: an enumeration is names for codes (`def { get = 1, post = 2 }`, §6.11), its codes fold where they are used, and anyone may extend it by spread, so code that meets an unknown member needs a default. Use it where extension is expected: protocol methods, opcodes, tokens, plugin points. Ask whether someone else may legitimately add a member: if so, keep the set open; if adding one should make every user reconsider, close it. A `oneof` whose tag is known folds away as well, so choose by meaning, not by cost; a payload, or a variant that exists at run time, needs the `oneof`.
+**Closed sets and open sets.** A `oneof` is a closed set: its alternatives are fixed where it is declared, a match handles each one, and adding an alternative makes the compiler point to every match that must learn it. Use it where completeness is part of the meaning: a connection's states, an operation's outcomes, the commands an editor understands. A vocabulary of known values is an open set: an enumeration is names for codes (`{ get = 1, post = 2 }`, §6.11), its codes fold where they are used, and anyone may extend it by spread, so code that meets an unknown member needs a default. Use it where extension is expected: protocol methods, opcodes, tokens, plugin points. Ask whether someone else may legitimately add a member: if so, keep the set open; if adding one should make every user reconsider, close it. A `oneof` whose tag is known folds away as well, so choose by meaning, not by cost; a payload, or a variant that exists at run time, needs the `oneof`.
 
 
 Composing vocabularies structurally does not make types structural: a `struct` stays nominal and ordered, and a `with` block stays keyed and unordered. A vocabulary that describes a structure (an interface, a capability set, a namespace) is capitalized like a type, `Editing`; one that holds data is lowercase, `config`, `span` (§19).
@@ -812,7 +812,7 @@ Most DSLs mix them: a declarative front end describes, an engine runs, and its h
 
 ```lua
 -- the methods a router speaks: a structural vocabulary of known values
-local Methods = def { get = 1, post = 2 }
+local Methods = { get = 1, post = 2 }
 ```
 
 **4. Make the builder check its sentences, and report at the user's line.** A structural mistake surfaces late, deep in an engine; a DSL feels like a language when a bad sentence is rejected where it is written. Validate while building, and give `fail` the level of the line that spoke the instruction:
@@ -936,7 +936,7 @@ assert(#site == 2 and site[2].path == "/notes")
 
 ```lua
 -- a dialect: the same builder over a vocabulary extended by spread
-local Dav = def { ..Methods, propfind = 7 }
+local Dav = { ..Methods, propfind = 7 }
 local dav_routes = router Dav
 local share = dav_routes:
     propfind "/":

@@ -428,12 +428,14 @@ syntax backport).
   form.
 - **E1. Lean emission.** The emitter allocates nothing per access and emits no closures of its
   own; what the runtime does is paid where a value is built (a keyed spread, a `struct`
-  construction, a contract check), never per name access. Opening compiles to locals: each
-  opening is `local names, ctx = __mua.open(v)`, and a free name reads through a
-  ternary chain over the openings newer than its nearest binding,
-  `(names2.x ? ctx2.x : names1.x ? ctx1.x : x)`; a write evaluates its value once and
-  assigns through the same chain. A host replaces `open` (Nua: names and a proxy for records
-  and methods); the emitted shape does not change.
+  construction, a contract check), never per name access. Opening compiles to locals: an
+  opening is `local o1 = __mua.open(v)` plus one boolean per name its region mentions
+  (`local o1_x = o1.x ~= nil`, which of them the context introduces as it is opened), and a
+  free name reads through a ternary chain over the openings newer than its nearest binding,
+  `(o2_x ? o2.x : o1_x ? o1.x : x)`; a write evaluates its value once and assigns through the
+  same chain. Opening allocates nothing (measured: 0.8 ns an entry, against 150 ns for the first
+  implementation, which built a set of the context's keys). A host replaces `open` (Nua: a
+  proxy for records and methods); the emitted shape does not change.
 - **E2. No FFI-backed `struct` in Mua:** cdata cannot hold Lua values, so a layout in C
   types is Nua's native world, not Mua's.
 - **L4. Both lambda spellings stay:** `do(x) = e`, `do … end` and the colon form (Mua's,
