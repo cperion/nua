@@ -1,6 +1,6 @@
 -- Raw pointers (Let syntax §8.5) and slices (§8.4) in nua.
 
-local Pixel = Struct { r: U8, g: U8, b: U8 }
+local Pixel = struct { r: U8, g: U8, b: U8 }
 
 -- Ptr: the foreign boundary. p[i] is an unchecked element place, p.field a field
 local brighten = do(px: Ptr Pixel, n: U32, k: U8): Unit
@@ -46,7 +46,7 @@ local sum_raw = do(p: Ptr U8, n: U32): U32 = sum Slice(p, U64 n)
 export sum_raw
 
 -- a binary format described as data; one range check, then constant offsets
-local Packet = Struct { version: U32, flags: U32, length: U32, id: U32 }
+local Packet = struct { version: U32, flags: U32, length: U32, id: U32 }
 local format = {
     { "version", 0, 1 },
     { "flags", 1, 1 },

@@ -109,8 +109,8 @@ end
 export absent
 
 -- NAME deliberately resembles a codegen placeholder; it is an ordinary field.
-local Key = Struct { NAME: U8, wide: U64, label: Chars 8 }
-local Payload = Struct { count: U32, weight: U64 }
+local Key = struct { NAME: U8, wide: U64, label: Chars 8 }
+local Payload = struct { count: U32, weight: U64 }
 local Records = Map(Key, Payload)
 local record_keys = do(n: U32): U64
     local m = Records {}
@@ -123,7 +123,7 @@ local record_keys = do(n: U32): U64
 end
 export record_keys
 
-local Choice = Sum { none: Unit, integer: I64, record: Key }
+local Choice = oneof { none: Unit, integer: I64, record: Key }
 local Choices = Map(Choice, U32)
 local sum_keys = do(n: I64): U32
     local m = Choices {}
@@ -135,7 +135,7 @@ local sum_keys = do(n: I64): U32
 end
 export sum_keys
 
-local Node = Struct { value: U32 }
+local Node = struct { value: U32 }
 local Ids = Map(Id Node, U32)
 local id_keys = do(n: U32): U32
     local nodes = Store(Node) {}
@@ -147,7 +147,7 @@ local id_keys = do(n: U32): U32
 end
 export id_keys
 
-local Owner = Struct { generation: U32, entries: Counts }
+local Owner = struct { generation: U32, entries: Counts }
 local map_field = do(n: U32): U64
     local owner = Owner { generation = 7, entries = Counts {} }
     owner.entries:put(n, 12)

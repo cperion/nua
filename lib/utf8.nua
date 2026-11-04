@@ -6,7 +6,7 @@
 -- U+10FFFF.
 local utf8 = {}
 
-local Rune = Struct { cp: U32, size: U64 }
+local Rune = struct { cp: U32, size: U64 }
 
 -- the rune starting at i: its code point and width, or U+FFFD with size 0
 local function step(s: Str, i: U64): Rune

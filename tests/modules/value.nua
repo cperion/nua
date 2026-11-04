@@ -1,4 +1,4 @@
 local name = ...
-local Item = Struct { value: U32 }
+local Item = struct { value: U32 }
 local increment = do(x: U32): U32 = x + 1
 return { .name, .Item, .increment }

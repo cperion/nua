@@ -1,7 +1,7 @@
 -- SipHash-2-4 as ordinary Nua, including streaming across arbitrary chunks.
 -- Explicit keys let the entire algorithm execute at compile time.
 local hash = {}
-local State = Struct with
+local State = struct with
     v0: U64
     v1: U64
     v2: U64

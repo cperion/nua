@@ -18,10 +18,11 @@ word as a C function. Only what the exports reach is emitted.
 local source = debug.getinfo(1, 'S').source
 local here = rawget(_G, 'nua_root') or source:match('^@(.*)[/\\][^/\\]*$') or '.'
 if here ~= '.' then package.path = here .. '/?.lua;' .. package.path end
+-- Mua, the pinned dependency (tools/mua.lock), is installed beside the other local libraries
+package.path = package.path .. ';' .. here .. '/.local/share/lua/5.1/?.lua'
 
-local macro = require 'macro'
-require 'macro.builtin'
-require 'macro.nua'
+local mua = require 'mua.init'
+local front = require 'nua.front'
 local S = require 'nua.stage'
 local G = require 'nua.cgen'
 local T = require 'nua.types'
@@ -40,10 +41,12 @@ function nua.prelude()
     local env = setmetatable({}, { __index = _G })
     for _, n in ipairs(T.scalars) do env[n] = T[n] end
     env.__S = S
-    -- keyed spread in a table constructor (macro/nua.lua): the spreads are marked keys
-    env.__nua_spread = S.spread_mark
-    env.__nua_keyed = S.keyed_table
-    env.with = S.contextual    -- `with` where an expression starts (nua.colon)
+    -- Mua's runtime with Nua's meanings (design macro-layer.md §4.5, §6): keyed spread
+    -- also builds records, contextual `with` takes its type from its context
+    env.__mua = require('mua.runtime').extend {
+        keyed = S.keyed_table, spread_mark = S.spread_mark, with = S.contextual,
+    }
+    env.with = S.contextual    -- `with { ... }` in a typed body (nua.front)
     env.__ENV = env
     env.Ref = S.Ref
     env.opaque = T.opaque
@@ -84,8 +87,8 @@ function nua.prelude()
     env.fence = S.fence
     env.trap = S.trap
     env.TODO = S.trap    -- TODO "message": work not written yet; it traps with the message
-    -- define with ... end: a compile-time table (a vocabulary), extended by keyed spread
-    env.define = function(t) return t end
+    -- define ... end (def with ... end): a compile-time table (a vocabulary), extended by keyed spread
+    env.def = function(t) return t end
     env.atomic_ptr = S.atomic_ptr
     env.bytes = S.bytes
     env.size_of = S.size_of
@@ -146,13 +149,7 @@ end
 
 -- translate a source text to Lua
 function nua.translate(src, path)
-    local code, err = macro.substitute_tostring(src, path)
-    if not code then
-        -- macro errors name the macro's own file first; keep the program's line
-        local at = tostring(err):find(path .. ':', 1, true)
-        error(at and err:sub(at) or err, 0)
-    end
-    return require('nua.syntax').statement_calls(code, path)
+    return mua.translate(src, path, { host = front.host(path) })
 end
 
 -- The runtime is Nua, so it is built with the program: its words are made lazily,
@@ -387,8 +384,8 @@ end
 local function doctor()
     local lines = {}
     lines[#lines + 1] = jit and jit.version or _VERSION
-    local ok, lpeg = pcall(require, 'lpeg')
-    lines[#lines + 1] = 'LPeg: ' .. (ok and (type(lpeg.version) == 'function' and lpeg.version() or 'present') or 'MISSING (install lpeg 5.1)')
+    local have_mua, mua = pcall(require, 'mua.init')
+    lines[#lines + 1] = 'Mua: ' .. (have_mua and ('version ' .. tostring(mua.version)) or 'MISSING (run make mua)')
     local c = require 'nua.cjit'
     local have_jit, lib = pcall(c.lib)
     lines[#lines + 1] = have_jit and ('libgccjit: %d.%d.%d'):format(
@@ -404,7 +401,7 @@ local function doctor()
     lines[#lines + 1] = 'cache: ' .. t.cache_dir()
     lines[#lines + 1] = 'runtime: ' .. (os.getenv('NUA_RT') and ('linked in; archive ' .. os.getenv('NUA_RT')) or 'built on demand')
     for _, l in ipairs(lines) do print(l) end
-    os.exit(ok and have_jit and 0 or 1)
+    os.exit(have_mua and have_jit and 0 or 1)
 end
 
 -- nua cache clean: drop the probe/compilation cache

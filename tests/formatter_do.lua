@@ -39,18 +39,19 @@ formatted('nested do blocks', 'visit(do(x)\nother(do(y)\nconsume y\nend)\nend)',
 -- Exercise the actual macro translator independently of runtime/compiler
 -- initialization. Execute the host case; compare generated staged Lua for the
 -- native case, rather than relying only on the formatter's parser fingerprint.
-local macro = require 'macro'
-require 'macro.builtin'
-require 'macro.nua'
-local lexer = require 'macro.lexer'
+package.path = root .. '/?/init.lua;' .. package.path
+local mua = require 'mua.init'
+local front = require 'nua.front'
+local dlex = require 'mua.lex'
+local function translate(source, name) return mua.translate(source, name, { host = front.host(name) }) end
 local function equivalent(name, source, execute)
     local result = fmt.format(source, nil, name)
-    local before = assert(macro.substitute_tostring(source, name))
-    local after = assert(macro.substitute_tostring(result, name))
+    local before = translate(source, name)
+    local after = translate(result, name)
     local function normalize(code)
         local parts = {}
-        for _, tk in ipairs(lexer.scan_raw_tokenlist(code)) do
-            if tk[1] ~= 'space' and tk[1] ~= 'comment' then parts[#parts + 1] = tk[2] end
+        for _, tk in ipairs(dlex.scan(code, name)) do
+            if tk.t ~= 'space' and tk.t ~= 'comment' then parts[#parts + 1] = tk.v end
         end
         return table.concat(parts, '\0')
     end

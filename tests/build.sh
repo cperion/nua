@@ -11,7 +11,12 @@ fixture=$(mktemp -d "$root/build/tmp/build-check.XXXXXX")
 # Retain the small fixture on failure for diagnosis, like other build evidence.
 cp Makefile "$fixture/Makefile"
 mkdir -p "$fixture/tools"
-cp tools/deps.sh tools/deps.lock "$fixture/tools/"
+cp tools/deps.sh tools/deps.lock tools/mua.sh tools/mua.lock "$fixture/tools/"
+# Mua is installed beside the toolchain (tools/mua.sh check wants its pinned commit)
+mkdir -p "$fixture/.local/share/lua/5.1/mua"
+touch "$fixture/.local/share/lua/5.1/mua/init.lua"
+(source tools/mua.lock; printf '%s\n' "$MUA_COMMIT" > "$fixture/.local/share/lua/5.1/mua/.mua-commit")
+bash -n tools/mua.sh
 mkdir -p "$fixture/.local/bin" "$fixture/.local/lib/lua/5.1"
 printf '#!/usr/bin/env bash\nprintf "LUA_CPATH=%%s\\nCC=%%s\\nNUA_GCCJIT=%%s\\nLUA_BIN=%%s\\n" "$LUA_CPATH" "${CC:-}" "${NUA_GCCJIT:-}" "$(command -v luajit)"\n' > "$fixture/.local/bin/luajit"
 printf '#!/usr/bin/env bash\necho fixture-cc\n' > "$fixture/.local/bin/gcc"
@@ -22,7 +27,7 @@ fi
 [[ $(<"$fixture/incomplete.log") == *'Local dependencies are incomplete'* ]]
 inputs=$(cd "$fixture" && sha256sum tools/deps.lock tools/deps.sh | sha256sum)
 printf '%s\n' "${inputs%% *}" > "$fixture/.local/nua-deps.ready"
-touch "$fixture/.local/lib/libgccjit.so.0" "$fixture/.local/lib/lua/5.1/lpeg.so"
+touch "$fixture/.local/lib/libgccjit.so.0"
 make --no-print-directory -s -C "$fixture" doctor > "$fixture/local.log"
 local_output=$(<"$fixture/local.log")
 [[ $local_output == *"LUA_CPATH=$fixture/.local/lib/lua/5.1/?.so;;"* ]]

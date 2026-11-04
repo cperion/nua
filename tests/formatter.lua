@@ -2,7 +2,7 @@
 local root = arg[0]:match('^(.*)/tests/[^/]*$') or '.'
 package.path = root .. '/?.lua;' .. package.path
 local fmt = require 'nua.fmt'
-local lexer = require 'macro.lexer'
+local lex = require 'mua.lex'
 local passed = 0
 local function check(name, condition, detail)
     assert(condition, name .. (detail and ('\n' .. detail) or ''))
@@ -375,8 +375,8 @@ local literal = 'local s=[==[\n  literal\n\tbytes -- not a comment\n]==]\n--[=[\
 local out = fmt.format(literal)
 local function protected(text)
     local result = {}
-    for _, tk in ipairs(lexer.scan_raw_tokenlist(text)) do
-        if tk[1] == 'string' or tk[1] == 'comment' then result[#result + 1] = tk[2] end
+    for _, tk in ipairs(lex.scan(text, 'protected')) do
+        if tk.t == 'string' or tk.t == 'comment' then result[#result + 1] = tk.v end
     end
     return table.concat(result, '\0')
 end
@@ -402,7 +402,7 @@ local function normalized(c)
     return c:gsub('([%w_./%-]+%.nua):%d+:', '%1:<line>:')
 end
 local opening_program = [[
-local View = Struct { value: U32 }
+local View = struct { value: U32 }
 local apply = do(ctx: Ref View, body): U32 = body(ctx)
 local read = do(ctx: Ref View): U32
     return apply ctx do(unused..)
@@ -433,15 +433,35 @@ local anonymous_opening_c = nua.compile(anonymous_program, 'opening.nua')
 local original_body = assert(original_opening_c:match('(uint32_t opening_result%b() %b{})'))
 local anonymous_body = assert(anonymous_opening_c:match('(uint32_t opening_result%b() %b{})'))
 check('anonymous openings preserve residual C and compile-time results', original_body == anonymous_body)
+-- The examples compile twice each, which is slow in series: worker processes (one per core)
+-- run `tests/formatter_equiv.lua` on them while the formatting checks run here.
+local names = {}
 for name in io.popen('ls ' .. q(root .. '/examples') .. '/*.nua ' .. q(root .. '/lib') .. '/*.nua'):lines() do
+    names[#names + 1] = name
+end
+local jobs, running = {}, 0
+local width = tonumber(io.popen('nproc'):read('*l')) or 4
+local function start(name)
+    jobs[name] = io.popen(('%s %s %s 2>&1'):format(q(arg[-1] or 'luajit'), q(root .. '/tests/formatter_equiv.lua'), q(name)))
+end
+local started = 0
+local function fill()
+    while started < #names and running < width do
+        started = started + 1
+        if names[started]:find('/examples/', 1, true) then start(names[started]); running = running + 1 end
+    end
+end
+fill()
+for i, name in ipairs(names) do
     local source = read(name)
     local result = fmt.format(source, nil, name)
     check(name .. ': idempotent', fmt.format(result, nil, name) == result)
     check(name .. ': protected tokens', protected(source) == protected(result))
     if name:find('/examples/', 1, true) then
-        local before = nua.compile(source, name)
-        local after = nua.compile(result, name)
-        check(name .. ': equivalent C', normalized(before) == normalized(after))
+        local out = jobs[name]:read('*a'); jobs[name]:close(); jobs[name] = nil
+        running = running - 1
+        fill()
+        check(name .. ': equivalent C', out:match('^equivalent') ~= nil, out)
     end
 end
 

@@ -10,7 +10,7 @@ local primary = ui.style:
     disabled do(..) opacity 50 end
 end
 local Confirmation = ui.component "Confirmation":
-    outcome Sum { reset: Unit, keep: Unit }
+    outcome oneof { reset: Unit, keep: Unit }
     modal:
         w 80
         h 40

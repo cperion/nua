@@ -6,7 +6,7 @@ local no_metrics = do(caption: Ref Chars(256), size: F32, font: U32): ui.Size
     missing_metrics "this fixed-size example must not request font metrics"
     return ui.Size { width = 0, height = 0 }
 end
-local Observation = Struct with
+local Observation = struct with
     count: U32
     consumed: U32
     modal: Bool

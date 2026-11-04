@@ -17,7 +17,7 @@ local function check(name, ok, detail)
 end
 
 -- Curried expression factories preserve native parameter and result types.
-local factories = nua.load(root .. '/tests/macros/fixtures/expression_native.nua')
+local factories = nua.load(root .. '/tests/front_fixtures/expression_native.nua')
 local record = factories.types.Record { value = 41 }
 check('expression factory native call', factories.read_expression(record) == 42)
 check('block factory native call', factories.read_block(record) == 42)
@@ -81,7 +81,7 @@ check('with blocks build structs, sums and handlers', with_blocks.sum(7) == 29 a
 check('endall closes handlers and data blocks', with_blocks.pair(5) == 16)
 check('a with block takes its type from the context', with_blocks.shifted(5) == 5 + 6 + 1 + 2)
 local owners = nua.load(root .. '/tests/owners.nua')
-check('owner Struct with two owner fields', owners.two_fields(3) == 70303)
+check('owner struct with two owner fields', owners.two_fields(3) == 70303)
 check('nested owner structs through Ref and call', owners.nested(2) == 202020804)
 check('owner returned into the caller', owners.returned(3) == 1405)
 check('owner returned from either path', owners.picked(true, 5) == 51 and owners.picked(false, 5) == 112)

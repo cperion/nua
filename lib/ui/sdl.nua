@@ -44,7 +44,7 @@ local render_texture = extern("SDL_RenderTexture",
     { Ptr sdl.Renderer, Ptr Texture, Ptr sdl.Rect, Ptr sdl.Rect }, Bool, { .header })
 local Operation = { font_init = 20, font_open = 21, font_size = 22, measure = 23,
     text = 24, texture = 25, texture_size = 26, texture_draw = 27, blend = 28, coordinates = 29 }
-local Painter = Struct { renderer: Ptr sdl.Renderer, font: Ptr Font, failure: sdl.Failure }
+local Painter = struct { renderer: Ptr sdl.Renderer, font: Ptr Font, failure: sdl.Failure }
 function Painter:checked(ok: Bool, operation: U32): Unit
     if not ok and self.failure.operation == 0 then self.failure = sdl.failure operation end
 end

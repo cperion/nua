@@ -3,8 +3,9 @@
 ## Pinned local toolchain
 
 The local bootstrap currently targets 64-bit Linux. It builds GCC 15.2.0 with
-its C and JIT frontends, libgccjit, LuaJIT 2.1, and LPeg 1.1.0 for LuaJIT's Lua
-5.1 ABI. GCC's GMP 6.2.1, MPFR 4.1.0 and MPC 1.2.1 are also pinned and built
+its C and JIT frontends, libgccjit, and LuaJIT 2.1 for Lua 5.1's ABI.
+Mua, the pinned Lua language Nua is a host of, is fetched and installed separately
+(`make mua`, `tools/mua.lock`). GCC's GMP 6.2.1, MPFR 4.1.0 and MPC 1.2.1 are also pinned and built
 from source, not taken from system development packages.
 
 Required host tools:
@@ -27,7 +28,7 @@ disk space and a substantial first build. Four parallel dependency jobs are the 
 make bootstrap DEPS_JOBS=4
 make doctor
 make test-build
-make test-macros
+make test-mua
 make test
 make test-native
 make test-dist
@@ -79,7 +80,7 @@ management. The build does not depend on any neighboring repository.
 
 Make automatically selects a local toolchain when `.local/nua-deps.ready` exists.
 `LOCAL_DEPS=1` explicitly requires it; `LOCAL_DEPS=0` explicitly selects the original
-host-dependency setup. Local mode selects the installed LuaJIT, Lua 5.1 LPeg path,
+host-dependency setup. Local mode selects the installed LuaJIT, the Lua 5.1 library path,
 libgccjit and (unless `CC` was explicitly overridden) GCC. It exports those paths
 to test harnesses and adds the local library directory and rpath to the dist link.
 Nua build/test targets also prepend the local binary directory to their subprocess

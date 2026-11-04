@@ -113,8 +113,8 @@ static int l_embedded(lua_State *L) {
         size_t fl = strlen(f->name);
         if (n == fl && strcmp(name, f->name) == 0) { best = f; best_len = fl; break; }
         /* a caller may pass a path with a root prefix: take the longest name
-           that ends this path at a boundary ("macro/nua.lua" must not match
-           "nua.lua") */
+           that ends this path at a boundary ("nua/front.lua" must not match
+           "a/front.lua") */
         if (n > fl && name[n - fl - 1] == '/' && strcmp(name + n - fl, f->name) == 0 && fl > best_len) {
             best = f; best_len = fl;
         }

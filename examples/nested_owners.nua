@@ -1,9 +1,9 @@
 -- Owners inside owners (design memory.md §5.9). An element may hold owners: their bytes live
 -- in arenas of the outermost container, one per owner position, and move only when they
 -- grow (R3). Each word returns 0, or the number of the check that failed.
-local Item = Struct { weight: U32 }
-local Player = Struct { score: U32, name: Text, items: Grow Item }
-local Writer = Struct { name: Text, log: Grow Text }
+local Item = struct { weight: U32 }
+local Player = struct { score: U32, name: Text, items: Grow Item }
+local Writer = struct { name: Text, log: Grow Text }
 
 -- one text grows while its neighbours keep theirs
 local lines = do(): I32
@@ -194,7 +194,7 @@ local churn = do(rounds: U32): I32
 end
 
 -- Array(T, n) of owners: the array holds its elements' arenas
-local Contact = Struct { id: U32, names: Array(Text, 2) }
+local Contact = struct { id: U32, names: Array(Text, 2) }
 local arrays = do(): I32
     local a = Array(Text, 3) {}
     a[0]:write "zero"
@@ -229,8 +229,8 @@ local arrays = do(): I32
     return 0
 end
 
--- a Sum whose payloads hold owners: matched by reference, one payload at a time
-local Doc = Sum { empty: Unit, text: Text, list: Grow U32 }
+-- a oneof whose payloads hold owners: matched by reference, one payload at a time
+local Doc = oneof { empty: Unit, text: Text, list: Grow U32 }
 local doc_length = do(d: Ref Doc): U64
     return d with
         empty = do(): U64 return 0 end
@@ -250,7 +250,7 @@ local add_to = do(d: Ref Doc, s: Str): Unit
         end
     end
 end
-local Card = Struct { id: U32, doc: Doc }
+local Card = struct { id: U32, doc: Doc }
 local sums = do(): I32
     local d = Doc.text Text {}
     add_to(Ref d, "hello")
@@ -309,7 +309,7 @@ local globals = do(): I32
 end
 
 -- maps inside containers and map values: each of a map's stacks is a shared position
-local Tagged = Struct { id: U32, tags: Map(Str, U32) }
+local Tagged = struct { id: U32, tags: Map(Str, U32) }
 local nested_maps = do(): I32
     local outer = Map(U32, Map(U32, U32)) {}
     outer:put(1, Map(U32, U32) {})

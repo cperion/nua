@@ -24,7 +24,7 @@ layout.StrMap = cstruct("nua_strmap", h, {
         { "arena_cap", U64 },
     })
 -- where an owner with no header of its own (a sum holding owners) began its stacks
-layout.Bookkeeping = Struct { stack: U64, base: U64 }
+layout.Bookkeeping = struct { stack: U64, base: U64 }
 layout.keep = do(h: Ptr layout.Bookkeeping, stack: U64, base: U64): Unit
     h.stack = stack
     h.base = base
@@ -126,8 +126,8 @@ function layout.maps(T, Entry, view)
     local Stored = Entry.index.key.type
     -- One acquisition of a table: its slots (which never move), its index
     -- cells and, for text keys, the live arena bytes the stored keys point into.
-    local View = Struct { entries: EP, len: U32, cells: Cells, cap: U32 }
-    if str then View = Struct { entries: EP, len: U32, cells: Cells, cap: U32, arena: Ptr U8 } end
+    local View = struct { entries: EP, len: U32, cells: Cells, cap: U32 }
+    if str then View = struct { entries: EP, len: U32, cells: Cells, cap: U32, arena: Ptr U8 } end
     local header = do(self: Ref T): Ptr layout.Map
         local h = view self
         if str then return Ptr h.entries end

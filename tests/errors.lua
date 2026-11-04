@@ -8,8 +8,10 @@ end
 export f
 ]] },
     { name = 'bare methods do not invoke in expressions', expect = 'needs arguments',
-      src = [[local Counter = Struct { count: U32 }
-function Counter:tick(): Unit self.count = self.count + 1 end
+      src = [[local Counter = struct { count: U32 }
+function Counter:tick(): Unit
+    self.count = self.count + 1
+end
 local f = do(c: Ref Counter): U32
     local action = c:tick
     return c.count
@@ -48,7 +50,7 @@ local f = do(): Unit m:put(1, 2) end
 export f
 ]] },
     { name = 'a map key may not define __eq', expect = 'the map key Money, which defines __eq',
-      src = [[local Money = Struct { cents: I64 }
+      src = [[local Money = struct { cents: I64 }
 function Money.__eq(a: Money, b: Money): Bool return a.cents == b.cents end
 local M = Map(Money, U32)
 local f = do(): U32
@@ -59,9 +61,9 @@ end
 export f
 ]] },
     { name = 'a map key may not contain a type that defines __eq', expect = "field 'amount' of Pair is Money",
-      src = [[local Money = Struct { cents: I64 }
+      src = [[local Money = struct { cents: I64 }
 function Money.__eq(a: Money, b: Money): Bool return a.cents == b.cents end
-local Pair = Struct { label: U32, amount: Money }
+local Pair = struct { label: U32, amount: Money }
 local M = Map(Pair, U32)
 local f = do(): U32
     local m = M {}
@@ -70,9 +72,9 @@ end
 export f
 ]] },
     { name = 'a sum key may not carry a type that defines __eq', expect = "alternative 'some' of Choice is Money",
-      src = [[local Money = Struct { cents: I64 }
+      src = [[local Money = struct { cents: I64 }
 function Money.__eq(a: Money, b: Money): Bool return a.cents == b.cents end
-local Choice = Sum { none: Unit, some: Money }
+local Choice = oneof { none: Unit, some: Money }
 local M = Map(Choice, U32)
 local f = do(): U32
     local m = M {}
@@ -165,7 +167,7 @@ export f]] },
     { name = 'a recursive owner type', expect = 'a recursive owner type has unboundedly many owner positions',
       src = [[local Node = __S.struct("Node", function(self) return { { "children", Grow(self) } } end)]] },
     { name = 'an owner payload matched by value', expect = 'its handler takes it by reference',
-      src = [[local Doc = Sum { empty: Unit, text: Text }
+      src = [[local Doc = oneof { empty: Unit, text: Text }
 local f = do(): U64
     local d = Doc.text(Text {})
     return d { empty = do(): U64 return 0 end, text = do(t: Text): U64 return 1 end }
@@ -346,12 +348,12 @@ end
 f(3)
 ]] },
     { name = 'a reference in a channel message', expect = 'a reference points into memory someone else owns',
-      src = [[local Box = Struct { r: Ref U32 }
+      src = [[local Box = struct { r: Ref U32 }
 local C = Chan Box
 ]] },
     { name = 'an owner moved on one path is moved after the join', expect = "'s' was moved",
-      src = [[local N = Struct { v: U32 }
-local G = Struct { nodes: Store N }
+      src = [[local N = struct { v: U32 }
+local G = struct { nodes: Store N }
 local f = do(x: U32): U32
     local s: Store N = Store(N) {}
     local g = G {}
@@ -361,7 +363,7 @@ end
 export f
 ]] },
     { name = 'a word returning a store returns a store', expect = 'expected a Store N',
-      src = [[local N = Struct { v: U32 }
+      src = [[local N = struct { v: U32 }
 local f = do(x: U32): Store N = x
 local g = do(x: U32): U32
     local s = f x
@@ -370,8 +372,8 @@ end
 export g
 ]] },
     { name = 'a struct field of a moved owner struct', expect = "'g' was moved into 'h'",
-      src = [[local N = Struct { v: U32 }
-local G = Struct { nodes: Store N, count: U32 }
+      src = [[local N = struct { v: U32 }
+local G = struct { nodes: Store N, count: U32 }
 local f = do(x: U32): U32
     local g = G {}
     local h: G = g
@@ -392,8 +394,8 @@ end
 export f
 ]] },
     { name = 'a payload borrow used after the variant changed', expect = 'was given another variant',
-      src = [[local Running = Struct { ticks: U32 }
-local State = Sum { running: Running, stopped: U32 }
+      src = [[local Running = struct { ticks: U32 }
+local State = oneof { running: Running, stopped: U32 }
 local f = do(n: U32): U32
     local state = State.running { ticks = n }
     local dummy: U32 = 0
@@ -432,8 +434,8 @@ end
 export f
 ]] },
     { name = 'moving out through a Ref whose target is chosen at run time', expect = 'not known while compiling',
-      src = [[local G = Struct { order: Grow U32 }
-local H = Struct { r: Ref G }
+      src = [[local G = struct { order: Grow U32 }
+local H = struct { r: Ref G }
 local f = do(flag: Bool): U32
     local a = G {}
     local b = G {}
@@ -445,7 +447,7 @@ end
 export f
 ]] },
     { name = 'an exported word moving out of a Ref argument', expect = 'a C caller could not know it moved',
-      src = [[local G = Struct { order: Grow U32 }
+      src = [[local G = struct { order: Grow U32 }
 local f = do(g: Ref G): U32
     local o = g.order
     return U32 o.length
@@ -467,7 +469,7 @@ end
 export f
 ]] },
     { name = 'an owner moved twice', expect = "'s' was moved into 'a'",
-      src = [[local N = Struct { v: U32 }
+      src = [[local N = struct { v: U32 }
 local f = do(x: U32): U32
     local s = Store(N) {}
     local a = s
@@ -477,8 +479,8 @@ end
 export f
 ]] },
     { name = 'an owner struct moved after one of its fields moved', expect = "'g.nodes' was moved",
-      src = [[local N = Struct { v: U32 }
-local G = Struct { count: U32, nodes: Store N }
+      src = [[local N = struct { v: U32 }
+local G = struct { count: U32, nodes: Store N }
 local f = do(x: U32): U32
     local g = G {}
     local n = g.nodes
@@ -513,7 +515,7 @@ end
 export f
 ]] },
     { name = 'a store created at compile time', expect = 'cannot be created at compile time',
-      src = [[local N = Struct { v: U32 }
+      src = [[local N = struct { v: U32 }
 local f = do(x: U32): U32
     local s: Store N = Store(N) {}
     return x
@@ -540,18 +542,18 @@ export f
       src = [[local f = do(..: U32): U32 = (...)
 ]] },
     { name = 'two keyed spreads with a common field', expect = 'spread-overlap',
-      src = [[local P = Struct { x: U32, y: U32 }
+      src = [[local P = struct { x: U32, y: U32 }
 local f = do(a: P, b: P): P = P { ..a, ..b, x = 1 }
 export f
 ]] },
     { name = 'a keyed spread bringing an unknown field', expect = "has no field 'z'",
-      src = [[local P = Struct { x: U32 }
-local Q = Struct { x: U32, z: U32 }
+      src = [[local P = struct { x: U32 }
+local Q = struct { x: U32, z: U32 }
 local f = do(q: Q): P = P { ..q, z = 1 }
 export f
 ]] },
     { name = 'a record spread into an ordered list', expect = 'spread-source',
-      src = [[local P = Struct { x: U32, y: U32 }
+      src = [[local P = struct { x: U32, y: U32 }
 local add = do(a: U32, b: U32): U32 = a + b
 local f = do(p: P): U32 = add(..p)
 export f
@@ -571,7 +573,7 @@ export g
       src = [[local f = do(..xs, y: U32): U32 = y
 ]] },
     { name = 'assigning an opened context', expect = 'context-use',
-      src = [[local E = Struct { n: U32 }
+      src = [[local E = struct { n: U32 }
 local f = do(x: U32): U32
     local e.. = E { n = x }
     e = E { n = 1 }
@@ -590,43 +592,43 @@ export f
 end
 ]] },
     { name = 'a match missing an alternative', expect = "alternative 'dot' has no handler",
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(s: S): U32 = s { num(v) = v }
 export f
 ]] },
     { name = 'a match handling an unknown alternative', expect = "no alternative 'nope' to handle",
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(s: S): U32 = s { num(v) = v, dot() = 0, nope() = 1 }
 export f
 ]] },
     { name = 'a match missing an alternative, even with a known tag', expect = 'has no handler',
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(x: U32): U32 = S.num(x) { num(v) = v }
 export f
 ]] },
     { name = 'a duplicate handler', expect = "duplicate key 'num'",
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(s: S): U32 = s { num(v) = v, dot() = 0, num(v) = 1 }
 export f
 ]] },
     { name = 'handlers with different result types on a runtime tag', expect = 'expected Bool, got U32',
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(s: S): U32 = s { num(v) = v, dot() = true }
 export f
 ]] },
     { name = 'selecting a payload by name', expect = 'reached by matching',
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(s: S): U32 = s.num
 export f
 ]] },
     { name = 'a payload for a Unit alternative', expect = 'takes no payload',
-      src = [[local S = Sum { dot: Unit, num: U32 }
+      src = [[local S = oneof { dot: Unit, num: U32 }
 local f = do(x: U32): S = S.dot(x)
 export f
 ]] },
     { name = 'a reference payload returned past its target', expect = 'returns a borrow of its own local',
-      src = [[local Node = Struct { v: U32 }
-local Link = Sum { none: Unit, some: Ref Node }
+      src = [[local Node = struct { v: U32 }
+local Link = oneof { none: Unit, some: Ref Node }
 local make = do(): Link
     local node = Node { v = 1 }
     return Link.some(Ref node)
@@ -637,8 +639,8 @@ local f = do(): U32
 end
 export f
 ]] },
-    { name = 'an empty Sum', expect = 'at least one named alternative',
-      src = [[local Never = Sum { }
+    { name = 'an empty oneof', expect = 'at least one named alternative',
+      src = [[local Never = oneof { }
 ]] },
     { name = 'a known index outside a known length', expect = 'index-range',
       src = [[local f = do(b: Slice U8): U32
@@ -703,7 +705,7 @@ end
 export f
 ]] },
     { name = 'a borrow stored in a struct used after its source was cleared', expect = "a borrow of 'text' is used after 'text' was cleared",
-      src = [[local Token = Struct { text: Str }
+      src = [[local Token = struct { text: Str }
 local f = do(n: U32): U32
     local text = Text {}
     text:write "inner"
@@ -789,7 +791,7 @@ end
 export f
 ]] },
     { name = 'a Store element borrow used after a removal', expect = "is used after an element of 'nodes' was removed",
-      src = [[local Node = Struct { value: U32 }
+      src = [[local Node = struct { value: U32 }
 local f = do(n: U32): U32
     local nodes = Store(Node) {}
     local a = nodes:add(Node { value = 1 })
@@ -890,7 +892,7 @@ end
 export f
 ]] },
     { name = 'a store element borrowing a word local', expect = "cannot be stored in 'tokens'",
-      src = [[local Token = Struct { text: Str }
+      src = [[local Token = struct { text: Str }
 local fill = do(tokens: Ref (Store Token)): Unit
     local c = Chars(8) "ab"
     local id = tokens:add Token { text = c:str() }
@@ -908,11 +910,11 @@ export f
 ]] },
     { name = 'an opaque type held by value', expect = 'hold it as Ptr FILE',
       src = [[local FILE = opaque "FILE"
-local S = Struct { f: FILE }
+local S = struct { f: FILE }
 ]] },
     { name = 'a variadic argument that is a record', expect = 'must be a native scalar',
       src = [[local printf = extern("printf", { CString }, I32, { header = "<stdio.h>", variadic = true })
-local P = Struct { x: U32 }
+local P = struct { x: U32 }
 local f = do(x: U32): Unit
     printf("%u", P { x = x })
 end
@@ -929,31 +931,31 @@ export f
       src = [[local Stat = cstruct("struct stat", nil, { { "size", I64, "st_size" } })
 ]] },
     { name = 'reading an atomic plainly', expect = 'is read with :load()',
-      src = [[local C = Struct { n: Atomic U32 }
+      src = [[local C = struct { n: Atomic U32 }
 local f = do(c: Ref C): U32 = c.n
 export f
 ]] },
     { name = 'writing an atomic plainly', expect = 'is written with :store(v)',
-      src = [[local C = Struct { n: Atomic U32 }
+      src = [[local C = struct { n: Atomic U32 }
 local f = do(c: Ref C): Unit
     c.n = 3
 end
 export f
 ]] },
     { name = 'a load with release order', expect = "memory order 'release' is not valid",
-      src = [[local C = Struct { n: Atomic U32 }
+      src = [[local C = struct { n: Atomic U32 }
 local f = do(c: Ref C): U32 = c.n:load("release")
 export f
 ]] },
     { name = 'a store with acquire order', expect = "memory order 'acquire' is not valid",
-      src = [[local C = Struct { n: Atomic U32 }
+      src = [[local C = struct { n: Atomic U32 }
 local f = do(c: Ref C): Unit
     c.n:store(1, "acquire")
 end
 export f
 ]] },
     { name = 'an unknown memory order', expect = "unknown memory order 'strong'",
-      src = [[local C = Struct { n: Atomic U32 }
+      src = [[local C = struct { n: Atomic U32 }
 local f = do(c: Ref C): U32 = c.n:add(1, "strong")
 export f
 ]] },
@@ -961,19 +963,19 @@ export f
       src = [[local f = do(n: Atomic U32): U32 = 0
 ]] },
     { name = 'copying a struct holding an atomic', expect = 'is read with :load()',
-      src = [[local C = Struct { n: Atomic U32 }
+      src = [[local C = struct { n: Atomic U32 }
 local f = do(c: Ref C): Unit
     local d: C = c
 end
 export f
 ]] },
     { name = 'add on an atomic Bool', expect = 'offers load, store, exchange, cas;',
-      src = [[local L = Struct { held: Atomic Bool }
+      src = [[local L = struct { held: Atomic Bool }
 local f = do(l: Ref L): Bool = l.held:add(true)
 export f
 ]] },
     { name = 'an atomic struct', expect = 'Atomic holds an integer, a Bool or a pointer',
-      src = [[local P = Struct { x: U32 }
+      src = [[local P = struct { x: U32 }
 local A = Atomic P
 ]] },
     { name = 'a task assigning a copy', expect = "'total' is a copy taken at spawn; a task cannot assign it", line = 4,
@@ -1002,7 +1004,7 @@ end
 export f
 ]] },
     { name = 'a spawned block mentioning a reference', expect = "a task shares no memory: the outside value 'c' is a Ref C",
-      src = [[local C = Struct { n: U32 }
+      src = [[local C = struct { n: U32 }
 local f = do(c: Ref C): Unit
     tasks do(scope..)
         spawn do
@@ -1038,7 +1040,7 @@ end
 export f
 ]] },
     { name = 'spawning with a reference', expect = "spawn: parameter 'c' of bump is a Ref C; a task shares no memory",
-      src = [[local C = Struct { n: U32 }
+      src = [[local C = struct { n: U32 }
 local bump = do(c: Ref C): Unit
     c.n = c.n + 1
 end
@@ -1054,7 +1056,7 @@ export f
 end
 ]] },
     { name = 'a channel of records holding a pointer', expect = "its field 'p' is a Ptr U8",
-      src = [[local M = Struct { p: Ptr U8 }
+      src = [[local M = struct { p: Ptr U8 }
 local f = do(c: Chan M): Unit
 end
 ]] },
@@ -1133,7 +1135,7 @@ end
 export f
 ]] },
     { name = 'a slot used after it was sent', expect = 'this slot was sent at', line = 8,
-      src = [[local B = Struct { n: U32 }
+      src = [[local B = struct { n: U32 }
 local f = do(): Unit
     tasks do(scope..)
         local p = pool(B, 2)
@@ -1146,7 +1148,7 @@ end
 export f
 ]] },
     { name = 'a slot released twice', expect = 'this slot was released at',
-      src = [[local B = Struct { n: U32 }
+      src = [[local B = struct { n: U32 }
 local f = do(): Unit
     tasks do(scope..)
         local p = pool(B, 2)
@@ -1161,14 +1163,14 @@ export f
       src = [[local f = do(p: Pool (Ptr U8)): Unit
 end
 ]] },
-    { name = 'a slot inside a Sum on a channel', expect = 'a Slot inside a Sum cannot move',
-      src = [[local B = Struct { n: U32 }
-local M = Sum { buf: Slot B, none: Unit }
+    { name = 'a slot inside a oneof on a channel', expect = 'a Slot inside a oneof cannot move',
+      src = [[local B = struct { n: U32 }
+local M = oneof { buf: Slot B, none: Unit }
 local f = do(c: Chan M): Unit
 end
 ]] },
     { name = 'reading a slot directly', expect = 'is a handle: its contents are addressed through its pool, pool[slot]',
-      src = [[local B = Struct { n: U32 }
+      src = [[local B = struct { n: U32 }
 local f = do(s: Slot B): U32 = s.n
 export f
 ]] },
@@ -1217,8 +1219,8 @@ end
 export f
 ]] },
     { name = 'a store addressed with the wrong key', expect = 'Id: expected Id N, got U32',
-      src = [[local N = Struct { v: U32 }
-local G = Struct { nodes: Store N }
+      src = [[local N = struct { v: U32 }
+local G = struct { nodes: Store N }
 local f = do(g: Ref G, k: U32): U32 = g.nodes[k].v
 export f
 ]] },
@@ -1236,7 +1238,7 @@ end
 export f
 ]] },
     { name = 'an operator hook written as a method', expect = '__add is a hook, not a method',
-      src = [[local N = Struct { v: U32 }
+      src = [[local N = struct { v: U32 }
 function N:__add(other: N): N
     return N { v = self.v + other.v }
 end
@@ -1282,7 +1284,7 @@ end
 export f
 ]] },
     { name = 'a local view stored in a global record', expect = 'cannot be stored',
-      src = [[local Holder = Struct { s: Str }
+      src = [[local Holder = struct { s: Str }
 local held = global(Holder, {})
 local f = do(): U32
     local c = Chars(8) "ab"

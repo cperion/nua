@@ -63,7 +63,7 @@ local branch_length = do(pointer: Ptr U8, length: U32, flag: Bool): U32
 end
 export branch_length
 
-local Optional = Sum { some: Str, none: Unit }
+local Optional = oneof { some: Str, none: Unit }
 local select_optional = do(text: Str, flag: Bool): Optional
     if flag then return Optional.some text end
     return Optional.none()

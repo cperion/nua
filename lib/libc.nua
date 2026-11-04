@@ -41,7 +41,7 @@ end
 -- files ----------------------------------------------------------------------------------------
 
 -- the vocabulary inside with_file
-local File = Struct { handle: Ptr FILE }
+local File = struct { handle: Ptr FILE }
 
 function File:write(s: CString): Unit
     fputs(s, self.handle)
@@ -86,7 +86,7 @@ end
 -- memory ---------------------------------------------------------------------------------------
 
 -- the vocabulary inside with_buffer: the bytes and how many
-local Buffer = Struct { data: Ptr U8, size: U32 }
+local Buffer = struct { data: Ptr U8, size: U32 }
 
 function Buffer:fill(byte: U8): Unit
     memset(self.data, I32 byte, U64 self.size)

@@ -21,7 +21,7 @@ assert(body('constant_payload'):find('return 101u;', 1, true))
 assert(body('boundary_match'):find('choose(', 1, true))
 assert(body('boundary_match'):find('%.tag'), 'an explicit call boundary was bypassed')
 assert(body('mixed_unknown'):find('%.tag'), 'unknown sum returns lost their runtime dispatch')
-local ok, err = pcall(nua.compile, [[local Choice = Sum { yes: U32, no: Unit }
+local ok, err = pcall(nua.compile, [[local Choice = oneof { yes: U32, no: Unit }
 local run = do(n: U32): U32
     local body = do()
         if n > 0 then return Choice.yes(U32 1) end

@@ -25,7 +25,7 @@ is recommended.
    borrows of every element's contents of the holder.
 4. Space abandoned by moving, and the contents of removed elements, return on clear, on the
    end of the outer owner, or on an explicit `compact()`.
-5. A `Sum` with an owner payload needs one stack and no arena: replacing the variant resets
+5. A `oneof` with an owner payload needs one stack and no arena: replacing the variant resets
    the stack to its base.
 6. `copy` is deep. Owners may be globals, each with its own reserved region.
 
@@ -101,8 +101,8 @@ moves (turns every element access into two loads). Recommended: accept, and make
 diagnostic name the growth ("`names[0]:write` may move the contents of `names`").
 → **Decision N4.**
 
-**F6. Recursive owner types have no static stack count.** `Json = Sum { array: Grow Json,
-object: Map(Str, Json) }` or `Node = Struct { children: Grow Node }` have unbounded nesting
+**F6. Recursive owner types have no static stack count.** `Json = oneof { array: Grow Json,
+object: Map(Str, Json) }` or `Node = struct { children: Grow Node }` have unbounded nesting
 depth, so claim 1 ("depth is part of the type") fails. Today types cannot be recursive
 except through `Ref`/`Id`, so this is new ground. Two options:
 (a) **Reject recursive owner types** and say why; trees go through `Id` into a `Store`, as
@@ -113,17 +113,17 @@ over data). The stack count stays static, so this is sound.
 Recommended: (a) for milestone 5 with a diagnostic that names (b)'s idea, and keep (b) as
 the extension. → **Decision N5.**
 
-**F7. The `Sum` claim is true only for a top-level `Sum`.** "Replacing the variant resets
-that stack to its base" holds for a local `Sum`. A `Sum` that is an *element* of a
+**F7. The `oneof` claim is true only for a top-level `oneof`.** "Replacing the variant resets
+that stack to its base" holds for a local `oneof`. A `oneof` that is an *element* of a
 container has its payload in the holder's arena, with other elements' contents beside it,
 so replacing the variant abandons the payload (dead bytes) like a removal. Also the stack
-count of a `Sum` is the **maximum** over its alternatives (alternatives share stacks), not
+count of a `oneof` is the **maximum** over its alternatives (alternatives share stacks), not
 one. → correction C3, **Decision N7**.
 
 **F8. Arrays of owners must share an arena.** `Array(Text, n)` and `Bounded(Text, n)` hold
 `n` headers inline and `n` is not bounded (it may be 1000), so one stack per element is
 impossible. All elements share one arena per array and use the same relocate-or-extend
-growth. Struct fields remain the one case where each owner gets its own stack, because the
+growth. struct fields remain the one case where each owner gets its own stack, because the
 field count is small and static. → **Decision N6.**
 
 **F9. Arenas are per owner position, not per nesting level.** The proposal's own examples
@@ -155,7 +155,7 @@ being an element.
 
 **F12. Compaction is a generic Nua word over the type's owner tree.** It walks the holder's
 live elements (slot order for `Store`/`Map`, index order for `Grow`/`Array`, the active
-alternative of a `Sum`), moves their nested contents above the arena, then back down, and
+alternative of a `oneof`), moves their nested contents above the arena, then back down, and
 updates headers. Nested depth k needs the walk of level k−1 to find the headers, which
 live in arena k−1. `Map(Str, V)` implements the single-level case; the multi-level case is
 the same word applied per level, specialized at compile time. It belongs in
@@ -202,8 +202,8 @@ while it holds one above it: the existing summary rule applies unchanged).
 |---|---|---|
 | typed local, parameter, result | yes | exists. Result stacks: one per owner leaf (F9, F16). |
 | struct field | yes | each top-level owner leaf has its own stack; fields of an element struct become arena-based (F9). |
-| `Sum` payload, as a local | yes | the stack is reset when the variant is replaced. |
-| `Sum` payload, as an element | yes, with a correction | arena payload; replacing abandons it (F7). Stack count is the maximum over alternatives. |
+| `oneof` payload, as a local | yes | the stack is reset when the variant is replaced. |
+| `oneof` payload, as an element | yes, with a correction | arena payload; replacing abandons it (F7). Stack count is the maximum over alternatives. |
 | `Array(T, n)`, `Bounded(T, n)` element | yes | one shared arena per array (F8). |
 | `Grow`, `Array T` element | yes | arena; header per element (F2). |
 | `Store` element | yes | arena; `remove` abandons contents (F13); slot reuse starts with an empty header. |
@@ -250,7 +250,7 @@ Recommendations first; each is a decision for you, not a default taken.
   extension.
 - **N6. Arrays and `Bounded` of owners share one arena per array;** struct fields keep one
   stack each.
-- **N7. A `Sum` stack count is the maximum over its alternatives;** an element `Sum` abandons
+- **N7. A `oneof` stack count is the maximum over its alternatives;** an element `oneof` abandons
   its payload on replacement.
 - **N8. Owner globals are the main thread's only;** tasks may not read or write them.
 - **N9. Moving out of an element stays rejected;** the ways out are `copy`, `pop` and
@@ -266,8 +266,8 @@ These are for you to approve; none is applied.
   is stack, base, length, capacity (N2); the holder keeps arena bookkeeping (F3); compaction
   runs inside borrow-ending operations (N3); recursive owner types are rejected (N5);
   arrays share an arena (N6).
-- **C3 (§5.9, `Sum`).** The "reset to base, no arena" sentence applies to a local `Sum`; an
-  element `Sum` uses the arena (F7, N7).
+- **C3 (§5.9, `oneof`).** The "reset to base, no arena" sentence applies to a local `oneof`; an
+  element `oneof` uses the arena (F7, N7).
 - **C4 (§5.10).** Owner globals belong to the main thread; regions are process-wide, not
   slots of a thread's stack set (F14, N8).
 - **C5 (§14).** "None" is wrong until N1–N9 are decided; list them.
@@ -285,7 +285,7 @@ These are for you to approve; none is applied.
 3. **Owner-aware element store** (F11): creating, copying and overwriting an element
    builds its nested owners in the arena; `types.element` and `map_value` admit owners.
 4. **Dead accounting and compaction** words for `Grow`, `Array T`, `Store`, `Map` (F12,
-   F13), then `Sum`, `Array(T, n)` and `Bounded` payloads and elements.
+   F13), then `oneof`, `Array(T, n)` and `Bounded` payloads and elements.
 5. **Borrow effects** for nested growth, removal and compaction (F15), with summaries.
 6. **Owner globals** (F14), after the rest.
 

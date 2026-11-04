@@ -30,9 +30,9 @@ local Operation = {
 }
 -- Owned, bounded diagnostic. Truncation is explicit, never a dangling CString.
 local Message = Chars 512
-local Failure = Struct { operation: U32, message: Message, truncated: Bool }
+local Failure = struct { operation: U32, message: Message, truncated: Bool }
 local no_failure = Failure { operation = 0, message = Message(), truncated = false }
-local Result = Sum { done: Unit, failed: Failure }
+local Result = oneof { done: Unit, failed: Failure }
 local failure = do(operation: U32): Failure
     local out = no_failure
     out.operation = operation

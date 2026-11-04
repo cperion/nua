@@ -1,12 +1,9 @@
 -- Dependency checks only: no downloads or system package changes.
 print(jit and jit.version or _VERSION)
 assert(jit, 'Nua requires LuaJIT')
-local ok, lpeg = pcall(require, 'lpeg')
-assert(ok, 'LPeg for Lua 5.1 is missing; install with luarocks --lua-version=5.1 install lpeg, or set LUA_CPATH')
-print('LPeg: ' .. (type(lpeg.version) == 'function' and lpeg.version() or tostring(lpeg.version)))
-assert(require('macro'), 'project macro source is missing')
-assert(package.preload.macro == nil, 'macro must load from source, not a bundle')
-print('LuaMacro: project source modules')
+local ok, mua = pcall(require, 'mua.init')
+assert(ok, 'Mua is not installed; run make mua (tools/mua.lock pins it)')
+print('Mua: version ' .. tostring(mua.version))
 local c = require 'nua.cjit'
 local available, lib = pcall(c.lib)
 if available then

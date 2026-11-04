@@ -96,8 +96,8 @@ export run
         expect = 'steps = 8418',
         source = [[
 local libc = require "nua.libc"
-local Job = Struct { n: U32 }
-local Done = Struct { steps: U32 }
+local Job = struct { n: U32 }
+local Done = struct { steps: U32 }
 
 local collatz = do(n: U32): U32
     local steps: U32 = 0
@@ -151,7 +151,7 @@ export run
         expect = 'bytes = 64000',
         source = [[
 local libc = require "nua.libc"
-local Buffer = Struct { n: U32, bytes: Array(U8, 64) }
+local Buffer = struct { n: U32, bytes: Array(U8, 64) }
 
 -- buffers move through a pool; the total of their sizes is fixed
 local run = do(): Unit

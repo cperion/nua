@@ -53,7 +53,7 @@ assert(not analyze(base, fn({}, { { T = foreign } }))[R])
 local recursive = T.struct('LayoutRecursive', {})
 recursive.fields = { { name = 'next', type = T.ptr(recursive) } }
 analyze(fn({}, { { T = recursive } })) -- recursive pointer graphs terminate
--- Sum payload projections include an untyped synthetic union member.
+-- oneof payload projections include an untyped synthetic union member.
 local sum = T.sum('LayoutSum', { { 'record', R }, { 'empty', T.Unit } })
 local payload = { op = 'field', name = 'record', T = R,
     a = { op = 'field', name = 'as', a = { op = 'param', T = sum, name = 'value' } } }

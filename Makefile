@@ -7,7 +7,7 @@ ifeq ($(LOCAL_DEPS),1)
 DEPS_PREFIX := $(CURDIR)/.local
 # Subprocesses in the existing harnesses also invoke luajit by name. Keep
 # this PATH target-specific so make deps still finds the host bootstrap GCC.
-NUA_TARGETS := doctor runtime test test-macros test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite test-canvas test-ui
+NUA_TARGETS := doctor runtime test test-mua test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite test-canvas test-ui
 $(NUA_TARGETS): export PATH := $(DEPS_PREFIX)/bin:$(PATH)
 LUA ?= $(DEPS_PREFIX)/bin/luajit
 ifeq ($(origin CC),default)
@@ -22,11 +22,8 @@ LUAJIT_INCLUDE ?= $(DEPS_PREFIX)/include/luajit-2.1
 DEPS_LDFLAGS := -L$(DEPS_PREFIX)/lib -Wl,-rpath,$(DEPS_PREFIX)/lib
 else
 LUA ?= luajit
-# LuaJIT needs LPeg's Lua 5.1 ABI, not the system Lua's newer ABI.
-ROCKS_CPATH := $(shell command -v luarocks >/dev/null 2>&1 && luarocks --lua-version=5.1 path --lr-cpath 2>/dev/null)
-ifeq ($(origin LUA_CPATH),undefined)
-export LUA_CPATH := $(ROCKS_CPATH);;
-endif
+# Mua, the pinned dependency, is installed under .local/share/lua/5.1 (make mua)
+export LUA_PATH := $(CURDIR)/.local/share/lua/5.1/?.lua;;
 endif
 export NUA_CACHE ?= $(CURDIR)/build/cache
 export TMPDIR ?= $(CURDIR)/build/tmp
@@ -38,7 +35,7 @@ export NUA_GCCJIT := $(CURDIR)/.local/lib/libgccjit.so.0
 endif
 endif
 
-.PHONY: help doctor dirs runtime test test-macros test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite deps-fetch deps bootstrap test-build
+.PHONY: mua help doctor dirs runtime test test-mua test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite deps-fetch deps bootstrap test-build
 
 # Fetching is explicit; deps itself can run with the network disconnected.
 deps-fetch:
@@ -55,38 +52,41 @@ bootstrap:
 test-build:
 	bash tests/build.sh
 
-TREE_SITTER ?= tree-sitter
 NVIM ?= nvim
-TS_SOURCE := tools/tree-sitter-nua
-TS_BUILD := build/tree-sitter-nua
 
-# Keep generated parser sources and binaries out of the source tree.
+# Editor support is Mua's (its grammar, parser and plugin); Nua adds queries over it
+# (tools/nvim-nua). The parser is built in the pinned Mua checkout that `make mua` fetched.
 tree-sitter: dirs
-	mkdir -p $(TS_BUILD)/src
-	cp $(TS_SOURCE)/grammar.js $(TS_BUILD)/grammar.js
-	cp $(TS_SOURCE)/src/scanner.c $(TS_BUILD)/src/scanner.c
-	$(TREE_SITTER) generate --abi 14 $(TS_BUILD)/grammar.js -o $(TS_BUILD)/src
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c99 -Wall -Wextra -Werror -fPIC -shared -I$(TS_BUILD)/src $(TS_BUILD)/src/parser.c $(TS_BUILD)/src/scanner.c $(LDFLAGS) -o $(TS_BUILD)/nua.so
+	$(MAKE) -C build/deps/src/mua tree-sitter
 
 test-tree-sitter: tree-sitter
-	$(NVIM) --headless -u NONE -l $(TS_SOURCE)/tests/check.lua
+	$(NVIM) --headless -u NONE -l tools/nvim-nua/tests/check.lua
 help:
 	@printf '%s\n' 'make bootstrap    Fetch pinned sources, build local dependencies and Nua (64-bit Linux)' 'make deps-fetch   Fetch and verify pinned sources only' 'make deps         Build/install fetched dependencies offline under .local/' 'make test-build   Check build setup without downloading or compiling GCC' 'LOCAL_DEPS=0      Use host dependencies instead of a completed local toolchain'
-	@printf '%s\n' 'make doctor       Check LuaJIT, LPeg, C compiler and optional libgccjit' 'make test         Macro checks and complete packaged C/JIT test suite' 'make test-macros  Source-module and macro CLI regressions' 'make test-format  Formatter semantics, style and CLI regressions' 'make test-modules Lua require and compilation cache regressions' 'make test-native  Require libgccjit and run in-process checks' 'make run PROGRAM=examples/csv.nua ARGS="examples/data/sales.csv price"' 'make tree-sitter  Build the local Nua parser for Neovim' 'make test-tree-sitter  Check parsing and Neovim highlighting'
+	@printf '%s\n' 'make doctor       Check LuaJIT, Mua, C compiler and optional libgccjit' 'make test         Mua checks and complete packaged C/JIT test suite' 'make test-mua     Nua's front end over Mua, and Mua's own tests' 'make test-format  Formatter semantics, style and CLI regressions' 'make test-modules Lua require and compilation cache regressions' 'make test-native  Require libgccjit and run in-process checks' 'make run PROGRAM=examples/csv.nua ARGS="examples/data/sales.csv price"' 'make tree-sitter  Build the local Nua parser for Neovim' 'make test-tree-sitter  Check parsing and Neovim highlighting'
 
 dirs:
 ifeq ($(LOCAL_DEPS),1)
 	@bash tools/deps.sh check
 endif
+	@bash tools/mua.sh check
 	@mkdir -p "$(TMPDIR)" "$(NUA_CACHE)" build/logs
 
 doctor: dirs
 	@$(LUA) tools/doctor.lua
 	@$(CC) --version
 
-test-macros: dirs
-	$(LUA) tests/macros.lua
+# Mua, pinned by tools/mua.lock: fetched into build/deps and installed under .local
+mua:
+	bash tools/mua.sh all
+
+# Nua's front end over Mua (the corpus, translation, colon blocks), then Mua's own tests from
+# the pinned checkout
+test-mua: dirs
+	$(LUA) tests/nua_corpus.lua
+	$(LUA) tests/front.lua
 	$(LUA) tests/colon.lua
+	cd build/deps/src/mua && $(LUA) tests/mua.lua && $(LUA) tests/guide.lua && $(LUA) tests/cli.lua && $(LUA) tests/fmt.lua && $(LUA) tests/fmt_do.lua && $(LUA) tests/examples.lua && $(LUA) tests/tour.lua
 
 test-format: dirs
 	$(LUA) tests/formatter_do.lua
@@ -104,7 +104,7 @@ test-ui: dirs
 	$(LUA) tests/ui.lua
 	$(LUA) tests/ui_sdl.lua
 
-test: test-build test-macros test-format test-modules
+test: test-build test-mua test-format test-modules
 	$(LUA) tests/run.lua
 
 runtime: dirs

@@ -6090,7 +6090,7 @@ function S.keyed(items)
 end
 
 -- `{ ..a, name = v, ..b }` arrives as a table whose spreads sit under marked keys, numbered in
--- source order (macro/nua.lua); the rest are its fields
+-- source order (Mua's emitter, __mua.spread_mark); the rest are its fields
 h.spread_marks = {}
 function S.spread_mark(n)
     local m = h.spread_marks[n]

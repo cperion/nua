@@ -1,6 +1,11 @@
 # Designing and writing Nua
 
-**Status: a guide to designing and writing programs in Nua, beside [the language](syntax.md) and [the compiler](architecture.md), which own the rules.** It follows Let's guide, *Designing and writing Let*, and keeps what transfers. Where Nua differs, it says how and why.
+**Status: the Nua addendum to Mua's guide, *Designing and writing Mua* (`docs/designing-and-writing-mua.md` in the Mua repository, which Nua pins), beside [the language](syntax.md) and [the compiler](architecture.md), which own the rules.** Mua's guide owns composition: vocabularies, blocks as arguments, opening, builders and small languages, choices and contracts, and how Mua reads. This guide adds what only Nua has: binding times, native types and layouts, ownership, states, concurrency and reading the C.
+
+| Sections | Owner | In this guide |
+|---|---|---|
+| §2 process, §4.1 name first, §4.3 outcomes, §6 activities and builders, §7 states, §9 composition, §10 skeleton, §12, §14, §16, §17, §19–§25 style, anti-patterns, checklist | **Mua's guide** (`docs/designing-and-writing-mua.md`: process §2, structure §3, activities §4–§5, states §6, composition §7, writing §9–§12, style §13–§19) | the same ideas with native examples and the C they produce; Nua-only items are called out |
+| §1 stance, §3 binding times, §4.2 laying out a type, §5 ownership, §8 concurrency, §11 reading the C and cost, §13 copy or borrow, §15 known information, §18 type hooks | **this guide** | the native half: what only Nua has |
 
 This guide is about discovering a good program, not deriving one mechanically from the language's philosophy. Nua's mechanisms inform the questions (§1); requirements, diagrams, experiments and code help answer them. Its centre is the **activity**: bounded work with someone responsible for setup and completion. Inside an opened context, an **instruction** is a call without a receiver (§6). The same composition, run while compiling, builds descriptions and types (§6.10). Design is **structural by default**: things are grouped and composed by name, as vocabularies, and given a nominal type with a layout when the program demands one (§4).
 
@@ -16,12 +21,12 @@ Every `lua` block below is an excerpt of [`examples/guide.nua`](../examples/guid
 |---|---|
 | `local f = do(x: T): R ... end`, `do(x: T): R = e` | typed words: compiled to native code |
 | `function T:m(...): R ... end` | methods: the receiver is `self`, a reference |
-| `Struct { ... }`, `Sum { ... }` | records and sums: a layout, where one is needed (§4.2) |
+| `struct { ... }`, `oneof { ... }` | records and sums: a layout, where one is needed (§4.2) |
 | `s { name = do(p) ... end, name(p) = e }` | matching a sum: one handler per alternative |
 | untyped parameters, `f known` | compile-time parameters, partial application |
 | `f "lit"`, `f 1 2`, `f x do ... end` | literal application and saturating chains |
 | `do(ctx..)`, `do(..)`, `local ctx.. = e` | opening a record or a vocabulary; `do(..)` leaves it unnamed |
-| `define with ... end`, `define { ... }` | a vocabulary: names bound while compiling, with no layout (§4.1) |
+| `define ... end`, `def { ... }` | a vocabulary: names bound while compiling, with no layout (§4.1) |
 | `{ ..base, name = v }`, `..base` in a `with` block | keyed spread: a vocabulary or a record extended, entries overriding |
 | `insert n`, `note 1` inside an opened block | instructions: calls the innermost opened receiver resolves (§6.3) |
 | `keymap do(..) bind "h" (...) end` | a builder: an activity run while compiling that returns a description or a type (§6.10) |
@@ -50,7 +55,7 @@ These language properties make certain design practices especially useful. They 
 | Principle | What it asks of you |
 |---|---|
 | **Binding time is the centre.** Pure known work can run while specializing. | Preserve known descriptions (§3); an engine over a known description can lose its interpreter (§17). Choose optional start-up compilation deliberately. |
-| **Name structurally; lay out on demand.** A vocabulary groups names while compiling and costs nothing at run time; a type commits a layout. | Start with vocabularies and compose them; introduce a `Struct`, a `Sum` or an owner when something must exist at run time, carry an invariant or have an identity (§4.2). |
+| **Name structurally; lay out on demand.** A vocabulary groups names while compiling and costs nothing at run time; a type commits a layout. | Start with vocabularies and compose them; introduce a `struct`, a `oneof` or an owner when something must exist at run time, carry an invariant or have an identity (§4.2). |
 | **A word is evaluated in place.** Ordinary application needs no runtime closure or call boundary. | Write words at the size the meaning wants (§15). Activities add no callback dispatch, but their work and storage may remain (§6). |
 | **Ownership is lexical.** Scopes own values; stores own slots. | Identify owners and distinguish identity from borrowed access (§5); make each borrow's valid lifetime clear. |
 | **The residual work is inspectable.** Generated C exposes operations and calls to mechanisms. | Read the C (§11.1); inspect reached library/runtime code when needed, and state costs, failures and lifetimes in contracts. |
@@ -109,7 +114,7 @@ Walk a successful scenario and a rejected or failed one through the drawing. Lab
 
 **The job.** A caller asks to insert `n` units into a document with a length cap. An accepted edit increases length, advances the cursor and records one edit. A rejected edit leaves all three fields unchanged and reports rejection. The document persists; tentative work does not. This is a small, in-memory operation on three counters, with no I/O or concurrent mutation. Assume the cursor starts within the document and all additions fit `U32`; a general text editor would need an explicit overflow and storage-capacity contract too.
 
-A first proposal is to call `insert` on the document, then test its length. Drawing the rejection path exposes the problem: the document has already changed. We could undo each write, but that gives every new instruction another rollback obligation. Instead, revise ownership: keep a private `Draft`, run the instructions there, and copy it back only on acceptance. This discovers the `attempt` activity (§6.6), rather than assuming a transaction because transactions are a familiar pattern.
+A first proposal is to call `insert` on the document, then test its length. Drawing the rejection path exposes the problem: the document has already changed. We could undo each write, but that gives every new instruction another rollback obligation. Instead, revise ownership: keep a private `Draft`, run the instructions there, and copy it back only on acceptance. This discovers the `try_edit` activity (§6.6), rather than assuming a transaction because transactions are a familiar pattern.
 
 ```mermaid
 flowchart TD
@@ -122,7 +127,7 @@ flowchart TD
 
 *This activity diagram is a behavior view: boxes are work, the diamond is a decision, and the two exits are distinct completion paths. The implementation uses a body outcome to choose them.*
 
-Then separate names from layout (§4). The verbs the body speaks (`insert`, `move_left`) are names: nothing about them must exist at run time, so they can start as a vocabulary. The document must be laid out: it persists across calls, so it is a `Struct`. The draft is laid out for a different reason: it carries an invariant, since only acceptance may copy it back, so it becomes a type whose activity guards the commit. Each nominal type in the example has a trigger, and later steps refer to it.
+Then separate names from layout (§4). The verbs the body speaks (`insert`, `move_left`) are names: nothing about them must exist at run time, so they can start as a vocabulary. The document must be laid out: it persists across calls, so it is a `struct`. The draft is laid out for a different reason: it carries an invariant, since only acceptance may copy it back, so it becomes a type whose activity guards the commit. Each nominal type in the example has a trigger, and later steps refer to it.
 
 Now revisit the other questions. The count and cap may be runtime inputs; making the cap a compile-time parameter is not required. The body needs `commit` or `abort` with the rejected length, while this caller needs only a `Bool`. There is one document owner and no concurrent work, so a task diagram adds nothing here. The sequence diagram in §6.1 will make the participant responsibilities explicit; §6.6 supplies the implementation; §11 returns to acceptance and rejection tests. The other examples show decisions this small frame does not need: persistent IDs, lifecycle states, builders and task groups.
 
@@ -184,7 +189,7 @@ Start with names. While the design is being discovered, group things **by name**
 
 ```lua
 -- vocabularies: names bound while compiling, with no layout
-local Moves = define with
+local Moves = define
     left = do(document: Ref Document): Unit
         if document.cursor > 0 then document.cursor = document.cursor - 1 end
     end
@@ -192,7 +197,7 @@ local Moves = define with
         if document.cursor < document.length then document.cursor = document.cursor + 1 end
     end
 end
-local Edits = define with
+local Edits = define
     insert = do(document: Ref Document, n: U32): Unit
         document.length = document.length + n
         document.cursor = document.cursor + n
@@ -200,13 +205,13 @@ local Edits = define with
 end
 
 -- capabilities compose by spread; two that both offer a name are rejected
-local Editing = define with
+local Editing = define
     ..Moves
     ..Edits
 end
 ```
 
-`define` is the identity; what it means comes from where it sits. `with` supplies keyed entries, an untyped parameter is a compile-time parameter, and keyed spread composes (syntax §10.7): explicit entries override, and two spreads that offer the same name are rejected rather than silently shadowing. A word takes a vocabulary as an untyped parameter and specializes against its members, or opens it:
+`def` is the identity and `define` is `def with`; what a definition means comes from where it sits. `with` supplies keyed entries, an untyped parameter is a compile-time parameter, and keyed spread composes (syntax §10.7): explicit entries override, and two spreads that offer the same name are rejected rather than silently shadowing. A word takes a vocabulary as an untyped parameter and specializes against its members, or opens it:
 
 ```lua
 -- a word that takes a vocabulary specializes against its members
@@ -245,7 +250,7 @@ A vocabulary may hold runtime values too. It groups them by name without inventi
 ```lua
 -- discovered as names: two runtime values that travel together through in-place words
 local remaining = do(document: Ref Document): U32
-    local span = define { start = document.cursor, stop = document.length }
+    local span = def { start = document.cursor, stop = document.length }
     return span.stop - span.start
 end
 export remaining
@@ -261,8 +266,8 @@ A structural type carries its defaults: its values are the default of each membe
 
 ```lua
 -- a structural type carries its defaults; an instance is the type spread with overrides
-local Margins = define { left = 4, right = 4 }
-local wide = define { ..Margins, right = 12 }
+local Margins = def { left = 4, right = 4 }
+local wide = def { ..Margins, right = 12 }
 local text_width = do(document: Ref Document): U32
     return document.length - wide.left - wide.right
 end
@@ -281,11 +286,11 @@ When the shape must be laid out (§4.2), the struct is filled from it, `MarginBy
 
 **A struct is a layout primitive, not a semantic product.** It says how bytes are arranged: field order, sizes, alignment, a C name. The meaning of a grouping (what its parts are called, what they do, how they compose) lives in names, and a vocabulary carries it without committing any bytes. A struct used only inside words evaluated in place never reaches the C anyway: the evaluator keeps it as separate field values, so its layout was never used. Structural design keeps only the layout the program needs, and every struct that remains marks a place where bytes really are arranged: a container element, a message, an ABI, a word compiled on its own.
 
-A grouping becomes a nominal type (a `Struct`, a `Sum`, an owner) when a trigger appears, and only then. The trigger is the reason the type exists; name it when you introduce one. A program can be written to meet only the unavoidable triggers: its own groupings stay vocabularies, its run-time data are scalars, library owners and the structs an outside ABI imposes (a `cstruct` from a C header), and it declares a struct of its own only when it must store its own records:
+A grouping becomes a nominal type (a `struct`, a `oneof`, an owner) when a trigger appears, and only then. The trigger is the reason the type exists; name it when you introduce one. A program can be written to meet only the unavoidable triggers: its own groupings stay vocabularies, its run-time data are scalars, library owners and the structs an outside ABI imposes (a `cstruct` from a C header), and it declares a struct of its own only when it must store its own records:
 
 | Trigger | Why names are not enough | Introduce |
 |---|---|---|
-| it must exist at run time as one thing: stored in a container, sent to a task, kept in a global, passed across a word compiled on its own (`call`, recursion, `export`) | a vocabulary exists only while compiling | a `Struct` or a `Sum` |
+| it must exist at run time as one thing: stored in a container, sent to a task, kept in a global, passed across a word compiled on its own (`call`, recursion, `export`) | a vocabulary exists only while compiling | a `struct` or a `oneof` |
 | it carries an invariant: fields only certain verbs may change | a vocabulary's entries are open | a type whose methods guard its fields |
 | it has an identity or owns storage | identity and ownership are nominal by nature | an entity in a `Store` named by an `Id`, or an owner |
 | its misuse should be reported where it is declared | a structural mistake surfaces deep inside the generic word that uses it | a named type: `Point has no field 'z'` |
@@ -295,30 +300,30 @@ Promotion is mechanical, because the structural phase found the names: value ent
 
 ```lua
 -- promoted when it must be stored: now it needs a layout
-local Span = Struct { start: U32, stop: U32 }
-local Selections = Struct { spans: Grow Span }
+local Span = struct { start: U32, stop: U32 }
+local Selections = struct { spans: Grow Span }
 ```
 
 Scenarios show which groupings meet a trigger: what must be stored, replayed, logged, undone or tested independently of the action that produced it? Those are the program's values, and they exist at run time, so they get a layout. A command that a key press produces, a log records and a replay re-applies is such a value:
 
 ```lua
-local Direction = Sum { left: Unit, right: Unit }
-local Command = Sum { move: Direction, insert: U32, undo: Unit, quit: Unit }
+local Direction = oneof { left: Unit, right: Unit }
+local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
 ```
 
 Commands as data give replay and tests a shared input, and (§17) they give specialization something to work with. Undo also needs enough history to reverse an operation; naming an `undo` command alone does not provide it. In this guide, `Document` tracks counts rather than actual text or undo history.
 
-**Closed sets and open sets.** A `Sum` is a closed set: its alternatives are fixed where it is declared, a match handles each one, and adding an alternative makes the compiler point to every match that must learn it. Use it where completeness is part of the meaning: a connection's states, an operation's outcomes, the commands an editor understands. A vocabulary of known values is an open set: an enumeration is names for codes (`define { get = 1, post = 2 }`, §6.11), its codes fold where they are used, and anyone may extend it by spread, so code that meets an unknown member needs a default. Use it where extension is expected: protocol methods, opcodes, tokens, plugin points. Ask whether someone else may legitimately add a member: if so, keep the set open; if adding one should make every user reconsider, close it. A `Sum` whose tag is known folds away as well, so choose by meaning, not by cost; a payload, or a variant that exists at run time, needs the `Sum`.
+**Closed sets and open sets.** A `oneof` is a closed set: its alternatives are fixed where it is declared, a match handles each one, and adding an alternative makes the compiler point to every match that must learn it. Use it where completeness is part of the meaning: a connection's states, an operation's outcomes, the commands an editor understands. A vocabulary of known values is an open set: an enumeration is names for codes (`def { get = 1, post = 2 }`, §6.11), its codes fold where they are used, and anyone may extend it by spread, so code that meets an unknown member needs a default. Use it where extension is expected: protocol methods, opcodes, tokens, plugin points. Ask whether someone else may legitimately add a member: if so, keep the set open; if adding one should make every user reconsider, close it. A `oneof` whose tag is known folds away as well, so choose by meaning, not by cost; a payload, or a variant that exists at run time, needs the `oneof`.
 
 
-Composing vocabularies structurally does not make types structural: a `Struct` stays nominal and ordered, and a `with` block stays keyed and unordered. A vocabulary that describes a structure (an interface, a capability set, a namespace) is capitalized like a type, `Editing`; one that holds data is lowercase, `config`, `span` (§19).
+Composing vocabularies structurally does not make types structural: a `struct` stays nominal and ordered, and a `with` block stays keyed and unordered. A vocabulary that describes a structure (an interface, a capability set, a namespace) is capitalized like a type, `Editing`; one that holds data is lowercase, `config`, `span` (§19).
 
 ### 4.3 Outcomes and failures
 
 An outcome a caller acts on is a value that crosses a word's boundary, so it is typed: use a sum when alternatives carry different data or require distinct handling, and match it exhaustively. A predicate can return `Bool`; a named sum makes a richer protocol explicit. Do not encode absence as a magic value:
 
 ```lua
-local Found = Sum { found: U64, missing: Unit }
+local Found = oneof { found: U64, missing: Unit }
 ```
 
 ```lua
@@ -334,7 +339,7 @@ local find_nonzero = do(xs: Slice U32): Found
 end
 ```
 
-The libraries follow the same rule: a receive is `Sum { value: T, closed: Unit }`, and a read/write I/O result is `Sum { done: U32, failed: I32 }`. In the bounded edit (§2.2), the body returns a `commit`/`abort` sum so completion can choose a path; the outer caller receives `Bool` because it needs only acceptance or rejection.
+The libraries follow the same rule: a receive is `oneof { value: T, closed: Unit }`, and a read/write I/O result is `oneof { done: U32, failed: I32 }`. In the bounded edit (§2.2), the body returns a `commit`/`abort` sum so completion can choose a path; the outer caller receives `Bool` because it needs only acceptance or rejection.
 
 **Which kind of failure is which:**
 
@@ -357,8 +362,8 @@ Ownership concerns what has been laid out (§4.2). A vocabulary owns nothing and
 
 | Role | What it is | Nua forms |
 |---|---|---|
-| **vocabulary** | names bound while compiling, with no layout (§4.1) | `define with ... end` |
-| **value** | copied freely; owned by whoever holds it | `Struct`, `Sum`, `Array`, `Chars n` |
+| **vocabulary** | names bound while compiling, with no layout (§4.1) | `define ... end` |
+| **value** | copied freely; owned by whoever holds it | `struct`, `oneof`, `Array`, `Chars n` |
 | **entity** | has identity across operations; independently recyclable entities can live in a store | a scope-owned record, or a struct in a `Store T` named by an `Id` |
 | **owned** | resizable storage, created in place, moved at its last use, duplicated only by `copy`, lent through `Ref` | `Store`, `Grow`, `Text`, `Map`; a struct, sum or `Array(T, n)` holding one; an element holding one (`Store(Player)` with a `name: Text`) |
 | **view** | a window on someone else's storage, valid within its owner's lifetime and borrowing rules | `Slice`, `Str` |
@@ -374,7 +379,7 @@ Ownership concerns what has been laid out (§4.2). A vocabulary owns nothing and
 | **borrow** | uses for a valid bounded lifetime | a `Ref T` parameter, or borrowed access supplied by an activity |
 | **message** | crosses a task boundary | a channel (copies) or a pool slot (moves) |
 
-These labels prevent a vague UML association from hiding ownership. Add other domain dependencies when useful, but do not mistake them for storage edges. Use a `Sum` for alternatives where a class hierarchy would otherwise encode variants; shared behavior can be a vocabulary of words rather than inheritance. A reference may be returned from a received reference when its owner's lifetime permits it; a reference to temporary activity-owned storage cannot escape with it. Persistent identity may need an `Id`, and task boundaries need messages.
+These labels prevent a vague UML association from hiding ownership. Add other domain dependencies when useful, but do not mistake them for storage edges. Use a `oneof` for alternatives where a class hierarchy would otherwise encode variants; shared behavior can be a vocabulary of words rather than inheritance. A reference may be returned from a received reference when its owner's lifetime permits it; a reference to temporary activity-owned storage cannot escape with it. Persistent identity may need an `Id`, and task boundaries need messages.
 
 ```mermaid
 classDiagram
@@ -411,8 +416,8 @@ classDiagram
 * **Trees are fields; graphs are stores.** A `Store T` holds objects with stable identity, and an `Id T` names one without owning it:
 
 ```lua
-local Heading = Struct { level: U32, words: U32 }
-local Outline = Struct { headings: Store Heading }
+local Heading = struct { level: U32, words: U32 }
+local Outline = struct { headings: Store Heading }
 
 local add_words = do(outline: Ref Outline, id: Id Heading, n: U32): U32
     outline.headings[id].words = outline.headings[id].words + n
@@ -425,7 +430,7 @@ end
 
 ```lua
 -- an owner inside an element: each note's title lives in the store's arena
-local Note = Struct { title: Text, words: U32 }
+local Note = struct { title: Text, words: U32 }
 local notes_demo = do(n: U32): U64
     local notes = Store(Note) {}
     local first = notes:add Note { words = n }
@@ -464,7 +469,7 @@ In the bounded edit, the all-or-nothing requirement discovers a private draft (�
 ```mermaid
 sequenceDiagram
     participant Caller as type_capped
-    participant A as attempt (activity)
+    participant A as try_edit (activity)
     participant D as document (entity)
     participant W as draft (context)
     Caller->>A: bounded edit body
@@ -491,17 +496,17 @@ sequenceDiagram
 
 | Kind | Setup | Completion | Example |
 |---|---|---|---|
-| working copy | copy the entity into a context | commit, or conditionally discard | `transaction`, `attempt` |
+| working copy | copy the entity into a context | commit, or conditionally discard | `edit`, `try_edit` |
 | in place | open a place | nothing; writes went through | `local node.. = g.nodes[id]` |
 | scoped resource | acquire | release | `with_file` |
 | accumulator | create the state | return a result from it | `counting` |
-| policy | nothing, or a measurement | record, check, clamp, retry | `counted`, `clamped` |
+| policy | nothing, or a measurement | record, check, clamp, retry | `count_into`, `clamp_length` |
 | builder | a vocabulary | return a description or a type | `keymap`, `ui.component` (§6.10) |
 
 ### 6.3 Enter an activity and speak its instructions
 
 ```lua
-local Draft = Struct { length: U32, cursor: U32, edits: U32 }
+local Draft = struct { length: U32, cursor: U32, edits: U32 }
 
 function Draft:insert(n: U32): Unit
     self.length = self.length + n
@@ -513,7 +518,7 @@ end
 ```lua
 local type_word = do(document: Ref Document, n: U32): U32
     local moved: U32 = 0
-    transaction document:
+    edit document:
         insert n
         local before = cursor
         move_left
@@ -534,7 +539,7 @@ An opened field name is the field's place: reading it reads the current value. A
 ### 6.5 The activity owns completion
 
 ```lua
-local transaction = do(document: Ref Document, body): Unit
+local edit = do(document: Ref Document, body): Unit
     local draft = Draft { ..document }
     body(Ref draft)
     document = Document { ..draft }
@@ -575,9 +580,9 @@ uint32_t type_word(Document *document, uint32_t n) {
 A body cannot leave its activity, so it cannot abort by jumping out. **It returns an outcome, and the activity matches on it to choose its completion:**
 
 ```lua
-local Outcome = Sum { commit: Unit, abort: U32 }
+local Outcome = oneof { commit: Unit, abort: U32 }
 
-local attempt = do(document: Ref Document, body): Bool
+local try_edit = do(document: Ref Document, body): Bool
     local draft = Draft { ..document }
     local committed: Bool = body(Ref draft) {
         commit() = true,
@@ -592,7 +597,7 @@ end
 
 ```lua
 local type_capped = do(document: Ref Document, n: U32, cap: U32): Bool
-    return attempt document:
+    return try_edit document:
         insert n
         if length > cap then
             return Outcome.abort length
@@ -630,7 +635,7 @@ L2:;
 
 The rule "the activity owns completion" covers the body's ordinary outcomes too: the body says what happened, and the activity decides what that means for the entity. The outcome type is part of the activity's contract, so give it outcome names (`commit`, `abort`, `retry`), not unexplained flags. An outcome protocol is not exception unwinding: a trap is not an `abort` return, and opening a context does not install automatic cleanup.
 
-This completes the bounded-edit design begun in §2.2. `abort` carries the tentative length to the activity; `attempt` deliberately projects that richer outcome to acceptance or rejection. A caller that needs the reason would need a richer outer result. Test both paths: successful commit changes the document, while rejection must preserve length, cursor and edit count.
+This completes the bounded-edit design begun in §2.2. `abort` carries the tentative length to the activity; `try_edit` deliberately projects that richer outcome to acceptance or rejection. A caller that needs the reason would need a richer outer result. Test both paths: successful commit changes the document, while rejection must preserve length, cursor and edit count.
 
 Match the body's outcome at the call when completion needs it immediately. Known-tag returns can jump directly to their handlers, without a temporary tagged sum. This preserves effects and payload joins; it does not let a nested call steal the body's completion or remove an explicit native boundary. Keep an outcome in a local when the program genuinely needs to carry it elsewhere.
 
@@ -640,7 +645,7 @@ Each policy is its own activity, and the order of the spine is the order of comp
 
 ```lua
 -- a policy that completes after the work inside it
-local clamped = do(document: Ref Document, max: U32, body): Unit
+local clamp_length = do(document: Ref Document, max: U32, body): Unit
     body
     if document.length > max then
         document.length = max
@@ -649,15 +654,15 @@ local clamped = do(document: Ref Document, max: U32, body): Unit
 end
 
 local import_capped = do(document: Ref Document, stats: Ref Stats, n: U32): Unit
-    counted stats do
-    clamped document 100 do
-    transaction document:
+    count_into stats do
+    clamp_length document 100 do
+    edit document:
         insert n
     endall
 end
 ```
 
-The transaction commits first, then the clamp applies, then the count is recorded, exactly as the spine reads from the inside out. `endall` closes the spine; it adds no semantics.
+The edit commits first, then the clamp applies, then the count is recorded, exactly as the spine reads from the inside out. `endall` closes the spine; it adds no semantics.
 
 ### 6.8 Nesting composes
 
@@ -665,21 +670,21 @@ Nested activities do not need to know about each other. A name the inner context
 
 ```lua
 -- nested activities compose: a name the inner context lacks reaches the outer one
-local Log = Struct { notes: U32 }
+local Log = struct { notes: U32 }
 
 function Log:note(count: U32): Unit
     self.notes = self.notes + count
 end
 
-local logged = do(body): U32
+local collect_notes = do(body): U32
     local log = Log { notes = 0 }
     body(Ref log)
     return log.notes
 end
 
 local type_logged = do(document: Ref Document, n: U32): U32
-    return logged:
-        transaction document:
+    return collect_notes:
+        edit document:
             insert n
             note 1
         end
@@ -727,7 +732,7 @@ A **builder** is an activity whose context is a vocabulary (§4.1) and whose com
 -- a builder: the block declares, the builder returns a description
 local keymap = function(body)
     local bindings = {}
-    local Keys = define with
+    local Keys = define
         bind = function(key)
             return function(command)
                 bindings[#bindings + 1] = { code = key:byte(), .command }
@@ -803,11 +808,11 @@ Most DSLs mix them: a declarative front end describes, an engine runs, and its h
 
 **2. Design from the sentences.** Write the text the user should write before anything else, then derive the vocabulary from it: verbs become instructions, nouns become declared parts or tokens, qualifiers become properties or stacked policy activities (§6.7), alternatives become sums. A sentence that does not read is a vocabulary problem; parentheses or a new syntax will not fix it (§19). For a router, the sentence is `get "/":` followed by what the route does: the HTTP methods are the verbs.
 
-**3. Layer it structurally, and type what must exist at run time.** The words and tokens of a DSL are vocabularies: structural, composable, free of layout. What runs is nominal: here the request is a `Struct`, because it exists at run time and crosses into the program. The methods are a vocabulary of known values:
+**3. Layer it structurally, and type what must exist at run time.** The words and tokens of a DSL are vocabularies: structural, composable, free of layout. What runs is nominal: here the request is a `struct`, because it exists at run time and crosses into the program. The methods are a vocabulary of known values:
 
 ```lua
 -- the methods a router speaks: a structural vocabulary of known values
-local Methods = define { get = 1, post = 2 }
+local Methods = def { get = 1, post = 2 }
 ```
 
 **4. Make the builder check its sentences, and report at the user's line.** A structural mistake surfaces late, deep in an engine; a DSL feels like a language when a bad sentence is rejected where it is written. Validate while building, and give `fail` the level of the line that spoke the instruction:
@@ -838,7 +843,7 @@ local routes = router Methods
 
 `get "notes"` is rejected at its own line, `get: a path starts with '/', got notes`; a second `post "/"` is rejected at the second one. The builder makes its verbs from the vocabulary it is given (one verb per method), so the vocabulary decides what can be said.
 
-**5. Treat the description as the interface.** The builder's result is keyed data, and the engine depends only on it. Keep it structural while only the engine reads it while specializing; promote it to a nominal type (a `Sum` of commands, a `Grow` of records) when it must exist at run time (§4.2, §17). Several front ends can then feed one engine: a builder, a file read at start-up, a test.
+**5. Treat the description as the interface.** The builder's result is keyed data, and the engine depends only on it. Keep it structural while only the engine reads it while specializing; promote it to a nominal type (a `oneof` of commands, a `Grow` of records) when it must exist at run time (§4.2, §17). Several front ends can then feed one engine: a builder, a file read at start-up, a test.
 
 ```lua
 -- the engine over the description: one test per route, each handler inlined
@@ -931,7 +936,7 @@ assert(#site == 2 and site[2].path == "/notes")
 
 ```lua
 -- a dialect: the same builder over a vocabulary extended by spread
-local Dav = define { ..Methods, propfind = 7 }
+local Dav = def { ..Methods, propfind = 7 }
 local dav_routes = router Dav
 local share = dav_routes:
     propfind "/":
@@ -957,12 +962,12 @@ stateDiagram-v2
     closed --> [*]
 ```
 
-A `Sum` is a natural representation when states carry different data. A word from state and event to next state makes the transition rules testable while compiling. Here `rejected` deliberately consumes the next event only to reset; even a `hang_up` in that state resets rather than closes. That is this example's policy, not a consequence of using sums:
+A `oneof` is a natural representation when states carry different data. A word from state and event to next state makes the transition rules testable while compiling. Here `rejected` deliberately consumes the next event only to reset; even a `hang_up` in that state resets rather than closes. That is this example's policy, not a consequence of using sums:
 
 ```lua
 -- a lifecycle as a sum, and one word per transition
-local Conn = Sum { reading: U32, rejected: U32, closed: Unit }
-local Event = Sum { bytes: U32, bad_line: Unit, hang_up: Unit }
+local Conn = oneof { reading: U32, rejected: U32, closed: Unit }
+local Event = oneof { bytes: U32, bad_line: Unit, hang_up: Unit }
 
 local step = do(c: Conn, e: Event): Conn = c {
     reading(n) = e {
@@ -1135,7 +1140,7 @@ The line between host Lua and typed words is the main structural decision of a N
 | choosing what to compile (`export`, `native`) | |
 | compile-time tests (`assert(host(...))`) | |
 
-Modules are ordinary Lua values returned through `require` (see [module loading](architecture.md#13-modules-and-the-compilation-scope)). A library module exports types and words; a program module exports its edges. A library is a vocabulary: write its words as locals, so they can use each other, and end the file with the surface it offers, `return define with .square .double end`. What is not listed stays private, and an entry may rename (`area = square`). A layer (a platform, a backend) is a vocabulary that spreads its base and overrides a few entries; the overlap rule catches two layers defining the same name.
+Modules are ordinary Lua values returned through `require` (see [module loading](architecture.md#13-modules-and-the-compilation-scope)). A library module exports types and words; a program module exports its edges. A library is a vocabulary: write its words as locals, so they can use each other, and end the file with the surface it offers, `return define .square .double end`. What is not listed stays private, and an entry may rename (`area = square`). A layer (a platform, a backend) is a vocabulary that spreads its base and overrides a few entries; the overlap rule catches two layers defining the same name.
 
 ### 9.3 Discipline for compile-time Lua
 
@@ -1158,7 +1163,7 @@ A useful implementation route is:
 
 Drafting order is not source binding order. Nua uses Lua's lexical scope: a later `local` helper is not visible to an earlier word definition. Put dependencies before their users, or use deliberate forward bindings and define them before export or other specialization. Reachability does not excuse syntax errors or host effects in module construction.
 
-For the bounded edit, the skeleton is `Document`, `Draft`, the draft verbs, `Outcome`, `attempt` and `type_capped`. A successful scenario must commit the expected fields; a rejected one must preserve all of them. Compilation establishes that the parts fit; these checks establish the intended contract.
+For the bounded edit, the skeleton is `Document`, `Draft`, the draft verbs, `Outcome`, `try_edit` and `type_capped`. A successful scenario must commit the expected fields; a rejected one must preserve all of them. Compilation establishes that the parts fit; these checks establish the intended contract.
 
 ## 11. Step 9: verify
 
@@ -1242,7 +1247,7 @@ function Document:at_end(): Bool
 end
 ```
 
-Put the body last when the word establishes structure: `transaction document do(..) ... end`. Name the opened parameter only when its name is used.
+Put the body last when the word establishes structure: `edit document do(..) ... end`. Name the opened parameter only when its name is used.
 
 ## 13. Let the contract say copy or borrow
 
@@ -1301,7 +1306,7 @@ uint32_t tab_stop_4(uint32_t column) {
 | keyed handlers | one behavior per outcome: matching a sum, a receive, an I/O result |
 | channel | values crossing tasks (§8) |
 
-**Saturating chains.** `transaction document do(..) ... end` applies `transaction` to its arguments group by group until it is saturated. The signature decides the invocation point, not the parser. A pending runtime argument stays inside its chain; it never becomes a runtime closure (Nua has none).
+**Saturating chains.** `edit document do(..) ... end` applies `edit` to its arguments group by group until it is saturated. The signature decides the invocation point, not the parser. A pending runtime argument stays inside its chain; it never becomes a runtime closure (Nua has none).
 
 ## 17. Describe, then run
 
@@ -1375,7 +1380,7 @@ Native arithmetic follows the width, wraparound and conversion rules in [syntax 
 
 ### 18.1 Type hooks
 
-A type's layout is a `Struct`; what the language's operations mean on it is a hook stored on the type under a `__` name ([syntax §16](syntax.md#16-library-defined-types)): `__index` and `__newindex` for `x[k]`, `__cast` for a value given where the type is expected, `__add` and the other arithmetic hooks, `__eq`, `__lt` and `__le`, and `__member` for `x.name`. Hooks run while specializing, so whatever they build folds and residualizes with the caller. Hook selection adds no runtime dispatch; the operations selected can still have runtime cost. The built-in types use the same hooks.
+A type's layout is a `struct`; what the language's operations mean on it is a hook stored on the type under a `__` name ([syntax §16](syntax.md#16-library-defined-types)): `__index` and `__newindex` for `x[k]`, `__cast` for a value given where the type is expected, `__add` and the other arithmetic hooks, `__eq`, `__lt` and `__le`, and `__member` for `x.name`. Hooks run while specializing, so whatever they build folds and residualizes with the caller. Hook selection adds no runtime dispatch; the operations selected can still have runtime cost. The built-in types use the same hooks.
 
 **A hook gives an operation the meaning the reader already expects.** If the meaning needs explaining, it is a named word.
 
@@ -1389,7 +1394,7 @@ A type's layout is a `Struct`; what the language's operations mean on it is a ho
 | `__member` | a family whose members follow from its parameters | members a method would declare: methods keep a type's vocabulary listable |
 
 ```lua
-local Fixed = Struct { raw: I32 }  -- a number with 16 fractional bits
+local Fixed = struct { raw: I32 }  -- a number with 16 fractional bits
 
 function Fixed.__cast(v, T)  -- a Lua number where a Fixed is expected
     if type v == 'number' then
@@ -1431,7 +1436,7 @@ end
 | transformation | participle or adjective | `trimmed`, `translated` |
 | query | the thing returned | `line_count`, `tab_stop` |
 | predicate | proposition | `at_end`, `has_selection` |
-| activity word | purposeful word, or `with_` + resource | `transaction`, `attempt`, `counted`, `with_file` |
+| activity word | a verb phrase for what it does to its destination, or `with_` + resource | `edit`, `try_edit`, `count_into`, `with_file` |
 | activity block parameter | snake_case noun, matching the context type | `draft`, `batch`, `file` |
 | declared part (a field a builder declares) | long, descriptive snake_case: what it is | `increment_button`, `question_label`, `count_display` |
 | builder instruction | the domain's own vocabulary | `bind`, `button`, `px`, `bg` |
@@ -1441,17 +1446,19 @@ end
 | vocabulary describing a structure (interface, capability set, namespace) | PascalCase, like a type | `Editing`, `Moves`, `Storage` |
 | vocabulary holding data (configuration, fixture, values in flight) | snake_case, like a value | `config`, `span` |
 
-**Activity words say what completion means; contexts are nouns for what the body holds.** `transaction` commits after the body returns normally; `attempt` commits only on acceptance. The body holds a draft. When an opened parameter needs a name, use the context's noun: `Draft`, `do(draft..)`. Otherwise use `do(..)`. A gerund is the fallback when the context is the state of an ongoing process with no natural noun.
+**Name an activity for what it does to its destination.** An activity is a verb phrase that takes the destination first, so the call reads as a sentence: `edit document do(..)`, `try_edit document do(..)`, `clamp_length document 100 do`, `count_into stats do`. The verb tells the relationship: `edit` always completes by committing, `try_edit` commits only on acceptance, `count_into` records into its destination after the work. A scoped resource is `with_` + the resource (`with_file`). Avoid a noun borrowed from another domain (`transaction`, `session`): it promises a guarantee the activity may not give, and says nothing about what it acts on.
+
+**Activity words say what completion means; contexts are nouns for what the body holds.** `edit` commits after the body returns normally; `try_edit` commits only on acceptance. The body holds a draft. When an opened parameter needs a name, use the context's noun: `Draft`, `do(draft..)`. Otherwise use `do(..)`. A gerund is the fallback when the context is the state of an ongoing process with no natural noun.
 
 | Kind of activity | Activity word | Context |
 |---|---|---|
-| working copy | `transaction`, `attempt` | `Draft` / `draft` |
+| working copy | `edit`, `try_edit` | `Draft` / `draft` |
 | in place | (opening a place) | the entity's own name: `local node.. = g.nodes[id]` |
 | scoped resource | `with_file` | the resource: `file` |
 | accumulator | `counting`, `importing` | what accumulates: `Tally` / `tally`, `Batch` / `batch` |
-| policy | `counted`, `timed`, `clamped` | none |
+| policy | `count_into`, `timed`, `clamp_length` | none |
 
-**Names carry the reading, not parentheses.** The house style drops call parentheses wherever the grammar and calling convention permit: `release slot`, `apply document command`, `counted stats do`. That works only when names are descriptive. If a line is confusing without parentheses, adding them back hides the problem: the names are not descriptive enough (`p:release s` instead of `pool:release slot`), or the design is wrong (a word with a role-less argument, a chain that applies too much at once, a flag where a sum or two words belong). Rename or redesign until the line reads as a sentence.
+**Names carry the reading, not parentheses.** The house style drops call parentheses wherever the grammar and calling convention permit: `release slot`, `apply document command`, `count_into stats do`. That works only when names are descriptive. If a line is confusing without parentheses, adding them back hides the problem: the names are not descriptive enough (`p:release s` instead of `pool:release slot`), or the design is wrong (a word with a role-less argument, a chain that applies too much at once, a flag where a sum or two words belong). Rename or redesign until the line reads as a sentence.
 
 **Prefer long, descriptive names for declared things.** A declared part shares a namespace with its owner's methods, and a name that says what the part is (`increment_button`) never competes with one that says what a method does (`increment`). Instructions are read without their receiver, so their names must carry the whole meaning.
 
@@ -1493,7 +1500,7 @@ Check the files you changed with `luajit nua.lua fmt --check examples/guide.nua`
 
 ## 22. Files and libraries
 
-* **A file is a vocabulary or a program.** A program file defines its words and exports its edges. A library returns its vocabulary through `require`, usually `return define with ... end` after its locals (§9.2). Bundled vocabularies live in `lib/` and use names such as `require "nua.io"`; project modules use their own names. Lua's `require "io"` still names Lua's I/O library. See [module loading](architecture.md#13-modules-and-the-compilation-scope) for paths and compilation lifetimes.
+* **A file is a vocabulary or a program.** A program file defines its words and exports its edges. A library returns its vocabulary through `require`, usually `return define ... end` after its locals (§9.2). Bundled vocabularies live in `lib/` and use names such as `require "nua.io"`; project modules use their own names. Lua's `require "io"` still names Lua's I/O library. See [module loading](architecture.md#13-modules-and-the-compilation-scope) for paths and compilation lifetimes.
 * **Readable dependency order:** `require`s first, then types and supporting words before their users. Put each `export` directly after the completed word or specialization. Give exported words a one-line promise. Drafting top-down does not make later local bindings visible earlier (§10).
 * **Dependencies point toward the domain.** Activities use entities; entities do not import every activity that can operate on them.
 
@@ -1516,7 +1523,7 @@ Explain why when the code says what. State what a signature cannot: an invariant
 | an activity configured by flags | stacked policy activities |
 | a builder that keeps a current-builder global, or an interface argument passed to every method | a block that opens the builder's vocabulary (§6.10) |
 | a nominal interface type introduced only to recognize a set of operations | a vocabulary the word takes or opens (§4.1) |
-| a `Struct` that groups compile-time names, constants or words | `define` (§4.1) |
+| a `struct` that groups compile-time names, constants or words | `define` (§4.1) |
 | a struct invented to carry two values between in-place words | a vocabulary of the values; promote it when it must be stored (§4.2) |
 | a vocabulary copied to change one entry | spread it and override the entry |
 | a block that writes a context's fields to get around its verbs | the verb that is missing (§6.9) |

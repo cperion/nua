@@ -1,9 +1,9 @@
 -- A single-window, main-thread canvas. SDL is the edge; these are Nua words.
 local sdl = require "nua.sdl"
 local Result, Failure, Operation = sdl.Result, sdl.Failure, sdl.Operation
-local Color = Struct { r: U8, g: U8, b: U8, a: U8 }
-local KeyEvent = Struct { code: U32, pressed: Bool, repeated: Bool }
-local Frame = Struct { handle: Ptr sdl.Renderer, width: I32, height: I32, frame_error: Failure }
+local Color = struct { r: U8, g: U8, b: U8, a: U8 }
+local KeyEvent = struct { code: U32, pressed: Bool, repeated: Bool }
+local Frame = struct { handle: Ptr sdl.Renderer, width: I32, height: I32, frame_error: Failure }
 
 function Frame:checked(ok: Bool, operation: U32): Unit
     if not ok and self.frame_error.operation == 0 then self.frame_error = sdl.failure operation end
@@ -42,7 +42,7 @@ local with_frame = do(renderer: Ptr sdl.Renderer, body): Result
     return Result.done()
 end
 
-local View = Struct with
+local View = struct with
     renderer: Ptr sdl.Renderer
     window_id: U32
     stopped: Bool

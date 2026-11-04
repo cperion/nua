@@ -30,7 +30,7 @@ residualized as C, checked against a memory model, and emitted.
 
 Five mechanisms carry the language:
 
-1. **LuaMacro provides the surface language.** Typed functions, annotations,
+1. **Mua provides the surface language.** Typed functions, annotations,
    methods, declarations and control flow look like natural extensions of Lua,
    and typed bodies are parsed with Lua's grammar so that comparisons,
    conditions, `and`/`or`, assignment and `return` can be staged (§2, §4).
@@ -94,7 +94,7 @@ It uses:
 - Juxtaposition for application.
 
 No source-level `emit`, `set`, `var`, `comptime`, `template` or `specialize` keyword
-is required. The macros add two words, `Struct` and `export` (with `Sum` as the
+is required. The macros add two words, `struct` and `export` (with `oneof` as the
 sum constructor, §11), and the prelude adds:
 
 * **types and their constructors**: `Ref`, `Store`, `Id`, `Grow`, `Ptr`, `Slice`,
@@ -144,12 +144,12 @@ search order, the compilation-scope cache and the acceptance checks.
 ### 2.2 Types are compile-time values
 
 ```lua
-local Vec2 = Struct with
+local Vec2 = struct with
     x: F32
     y: F32
 end
 
-local Player = Struct with
+local Player = struct with
     position: Vec2
     health: U32
 end
@@ -157,12 +157,12 @@ end
 
 `Vec2` and `Player` are Lua bindings to native type objects.
 
-The `Struct` operation constructs a type description. It does not immediately generate C; a struct is emitted only if residual code uses it.
+The `struct` operation constructs a type description. It does not immediately generate C; a struct is emitted only if residual code uses it.
 
 Annotations appear in exactly five places:
 
 ```lua
-Struct { x: U32 }               -- struct fields
+struct { x: U32 }               -- struct fields
 do(x: U32): U32 = ...           -- parameters and result types
 function T:m(n: U32): Unit      -- the same, on named functions and methods
 local y: U32 = x                -- typed locals
@@ -181,7 +181,7 @@ It is not a struct declaration merely because its value happens to be a type.
 ### 2.3 Generic types are ordinary Lua functions
 
 ```lua
-local Pair = do(A, B) = Struct with
+local Pair = do(A, B) = struct with
     first: A
     second: B
 end
@@ -198,7 +198,9 @@ Its result is a specialized native type object.
 
 ### 2.4 Application
 
-Application is juxtaposition, extending macro.let:
+Application is juxtaposition, as Mua defines it (Mua is the Lua language Nua is a host of; its own
+surface rules are in Mua's syntax doc, `docs/syntax.md` of the Mua repository, pinned by
+`tools/mua.lock`). This section keeps the rule numbers and says what Nua adds to each:
 
 ```lua
 local Numbers = Grow U32
@@ -223,44 +225,24 @@ self.nodes:add(Node { value = 42 })
 
 The rules:
 
-1. **What can be an argument.** After a callable expression, these start an argument: a number, a string, `true` or `false`, a table constructor, a `do` lambda — on any line — and a **name**, only on the same line and only directly after a name, a name argument (with its member chain: `f a.b x` is `f(a.b)(x)`), a number, string or boolean argument (`f 1 x` is `f(1)(x)`) or a spaced group (rule 3). A name does not continue an application after an attached call (`f a(b) x` is `f(a(b))` followed by `x`, rule 8) or after a table.
-2. **The newline rule.** A newline ends an application chain before any token that can begin a statement. Names and `(` can begin statements, so `local y: U32 = x` followed by `y = y + 1` on the next line stays two statements. Literals, tables and lambdas cannot begin statements, so they still attach across lines.
-3. **What an argument is.** A primary expression with its postfix chain, as Lua parses it: `.name`, `[i]`, `:m args`, `(args)`, and for a name, a table constructor or string. So `f a.b` is `f(a.b)`, `f a(b)` is `f(a(b))`, and `add Node { ... }` is `add(Node { ... })`. A literal's chain stops at a table or string (`f 21 {}` is `f(21)({})`). Only an attached `(` continues an argument's chain: a `(` with whitespace before it on the same line is the **next argument group**, so `f a (b + 1)` is `f(a)(b + 1)` and `f 21 (2)` is `f(21)(2)`. Such a spaced group is itself an argument, so names after it go on applying: `f (g x) y` is `f(g(x))(y)`. On a word these groups saturate as one supply (rule 7): `add3 x (y * 2) (twice y)` is `add3(x, y * 2, twice(y))`. After the callee itself the spacing makes no difference: `f (x)` and `f(x)` are the same call.
+1. **What can be an argument.** Mua's rule (Mua's syntax doc, §2 rule 1): numbers, strings, booleans, tables, lambdas, and names on the same line after a name, a literal or a spaced group. Nua adds nothing.
+2. **The newline rule.** Mua's (§2 rule 2): a newline ends an application chain before any token that can begin a statement.
+3. **What an argument is.** Mua's (§2 rule 3): a primary expression with its postfix chain; a spaced `(` is the next argument group. What Nua adds is the meaning of the groups: on a word they saturate as one supply (rule 7), so `add3 x (y * 2) (twice y)` is `add3(x, y * 2, twice(y))`.
 4. **Left associativity.** `f a b` is `f(a)(b)`. Application binds more tightly than infix operators: `f a + 1` is `f(a) + 1`, and `f -1` is subtraction (a word is not a number, so with a word for `f` the compiler says so and suggests `f(-1)` or `f (-1)`).
 5. **Brackets** group, delimit argument lists and resolve ambiguity: an empty store is `Store(Node) {}` or `(Store Node) {}`; `Store Node {}` would apply `Store` to `Node {}`. A compound argument is written as a spaced group: `f (x + 1) y`, `f a (b * 2)`.
-6. **Loop headers.** The `do` of a `while` or `for` header ends the header; a lambda inside a header goes in brackets: `for x in each(xs, do(x) = x > 0) do`.
+6. **Loop headers.** Mua's (§2 rule 6).
 7. **Saturating chains.** `f(a) do ... end` on a word accumulates arguments until the word is saturated (§10.4).
-8. **Statements on one line.** Two statements on one line where the first ends with a name and the second begins with one (`a = b c = d`) form an application; separate them with `;`. `f() g()` is unaffected: a name after an attached call's `)` is not an argument (after a spaced group it is, rule 3).
-9. **Field shorthand.** In a table constructor, `.name` is `name = name`: `Point { .x, .y, z = 3 }` is `Point { x = x, y = y, z = 3 }`. A `.` never follows `{`, `,` or `;` in Lua, so no existing program changes. The shorthand is rewritten in the token stream, so it works in typed bodies and in the plain Lua code around them, and it is only spelling: the program is the one the long form writes. A bare `{x}` is not a shorthand, because it is already a one-element array table.
+8. **Statements on one line.** Mua's (§2 rule 7).
+9. **Field shorthand.** Mua's `.name` entry (Mua's syntax doc, §4): in a table constructor `.name` is `name = name`. It works in typed bodies and in the plain Lua code around them, and it is only spelling.
 
-10. **Zero-argument call statements.** A bare name or qualified name used as a whole statement invokes it with zero arguments: `refresh`, `screen.refresh` and `screen:refresh` mean `refresh()`, `screen.refresh()` and `screen:refresh()`. This applies in native bodies, callbacks and host Lua code. Opened-context lookup and lexical shadowing are exactly those of the explicit call. The rule does not inspect the callee's type or arity: a non-callable value is an error, not a no-op. Use separate lines or `;` between calls (`refresh; save`); `refresh save` still supplies an argument. Parenthesized or indexed callees retain explicit invocation: `(refresh)()` and `actions[i]()`.
+10. **Zero-argument call statements.** Mua's (Mua's syntax doc, §2 rule 8): a bare name or qualified name used as a whole statement invokes it with zero arguments. In Nua this applies in native bodies, callbacks and host Lua code; opened-context lookup and lexical shadowing are exactly those of the explicit call, and the rule does not inspect the callee's type or arity. It is statement-only: `local action = refresh` and `return refresh` still refer to the callable.
 
-This is a statement-only rule. `local action = refresh` and `return refresh` still refer to the callable; `local result = refresh()` and `return refresh()` invoke it. A receiver-method expression still needs arguments, so `local action = screen:refresh` is not a new method-value form.
+11. **Trailing colon.** Mua's (Mua's syntax doc, §4): a colon that ends a line, optionally after parameter names, opens an untyped block lambda: `do(..)`, `do(names)` or `do(scope..)`; `=:` assigns a block and `return:` returns one (`return: body` then a block and `end` is `return do(body) … end`): the colon always means a block. The names are untyped; a typed parameter list keeps `do(x: U32)`. `:` alone opens whatever the activity hands over, exactly as `do(..)` does; an activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
 
-The syntax remains independent of the runtime arity of the callee.
-
-11. **Trailing colon.** A colon that ends a line, optionally after parameter names, opens an untyped block lambda: it is `do(..)`, `do(names)` or `do(scope..)`.
+12. **With blocks.** Mua's block (Mua's syntax doc, §4); what Nua adds is the table-shaped forms it takes. `T with entries end` is `T { entries }`: keyed data without commas, closed by `end`. `with` is to data what `do` is to computation: a `with` block supplies keyed data to the expression before it, a `do` block (or its colon form, rule 11) supplies a trailing computation.
 
 ```lua
-with_buffer n:               -- with_buffer n do(..)
-    ...
-end
-words:each: key value        -- words:each do(key, value)
-    ...
-end
-tasks: scope..               -- tasks do(scope..)
-    ...
-end
-```
-
-`=:` assigns a block, with the same parameter forms: `local f =: x`, and in a table `found =: v` and `other =: ..` are `found = do(v)` and `other = do(..)`. It works inside brackets, because `=:` occurs nowhere else; the plain colon does not, since inside brackets a colon is an annotation (`Struct { x: F32 }`).
-
-`:` alone opens whatever the activity hands over, exactly as `do(..)` does. An activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. The names are untyped; a typed parameter list keeps `do(x: U32)`. A colon is a block opener only where Nua has no annotation colon, so these are unchanged: the result type after a parameter list (`do(x: U32): U32`, `function f(x): T`), the names of a `local` (`local s: Store Node`), fields inside brackets, `::label::`, and a method call, where the name follows the colon directly (`xs:each`). It is a token rewrite below every other rule, so the block is translated as the `do(..)` it stands for, and line numbers do not move. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
-
-12. **With blocks.** `T with entries end` is `T { entries }`: keyed data without commas, closed by `end`. `with` is to data what `do` is to computation: a `with` block supplies keyed data to the expression before it, a `do` block (or its colon form, rule 11) supplies a trailing computation.
-
-```lua
-local Point = Struct with
+local Point = struct with
     x: F32
     y: F32
 end
@@ -282,7 +264,7 @@ local area = s with  -- matching is keyed application: the handlers are the entr
 end
 ```
 
-Every table-shaped form takes it: constructors, `Struct`, `Sum`, matches and any constructor-headed argument (`f x with k = 1 end` is `f(x { k = 1 })`, rule 3). Lua's own `{ }` tables are untouched, so no Lua table semantics change; `with` is the Nua spelling for keyed data and `{ }` stays for Lua tables and compact one-liners.
+Every table-shaped form takes it: constructors, `struct`, `oneof`, matches and any constructor-headed argument (`f x with k = 1 end` is `f(x { k = 1 })`, rule 3). Lua's own `{ }` tables are untouched, so no Lua table semantics change; `with` is the Nua spelling for keyed data and `{ }` stays for Lua tables and compact one-liners.
 
 *Contextual `with`.* Where an expression starts (after `return`, `=`, `(`, `,` or `{`), `with` takes no type before it, and the **context supplies the constructor**: a declared result, a typed local, a typed parameter or a field of a record. It is the same construction as `T with`, without repeating `T`.
 
@@ -304,7 +286,7 @@ total with x = 1, y = 2 end  -- a typed parameter
 
 The type is found by the coercion that every typed position already performs, so it works wherever an expected type is known and nowhere else: `local p = with x = 1 end`, with no type in the context, is rejected (`with` here has no type) rather than guessed. A variable named `with` is still a variable (`with + 1`, `t.with`, `pass(with)`); `with` begins a block only before an entry (`name =`, `.name`, `[`, a literal).
 
-*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`Struct with x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
+*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`struct with x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
 
 ### 2.5 Words and host functions
 
@@ -520,7 +502,7 @@ Lua cannot overload:
 - local assignment,
 - `return` (it exits the actual Lua function).
 
-A typed body is therefore parsed — a recursive-descent parser with Lua's precedence over the LuaMacro token stream — and translated:
+A typed body is therefore parsed — a recursive-descent parser with Lua's precedence over Mua's tokens — and translated:
 
 | Source | Staged form |
 |---|---|
@@ -541,7 +523,7 @@ A typed body is therefore parsed — a recursive-descent parser with Lua's prece
 | `f(a)(b)`, `f(a) do ... end` | `stage.chain(f, ...)`: a saturating chain (§10.4) |
 | a free name, a bare call or an assignment in an opened region | resolved against the opened contexts (§10.5) |
 | `..e`, `T { ..p, x = 1 }` | `stage.expand`, `stage.keyed` (§10.7, §10.8) |
-| `Sum { ... }`, `s { alt = handler, ... }` | `stage.oneof`, matching (§11) |
+| `oneof { ... }`, `s { alt = handler, ... }` | `stage.oneof`, matching (§11) |
 | `p[i]`, `s[i]`, `Ptr(place)`, `Slice(p, n)` | element places and checked reads (§12) |
 
 Arithmetic, calls, field access and constructors stay ordinary Lua expressions; metamethods handle them.
@@ -1017,7 +999,7 @@ A loop is sugar for a tail-recursive word, and a word receives its state as para
 So a residual loop's state is exactly its parameters, and no hidden iteration is needed to discover what it carries. In a residual loop a state variable is its own local: nothing else reads it while the loop runs, so the C has one variable, not a copy (`total` in `runtime_sum`).
 
 ```lua
-local Pair = Struct { a: U32, b: U32 }
+local Pair = struct { a: U32, b: U32 }
 local fib_pair = do(n: U32): U32
     local p = Pair { a = 0, b = 1 }
     for i: U32 = 1, n do
@@ -1050,7 +1032,7 @@ uint32_t fib_pair(uint32_t n) {
 **Ordinary records are carried field by field.** A record field that changes between rounds becomes runtime state; an unchanged known field stays known inside the loop and after it. Nested records follow the same rule.
 
 ```lua
-local Panel = Struct { gap: U32, padding: U32, count: U32 }
+local Panel = struct { gap: U32, padding: U32, count: U32 }
 local panel_extent = do(n: U32): U32
     local panel = Panel { gap = 12, padding = 24, count = 0 }
     local i: U32 = 0
@@ -1136,7 +1118,7 @@ LuaJIT's GC owns compiler objects: types, words, closures, staged values, comman
 ## 8. Methods and `self`
 
 ```lua
-local Counter = Struct with
+local Counter = struct with
     value: U32
 end
 
@@ -1244,7 +1226,7 @@ field or element is rebound by a reference and written through by a value of the
 referred type:
 
 ```lua
-local Holder = Struct { r: Ref U32, n: U32 }
+local Holder = struct { r: Ref U32, n: U32 }
 local holder = Holder { r = Ref a, n = 2 }
 holder.r = holder.r + holder.n    -- writes a
 holder.r = Ref b                  -- now refers to b
@@ -1328,11 +1310,11 @@ A store slot is addressed as a place, `s[id]`, whose address is recomputed and w
 ### 9.8 Managed stores and generational IDs
 
 ```lua
-local Node = Struct with
+local Node = struct with
     value: U32
 end
 
-local Graph = Struct with
+local Graph = struct with
     nodes: Store Node
 end
 ```
@@ -1361,7 +1343,7 @@ A store's slots live on its data stack; its header (stack index, base offset, co
 Graph edges contain IDs, not owning references:
 
 ```lua
-local Edge = Struct with
+local Edge = struct with
     from: Id Node
     to: Id Node
 end
@@ -1380,11 +1362,11 @@ Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.leng
 An owner may sit anywhere a value can: an element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)`, a field of such an element, a map value, a sum payload, a global (design memory.md §5.9, §5.10).
 
 ```lua
-local Player = Struct { score: U32, name: Text, items: Grow Item }
+local Player = struct { score: U32, name: Text, items: Grow Item }
 local lines = Grow(Text) {}
 local players = Store(Player) {}
 local names = Map(U64, Text) {}
-local Doc = Sum { empty: Unit, text: Text }
+local Doc = oneof { empty: Unit, text: Text }
 ```
 
 - **Positions.** Each place in an owner's type where an owner sits is a position, with one data stack. A position under an element (of a container, of an `Array(T, n)`, a map value) is shared by every element there: it is that position's arena. `Grow Text` holds 2 stacks, `Store Player` 3, `Grow(Grow Text)` 3. The number is fixed while compiling, so a type that contains itself through an owner is rejected; a tree goes through `Id`s into a `Store` (§9.11).
@@ -1443,8 +1425,8 @@ A native word may leave a parameter untyped. **An untyped parameter of a native 
 ### 10.3 Activity words
 
 ```lua
-local Document = Struct { length: U32, cursor: U32, edits: U32 }
-local Draft = Struct { length: U32, cursor: U32, edits: U32 }
+local Document = struct { length: U32, cursor: U32, edits: U32 }
+local Draft = struct { length: U32, cursor: U32, edits: U32 }
 
 function Draft:insert(n: U32): Unit
     self.length = self.length + n
@@ -1459,14 +1441,14 @@ function Draft:move_left(): Unit
 end
 
 -- work on a copy, commit at the end
-local transaction = do(document: Ref Document, body): Unit
+local edit = do(document: Ref Document, body): Unit
     local draft = Draft { ..document }
     body(Ref draft)
     document = Document { ..draft }
 end
 
 local type_text = do(doc: Ref Document, n: U32): Unit
-    transaction doc:
+    edit doc:
         insert n
         move_left
         if cursor > 3 then
@@ -1550,7 +1532,7 @@ Temporary resizable state (a worklist, a change log) created in an activity take
 
 ### 10.4 Saturating chains
 
-`transaction(doc) do(draft..) ... end` is the application `transaction(doc)(body)`. On its own, `transaction(doc)` would be a partial application with a runtime argument, which §3.8 rejects. **A chain of applications on a word accumulates its arguments until the word is saturated**, as in Let; surplus arguments apply to the result. The same holds for method chains (`m:each do(k, v) ... end`) and for library functions with a declared arity. Any other Lua function applies each group in turn.
+`edit(doc) do(draft..) ... end` is the application `edit(doc)(body)`. On its own, `edit(doc)` would be a partial application with a runtime argument, which §3.8 rejects. **A chain of applications on a word accumulates its arguments until the word is saturated**, as in Let; surplus arguments apply to the result. The same holds for method chains (`m:each do(k, v) ... end`) and for library functions with a declared arity. Any other Lua function applies each group in turn.
 
 In a typed body, a native-word chain concatenates its argument groups before
 applying the word. A rest requirement receives the remaining arguments from the
@@ -1560,6 +1542,8 @@ host Lua calls keep their application groups; their parentheses cannot be remove
 on the assumption that every callable is a native word.
 
 ### 10.5 Opening
+
+The general rule is Mua's (Mua's syntax doc, §6: an opened Lua table introduces its string keys, under lexical shadowing). This section is what Nua adds: records, places, references and native boundaries.
 
 Nua uses `..` to contribute bindings or values: postfix in opening declarations, prefix in keyed and ordered spreads, and prefix in a rest parameter. `(..)` reads the anonymous home. Infix `a .. b` keeps its concatenation semantics and precedence; for example, `f(a .. b)` passes one concatenated value, while `f(..args)` expands a pack. Ordinary Lua `...` varargs outside typed bodies are unchanged; `...` is not an alternative spelling for Nua opening or expansion.
 
@@ -1653,18 +1637,20 @@ Then the next use looks again. The C compiler cannot do this merging itself, bec
 
 ### 10.7 Keyed spread
 
+Spreading tables and `define` are Mua's (Mua's syntax doc, §5); records are Nua's:
+
 ```lua
 local moved_x = do(p: Point, dx: I32): Point = Point { ..p, x = p.x + dx }
 ```
 
-A spread contributes a record's data fields (from a value, place or reference); the result is ordinary construction. A spread of a compile-time table contributes its string keys, and when every spread is one, the result is a compile-time table: this is how vocabularies (for DSLs, and for any Lua code) are built and extended. `define` returns its argument, so a `with` block reads as a definition:
+A spread contributes a record's data fields (from a value, place or reference); the result is ordinary construction. A spread of a compile-time table contributes its string keys, and when every spread is one, the result is a compile-time table: this is how vocabularies (for DSLs, and for any Lua code) are built and extended. `def` returns its argument, and `define` followed by entries and `end` is `def with … end`, so a definition reads as one:
 
 ```lua
-local base = define with
+local base = define
     add = do(a: U32, b: U32): U32 return a + b end
     scale = 2
 end
-local more = define with
+local more = define
     ..base
     scale = 3
 end
@@ -1698,11 +1684,13 @@ A pack's shape is part of the specialization key, so each shape gets its own res
 
 ### 10.9 `endall`
 
+`endall` is Mua's (Mua's syntax doc, §4); in Nua the typed word is the function body it stops at.
+
 ```lua
 local import_rows = do(doc: Ref Document, n: U32): Unit
     traced 1 do
     traced 2 do
-    transaction doc:
+    edit doc:
         insert n
     endall
     trace 9
@@ -1763,12 +1751,12 @@ Sums follow Let's `syntax.md` §8.1.
 ### 11.1 Declaring and constructing
 
 ```lua
-local Circle = Struct { radius: U32 }
-local Rect = Struct { width: U32, height: U32 }
-local Shape = Sum { circle: Circle, rect: Rect, dot: Unit }
+local Circle = struct { radius: U32 }
+local Rect = struct { width: U32, height: U32 }
+local Shape = oneof { circle: Circle, rect: Rect, dot: Unit }
 ```
 
-A sum is a finite set of named alternatives, each with a payload type (`Unit` for none). Alternative order is canonical (by name), so two spellings of the same alternatives are the same type. A `Sum` needs at least one alternative. A payload may hold owners (§9.13), never references (*Let's recursive sums go through `Ref`; in Nua they go through `Id`s into a store, as graphs do*).
+A sum is a finite set of named alternatives, each with a payload type (`Unit` for none). Alternative order is canonical (by name), so two spellings of the same alternatives are the same type. A `oneof` needs at least one alternative. A payload may hold owners (§9.13), never references (*Let's recursive sums go through `Ref`; in Nua they go through `Id`s into a store, as graphs do*).
 
 Member selection on the sum type names a constructor. A record payload is built by keyed supply, another payload is applied to one value, and a `Unit` alternative to nothing:
 
@@ -1849,8 +1837,8 @@ A sum stored in a typed local keeps a known tag through the evaluator (lazy stor
 Commands as data and one interpreter:
 
 ```lua
-local Direction = Sum { left: Unit, right: Unit }
-local Command = Sum { move: Direction, insert: U32, undo: Unit }
+local Direction = oneof { left: Unit, right: Unit }
+local Command = oneof { move: Direction, insert: U32, undo: Unit }
 
 local apply = do(e: Ref Editor, c: Command): Unit
     c with
@@ -2034,7 +2022,7 @@ A view is read-only: `s[i] = v` is rejected (`not-a-place`); writes go through t
 ### 12.3 Describe, then run: a binary format
 
 ```lua
-local Packet = Struct { version: U32, flags: U32, length: U32, id: U32 }
+local Packet = struct { version: U32, flags: U32, length: U32, id: U32 }
 local format = {
     { "version", 0, 1 },
     { "flags", 1, 1 },
@@ -2192,12 +2180,12 @@ Three types, one per role, each fitting the memory model as it is: views never o
 | Word | Gives |
 |---|---|
 | `s:equals(t)`, `s:starts_with(t)`, `s:ends_with(t)` | `Bool` |
-| `s:find(t)` | `Sum { at: U64, missing: Unit }` |
-| `s:compare(t)` | `Sum { less, same, greater }` (bytes, then length) |
+| `s:find(t)` | `oneof { at: U64, missing: Unit }` |
+| `s:compare(t)` | `oneof { less, same, greater }` (bytes, then length) |
 | `s:trim()` | `Str` without leading and trailing spaces, tabs, CR, LF |
 | `s:split(",") do(part) ... end` | each part between one-byte separators |
 | `s:lines() do(line) ... end` | each line, without a last empty one |
-| `s:parse(T)` | `Sum { value: T, bad: Unit }` for any integer `T`; overflow is `bad` |
+| `s:parse(T)` | `oneof { value: T, bad: Unit }` for any integer `T`; overflow is `bad` |
 | `Str.of(x)` | a view of a `Slice U8` or a `CString` (`strlen` once) |
 
 These words are written in Nua (`lib/str.nua`), so they specialize like any other. Over text known while compiling they run while compiling (`assert(host(word_count("the quick  brown fox")) == 4)`). With a known needle, the method picks a variant that takes the needle as a Lua string, a compile-time parameter, so the loop over it is Lua's and unrolls:
@@ -2323,7 +2311,7 @@ export count
   survives `remove 2` when both keys are known and differ; with any unknown key the
   compiler assumes the two may be equal. (`Store` ends every element borrow: `Id`s are
   runtime values.)
-- `find(k)` returns `Sum { found: V, missing: Unit }`, with a found value snapshot.
+- `find(k)` returns `oneof { found: V, missing: Unit }`, with a found value snapshot.
 - `has(k)` returns Bool. `put(k, v)` inserts or replaces and returns Unit.
 - `ensure(k, initial)` inserts only if absent. Both arguments evaluate eagerly,
   including when an existing value makes `initial` unnecessary.
@@ -2360,7 +2348,7 @@ key the map by the fields that compare structurally, or wrap the type in an `Id`
 which is identity by token, slot and generation.
 
 ```lua
-local Money = Struct { cents: I64 }        -- a map value, not a key
+local Money = struct { cents: I64 }        -- a map value, not a key
 function Money.__eq(a: Money, b: Money): Bool
     return a.cents == b.cents
 end
@@ -2479,7 +2467,7 @@ slices of the feature: `examples/maps.nua`, `examples/strmaps.nua`,
 ## 16. Library-defined types
 
 A type is a layout plus what the language's operations mean on it. The layout is
-a `Struct`. The meaning is a set of **hooks**: Lua functions or native words stored
+a `struct`. The meaning is a set of **hooks**: Lua functions or native words stored
 on the type under `__`-names. A hook runs while specializing and returns staged
 values, places or words, so whatever it builds folds and residualizes with the
 caller. No runtime dispatch, inheritance or object model is involved (§22).
@@ -2510,7 +2498,7 @@ so a hook that compares is a native word. Assigning to a native field or element
 works in plain Lua code as well as in typed bodies.
 
 ```lua
-local Fixed = Struct { raw: I32 }  -- 16 fractional bits
+local Fixed = struct { raw: I32 }  -- 16 fractional bits
 
 function Fixed.__cast(v)
     if type v == 'number' then return Fixed { raw = I32(v * 65536) } end
@@ -2537,7 +2525,7 @@ hook that returns the element's place:
 
 ```lua
 local Ring =: E capacity
-    local R = Struct { head: U32, len: U32, items: Grow E }
+    local R = struct { head: U32, len: U32, items: Grow E }
 
     function R:push(v: E): Unit
         if self.len < capacity then
@@ -2683,7 +2671,7 @@ local FILE = opaque "FILE"
 local fopen = extern("fopen", { CString, CString }, Ptr FILE, { header = "<stdio.h>" })
 local fclose = extern("fclose", { Ptr FILE }, I32, { header = "<stdio.h>" })
 
-local File = Struct { handle: Ptr FILE }
+local File = struct { handle: Ptr FILE }
 function File:write(s: CString): Unit
     fputs(s, self.handle)
 end
@@ -2825,7 +2813,7 @@ references between tasks or change the ownership rules.
 
 ### 18.2 The library
 
-- `with_fd(path, flags) do(writing..) ... end` returns an **`Outcome`**, `Sum { done: Unit, failed: I32 }` carrying the errno. Inside, the body has `write_text`, `write_bytes`, `read_bytes`, `size` and `mapped`.
+- `with_fd(path, flags) do(writing..) ... end` returns an **`Outcome`**, `oneof { done: Unit, failed: I32 }` carrying the errno. Inside, the body has `write_text`, `write_bytes`, `read_bytes`, `size` and `mapped`.
 - `mapped(n) do(bytes) ... end` maps the file's first `n` bytes as a read-only `Slice U8` that ends with its `munmap`.
 - `with_eventfd do(counter..) ... end` gives a kernel counter that is a descriptor.
 - `with_epoll do(poll..) ... end` gives `watch(fd)` and `next_ready(timeout_ms)`.
@@ -2954,7 +2942,7 @@ Atomics serve two kinds of sharing: state shared between threads of a program, a
 ### 19.2 A spinlock is an activity
 
 ```lua
-local SpinLock = Struct { held: Atomic Bool }
+local SpinLock = struct { held: Atomic Bool }
 local with_lock = do(lock: Ref SpinLock, body): Unit
     while not lock.held:cas(false, true, "acquire") do
     end
@@ -2962,7 +2950,7 @@ local with_lock = do(lock: Ref SpinLock, body): Unit
     lock.held:store(false, "release")
 end
 
-local Shared = Struct { lock: SpinLock, total: U64 }
+local Shared = struct { lock: SpinLock, total: U64 }
 local add_locked = do(s: Ref Shared, times: U32): Unit
     local i: U32 = 0
     while i < times do
@@ -3002,7 +2990,7 @@ The expected value is reset on every round of the spin, as a compare-and-swap re
 A single-producer single-consumer ring publishes with release stores of its indices and observes with acquire loads:
 
 ```lua
-local Ring = Struct { head: Atomic U32, tail: Atomic U32, mask: U32, slots: Ptr U32 }
+local Ring = struct { head: Atomic U32, tail: Atomic U32, mask: U32, slots: Ptr U32 }
 
 local push = do(r: Ref Ring, v: U32): Bool
     local tail: U32 = r.tail:load "relaxed"
@@ -3029,7 +3017,7 @@ bool push(Ring *r, uint32_t v) {
 }
 ```
 
-The consumer side returns a sum (`Sum { empty: Unit, value: U32 }`), matched by the draining loop. For io_uring itself, the ring indices live in memory mapped from the kernel: `atomic_ptr` turns the plain pointers `mmap` returns into atomic ones.
+The consumer side returns a sum (`oneof { empty: Unit, value: U32 }`), matched by the draining loop. For io_uring itself, the ring indices live in memory mapped from the kernel: `atomic_ptr` turns the plain pointers `mmap` returns into atomic ones.
 
 ### 19.4 Checked with real threads
 
@@ -3234,10 +3222,10 @@ Every wait is an **operation**: it is started, and later it completes with a res
 | Operation | Completes with |
 |---|---|
 | `c:send(v)` | — (traps if `c` is closed) |
-| `c:recv()` | `Received T`: `Sum { value: T, closed: Unit }` |
+| `c:recv()` | `Received T`: `oneof { value: T, closed: Unit }` |
 | `p:take()` | a `Slot T` the task now owns (§20.6) |
 | `sleep(d)` | — (`d` is a `Duration`, built with `ns`, `us`, `ms` or `seconds`) |
-| I/O (§20.7) | `Sum { done: U32, failed: I32 }`, and `timed_out` with a deadline |
+| I/O (§20.7) | `oneof { done: U32, failed: I32 }`, and `timed_out` with a deadline |
 | `blocking do ... end` | — (the block ran on a blocking thread) |
 | a scope's end | — |
 
@@ -3265,7 +3253,7 @@ first_of {
 * When one case completes, the others are **withdrawn before the handler runs**, so exactly one case happens. A completing counterpart first claims the waiting task with a compare-and-swap on its selection word, so two senders cannot both deliver to it.
 * Ready cases are scanned from a rotating start, for fairness.
 
-The cases are known while compiling, so `first_of` is sequenced where it is written (`lib/select.nua`): the program fills the operation records itself, and a shared function per shape of `first_of` (its kinds in order, and whether it has a default) makes one attempt per case through the runtime's `nua_poll_recv`, `nua_poll_send` and `nua_poll_take`, each one locked transaction. Only when nothing is ready and there is no default does it wait, on every record, through `nua_select_arm`. No case array is built, no case kind is looked up at run time, and the clock is read only when a case waits on time: a two-case select over ready channels runs about 2.4 times faster than the interpreter it replaced.
+The cases are known while compiling, so `first_of` is sequenced where it is written (`lib/select.nua`): the program fills the operation records itself, and a shared function per shape of `first_of` (its kinds in order, and whether it has a default) makes one attempt per case through the runtime's `nua_poll_recv`, `nua_poll_send` and `nua_poll_take`, each one locked edit. Only when nothing is ready and there is no default does it wait, on every record, through `nua_select_arm`. No case array is built, no case kind is looked up at run time, and the clock is read only when a case waits on time: a two-case select over ready channels runs about 2.4 times faster than the interpreter it replaced.
 
 **Why I/O is never a case of `first_of`.** A channel operation, a pool take and a timer belong to the runtime, which can take them back exactly: a withdrawn receive has received nothing. The kernel's work cannot be taken back. A read that loses the race may already have consumed bytes from the socket, and then they are gone. So `first_of` admits only operations the runtime can withdraw, and an I/O case is rejected. The two needs behind such a case have direct forms:
 
@@ -3298,7 +3286,7 @@ Never `Ref`, `Ptr`, `Slice`, `CString`, `Atomic` or a store `Id`, at any depth. 
 Copying is right for messages and wrong for buffers. A pool moves them instead:
 
 ```lua
-local Block = Struct { n: U32, data: Array(U8, 64) }
+local Block = struct { n: U32, data: Array(U8, 64) }
 
 local pooled = do(count: U32): U64
     local total: U64 = 0
@@ -3400,7 +3388,7 @@ The operations live in a library, `local io = require "nua.io"`, like the libc a
 | `io.pipe()`, `io.listen(host, port)` | a `Pipe`, a `File` | setup that never waits |
 
 * **Options** are `{ at = offset }` for positioned reads and writes, and `{ deadline = d }`. A deadline adds `timed_out` to the result, and the result is exact: on a readiness backend the system call happens only once the descriptor is ready, so `timed_out` means nothing was done; on io_uring the deadline is a linked timeout, and an operation that finished first keeps its result.
-* **Results are sums**, `Sum { done: U32, failed: I32 }` and its relatives, matched exhaustively; `failed` carries the system's error code (`io.ENOENT`, `io.ECONNREFUSED`, ... come from the headers). A handler table may follow the call directly: `io.read(f, buf) { done = do(n) ... end, failed = do(e) ... end }`.
+* **Results are sums**, `oneof { done: U32, failed: I32 }` and its relatives, matched exhaustively; `failed` carries the system's error code (`io.ENOENT`, `io.ECONNREFUSED`, ... come from the headers). A handler table may follow the call directly: `io.read(f, buf) { done = do(n) ... end, failed = do(e) ... end }`.
 * **Suspension is the borrow.** During an operation its task is suspended (plain code: blocked), so nobody but the system touches the buffer. That holds for any memory the task owns, so no extra ownership rule is needed. Reading into a pool slot and then sending the slot is zero-copy I/O between tasks.
 * **I/O is never a `first_of` case**: `I/O cannot lose a first_of: give io.read a deadline ({ deadline = d }), or spawn a task that does it and receive its result` (§20.4).
 * **Regular files never hold a worker or the poller.** On io_uring a file read is asynchronous in the kernel. A readiness backend hands regular-file reads and writes, and every `open` and `close`, to the blocking threads, since a regular file is always "ready" and the call blocks.
@@ -3517,7 +3505,7 @@ While compiling:
 | `spawn(f, ...)` with a non-`Unit` result | `a task's result goes nowhere; send it on a channel` |
 | `spawn(f, ...)` with an unsendable parameter | `spawn: parameter 'c' of bump is a Ref C; a task shares no memory, ...` |
 | an unsendable channel element | `Chan M: values crossing a channel are copies, and its field 'p' is a Ptr U8: ...` |
-| a slot inside a Sum on a channel | `Chan M: a Slot inside a Sum cannot move (its ownership would depend on a runtime choice)` |
+| a slot inside a oneof on a channel | `Chan M: a Slot inside a oneof cannot move (its ownership would depend on a runtime choice)` |
 | a task waiting inside a function compiled on its own | `a wait inside walk, which is compiled as its own C function (...); a task cannot suspend inside it: loop by tail call, or keep an explicit stack` |
 | a `first_of` with `recv` cases and neither `closed` nor `default` | ``first_of: when every channel is closed it runs `closed = do ... end`; give it one (or a default)`` |
 | a `first_of` with `closed` but no `recv` case | ``first_of: `closed` runs when every received channel is closed, but no case receives`` |

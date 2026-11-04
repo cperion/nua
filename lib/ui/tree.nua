@@ -1,7 +1,7 @@
 -- Known-tree traversal generates ordinary Nua words. No runtime tree, layout
 -- interpreter, event registry, or stored callback is created.
-local Size = Struct { width: F32, height: F32 }
-local Input = Struct { kind: U32, x: F32, y: F32 }
+local Size = struct { width: F32, height: F32 }
+local Input = struct { kind: U32, x: F32, y: F32 }
 local dot = __S.dot
 local function home(owner, node)
     if node.field then return dot(owner, node.field) end

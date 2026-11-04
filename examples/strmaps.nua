@@ -29,7 +29,7 @@ local strmap_copy = do(): U32
 end
 export strmap_copy
 
-local Item = Struct { value: U32 }
+local Item = struct { value: U32 }
 local Items = Map(Str, Item)
 local strmap_live_key = do(): U32
     local words = Items {}
@@ -44,7 +44,7 @@ local strmap_live_key = do(): U32
 end
 export strmap_live_key
 
-local Owner = Struct { count: U32, words: Counts }
+local Owner = struct { count: U32, words: Counts }
 local strmap_scopes = do(n: U32): U32
     local sum: U32 = 0
     for i: U32 = 1, n do

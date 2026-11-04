@@ -29,7 +29,7 @@ test "addition" do(): Unit
     assert(call add 40 2 == 42)
 end
 
-local Counter = Struct { value: U32 }
+local Counter = struct { value: U32 }
 local bump = do(counter: Ref Counter): Unit
     counter.value = counter.value + 1
 end
@@ -124,7 +124,7 @@ test "foreign effect" do(): Unit
 end
 ]], { 'test "foreign effect"', 'cannot evaluate at compile time', 'test_effect_must_not_run' })
 reject('runtime storage', [[
-local Node = Struct { value: U32 }
+local Node = struct { value: U32 }
 test "runtime storage" do(): Unit
     local nodes = (Store Node) {}
     nodes:add Node { value = 1 }
@@ -219,11 +219,11 @@ check('ordinary compilation also rejects failed tests', status == 1
 
 -- compile-time tables (syntax §10.7): define builds one, keyed spread extends it
 local vocab_ok, vocab_err = pcall(compile, [[
-local base = define with
+local base = define
     add = do(a: U32, b: U32): U32 return a + b end
     scale = 2
 end
-local more = define with
+local more = define
     ..base
     scale = 3
     triple = do(a: U32): U32 return a * 3 end
@@ -236,12 +236,12 @@ export f
 ]])
 check('define and keyed spread build compile-time tables', vocab_ok, vocab_err)
 reject('two spreads giving one key', [[
-local a, b = define { k = 1 }, define { k = 2 }
+local a, b = def { k = 1 }, def { k = 2 }
 local c = { ..a, ..b }
 ]], { "spread-overlap: field 'k' comes from two spreads" })
 
 reject('a duplicated field beside a spread', [[
-local a = define { k = 1 }
+local a = def { k = 1 }
 local c = { ..a, x = 1, x = 2 }
 ]], { "duplicate field 'x'" })
 

@@ -44,7 +44,7 @@ follows a language principle:
 | An owner passed where a read-only borrow is expected borrows without a marker: `sum xs`. | Reading cannot invalidate anything; ceremony would buy nothing. |
 | Owner fields start empty: `Graph {}`. Initial contents are optional: `Grow U32 { 1, 2, 3 }`. | Creation in place should read like construction of any value. |
 | An owner is returned like a value; the callee builds it where the caller keeps it. | A word's result is its result; placement is the compiler's job. |
-| Anything that composes values may compose owners: `Grow Text`, `Store Player` with a `Text` field, `Sum` payloads. | Containers should not care what they contain. |
+| Anything that composes values may compose owners: `Grow Text`, `Store Player` with a `Text` field, `oneof` payloads. | Containers should not care what they contain. |
 | Checks are on; facts remove them. | Safety by default, cost only where nothing proves the bound. |
 | Raw memory is spelled raw: `Ptr T`, `Slice(p, n)`. | The trusted boundary is visible in the source. |
 
@@ -55,7 +55,7 @@ the size class (fixed, variable, resizable) follows from it.
 
 | Role | Meaning | Types |
 |---|---|---|
-| **value** | copied freely, owned by whoever holds it | scalars, `Struct`, `Sum`, `Array(T, n)`, `Bounded(T, n)`, `Chars n`, when they hold no owner |
+| **value** | copied freely, owned by whoever holds it | scalars, `struct`, `oneof`, `Array(T, n)`, `Bounded(T, n)`, `Chars n`, when they hold no owner |
 | **owner** | has storage; created in place; borrowed, moved or returned, never copied silently | `Grow T`, `Array T`, `Store T`, `Map(K, V)`, `Text`, and any aggregate holding one |
 | **borrow** | uses an owner's storage; cannot outlive it | `Ref T`, `Slice T`, `Slice.mut T`, `Str` |
 | **name** | identifies an entity without owning it; survives removal | `Id T` |
@@ -71,7 +71,7 @@ Fixed-size, copied on assignment and passing, stored in C locals and registers.
 | `Array(T, n)` | `n` elements of `T`, `n` known while compiling |
 | `Bounded(T, n)` | capacity `n` inline, with a runtime length; `push`, `pop`, `clear` within capacity; exceeding it traps |
 | `Chars n` | `Bounded(U8, n)` with the text words |
-| `Struct`, `Sum` | fields and payloads may hold borrows (*decided*) and owners (§5.9) |
+| `struct`, `oneof` | fields and payloads may hold borrows (*decided*) and owners (§5.9) |
 
 **Payloads can be borrowed** (proposed; Goose's fixed mode is not kept). A handler
 receives a copy of the payload, as today, unless its parameter is declared `Ref`.
@@ -140,7 +140,7 @@ stack. Owner fields left out of the constructor start empty, and value fields le
 start zeroed (*decided*):
 
 ```lua
-local Graph = Struct {
+local Graph = struct {
     nodes: Store Node,
     edges: Store Edge,
     name: Chars 32,
@@ -256,12 +256,12 @@ become dead bytes, reclaimed by compaction or when the position's stack is reset
 ### 5.9 Nested owners
 
 (*decided* 2026-11-03, D13) An owner may sit anywhere a value can: a field, a
-container element, an `Array(T, n)` or `Bounded(T, n)` element, a `Sum` payload, a
+container element, an `Array(T, n)` or `Bounded(T, n)` element, a `oneof` payload, a
 map value.
 
 ```lua
 local lines = Grow Text {}
-local players = Store Player {}      -- Player = Struct { name: Text, items: Grow Item }
+local players = Store Player {}      -- Player = struct { name: Text, items: Grow Item }
 local cache = Map(U64, Text) {}
 ```
 
@@ -276,8 +276,8 @@ local or an element, and a `Ref` to an element needs no other context.
 **R2. One stack per position.** Each owner position of a root's type has one data
 stack. A position under a container element, an array element or a map value is
 **shared** by every element there; its stack is that position's *arena*. Every
-other position has **one tenant**. Alternatives of a `Sum` share their positions, so
-a `Sum` needs as many stacks as its largest alternative. The stack count is the
+other position has **one tenant**. Alternatives of a `oneof` share their positions, so
+a `oneof` needs as many stacks as its largest alternative. The stack count is the
 number of positions, so it is fixed while compiling (§9): `Grow Text` uses 2 stacks,
 `Store Player` 3 (slots, names, items), `Map(Str, Text)` 4 (slots, index, keys,
 values), `Grow (Grow (Grow U8))` 3. A recursive owner type has unboundedly many
@@ -318,8 +318,8 @@ Consequences:
   arena does. Creating a nested owner is its type's `init` on the arena; filling it
   is `copy` (§5.5) with an element as the destination. Compaction is one Nua word over
   the type's positions, specialized per type.
-- **`Sum`.** A `Sum` in a one-tenant position resets its stacks when its variant is
-  replaced. A `Sum` that is an element sits in shared positions, and replacing its
+- **`oneof`.** A `oneof` in a one-tenant position resets its stacks when its variant is
+  replaced. A `oneof` that is an element sits in shared positions, and replacing its
   variant turns the old payload into dead bytes (R5).
 - **Copying** a holder builds the nested contents compact in the new stacks (`copy`
   is deep). **Moving** a holder moves its header and stacks, with no work per
@@ -353,7 +353,7 @@ Every holder crossed with every role. Three invariants decide each cell:
 |---|---|---|---|---|---|---|---|---|
 | typed local, parameter, result | yes | yes | yes | yes | yes | yes | yes | yes |
 | struct field | yes | yes | yes | yes | yes | yes | yes | yes |
-| `Sum` payload | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
+| `oneof` payload | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
 | `Array(T, n)`, `Bounded(T, n)` element | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
 | `Grow`, `Array T`, `Store` element | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
 | `Map` value | yes | yes | yes (§5.9) | yes | yes | yes | yes | deferred (D4) |
@@ -445,7 +445,7 @@ are used afterwards matter:
 | growing a nested owner (§5.9, R4) | that owner's contents; every element's at that position when the index is unknown | proposed |
 | removing, popping, truncating or overwriting an element with nested owners (R5) | the contents at its shared positions (compaction) | proposed |
 | `compact()` of a holder with nested owners | the contents at its shared positions | proposed |
-| replacing a `Sum` variant (§4) | the old payload | proposed |
+| replacing a `oneof` variant (§4) | the old payload | proposed |
 
 "Used afterwards" is liveness, not lexical scope: a borrow whose last use comes
 before the operation does not block it.
@@ -471,7 +471,7 @@ values). The one lifetime rule applies to the aggregate as a whole: it depends o
 everything its fields borrow.
 
 ```lua
-local Token = Struct { kind: Kind, text: Str }
+local Token = struct { kind: Kind, text: Str }
 
 local first_token = do(src: Str): Token
     return Token { kind = Kind.word, text = src:sub(0, 1) }   -- borrows src: allowed

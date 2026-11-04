@@ -5,18 +5,18 @@ local io = require "nua.io"
 -- §4.2 Values: laid out because they exist at run time --------------------------------------------
 -- (step 2 of the guide's process)
 
-local Direction = Sum { left: Unit, right: Unit }
-local Command = Sum { move: Direction, insert: U32, undo: Unit, quit: Unit }
+local Direction = oneof { left: Unit, right: Unit }
+local Command = oneof { move: Direction, insert: U32, undo: Unit, quit: Unit }
 
 -- an outcome a caller acts on is a sum
-local Found = Sum { found: U64, missing: Unit }
+local Found = oneof { found: U64, missing: Unit }
 
 -- §5 Ownership: trees are fields, graphs are stores ------------------------------------------------
 
-local Document = Struct { length: U32, cursor: U32, edits: U32 }
+local Document = struct { length: U32, cursor: U32, edits: U32 }
 
-local Heading = Struct { level: U32, words: U32 }
-local Outline = Struct { headings: Store Heading }
+local Heading = struct { level: U32, words: U32 }
+local Outline = struct { headings: Store Heading }
 
 local add_words = do(outline: Ref Outline, id: Id Heading, n: U32): U32
     outline.headings[id].words = outline.headings[id].words + n
@@ -33,7 +33,7 @@ end
 export outline_demo
 
 -- an owner inside an element: each note's title lives in the store's arena
-local Note = Struct { title: Text, words: U32 }
+local Note = struct { title: Text, words: U32 }
 local notes_demo = do(n: U32): U64
     local notes = Store(Note) {}
     local first = notes:add Note { words = n }
@@ -46,7 +46,7 @@ export notes_demo
 -- §4.1 Name first; §4.2 lay out on demand ---------------------------------------------------------
 
 -- vocabularies: names bound while compiling, with no layout
-local Moves = define with
+local Moves = define
     left = do(document: Ref Document): Unit
         if document.cursor > 0 then document.cursor = document.cursor - 1 end
     end
@@ -54,7 +54,7 @@ local Moves = define with
         if document.cursor < document.length then document.cursor = document.cursor + 1 end
     end
 end
-local Edits = define with
+local Edits = define
     insert = do(document: Ref Document, n: U32): Unit
         document.length = document.length + n
         document.cursor = document.cursor + n
@@ -62,7 +62,7 @@ local Edits = define with
 end
 
 -- capabilities compose by spread; two that both offer a name are rejected
-local Editing = define with
+local Editing = define
     ..Moves
     ..Edits
 end
@@ -87,22 +87,22 @@ export type_twice
 
 -- discovered as names: two runtime values that travel together through in-place words
 local remaining = do(document: Ref Document): U32
-    local span = define { start = document.cursor, stop = document.length }
+    local span = def { start = document.cursor, stop = document.length }
     return span.stop - span.start
 end
 export remaining
 
 -- a structural type carries its defaults; an instance is the type spread with overrides
-local Margins = define { left = 4, right = 4 }
-local wide = define { ..Margins, right = 12 }
+local Margins = def { left = 4, right = 4 }
+local wide = def { ..Margins, right = 12 }
 local text_width = do(document: Ref Document): U32
     return document.length - wide.left - wide.right
 end
 export text_width
 
 -- promoted when it must be stored: now it needs a layout
-local Span = Struct { start: U32, stop: U32 }
-local Selections = Struct { spans: Grow Span }
+local Span = struct { start: U32, stop: U32 }
+local Selections = struct { spans: Grow Span }
 
 -- §12 Words: subject first, body last ---------------------------------------------------------------
 
@@ -149,7 +149,7 @@ assert(host(tab_stop({ tab_width = 8 }, U32 3)) == 8)
 
 -- §6 Step 4: activities ----------------------------------------------------------------------------
 
-local Draft = Struct { length: U32, cursor: U32, edits: U32 }
+local Draft = struct { length: U32, cursor: U32, edits: U32 }
 
 function Draft:insert(n: U32): Unit
     self.length = self.length + n
@@ -164,7 +164,7 @@ function Draft:move_left(): Unit
 end
 
 -- the activity owns completion: work on a copy, commit at the end
-local transaction = do(document: Ref Document, body): Unit
+local edit = do(document: Ref Document, body): Unit
     local draft = Draft { ..document }
     body(Ref draft)
     document = Document { ..draft }
@@ -172,7 +172,7 @@ end
 
 local type_word = do(document: Ref Document, n: U32): U32
     local moved: U32 = 0
-    transaction document:
+    edit document:
         insert n
         local before = cursor
         move_left
@@ -183,9 +183,9 @@ end
 export type_word
 
 -- the body decides, the activity completes: the body returns an outcome
-local Outcome = Sum { commit: Unit, abort: U32 }
+local Outcome = oneof { commit: Unit, abort: U32 }
 
-local attempt = do(document: Ref Document, body): Bool
+local try_edit = do(document: Ref Document, body): Bool
     local draft = Draft { ..document }
     local committed: Bool = body(Ref draft) {
         commit() = true,
@@ -198,7 +198,7 @@ local attempt = do(document: Ref Document, body): Bool
 end
 
 local type_capped = do(document: Ref Document, n: U32, cap: U32): Bool
-    return attempt document:
+    return try_edit document:
         insert n
         if length > cap then
             return Outcome.abort length
@@ -209,16 +209,16 @@ end
 export type_capped
 
 -- stack activities instead of adding options
-local Stats = Struct { entered: U32, left: U32 }
+local Stats = struct { entered: U32, left: U32 }
 
-local counted = do(stats: Ref Stats, body): Unit
+local count_into = do(stats: Ref Stats, body): Unit
     stats.entered = stats.entered + 1
     body
     stats.left = stats.left + 1
 end
 
 -- a policy that completes after the work inside it
-local clamped = do(document: Ref Document, max: U32, body): Unit
+local clamp_length = do(document: Ref Document, max: U32, body): Unit
     body
     if document.length > max then
         document.length = max
@@ -227,30 +227,30 @@ local clamped = do(document: Ref Document, max: U32, body): Unit
 end
 
 local import_capped = do(document: Ref Document, stats: Ref Stats, n: U32): Unit
-    counted stats do
-    clamped document 100 do
-    transaction document:
+    count_into stats do
+    clamp_length document 100 do
+    edit document:
         insert n
     endall
 end
 export import_capped
 
 -- nested activities compose: a name the inner context lacks reaches the outer one
-local Log = Struct { notes: U32 }
+local Log = struct { notes: U32 }
 
 function Log:note(count: U32): Unit
     self.notes = self.notes + count
 end
 
-local logged = do(body): U32
+local collect_notes = do(body): U32
     local log = Log { notes = 0 }
     body(Ref log)
     return log.notes
 end
 
 local type_logged = do(document: Ref Document, n: U32): U32
-    return logged:
-        transaction document:
+    return collect_notes:
+        edit document:
             insert n
             note 1
         end
@@ -261,8 +261,8 @@ export type_logged
 -- §7 Step 5: states ---------------------------------------------------------------------------------
 
 -- a lifecycle as a sum, and one word per transition
-local Conn = Sum { reading: U32, rejected: U32, closed: Unit }
-local Event = Sum { bytes: U32, bad_line: Unit, hang_up: Unit }
+local Conn = oneof { reading: U32, rejected: U32, closed: Unit }
+local Event = oneof { bytes: U32, bad_line: Unit, hang_up: Unit }
 
 local step = do(c: Conn, e: Event): Conn = c {
     reading(n) = e {
@@ -313,7 +313,7 @@ end
 -- a builder: the block declares, the builder returns a description
 local keymap = function(body)
     local bindings = {}
-    local Keys = define with
+    local Keys = define
         bind = function(key)
             return function(command)
                 bindings[#bindings + 1] = { code = key:byte(), .command }
@@ -342,10 +342,10 @@ export on_key
 
 -- §6.11 Designing a DSL ------------------------------------------------------------------------------
 
-local Request = Struct { method: U8, path: Str }
+local Request = struct { method: U8, path: Str }
 
 -- the methods a router speaks: a structural vocabulary of known values
-local Methods = define { get = 1, post = 2 }
+local Methods = def { get = 1, post = 2 }
 
 -- the builder: one verb per method; sentences in, a checked description out
 local router = function(Verbs)
@@ -398,7 +398,7 @@ export handle
 assert(#site == 2 and site[2].path == "/notes")
 
 -- a dialect: the same builder over a vocabulary extended by spread
-local Dav = define { ..Methods, propfind = 7 }
+local Dav = def { ..Methods, propfind = 7 }
 local dav_routes = router Dav
 local share = dav_routes:
     propfind "/":
@@ -428,7 +428,7 @@ export replay
 
 -- §18.1 Type hooks: a number that knows what + and < mean --------------------------------
 
-local Fixed = Struct { raw: I32 }  -- a number with 16 fractional bits
+local Fixed = struct { raw: I32 }  -- a number with 16 fractional bits
 
 function Fixed.__cast(v, T)  -- a Lua number where a Fixed is expected
     if type v == 'number' then
@@ -449,7 +449,7 @@ export below
 
 -- §8 Step 6: concurrency ----------------------------------------------------------------------------
 
-local Chunk = Struct { n: U32, bytes: Array(U8, 64) }
+local Chunk = struct { n: U32, bytes: Array(U8, 64) }
 
 -- lines, not words: a word can straddle two chunks, a newline cannot
 local count_lines = do(c: Ref Chunk): U32

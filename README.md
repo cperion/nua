@@ -46,8 +46,9 @@ make test-dist
 
 Source pins live in [the dependency lock](tools/deps.lock), not Git submodules:
 this keeps repository changes native to jj. GCC 15.2.0 (including libgccjit),
-LuaJIT, LPeg, and GCC's GMP/MPFR/MPC prerequisites build under ignored `build/deps/`
-and install under `.local/`. No dependency source or binary is committed.
+LuaJIT, and GCC's GMP/MPFR/MPC prerequisites build under ignored `build/deps/`
+and install under `.local/`. Mua, the Lua language Nua is a host of, is a separate
+project pinned by [`tools/mua.lock`](tools/mua.lock); `make mua` fetches and installs it. No dependency source or binary is committed.
 The completed local toolchain is selected by Make; incomplete or stale installs
 fail rather than silently selecting host libraries. `LOCAL_DEPS=0` selects the host
 setup below. See [building Nua](docs/building.md) for host prerequisites, offline
@@ -55,22 +56,16 @@ builds, pin updates, and the distinction between a local build and a portable pa
 
 ### Host dependencies (alternative)
 
-- LuaJIT and LPeg built for **Lua 5.1**, not another Lua ABI. `make dist` also
-  needs the LuaJIT development files (`lua.h`) and `libluajit-5.1`.
+- LuaJIT 2.1 carrying the LuaJIT 3.0 syntax backport (the pinned build has it), for
+  **Lua 5.1**'s ABI. `make dist` also needs the LuaJIT development files (`lua.h`) and
+  `libluajit-5.1`.
 - A C99 compiler and POSIX threads for the native runtime/harnesses.
 - libgccjit **13+**, on a 64-bit target, for JIT/native loading (optional for C output).
 - GNU make and `timeout` for the convenience/check targets. Some packaged checks
   additionally use Clang/ThreadSanitizer or optional platform I/O facilities.
 
-If LPeg is not installed for LuaJIT:
-
-```sh
-luarocks --lua-version=5.1 install lpeg
-```
-
-`make` discovers LuaRocks' Lua 5.1 C path. For direct LuaJIT commands, use
-`luarocks --lua-version=5.1 path` or set `LUA_CPATH` yourself, retaining `;;` for
-LuaJIT's defaults. An LPeg module built for Lua 5.4 is not interchangeable.
+Mua is installed under `.local/share/lua/5.1` by `make mua`; direct LuaJIT commands find
+it through `LUA_PATH` (`make` sets it) or `nua.lua`'s own path.
 
 ```sh
 make doctor
@@ -138,11 +133,11 @@ Run `make test-modules` for the loader/cache contract checks.
 
 ## Neovim syntax highlighting
 
-Nua has a dedicated Tree-sitter grammar and highlight queries. Build the local
-parser with `make tree-sitter`, then follow the
-[Neovim setup instructions](tools/tree-sitter-nua/README.md).
-`make test-tree-sitter` checks the parser and highlighting in headless Neovim.
-No changes to the compiler or your existing Lua filetype are required.
+The editor grammar is Mua's (the language lives there; Nua is another way to run it). Nua adds
+highlight queries over Mua's parser in [`tools/nvim-nua`](tools/nvim-nua/README.md). Build the
+parser with `make tree-sitter` (it builds in the Mua checkout `make mua` fetched) and check it
+with `make test-tree-sitter`, which parses every example and library in headless Neovim. No
+changes to the compiler or your existing Lua filetype are required.
 
 ## Compiler and library
 
@@ -194,11 +189,10 @@ headless SDL checks. With SDL3 installed, run `make test-canvas` and then
 | Part | Source |
 |---|---|
 | Driver / embedding entry | `nua.lua` |
-| LuaMacro engine | `macro.lua`, `macro/`, `macro/lib/` |
-| Nua application, lambdas, typed bodies | `macro/let.lua`, `macro/nua.lua` |
-| Standalone source macro CLI | `luam` (`luajit luam -lmacro.let program.lua`) |
+| Nua as a host of Mua: typed bodies, `export`, `call` | `nua/front.lua` (Mua itself is a pinned dependency, `tools/mua.lock`, `make mua`) |
+| Mua, the Lua language underneath (separate repository, pinned) | `tools/mua.lock`; the `mua` command: `luajit mua.lua file.lua` in that repository |
 | Native types and exact folding | `nua/types.lua`, `nua/fold.lua` |
-| Typed-body parser and translation | `nua/syntax.lua` |
+| Nua's word and extern facts for Mua's analysis | `nua/application.lua` |
 | Specialization, state, words, control, tasks | `nua/stage.lua` |
 | Goose storage and record layouts | `nua/memory.lua` |
 | Immutable fixed-array contents | `nua/array_value.lua` |
@@ -218,9 +212,8 @@ headless SDL checks. With SDL3 installed, run `make test-canvas` and then
 [Architecture §18](docs/architecture.md#18-source-layout) has the complete table,
 including the single-binary tools.
 
-The macro layer is project source, **not a runtime bundle**. See
-[its integration notes](docs/luamacro/INTEGRATION.md) and
-[third-party attribution](THIRD_PARTY.md).
+Mua is a separate project, not part of this tree and not a runtime bundle; see
+[the macro-layer design](docs/design/macro-layer.md) and [third-party notes](THIRD_PARTY.md).
 
 ## Licence
 
@@ -232,7 +225,7 @@ prototype and alpha design. Third-party notices retain their own terms.
 
 ## Differential fuzzing
 
-With LuaJIT/LPeg and libgccjit configured as above:
+With LuaJIT and libgccjit configured as above:
 
 ```sh
 luajit tests/fuzz/fuzz.lua --regressions

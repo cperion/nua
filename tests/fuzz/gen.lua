@@ -424,8 +424,8 @@ end
 
 function Gen.render(prog)
     local out = { '-- fuzz program ' .. tostring(prog.seed) }
-    if prog.use_struct then out[#out + 1] = 'local S = Struct { a: U32, b: U32 }' end
-    if prog.use_sum then out[#out + 1] = 'local O = Sum { num: U32, none: Unit }' end
+    if prog.use_struct then out[#out + 1] = 'local S = struct { a: U32, b: U32 }' end
+    if prog.use_sum then out[#out + 1] = 'local O = oneof { num: U32, none: Unit }' end
     for _, h in ipairs(prog.helpers) do print_helper(h, out) end
     local ps = {}
     for j, t in ipairs(prog.params) do ps[j] = 'a' .. j .. ': ' .. t end

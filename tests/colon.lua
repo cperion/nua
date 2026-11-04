@@ -2,11 +2,12 @@
 -- is `do(..)`, `do(names)` or `do(scope..)`. Annotation colons never change.
 local root = arg[0]:match('^(.*)/tests/[^/]*$') or '.'
 package.path = root .. '/?.lua;' .. package.path
-local macro = require 'macro'
-require 'macro.builtin'
-require 'macro.nua'
-local lexer = require 'macro.lexer'
-local colon = require 'nua.colon'
+package.path = root .. '/?/init.lua;' .. package.path
+-- sources translate through Mua with the Nua host (design macro-layer.md step 3)
+local mua = require 'mua.init'
+local front = require 'nua.front'
+local dlex = require 'mua.lex'
+local colon = require 'mua.fmt_text'
 local fmt = require 'nua.fmt'
 local passed = 0
 local function check(name, condition, detail)
@@ -15,13 +16,15 @@ local function check(name, condition, detail)
 end
 local function normal(code)
     local parts = {}
-    for _, tk in ipairs(lexer.scan_raw_tokenlist(code)) do
-        if tk[1] ~= 'space' and tk[1] ~= 'comment' then parts[#parts + 1] = tk[2] end
+    -- the runtime binding the emitter puts on the first line is not part of the program
+    code = code:gsub('^local __mua = __mua or require%("mua%.runtime"%); ', '')
+    for _, tk in ipairs(dlex.scan(code, 'normal')) do
+        if tk.t ~= 'space' and tk.t ~= 'comment' then parts[#parts + 1] = tk.v end
     end
     return table.concat(parts, '\0')
 end
 local function translated(source, name)
-    return assert(macro.substitute_tostring(source, name))
+    return mua.translate(source, name, { host = front.host(name) })
 end
 
 -- every colon form translates exactly as the do-form it stands for
@@ -50,7 +53,7 @@ local with_pairs = {
     { 'with block', 'local p = Point with\n    x = 1\n    y = 2\nend\n', 'local p = Point {\n    x = 1,\n    y = 2\n}\n' },
     { 'with on one line', 'local p = Point with x = 1 y = 2 end\n', 'local p = Point { x = 1, y = 2 }\n' },
     { 'shorthand entries', 'local p = Point with\n    .x\n    .y\nend\n', 'local p = Point {\n    .x,\n    .y\n}\n' },
-    { 'Struct with', 'local P = Struct with\n    x: F32\n    y: F32\nend\n', 'local P = Struct {\n    x: F32,\n    y: F32\n}\n' },
+    { 'struct with', 'local P = struct with\n    x: F32\n    y: F32\nend\n', 'local P = struct {\n    x: F32,\n    y: F32\n}\n' },
     { 'continued entry', 'local p = T with\n    x = a +\n        b\n    y = 2\nend\n', 'local p = T {\n    x = a +\n        b,\n    y = 2\n}\n' },
     { 'handlers', 'local r = s with\n    a =: v\n        go v\n    end\n    b = do(x) = x\nend\n',
       'local r = s {\n    a = do(v)\n        go v\n    end,\n    b = do(x) = x\n}\n' },
@@ -73,12 +76,13 @@ assert(x == 4 and t.with == 5)
 assert(loadstring(translated(ordinary, 'ordinary.nua'), '@ordinary.nua'))()
 check('with is an ordinary name elsewhere', true)
 
--- `with` where an expression starts takes its type from the context
+-- `with` where an expression starts takes its type from the context: it is the runtime's
+-- `with` applied to the entries (Nua's prelude binds it to the contextual constructor)
 local contextual = {
-    { 'return with', 'return with\n    x = 1\nend\n', 'return with {\n    x = 1\n}\n' },
-    { 'typed local', 'local p: Point = with x = 1, y = 2 end\n', 'local p: Point = with { x = 1, y = 2 }\n' },
-    { 'argument', 'f(with x = 1 end)\n', 'f(with { x = 1 })\n' },
-    { 'field value', 'local p = T with\n    left = with x = 1 end\nend\n', 'local p = T {\n    left = with { x = 1 }\n}\n' },
+    { 'return with', 'return with\n    x = 1\nend\n', 'return __mua.with {\n    x = 1\n}\n' },
+    { 'typed local', 'local p: Point = with x = 1, y = 2 end\n', 'local p: Point = __mua.with { x = 1, y = 2 }\n' },
+    { 'argument', 'f(with x = 1 end)\n', 'f(__mua.with { x = 1 })\n' },
+    { 'field value', 'local p = T with\n    left = with x = 1 end\nend\n', 'local p = T {\n    left = __mua.with { x = 1 }\n}\n' },
 }
 for _, case in ipairs(contextual) do
     check('contextual with: ' .. case[1], normal(translated(case[2], case[1])) == normal(translated(case[3], case[1])),
@@ -118,14 +122,10 @@ local unchanged = {
     { 'local function', 'local function f(n: U32): U32\n    return n\nend\n' },
     { 'label', 'do\n    goto done\n    ::done::\nend\n' },
     { 'method statement', 'xs:refresh\nxs:each(f)\n' },
-    { 'table field', 'local t = {\n    x: 1,\n}\n' },
+    { 'struct field', 'local P = struct { x: U32 }\n' },
 }
 for _, case in ipairs(unchanged) do
-    local tokens = lexer.scan_raw_tokenlist(case[2])
-    local out = colon.rewrite(lexer.scan_raw_tokenlist(case[2]))
-    local same = #out == #tokens
-    for i = 1, #tokens do same = same and out[i] and out[i][2] == tokens[i][2] end
-    check('not a block: ' .. case[1], same)
+    check('not a block: ' .. case[1], colon.expand(case[2]) == case[2])
 end
 
 -- line numbers survive the rewrite
@@ -182,7 +182,7 @@ formatted('fmt: braces stay braces', 'local p = Point { x = 1, y = 2 }\n', 'loca
 formatted('fmt: with commas on one line stay', 'local p = Point with x = 1, y = 2 end\n', 'local p = Point with x = 1, y = 2 end\n')
 formatted('fmt: with and a block entry', 'local r = s with\n  a =: v\n    local x, y = v, v\n    go x y\n  end\n  b = 2\nend\n',
     'local r = s with\n    a =: v\n        local x, y = v, v\n        go x y\n    end\n    b = 2\nend\n')
-formatted('fmt: Struct with', 'local P = Struct with\nx: F32\ny: F32\nend\n', 'local P = Struct with\n    x: F32\n    y: F32\nend\n')
+formatted('fmt: struct with', 'local P = struct with\nx: F32\ny: F32\nend\n', 'local P = struct with\n    x: F32\n    y: F32\nend\n')
 formatted('fmt: positional entries keep commas', 'local a = Array(U32, 2) with 1, 2 end\n', 'local a = Array(U32, 2) with 1, 2 end\n')
 formatted('fmt: multi-line table after a head becomes with', 'local q = Point {\n    x = 1,\n    y = 2,\n}\n',
     'local q = Point with\n    x = 1\n    y = 2\nend\n')

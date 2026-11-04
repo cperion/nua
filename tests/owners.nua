@@ -1,8 +1,8 @@
 -- Owners: owner structs with several owner fields, defaults, moves, returns,
 -- copies, runtime-length arrays and owner parameters (design memory.md §5).
 
-local Node = Struct { weight: U32 }
-local Graph = Struct with
+local Node = struct { weight: U32 }
+local Graph = struct with
     nodes: Store Node
     label: U32
     order: Grow U32
@@ -22,8 +22,8 @@ end
 export two_fields
 
 -- an owner struct inside an owner struct, with text and maps, passed by Ref
-local Index = Struct { words: Map(Str, U32), names: Text, counts: Map(U32, U32) }
-local World = Struct { graph: Graph, index: Index, ticks: U32 }
+local Index = struct { words: Map(Str, U32), names: Text, counts: Map(U32, U32) }
+local World = struct { graph: Graph, index: Index, ticks: U32 }
 local fill = do(w: Ref World, n: U32): Unit
     for i: U32 = 1, n do
         w.graph.nodes:add Node { weight = i }
@@ -228,8 +228,8 @@ end
 export views
 
 -- a handler declaring Ref borrows the payload of the sum place
-local Running = Struct { ticks: U32, limit: U32 }
-local State = Sum { running: Running, stopped: U32 }
+local Running = struct { ticks: U32, limit: U32 }
+local State = oneof { running: Running, stopped: U32 }
 local tick = do(state: Ref State): Unit
     state with
         running = do(r: Ref Running): Unit
@@ -259,7 +259,7 @@ export payloads
 
 -- recursion while owners are live: each level's owners sit above the
 -- previous level's on the same stacks
-local N = Struct { v: U32 }
+local N = struct { v: U32 }
 local function walk(n: U32): U32
     local s = Store(N) {}
     s:add N { v = n }

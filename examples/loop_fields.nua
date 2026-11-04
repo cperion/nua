@@ -1,5 +1,5 @@
 -- Loop state is generalized field by field, including changes on exit paths.
-local Panel = Struct { gap: U32, padding: U32, count: U32 }
+local Panel = struct { gap: U32, padding: U32, count: U32 }
 
 local panel_extent = do(n: U32): U32
     local panel = Panel { gap = 12, padding = 24, count = 0 }
@@ -12,7 +12,7 @@ local panel_extent = do(n: U32): U32
 end
 export panel_extent
 
-local Tally = Struct { seen: U32, odd: U32, step: U32 }
+local Tally = struct { seen: U32, odd: U32, step: U32 }
 local tally_odd = do(n: U32): U32
     local t = Tally { seen = 0, odd = 0, step = 1 }
     while t.seen < n do
@@ -37,7 +37,7 @@ local exit_change = do(n: U32): U32
 end
 export exit_change
 
-local Outer = Struct { panel: Panel, step: U32 }
+local Outer = struct { panel: Panel, step: U32 }
 local nested_exit = do(n: U32): U32
     local o = Outer { panel = Panel { gap = 3, padding = 4, count = 0 }, step = 2 }
     while o.panel.count < n do
@@ -75,7 +75,7 @@ local continue_fields = do(n: U32): U32
 end
 export continue_fields
 
-local Pair = Struct { x: U32, y: U32, step: U32 }
+local Pair = struct { x: U32, y: U32, step: U32 }
 local swap_fields = do(n: U32): U32
     local p = Pair { x = 1, y = 2, step = 9 }
     for i: U32 = 1, n do p = Pair { x = p.y, y = p.x, step = p.step } end
@@ -158,7 +158,7 @@ local multiple_exits = do(n: U32): U32
 end
 export multiple_exits
 
-local Flags = Struct { enabled: Bool, count: U32 }
+local Flags = struct { enabled: Bool, count: U32 }
 local bool_exit = do(n: U32): Bool
     local flags = Flags { enabled = false, count = 0 }
     while flags.count < n do
@@ -173,7 +173,7 @@ end
 export bool_exit
 
 -- An inline early return must not flush unchanged pending caller fields.
-local Layout = Struct { w: F32, gap: F32, value: F32 }
+local Layout = struct { w: F32, gap: F32, value: F32 }
 local maximum = do(a: F32, b: F32): F32
     if a > b then return a end
     return b

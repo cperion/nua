@@ -1,6 +1,6 @@
 -- Construction-time tokens. Colours stored by components are native RGBA values;
 -- token tags and scale names never become part of the residual program.
-local Color = Struct { r: U8, g: U8, b: U8, a: U8 }
+local Color = struct { r: U8, g: U8, b: U8, a: U8 }
 local M = { .Color }
 local token_mt = {}
 local function token(kind, name, value)

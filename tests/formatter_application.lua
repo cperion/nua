@@ -113,7 +113,7 @@ local multi = do(x: U32, y: U32): U32
     return nested(x, y) + alias(x, y) + partial(x, y) + count(x, y, 42)
 end
 local adjusted = do(y: U32): U32 = add(pair(), y)
-local Outcome = Sum { ok: U32 }
+local Outcome = oneof { ok: U32 }
 local producer = do(x: U32): Outcome = Outcome.ok(x)
 local handled = do(x: U32): U32 = producer(x) { ok(v) = v + 1 }
 local through_alias = do(x: U32, y: U32): U32
@@ -195,13 +195,13 @@ end
 
 -- A known local chain now emits the same staged Lua as its grouped spelling:
 -- the compiler, not just the formatter, consumes the shared analysis.
-local macro = require 'macro'
-local lexer = require 'macro.lexer'
+local nua = require 'nua'
+local lex = require 'mua.lex'
 local function translated(source)
-    local code = assert(macro.substitute_tostring(source, 'shared.nua'))
+    local code = assert(nua.translate(source, 'shared.nua'))
     local parts = {}
-    for _, tk in ipairs(lexer.scan_raw_tokenlist(code)) do
-        if tk[1] ~= 'space' and tk[1] ~= 'comment' then parts[#parts + 1] = tk[2] end
+    for _, tk in ipairs(lex.scan(code, 'shared.lua')) do
+        if tk.t ~= 'space' and tk.t ~= 'comment' then parts[#parts + 1] = tk.v end
     end
     return table.concat(parts, '\0')
 end

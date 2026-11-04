@@ -8,7 +8,7 @@ and their implementation constraints do not apply here.
 - Start from the user's request, the current source and tests.
 - `docs/syntax.md` owns language/ABI contracts; `docs/architecture.md` owns the
   compiler, the runtime and the Nua/Lua/C boundary; `docs/designing-and-writing-nua.md`
-  explains programming style. Distinguish intended semantics, implementation behavior
+  explains programming style (the Nua addendum to Mua's `designing-and-writing-mua.md`). Distinguish intended semantics, implementation behavior
   and freshly observed evidence.
 - Inspect before editing. Discuss material semantic/architectural changes and obtain
   approval before implementation. Do not silently add fallbacks or compatibility paths.
@@ -68,17 +68,22 @@ authorship or published history.
   Preserve checks, lifetimes, ownership transfers and foreign-boundary behavior.
 - C and libgccjit use the same prepared IR. Do not duplicate language semantics,
   runtime algorithms or helper definitions between backends.
-- The macro engine is ordinary source in `macro.lua` and `macro/`, with Nua's
-  extensions in `macro/let.lua` and `macro/nua.lua`. Do not restore a runtime bundle
-  bootstrap or edit generated bundles as the source of truth.
-- Preserve LuaMacro/lexer attribution and notices. Follow the incoming prototype's
+- **Mua is a separate project** (its own repository, `tools/mua.lock` pins the commit; `make mua`
+  installs it under `.local/`). Nua requires it and does not contain it. The rule is one way:
+  Mua knows nothing about Nua; Nua knows about Mua. Nua's front end is `nua/front.lua`, a host
+  of Mua over Mua's AST (never translate to Lua and reparse). A change to Mua's surface
+  syntax or runtime is made in the Mua repository, then the pin moves; if a Nua need is
+  really an abstraction that should exist in Lua, it belongs in Mua. LuaMacro and LPeg are
+  gone (docs/design/macro-layer.md): do not restore a runtime bundle bootstrap or edit
+  generated bundles as the source of truth.
+- Preserve third-party notices (`THIRD_PARTY.md`). Follow the incoming prototype's
   GPL-3.0-or-later terms and the runtime's GCC Runtime Library Exception 3.1;
   `COPYING`, `COPYING.RUNTIME` and `THIRD_PARTY.md` record them. Do not invent or
   silently change licensing terms.
 
 ## Checks and artifacts
 
-`make doctor`, `make test-macros`, `make test`, and `make test-native` are the project
+`make doctor`, `make test-mua`, `make test`, and `make test-native` are the project
 entry points. `tests/run.lua` also exercises supported C/JIT backends, native harnesses,
 rejection diagnostics, documentation listings and available sanitizer paths.
 

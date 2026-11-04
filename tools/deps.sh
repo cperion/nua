@@ -11,7 +11,7 @@ inputs=${inputs%% *}
 if [[ $mode == check ]]; then
     [[ -f .local/nua-deps.ready && $(<.local/nua-deps.ready) == "$inputs" &&
        -x .local/bin/gcc && -x .local/bin/luajit &&
-       -f .local/lib/libgccjit.so.0 && -f .local/lib/lua/5.1/lpeg.so ]] || {
+       -f .local/lib/libgccjit.so.0 ]] || {
         echo 'Local dependencies are incomplete or stale; run make deps-fetch && make deps, or select LOCAL_DEPS=0.' >&2; exit 2;
     }
     exit 0
@@ -50,7 +50,6 @@ for dep in GMP MPFR MPC; do
     [[ $dep != MPC ]] || extension=tar.gz
     archive "https://gcc.gnu.org/pub/gcc/infrastructure/$name.$extension" "$name.$extension" "${!hash_var}" 512
 done
-archive "$LPEG_URL" lpeg-1.1.0.tar.gz "$LPEG_SHA256" 256
 
 luajit_src=$base/src/luajit
 if [[ ! -d $luajit_src/.git ]]; then
@@ -67,7 +66,7 @@ git -C "$luajit_src" diff --exit-code HEAD --
 
 # Build never accesses the network. Extract only verified archives, and never
 # delete existing sources or builds on a pin change: keep them as evidence.
-for name in "gcc-$GCC_VERSION.tar.xz" "gmp-$GMP_VERSION.tar.bz2" "mpfr-$MPFR_VERSION.tar.bz2" "mpc-$MPC_VERSION.tar.gz" lpeg-1.1.0.tar.gz; do
+for name in "gcc-$GCC_VERSION.tar.xz" "gmp-$GMP_VERSION.tar.bz2" "mpfr-$MPFR_VERSION.tar.bz2" "mpc-$MPC_VERSION.tar.gz"; do
     directory=${name%.tar.*}
     if [[ ! -f $base/src/$directory/.nua-extracted ]]; then
         tar -xf "$base/downloads/$name" -C "$base/src"
@@ -114,17 +113,9 @@ if [[ ! -f $prefix/luajit.build-id || $(<"$prefix/luajit.build-id") != "$fingerp
     make -C "$work/luajit" install PREFIX="$prefix" LDCONFIG=true
     printf '%s\n' "$fingerprint" > "$prefix/luajit.build-id"
 fi
-if [[ ! -f $prefix/lpeg.build-id || $(<"$prefix/lpeg.build-id") != "$fingerprint" || ! -f $prefix/lib/lua/5.1/lpeg.so ]]; then
-    if [[ ! -d $work/lpeg ]]; then cp -a "$base/src/lpeg-1.1.0" "$work/lpeg"; fi
-    make -C "$work/lpeg" -j"$jobs" linux CC="$host_cc" LUADIR="$prefix/include/luajit-2.1"
-    install -d "$prefix/lib/lua/5.1" "$prefix/share/lua/5.1"
-    install -m 644 "$work/lpeg/lpeg.so" "$prefix/lib/lua/5.1/lpeg.so"
-    install -m 644 "$work/lpeg/re.lua" "$prefix/share/lua/5.1/re.lua"
-    printf '%s\n' "$fingerprint" > "$prefix/lpeg.build-id"
-fi
 # Publish readiness only after loading the actual installed libraries succeeds.
-LUA_CPATH="$prefix/lib/lua/5.1/?.so" LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     NUA_GCCJIT="$prefix/lib/libgccjit.so.0" "$prefix/bin/luajit" -e \
-    'assert(require("lpeg")); local j = require("nua.cjit").lib(); assert(j.gcc_jit_version_major() >= 13)'
+    'local j = require("nua.cjit").lib(); assert(j.gcc_jit_version_major() >= 13)'
 printf '%s\n' "$inputs" > "$prefix/nua-deps.ready"
 echo 'Local dependencies ready. Use make LOCAL_DEPS=1 doctor, dist, or test.'

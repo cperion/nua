@@ -7,7 +7,7 @@
 -- The same word compiles ahead of time too: price_stats below is the decoder
 -- for a layout known in the source, and tests/csv_main.c checks it.
 
-local Stats = Struct { rows: U32, sum: I64, min: I64, max: I64 }
+local Stats = struct { rows: U32, sum: I64, min: I64, max: I64 }
 
 -- the statistics of one numeric field, in units of 10^-decimals; `rows` are the
 -- lines after the header

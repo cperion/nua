@@ -33,7 +33,7 @@ function L.analyze(fns, walk_block)
     end
     local function field(t, name)
         visit(t)
-        -- Sum payload/array wrapper projections are not source record fields;
+        -- oneof payload/array wrapper projections are not source record fields;
         -- the synthetic `as` projection of a sum has no source type at all.
         if not t or t.kind ~= 'struct' then return end
         used[t] = used[t] or {}

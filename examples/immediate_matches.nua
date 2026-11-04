@@ -1,5 +1,5 @@
-local Choice = Sum { yes: U32, no: Unit }
-local Box = Struct { value: U32 }
+local Choice = oneof { yes: U32, no: Unit }
+local Box = struct { value: U32 }
 local choose = do(n: U32): Choice
     if n == 0 then return Choice.yes(U32 10) end
     if n == 1 then return Choice.yes(U32 20) end
@@ -119,8 +119,8 @@ local side_effects = do(n: U32): U32
 end
 export side_effects
 
-local Pair = Struct { a: U32, b: U32 }
-local RecordChoice = Sum { value: Pair, none: Unit }
+local Pair = struct { a: U32, b: U32 }
+local RecordChoice = oneof { value: Pair, none: Unit }
 local record_payload = do(n: U32): U32
     local body = do()
         if n % 2 == 0 then return RecordChoice.value Pair { a = 1, b = 2 } end

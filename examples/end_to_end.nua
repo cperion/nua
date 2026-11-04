@@ -2,7 +2,7 @@
 
 -- Generic compile-time type generator
 local Box =: T
-    local B = Struct { value: T }
+    local B = struct { value: T }
 
     function B:get(): T
         return self.value

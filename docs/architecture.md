@@ -19,7 +19,7 @@ and the reasons for each thing that remains on the Lua or C side.
 
 ### 1.1 Vision
 
-Nua is a small, staged systems-programming language built on Lua and LuaMacro.
+Nua is a small, staged systems-programming language built on Lua and Mua, the Lua language it is a host of (a separate project; Lua → Mua → Nua).
 
 The language uses ordinary Lua for compile-time computation, native typed words for runtime computation, and **online partial evaluation** to determine which computations can be completed during compilation and which must be residualized into C.
 
@@ -29,7 +29,7 @@ Managed stores provide independently recyclable objects, with generational IDs r
 
 The language has five essential mechanisms:
 
-1. **LuaMacro provides a unified surface language.** Typed functions, annotations, methods, declarations and control flow look like natural extensions of Lua. Typed bodies are parsed with Lua's grammar so that every construct Lua cannot overload can be staged.
+1. **Mua provides a unified surface language.** Typed functions, annotations, methods, declarations and control flow look like natural extensions of Lua. Mua parses every source into one AST with Lua's grammar; Nua's front end (`nua/front.lua`) gives typed bodies their staged meaning, so every construct Lua cannot overload can be staged.
 2. **LuaJIT executes compile-time computation.** Lua functions, closures, tables, generics and higher-order generators construct and specialize programs.
 3. **Native words specialize through application.** Partial application binds known arguments; saturated applications evaluate the word's body with every argument, known or not.
 4. **Online partial evaluation constructs residual code.** Known operations compute immediately. Unknown operations produce typed commands. The same computation can do both.
@@ -47,17 +47,11 @@ The central principle is:
 
 Lua already provides a complete compile-time programming environment: lexical scope, closures, higher-order functions, tables, modules and control flow. There is no need to invent another metaprogramming language.
 
-#### Why LuaMacro, and why parse typed bodies?
+#### Why Mua, and why parse typed bodies?
 
-LuaMacro keeps the surface Lua's: macro.let gives lambdas and application, and the same token stream feeds the typed-body parser. Parsing is unavoidable: with token rewriting alone, staging `a < b and c` correctly would need operator precedence anyway, and comparisons cannot be staged by metamethods at all.
+Mua keeps the surface Lua's: it parses lambdas, application and the typed forms into one tree, and Nua's front end translates the nodes it gives meaning to (typed lambdas and functions, opened lambdas, `struct`, `oneof`, `export`, `call`) into calls into the compiler. Parsing is unavoidable: with token rewriting alone, staging `a < b and c` correctly would need operator precedence anyway, and comparisons cannot be staged by metamethods at all.
 
-Bare-name call statements are recognized by that parser, not by looking up a
-value's type or guessing its arity. Native bodies emit the same staged call as
-an explicit `()`. After macro expansion, `nua.translate` uses the same parser in
-Lua mode to insert `()` for remaining host call statements, preserving other
-bytes and line numbers. Expressions are never implicitly invoked; ordinary Lua
-postfix parsing is retained in expanded host code. The formatter reparses an
-omission and checks the same syntax tree before adopting it.
+Bare-name call statements are recognized by that parser, not by looking up a value's type or guessing its arity. Native bodies emit the same staged call as an explicit `()`, and Mua's emitter writes the `()` for remaining host call statements, preserving line numbers. Expressions are never implicitly invoked; ordinary Lua postfix parsing is retained in host code. The formatter reparses an omission and checks the same syntax tree before adopting it.
 
 Staged code generation and the formatter share the non-executing application
 analysis in [`nua/application.lua`](../nua/application.lua). It follows lexical
@@ -119,10 +113,10 @@ The significance is not simply that Lua generates C. It is that **the generated 
                 Lua + typed extensions
                           |
                           v
-                LUAMACRO + macro.let
-         Application, lambdas, struct, export.
-      Typed bodies are parsed (Lua's precedence)
-        and translated into staged operations
+                MUA + nua/front.lua
+     Mua parses (application, lambdas, blocks, with);
+   Nua translates typed bodies, struct, oneof, export
+        into staged operations
                           |
                           v
                       LUA CODE
@@ -550,7 +544,7 @@ NodeId insert_double(Graph *graph, uint32_t value) {
 ```lua
 -- Generic compile-time type generator
 local Box =: T
-    local B = Struct with
+    local B = struct with
         value: T
     end
 
@@ -635,11 +629,11 @@ No generic abstraction, partial-application environment, closure, method dispatc
 A computation that genuinely needs dynamic native storage:
 
 ```lua
-local Node = Struct with
+local Node = struct with
     value: U32
 end
 
-local Graph = Struct with
+local Graph = struct with
     nodes: Store Node
 end
 
@@ -865,7 +859,7 @@ The compiler therefore scopes **Lua's existing cache** rather than adding one.
 Existing host modules keep their identity: the copy holds the same tables. Every
 newly loaded module — Lua, Nua or native — lands in the compilation's table.
 
-Compiler implementation modules (`nua/*.lua`, `macro/*.lua`) are loaded before
+Compiler implementation modules (`nua/*.lua`, Mua's `mua/*.lua`) are loaded before
 entering this scope and keep host lifetime, so their registration hooks cannot be
 stacked twice and their native-backend and FFI state survives a compilation. What
 must *not* survive is any cache of a program's words: library-word caches look
@@ -925,7 +919,7 @@ io.write(stop 5, "\n")
 
 `make dist` builds a single executable, `build/dist/nua`. It embeds Nua's own parts
 and uses the selected dependency toolchain for LuaJIT, libgccjit and the C compiler.
-`make bootstrap` fetches pinned sources and builds GCC/libgccjit, LuaJIT and LPeg
+`make bootstrap` fetches pinned sources and builds GCC/libgccjit and LuaJIT
 locally; the original host-dependency setup remains available with `LOCAL_DEPS=0`.
 Source pins are tracked, not dependency copies or Git submodules, so normal history
 stays in jj. Binutils, libc and platform headers remain host prerequisites. See
@@ -937,7 +931,7 @@ What the binary contains, and where each part comes from:
 |---|---|
 | LuaJIT | **the selected toolchain's**, linked dynamically (`libluajit-5.1`) |
 | libgccjit | **the selected toolchain's**, loaded at run time (`NUA_GCCJIT`, else the loader's search path) |
-| Nua (`nua.lua`, `nua/*.lua`, `macro/*.lua`) | embedded as **LuaJIT bytecode**: no source parsing at startup |
+| Nua (`nua.lua`, `nua/*.lua`) and Mua (`mua/*.lua`, installed by `make mua`) | embedded as **LuaJIT bytecode**: no source parsing at startup |
 | `lib/*.nua` | embedded sources: the compiler still specializes them with the program |
 | the runtime | compiled at dist time (C plus the Nua policy), linked into `nua` with `-rdynamic`, so gccjit'd code binds to `nua_*` in the process |
 | `libnua_rt.a` | built once at dist time, embedded, written out for `nua build` and for C harnesses |
@@ -1081,9 +1075,9 @@ single unit's speed. `--split` cannot be combined with `-o`, `-H`, `-d`, `--cc` 
 tree's compiler, or the embedded copy when invoked from a built binary.
 
 **`cc`** is a thin driver over the host compiler, for probes, for C beside Nua, and
-for tests. **`doctor`** prints the versions it found for LuaJIT, LPeg, libgccjit, `cc`
+for tests. **`doctor`** prints the versions it found for LuaJIT, Mua, libgccjit, `cc`
 and binutils, the cache location, and whether the runtime is linked in; it exits
-nonzero when LuaJIT, LPeg or libgccjit is missing. **`cache`** prints the cache
+nonzero when LuaJIT, Mua or libgccjit is missing. **`cache`** prints the cache
 directory, `cache clean` removes it. **`version`** prints `nua 0.5-alpha`.
 
 From Lua, `require 'nua'` and `nua.load(path)` return the program's exports as
@@ -1534,13 +1528,12 @@ policy objects, recursive layouts and the queue/heap/channel/pool models.
 | Driver and embedding entry | [`nua.lua`](../nua.lua) |
 | Project file resolution | [`nua/project.lua`](../nua/project.lua) |
 | Host compiler, cache location | [`nua/toolchain.lua`](../nua/toolchain.lua) |
-| LuaMacro engine and upstream modules | [`macro.lua`](../macro.lua), [`macro/`](../macro/), [`macro/lib/`](../macro/lib/) |
-| Nua application, lambdas, typed bodies | [`macro/let.lua`](../macro/let.lua), [`macro/nua.lua`](../macro/nua.lua) |
-| Keyed spread in any table (`{ ..base, k = v }`): a token rewrite to `__nua_keyed{ [__nua_spread(n)] = base, ... }`, resolved by `S.keyed_table`; `define` | [`macro/nua.lua`](../macro/nua.lua), [`nua/stage.lua`](../nua/stage.lua), [`nua.lua`](../nua.lua) |
-| Standalone source-macro CLI | [`luam`](../luam) |
+| Mua, the Lua language underneath (separate repository, pinned by `tools/mua.lock`, installed by `make mua`) | `mua/` under `.local/share/lua/5.1/`: lexer, parser, emitter, runtime, scope, loader |
+| Nua as a host of Mua: typed lambdas and functions, opened lambdas, `struct`, `oneof`, `export`, `call` | [`nua/front.lua`](../nua/front.lua) |
+| Keyed spread in any table (`{ ..base, k = v }`) and `define`: Mua's runtime, with Nua's records as overrides | Mua's `mua/runtime.lua`, [`nua/stage.lua`](../nua/stage.lua), [`nua.lua`](../nua.lua) |
+| Nua's word and extern facts for Mua's analysis | [`nua/application.lua`](../nua/application.lua) |
 | Native types and constructors | [`nua/types.lua`](../nua/types.lua) |
 | C-exact folding | [`nua/fold.lua`](../nua/fold.lua) |
-| Typed-body parser and translation | [`nua/syntax.lua`](../nua/syntax.lua) |
 | Values, places, lazy stores, branches, loops, words, materialization, tasks, I/O | [`nua/stage.lua`](../nua/stage.lua) |
 | Goose storage and record layouts | [`nua/memory.lua`](../nua/memory.lua) |
 | Immutable fixed-array contents | [`nua/array_value.lua`](../nua/array_value.lua) |
@@ -1562,7 +1555,7 @@ policy objects, recursive layouts and the queue/heap/channel/pool models.
 | Runtime policy (Nua) | [`runtime/scheduler.nua`](../runtime/scheduler.nua), [`tasks.nua`](../runtime/tasks.nua), [`protocol.nua`](../runtime/protocol.nua), [`lifecycle.nua`](../runtime/lifecycle.nua), [`bookkeeping.nua`](../runtime/bookkeeping.nua), [`process.nua`](../runtime/process.nua) |
 | Runtime: I/O backends (selected by `NUA_IO`) | [`runtime/poll.nua`](../runtime/poll.nua), [`runtime/kqueue.nua`](../runtime/kqueue.nua), [`runtime/uring.nua`](../runtime/uring.nua) with [`runtime/nua_io_uring.c`](../runtime/nua_io_uring.c), over [`runtime/posix.nua`](../runtime/posix.nua), [`runtime/io.nua`](../runtime/io.nua), [`runtime/backend.nua`](../runtime/backend.nua) |
 | Single binary | [`tools/embed.lua`](../tools/embed.lua), [`tools/launcher.c`](../tools/launcher.c), [`tools/tables.lua`](../tools/tables.lua) |
-| Editor support | [`tools/tree-sitter-nua/`](../tools/tree-sitter-nua) |
+| Editor support: Mua's Tree-sitter grammar and plugin (in the Mua repository), and Nua's queries over it | [`tools/nvim-nua/`](../tools/nvim-nua) |
 | Examples, fixtures and checks | [`examples/`](../examples), [`tests/`](../tests) |
 
 Generated C includes `nua_rt.h` when it needs the runtime. Beside it, link

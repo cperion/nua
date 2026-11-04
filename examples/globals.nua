@@ -20,7 +20,7 @@ local read_seed = do(): U32 = seed[0]
 export read_seed
 
 -- a global of a struct type: fields are places through the pointer
-local Counter = Struct { total: U32, calls: U32 }
+local Counter = struct { total: U32, calls: U32 }
 local counter = global(Counter, { name = 'counter' })
 local record = do(n: U32): U32
     counter.total = counter.total + n
@@ -45,7 +45,7 @@ end
 export pick
 
 -- a table of operations in a global, filled once, called through the table
-local Table = Struct { first: Op, second: Op }
+local Table = struct { first: Op, second: Op }
 local table_of = global(Table, { name = 'table_of' })
 local fill = do(): Unit
     table_of.first = fnptr double

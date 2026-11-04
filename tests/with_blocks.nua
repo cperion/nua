@@ -1,10 +1,10 @@
 -- `T with entries end` is `T { entries }`: keyed data without commas.
-local Point = Struct with
+local Point = struct with
     x: U32
     y: U32
 end
 
-local Shape = Sum with
+local Shape = oneof with
     circle: U32
     rect: Point
 end

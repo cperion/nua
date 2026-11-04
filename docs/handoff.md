@@ -24,7 +24,7 @@ road are, what is left and how to run things. Read it first, then `docs/design/m
 | `xnyzppkz`, `ozxxkzkl` | the memory design as a whole; docs for borrows in arrays/stores |
 | `rrxssoyk`, `muxvmszz`, `zlwpounz` | milestone 3: the owner API, `U64` lengths, mutual recursion with owners |
 | `vvsrzlqm`, `lzzmzykk`, `lpnluows` | sugar: trailing colon `f x:`, `=:`, `with` blocks |
-| `opnnzorz` | `Struct` and `Sum` replace `struct` and `oneof` |
+| `opnnzorz` | `struct` and `oneof` replace `struct` and `oneof` |
 | `uymsyopt`, `uqwzkkul` | formatter writes multi-line tables as `with`; the code reformatted |
 | `ttroklsl`, `qxtopmmo`, `qnmyskyt` | milestone 4: Map slot layout and real borrows, `Map(Str, V)`, `Map.borrowing`, `m[k] = v`, Grow `pop`/`truncate`, remove rules, compile-time `each` check |
 | `nllxspxz`, `tpqzwnqk`, `vmwopkwk` | D12 design; library words state their borrow effects; one adapter for container methods |
@@ -90,7 +90,7 @@ compiler type by decision. `TODO "msg"` is a prelude builtin (an alias of `trap`
 
 **Syntax added:** trailing colon (`f x:`, `xs:each: k v`, `tasks: scope..`), `key =: x`,
 `T with … end` (commas optional; entries by `name =`, `name:`, `.name`, a line of their own),
-contextual `with` (the expected type supplies the constructor), `Struct`/`Sum`, `endall` over
+contextual `with` (the expected type supplies the constructor), `struct`/`oneof`, `endall` over
 every Nua block. All of these are **token rewrites** in `nua/colon.lua` (see §5). The formatter
 (`nua/fmt.lua`) round-trips them: it expands to braces, formats, then `withize`, `foldends`,
 `colonize`. Options: `block_style`, `data_style`, `spine_style`, `inline_with` (default 2: a head table of
@@ -113,7 +113,7 @@ one or two plain entries that fits the column goes on one line in braces; `nua/c
 | formatter | `nua/fmt.lua`, `nua/fmt_cli.lua`, `nua/application.lua` |
 | typed-body parser (`endall` for lambdas) | `nua/syntax.lua` |
 | C runtime header and harnesses | `runtime/nua_rt.h`, `tests/map_reference.h`, `tests/*_main.c` |
-| tree-sitter | `tools/tree-sitter-nua/` (CLI in `.local/tree-sitter`, git-ignored) |
+| tree-sitter | Mua's grammar (Mua repository, `tools/tree-sitter-mua/`); Nua's queries in `tools/nvim-nua/` (CLI in `.local/tree-sitter`, git-ignored) |
 
 ## 6. Commands
 
