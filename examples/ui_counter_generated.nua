@@ -4,7 +4,7 @@
 -- Fixed geometry isolates event specialization and loop fields; this is not a
 -- font renderer, SDL host, or implementation of the proposed builders.
 local Input = struct { kind: U32, x: U32, y: U32 }
-local Draw = struct with
+local Draw = struct
     control: U32
     x: U32
     y: U32
@@ -15,7 +15,7 @@ local Draw = struct with
     enabled: Bool
 end
 local Frame = struct { length: U32, commands: Array(Draw, 5) }
-local Observation = struct with
+local Observation = struct
     consumed: U32
     frames: U32
     count: U32
@@ -27,7 +27,7 @@ end
 local Button = struct { x: U32, y: U32, width: U32, height: U32, color: U32, enabled: Bool }
 local Number = struct { x: U32, y: U32, width: U32, height: U32, color: U32, value: U32 }
 local Confirmation = struct { visible: Bool, reset_button: Button, keep_button: Button }
-local Counter = struct with
+local Counter = struct
     count: Number
     increment_button: Button
     reset_button: Button

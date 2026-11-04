@@ -42,7 +42,7 @@ local with_frame = do(renderer: Ptr sdl.Renderer, body): Result
     return Result.done()
 end
 
-local View = struct with
+local View = struct
     renderer: Ptr sdl.Renderer
     window_id: U32
     stopped: Bool

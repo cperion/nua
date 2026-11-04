@@ -144,12 +144,12 @@ search order, the compilation-scope cache and the acceptance checks.
 ### 2.2 Types are compile-time values
 
 ```lua
-local Vec2 = struct with
+local Vec2 = struct
     x: F32
     y: F32
 end
 
-local Player = struct with
+local Player = struct
     position: Vec2
     health: U32
 end
@@ -181,7 +181,7 @@ It is not a struct declaration merely because its value happens to be a type.
 ### 2.3 Generic types are ordinary Lua functions
 
 ```lua
-local Pair = do(A, B) = struct with
+local Pair = do(A, B) = struct
     first: A
     second: B
 end
@@ -242,7 +242,7 @@ The rules:
 12. **With blocks.** Mua's block (Mua's syntax doc, §4); what Nua adds is the table-shaped forms it takes. `T with entries end` is `T { entries }`: keyed data without commas, closed by `end`. `with` is to data what `do` is to computation: a `with` block supplies keyed data to the expression before it, a `do` block (or its colon form, rule 11) supplies a trailing computation.
 
 ```lua
-local Point = struct with
+local Point = struct
     x: F32
     y: F32
 end
@@ -264,7 +264,7 @@ local area = s with  -- matching is keyed application: the handlers are the entr
 end
 ```
 
-Every table-shaped form takes it: constructors, `struct`, `oneof`, matches and any constructor-headed argument (`f x with k = 1 end` is `f(x { k = 1 })`, rule 3). Lua's own `{ }` tables are untouched, so no Lua table semantics change; `with` is the Nua spelling for keyed data and `{ }` stays for Lua tables and compact one-liners.
+Every table-shaped form takes it: constructors, matches and any constructor-headed argument (`f x with k = 1 end` is `f(x { k = 1 })`, rule 3). Lua's own `{ }` tables are untouched, so no Lua table semantics change; `with` is the Nua spelling for keyed data and `{ }` stays for Lua tables and compact one-liners.
 
 *Contextual `with`.* Where an expression starts (after `return`, `=`, `(`, `,` or `{`), `with` takes no type before it, and the **context supplies the constructor**: a declared result, a typed local, a typed parameter or a field of a record. It is the same construction as `T with`, without repeating `T`.
 
@@ -286,7 +286,7 @@ total with x = 1, y = 2 end  -- a typed parameter
 
 The type is found by the coercion that every typed position already performs, so it works wherever an expected type is known and nowhere else: `local p = with x = 1 end`, with no type in the context, is rejected (`with` here has no type) rather than guessed. A variable named `with` is still a variable (`with + 1`, `t.with`, `pass(with)`); `with` begins a block only before an entry (`name =`, `.name`, `[`, a literal).
 
-*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`struct with x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
+*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`struct x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
 
 ### 2.5 Words and host functions
 
@@ -1118,7 +1118,7 @@ LuaJIT's GC owns compiler objects: types, words, closures, staged values, comman
 ## 8. Methods and `self`
 
 ```lua
-local Counter = struct with
+local Counter = struct
     value: U32
 end
 
@@ -1310,11 +1310,11 @@ A store slot is addressed as a place, `s[id]`, whose address is recomputed and w
 ### 9.8 Managed stores and generational IDs
 
 ```lua
-local Node = struct with
+local Node = struct
     value: U32
 end
 
-local Graph = struct with
+local Graph = struct
     nodes: Store Node
 end
 ```
@@ -1343,7 +1343,7 @@ A store's slots live on its data stack; its header (stack index, base offset, co
 Graph edges contain IDs, not owning references:
 
 ```lua
-local Edge = struct with
+local Edge = struct
     from: Id Node
     to: Id Node
 end

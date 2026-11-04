@@ -2,7 +2,7 @@
 -- copies, runtime-length arrays and owner parameters (design memory.md §5).
 
 local Node = struct { weight: U32 }
-local Graph = struct with
+local Graph = struct
     nodes: Store Node
     label: U32
     order: Grow U32
