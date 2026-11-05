@@ -18,7 +18,7 @@ local magic = do(path: CString): U32
     local found: U32 = 0
     local outcome = with_fd(path, O_RDONLY):
         if size() >= 4 then
-            mapped 4: bytes
+            mapped 4 do(bytes)
                 local h = bytes:sub(0, 4)
                 found = U32 h[0] * 16777216 + U32 h[1] * 65536 + U32 h[2] * 256 + U32 h[3]
             end

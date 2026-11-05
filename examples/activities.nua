@@ -148,7 +148,7 @@ export import_rows
 -- callbacks: staged control flow; `return` leaves only the callback
 local apply = do(f, x: U32): U32 = f x
 local clamp_cb = do(x: U32): U32
-    return apply: v
+    return apply do(v)
         if v > 10 then return v - 10 end
         return v
     end x + 1

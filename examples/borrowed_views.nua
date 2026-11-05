@@ -12,7 +12,7 @@ local checksum = do(text: Str): U32
 end
 
 local foreign_sum = do(pointer: Ptr U8, length: U32): U32
-    return view_of(pointer, length): bytes
+    return view_of(pointer, length) do(bytes)
         local text = Str.of bytes
         return checksum text
     end
@@ -21,7 +21,7 @@ export foreign_sum
 
 -- The supplied length is a value, not a live read of foreign metadata.
 local snapshot_length = do(pointer: Ptr U8, length: Ptr U32): U32
-    return view_of(pointer, length[0]): bytes
+    return view_of(pointer, length[0]) do(bytes)
         length[0] = 0
         return U32 bytes.length
     end
@@ -32,7 +32,7 @@ export snapshot_length
 -- after freeing the foreign bytes, not merely after the loan's compiler scope.
 local copy_fixed_release = do(pointer: Ptr U8, length: U32): U32
     local owned = Chars 32 ()
-    view_of(pointer, length): bytes
+    view_of(pointer, length) do(bytes)
         owned = Chars 32 (Str.of bytes)
     end
     release pointer
@@ -42,7 +42,7 @@ export copy_fixed_release
 
 local copy_text_release = do(pointer: Ptr U8, length: U32): U32
     local owned = Text {}
-    view_of(pointer, length): bytes
+    view_of(pointer, length) do(bytes)
         owned:write(Str.of bytes)
     end
     release pointer
@@ -56,7 +56,7 @@ local select_text = do(text: Str, flag: Bool): Str
 end
 
 local branch_length = do(pointer: Ptr U8, length: U32, flag: Bool): U32
-    return view_of(pointer, length): bytes
+    return view_of(pointer, length) do(bytes)
         local selected = select_text(Str.of bytes, flag)
         return U32 selected.length
     end
@@ -70,7 +70,7 @@ local select_optional = do(text: Str, flag: Bool): Optional
 end
 
 local outcome_length = do(pointer: Ptr U8, length: U32, flag: Bool): U32
-    return view_of(pointer, length): bytes
+    return view_of(pointer, length) do(bytes)
         return select_optional(Str.of bytes, flag) with
             some = do(text) return U32 text.length end
             none = do() return U32 0 end
@@ -85,15 +85,15 @@ local function tail(text: Str, count: U32): U32
 end
 
 local tail_length = do(pointer: Ptr U8, length: U32, count: U32): U32
-    return view_of(pointer, length): bytes
+    return view_of(pointer, length) do(bytes)
         return tail(Str.of bytes, count)
     end
 end
 export tail_length
 
 local nested_length = do(first: Ptr U8, second: Ptr U8, length: U32): U32
-    return view_of(first, length): outer
-        local text = view_of(second, length): inner
+    return view_of(first, length) do(outer)
+        local text = view_of(second, length) do(inner)
             return Str.of outer
         end
         return U32 text.length

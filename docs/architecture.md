@@ -543,7 +543,7 @@ NodeId insert_double(Graph *graph, uint32_t value) {
 
 ```lua
 -- Generic compile-time type generator
-local Box =: T
+local Box = do(T)
     local B = struct
         value: T
     end

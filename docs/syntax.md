@@ -237,7 +237,7 @@ The rules:
 
 10. **Zero-argument call statements.** Mua's (Mua's syntax doc, §2 rule 8): a bare name or qualified name used as a whole statement invokes it with zero arguments. In Nua this applies in native bodies, callbacks and host Lua code; opened-context lookup and lexical shadowing are exactly those of the explicit call, and the rule does not inspect the callee's type or arity. It is statement-only: `local action = refresh` and `return refresh` still refer to the callable.
 
-11. **Trailing colon.** Mua's (Mua's syntax doc, §4): a colon that ends a line, optionally after parameter names, opens an untyped block lambda: `do(..)`, `do(names)` or `do(scope..)`; `=:` assigns a block and `return:` returns one (`return: body` then a block and `end` is `return do(body) … end`): the colon always means a block. The names are untyped; a typed parameter list keeps `do(x: U32)`. `:` alone opens whatever the activity hands over, exactly as `do(..)` does; an activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
+11. **Trailing colon.** Mua's (Mua's syntax doc, §4): a colon that ends a line opens an untyped block lambda that opens the home: `do(..)`. A block with parameters, an assigned block and a returned block are do lambdas (`xs:each do(k, v) … end`, `local f = do(x) … end`, `return do(body) … end`): only the bare colon means a block. `:` alone opens whatever the activity hands over, exactly as `do(..)` does; an activity that hands over nothing opens the empty set, so `spawn:` is `spawn do ... end`. `nua fmt` prints the colon form for every untyped trailing `do(..)` that ends a line; `block_style = "do"` in `.nuafmt.lua` keeps the `do` spelling.
 
 12. **With blocks.** Mua's block (Mua's syntax doc, §4); what Nua adds is the table-shaped forms it takes. `T with entries end` is `T { entries }`: keyed data without commas, closed by `end`. `with` is to data what `do` is to computation: a `with` block supplies keyed data to the expression before it, a `do` block (or its colon form, rule 11) supplies a trailing computation.
 
@@ -250,7 +250,7 @@ end
 local p = Point with
     x = 1
     .y
-    found =: v  -- a keyed handler is an entry too
+    found = do(v)  -- a keyed handler is an entry too
         go v
     end
 end
@@ -258,7 +258,7 @@ end
 local q = Point with x = 1, y = 2 end
 local area = s with  -- matching is keyed application: the handlers are the entries
     circle = do(r) = r * r
-    rect =: p
+    rect = do(p)
         return p.x * p.y
     end
 end
@@ -286,7 +286,7 @@ total with x = 1, y = 2 end  -- a typed parameter
 
 The type is found by the coercion that every typed position already performs, so it works wherever an expected type is known and nowhere else: `local p = with x = 1 end`, with no type in the context, is rejected (`with` here has no type) rather than guessed. A variable named `with` is still a variable (`with + 1`, `t.with`, `pass(with)`); `with` begins a block only before an entry (`name =`, `.name`, `[`, a literal).
 
-*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name =: params` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`struct x: F32 end`); use `=:` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
+*Entries.* Anything a table constructor accepts: `name = value`, `.name` (rule 9), `[key] = value`, positional values, and `name = do(params)` handlers. *Boundaries.* An entry ends where the next begins: a name followed by `=` or by `:` and a space begins one (so `x = a y = b` is two entries, not `x = a(y)(...)`); on a line of its own, a name or `.name` begins one. A value may continue over several lines (`z = a +` then `b`). `,` and `;` are still accepted and separate entries as in a table, and are needed before an entry that starts with `[`, a literal or a bracket, which would otherwise continue the previous value. *Inside.* The colon is an annotation, never a block opener (`struct x: F32 end`); use `= do(params)` for handlers. *Reserved.* `with` is a keyword only after an operand, where it would otherwise be an argument: `local with = 3`, `t.with` and `with(x)` are unchanged. The rewrite is a token rewrite below every other rule, like the trailing colon, and line numbers do not move. `nua fmt` keeps a `with` block as `with` (never turns braces into `with`, and drops the commas the reader writes back).
 
 ### 2.5 Words and host functions
 
@@ -314,7 +314,7 @@ The language distinguishes **host computation** from **native computation**, but
 ### 3.1 Ordinary Lua
 
 ```lua
-local make_multiplier =: k
+local make_multiplier = do(k)
     return do(x: U32): U32 =
     x * k
 end
@@ -785,7 +785,7 @@ There is one iteration mechanism: **tail recursion**. `while` and typed `for` ar
 An untyped `for` is ordinary Lua and runs while the word is being constructed or evaluated:
 
 ```lua
-local make_sum =: n
+local make_sum = do(n)
     return do(x: U32): U32
         local total = x
         for i = 1, n do
@@ -1396,7 +1396,7 @@ An untyped lambda inside a typed body is a **callback**. It is evaluated in plac
 ```lua
 local apply = do(f, x: U32): U32 = f x
 local clamp_cb = do(x: U32): U32
-    return apply: v
+    return apply do(v)
         if v > 10 then return v - 10 end
         return v
     end x + 1
@@ -1697,17 +1697,17 @@ local import_rows = do(doc: Ref Document, n: U32): Unit
 end
 ```
 
-`endall` closes **every open Nua block** (`do`, colon, `=:` and `with` blocks) back to the nearest enclosing Lua control block or word body: `if`, `while`, `for`, `function`, `repeat`, a bare `do … end`, or the typed word the code sits in. Those keep their own `end`, so the word's body stays open. Nothing may follow `endall` inside the blocks it closes, which is what makes the rule simple: put the deepest handler last, and one closer ends a whole pyramid. It returns nothing, calls nothing and cleans nothing up: its effects are exactly those of the expanded program.
+`endall` closes **every open Nua block** (`do`, colon and `with` blocks) back to the nearest enclosing Lua control block or word body: `if`, `while`, `for`, `function`, `repeat`, a bare `do … end`, or the typed word the code sits in. Those keep their own `end`, so the word's body stays open. Nothing may follow `endall` inside the blocks it closes, which is what makes the rule simple: put the deepest handler last, and one closer ends a whole pyramid. It returns nothing, calls nothing and cleans nothing up: its effects are exactly those of the expanded program.
 
 ```lua
 tasks:
     spawn:
         io.listen(0) with
             failed = do(e) end
-            done =: l
+            done = do(l)
                 io.accept(l) with
                     failed = do(e) end
-                    done =: c
+                    done = do(c)
                         go c
                     end
                 end
@@ -1718,7 +1718,7 @@ end
 return n
 ```
 
-`endall` there closes seven blocks. It is also how a chain is written flat: the wrappers (`tasks:`, `spawn:`) sit at one indent, the content after them is indented once, the handler chain (`done =: l`, `io.accept(l) with`, `done =: c`) is flat within the content, sibling entries (`failed = …`) are one level in under their `with`, and the innermost body is one level in again. `nua fmt` writes this layout and folds a trailing run of three or more `end` lines that close Nua blocks into an `endall` (a run that holds a `with`; `spine_style = "none"` keeps the staircase).
+`endall` there closes seven blocks. It is also how a chain is written flat: the wrappers (`tasks:`, `spawn:`) sit at one indent, the content after them is indented once, the handler chain (`done = do(l)`, `io.accept(l) with`, `done = do(c)`) is flat within the content, sibling entries (`failed = …`) are one level in under their `with`, and the innermost body is one level in again. `nua fmt` writes this layout and folds a trailing run of three or more `end` lines that close Nua blocks into an `endall` (a run that holds a `with`; `spine_style = "none"` keeps the staircase).
 
 ```c
 void import_rows(Document *doc, uint32_t n) {
@@ -1786,7 +1786,7 @@ Matching is keyed application of a sum value, with one handler per alternative. 
 ```lua
 local area = do(s: Shape): U32 = s with
     circle = do(c) = c.radius * c.radius * 3
-    rect =: r
+    rect = do(r)
         local w = r.width
         return w * r.height
     end
@@ -1842,7 +1842,7 @@ local Command = oneof { move: Direction, insert: U32, undo: Unit }
 
 local apply = do(e: Ref Editor, c: Command): Unit
     c with
-        move =: d
+        move = do(d)
             d with
                 left = do
                     if e.cursor > 0 then e.cursor = e.cursor - 1 end
@@ -1852,7 +1852,7 @@ local apply = do(e: Ref Editor, c: Command): Unit
                 end
             end
         end
-        insert =: n
+        insert = do(n)
             e.length = e.length + n
             e.cursor = e.cursor + n
         end
@@ -2093,7 +2093,7 @@ activity instead of handing the callback an unscoped `Slice(p, n)`:
 
 ```lua
 local foreign_sum = do(pointer: Ptr U8, length: U32): U32
-    return view_of(pointer, length): bytes
+    return view_of(pointer, length) do(bytes)
         local text = Str.of bytes
         return checksum text
     end
@@ -2524,7 +2524,7 @@ storage is a field of an existing resizable kind (`Grow`, `Store`), and `[]` is 
 hook that returns the element's place:
 
 ```lua
-local Ring =: E capacity
+local Ring = do(E, capacity)
     local R = struct { head: U32, len: U32, items: Grow E }
 
     function R:push(v: E): Unit
@@ -2871,7 +2871,7 @@ Constants are the header's (`O_WRONLY | (O_CREAT | O_TRUNC)`); text known while 
 A mapping is a view, so the header format idiom applies (§12.3): one sub-slice of known length, then constant offsets, with no check left:
 
 ```lua
-mapped 4: bytes
+mapped 4 do(bytes)
     local h = bytes:sub(0, 4)
     found = U32(h[0]) * 16777216 + U32(h[1]) * 65536 + U32(h[2]) * 256 + U32(h[3])
 end
@@ -3098,7 +3098,7 @@ A task is not a thread. It compiles to a **resumable C function**: a frame struc
 
 ```lua
 local square = do(inp: Chan U32, out: Chan U64): Unit
-    inp:each: v
+    inp:each do(v)
         out:send(U64 v * U64 v)
     end
     out:close
@@ -3303,7 +3303,7 @@ local pooled = do(count: U32): U64
             end
             full:close
         end
-        full:each: s
+        full:each do(s)
             total = total + U64(checksum buffers[s])
             buffers:release s
         endall

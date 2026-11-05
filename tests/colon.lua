@@ -1,5 +1,5 @@
--- The trailing colon: a colon that ends a line (optionally after parameter names)
--- is `do(..)`, `do(names)` or `do(scope..)`. Annotation colons never change.
+-- The trailing colon: a colon that ends a line is `do(..)`. A block with parameters, an
+-- assigned block and a returned block are do lambdas. Annotation colons never change.
 local root = arg[0]:match('^(.*)/tests/[^/]*$') or '.'
 package.path = root .. '/?.lua;' .. package.path
 package.path = root .. '/?/init.lua;' .. package.path
@@ -27,25 +27,36 @@ local function translated(source, name)
     return mua.translate(source, name, { host = front.host(name) })
 end
 
--- every colon form translates exactly as the do-form it stands for
+-- the bare trailing colon translates exactly as the do-form it stands for
 local pairs_of = {
     { 'anonymous', 'with_buffer n:\n    go\nend\n', 'with_buffer n do(..)\n    go\nend\n' },
     { 'after a call', 'view_of(p, n):\n    go\nend\n', 'view_of(p, n) do(..)\n    go\nend\n' },
-    { 'names', 'xs:each: key value\n    go\nend\n', 'xs:each do(key, value)\n    go\nend\n' },
-    { 'one name', 'xs:each: x\n    go x\nend\n', 'xs:each do(x)\n    go x\nend\n' },
-    { 'named opening', 'tasks: scope..\n    go\nend\n', 'tasks do(scope..)\n    go\nend\n' },
-    { 'trailing comment', 'xs:each: x -- note\n    go x\nend\n', 'xs:each do(x) -- note\n    go x\nend\n' },
-    { 'in an initializer', 'local total = view_of(p, n): bytes\n    go\nend\n',
-      'local total = view_of(p, n) do(bytes)\n    go\nend\n' },
-    { 'assigned', 'local f =: x\n    go x\nend\n', 'local f = do(x)\n    go x\nend\n' },
-    { 'assigned in a table', 'local t = {\n    found =: v\n        go v\n    end,\n    other =: ..\n        go\n    end,\n}\n',
-      'local t = {\n    found = do(v)\n        go v\n    end,\n    other = do(..)\n        go\n    end,\n}\n' },
-    { 'assigned opened', 'g.h =:\n    go\nend\n', 'g.h = do(..)\n    go\nend\n' },
-    { 'nested', 'a:\n    b: x\n        go x\n    end\nend\n', 'a do(..)\n    b do(x)\n        go x\n    end\nend\n' },
+    { 'trailing comment', 'xs:each: -- note\n    go\nend\n', 'xs:each do(..) -- note\n    go\nend\n' },
+    { 'in an initializer', 'local total = view_of(p, n):\n    go\nend\n',
+      'local total = view_of(p, n) do(..)\n    go\nend\n' },
+    { 'nested', 'a:\n    b:\n        go\n    end\nend\n', 'a do(..)\n    b do(..)\n        go\n    end\nend\n' },
 }
 for _, case in ipairs(pairs_of) do
     check('colon block: ' .. case[1], normal(translated(case[2], case[1]))
         == normal(translated(case[3], case[1])), translated(case[2], case[1]))
+end
+
+-- the removed spellings are parse errors that say what to write
+local rejected = {
+    { 'colon parameters', 'xs:each: k v\n    go\nend\n',
+      "a block colon takes no parameters; write 'do(k, v) ... end' after the call" },
+    { 'a named opening', 'tasks: scope..\n    go\nend\n',
+      "a block colon takes no parameters; write 'do(scope..) ... end' after the call" },
+    { 'an assigned block', 'local f =: x\n    go x\nend\n',
+      "an assigned block is written '= do(x) ... end', not '=:'" },
+    { 'an assigned block opening the home', 'g.h =:\n    go\nend\n',
+      "an assigned block is written '= do(..) ... end', not '=:'" },
+    { 'a returned block', 'return: b\n    go\nend\n',
+      "a returned block is written 'return do(b) ... end', not 'return:'" },
+}
+for _, case in ipairs(rejected) do
+    local ok, err = pcall(translated, case[2], case[1])
+    check('rejects ' .. case[1], not ok and tostring(err):find(case[3], 1, true), ok and 'translated' or err)
 end
 
 -- `with` blocks are table constructors without commas
@@ -55,7 +66,7 @@ local with_pairs = {
     { 'shorthand entries', 'local p = Point with\n    .x\n    .y\nend\n', 'local p = Point {\n    .x,\n    .y\n}\n' },
     { 'struct', 'local P = struct\n    x: F32\n    y: F32\nend\n', 'local P = struct {\n    x: F32,\n    y: F32\n}\n' },
     { 'continued entry', 'local p = T with\n    x = a +\n        b\n    y = 2\nend\n', 'local p = T {\n    x = a +\n        b,\n    y = 2\n}\n' },
-    { 'handlers', 'local r = s with\n    a =: v\n        go v\n    end\n    b = do(x) = x\nend\n',
+    { 'handlers', 'local r = s with\n    a = do(v)\n        go v\n    end\n    b = do(x) = x\nend\n',
       'local r = s {\n    a = do(v)\n        go v\n    end,\n    b = do(x) = x\n}\n' },
     { 'nested', 'local p = T with\n    inner = U with k = 1 end\n    z = 3\nend\n', 'local p = T {\n    inner = U { k = 1 },\n    z = 3\n}\n' },
     { 'as an argument', 'f x with k = 1 end\n', 'f x { k = 1 }\n' },
@@ -99,11 +110,11 @@ assert(loadstring(translated(variable, 'variable.nua'), '@variable.nua'))()
 check('a variable named with is still a variable', true)
 check('an unclosed with block is an error', not pcall(translated, 'local p = T with x = 1\n', 'open'))
 
--- `endall` closes every open Nua block (colon, do, =: and with) back to Lua control
+-- `endall` closes every open Nua block (colon, do and with) back to Lua control
 local endall_pairs = {
     { 'a chain of data and handlers',
-      'a with\n    y =: v\n        b with\n            z =: w\n                go w\nendall\nafter()\n',
-      'a with\n    y =: v\n        b with\n            z =: w\n                go w\n            end\n        end\n    end\nend\nafter()\n' },
+      'a with\n    y = do(v)\n        b with\n            z = do(w)\n                go w\nendall\nafter()\n',
+      'a with\n    y = do(v)\n        b with\n            z = do(w)\n                go w\n            end\n        end\n    end\nend\nafter()\n' },
     { 'it stops at a Lua block',
       'x:\n    if c then\n        y:\n            go\n        endall\n    end\nend\n',
       'x:\n    if c then\n        y:\n            go\n        end\n    end\nend\n' },
@@ -129,29 +140,28 @@ for _, case in ipairs(unchanged) do
 end
 
 -- line numbers survive the rewrite
-local located = translated('local n = 0\nxs:each: x\n    n = n + x\nend\nlocal bad = nope.nope\n', 'lines.nua')
+local located = translated('local n = 0\nxs:each:\n    n = n + 1\nend\nlocal bad = nope.nope\n', 'lines.nua')
 check('line numbers stay put', select(2, located:gsub('\n', '\n')) == 5, located)
 
 -- a colon block runs
 local host = [[
-local each = do(body)
-    body(1)
-    body(2)
-    body(3)
+local run = do(body)
+    body()
 end
 local total = 0
-each: x
-    total = total + x
+run:
+    total = 6
 end
 assert(total == 6)
-local twice = do(body) = body(2) + body(3)
-local value = twice: y
-    return y * 10
+local twice = do(body) = body() * 2
+local value = twice:
+    return 25
 end
 assert(value == 50)
 ]]
-assert(loadstring(translated(host, 'host.nua'), '@host.nua'))()
-check('colon blocks run as host code', true)
+-- a bare colon block opens its home in Mua; Nua's staging gives that home meaning
+assert(loadstring(mua.translate(host, 'host.mua'), '@host.mua'))()
+check('colon blocks run', true)
 
 -- the formatter prints the colon form for untyped trailing blocks, and only there
 local function formatted(name, source, expected, options)
@@ -163,33 +173,33 @@ local function formatted(name, source, expected, options)
     check(name .. ': idempotent', fmt.format(out, options, name) == out)
 end
 formatted('fmt: do-form becomes colon', 'with_buffer n do(..)\n    go\nend\n', 'with_buffer n:\n    go\nend\n')
-formatted('fmt: names', 'xs:each do(key, value)\n    go\nend\n', 'xs:each: key value\n    go\nend\n')
-formatted('fmt: opened name', 'tasks do(scope..)\n    use scope\nend\n', 'tasks: scope..\n    use scope\nend\n')
-formatted('fmt: assigned block', 'local t = {\n    found = do(v)\n        go v\n    end,\n}\n',
-    'local t = {\n    found =: v\n        go v\n    end,\n}\n')
-formatted('fmt: assigned block, anonymous', 'local f = do(..)\n    go\nend\n', 'local f =:\n    go\nend\n')
+formatted('fmt: parameters stay a do-form', 'xs:each do(key, value)\n    go\nend\n', 'xs:each do(key, value)\n    go\nend\n')
+formatted('fmt: an opened name stays a do-form', 'tasks do(scope..)\n    use scope\nend\n', 'tasks do(scope..)\n    use scope\nend\n')
+formatted('fmt: an assigned block stays a do-form', 'local t = {\n    found = do(v)\n        go v\n    end,\n}\n',
+    'local t = {\n    found = do(v)\n        go v\n    end,\n}\n')
+formatted('fmt: an assigned block opens the home', 'local f = do(..)\n    go\nend\n', 'local f = do(..)\n    go\nend\n')
 formatted('fmt: expression lambda untouched', 'local f = do(x) = x + 1\n', 'local f = do(x) = x + 1\n')
-formatted('fmt: colon form kept', 'xs:each: x\n    go x\nend\n', 'xs:each: x\n    go x\nend\n')
+formatted('fmt: colon form kept', 'xs:each:\n    go\nend\n', 'xs:each:\n    go\nend\n')
 formatted('fmt: typed lambda untouched', 'local f = do(a: U32): U32\n    return a\nend\n',
     'local f = do(a: U32): U32\n    return a\nend\n')
 formatted('fmt: inline block untouched', 'xs:each do(x) go x end\n', 'xs:each do(x) go x end\n')
 formatted('fmt: nullary block untouched', 'spawn do\n    go\nend\n', 'spawn do\n    go\nend\n')
-formatted('fmt: block style do', 'xs:each: x\n    go x\nend\n', 'xs:each do(x)\n    go x\nend\n',
+formatted('fmt: block style do', 'xs:each:\n    go\nend\n', 'xs:each do(..)\n    go\nend\n',
     { block_style = 'do' })
 formatted('fmt: with block kept', 'local p = Point with\nx = 1\ny = 2\nend\n', 'local p = Point with\n    x = 1\n    y = 2\nend\n')
 formatted('fmt: with on one line keeps commas', 'local p = Point   with x=1   y=2 end\n', 'local p = Point with x = 1, y = 2 end\n')
 formatted('fmt: braces stay braces', 'local p = Point { x = 1, y = 2 }\n', 'local p = Point { x = 1, y = 2 }\n')
 formatted('fmt: with commas on one line stay', 'local p = Point with x = 1, y = 2 end\n', 'local p = Point with x = 1, y = 2 end\n')
-formatted('fmt: with and a block entry', 'local r = s with\n  a =: v\n    local x, y = v, v\n    go x y\n  end\n  b = 2\nend\n',
-    'local r = s with\n    a =: v\n        local x, y = v, v\n        go x y\n    end\n    b = 2\nend\n')
+formatted('fmt: with and a block entry', 'local r = s with\n  a = do(v)\n    local x, y = v, v\n    go x y\n  end\n  b = 2\nend\n',
+    'local r = s with\n    a = do(v)\n        local x, y = v, v\n        go x y\n    end\n    b = 2\nend\n')
 formatted('fmt: struct', 'local P = struct\nx: F32\ny: F32\nend\n', 'local P = struct\n    x: F32\n    y: F32\nend\n')
 formatted('fmt: positional entries keep commas', 'local a = Array(U32, 2) with 1, 2 end\n', 'local a = Array(U32, 2) with 1, 2 end\n')
 formatted('fmt: multi-line table after a head becomes with', 'local q = Point {\n    x = 1,\n    y = 2,\n}\n',
     'local q = Point with\n    x = 1\n    y = 2\nend\n')
 formatted('fmt: head-less tables stay braces', 'local t = {\n    a = 1,\n    b = 2,\n}\n', 'local t = {\n    a = 1,\n    b = 2,\n}\n')
 formatted('fmt: one-line tables stay braces', 'local q = Point { x = 1, y = 2 }\n', 'local q = Point { x = 1, y = 2 }\n')
-formatted('fmt: handlers become with', 'local r = s {\n    a =: v\n        go v\n    end,\n    b = do(x) = x,\n}\n',
-    'local r = s with\n    a =: v\n        go v\n    end\n    b = do(x) = x\nend\n')
+formatted('fmt: handlers become with', 'local r = s {\n    a = do(v)\n        go v\n    end,\n    b = do(x) = x,\n}\n',
+    'local r = s with\n    a = do(v)\n        go v\n    end\n    b = do(x) = x\nend\n')
 formatted('fmt: positional entries keep their commas', 'local a = Array(U32, 2) {\n    1,\n    [3] = 2,\n}\n',
     'local a = Array(U32, 2) with\n    1,\n    [3] = 2\nend\n')
 formatted('fmt: nested tables convert one by one', 'local p = T {\n    inner = U {\n        k = 1,\n    },\n    z = {1, 2},\n}\n',
@@ -208,15 +218,15 @@ formatted('fmt: contextual with kept', 'return with\nx = 1\nend\n', 'return with
 formatted('fmt: contextual with on one line', 'local p: Point = with x = 1, y = 2 end\n', 'local p: Point = with x = 1, y = 2 end\n')
 -- trailing runs of `end` that close Nua blocks fold into one `endall`, flat: the wrappers,
 -- then the content indented once, the handler chain flat, siblings and the body one level in
-local pyramid = 'local f = do(n: U32): U32\n    tasks:\n        spawn:\n            io.listen(0) with\n                failed = do(e) end\n                done =: l\n                    io.accept(l) with\n                        failed = do(e) end\n                        done =: c\n                            go c\n                        end\n                    end\n                end\n            end\n        end\n    end\n    return n\nend\n'
-local folded = 'local f = do(n: U32): U32\n    tasks:\n    spawn:\n        io.listen 0 with\n            failed = do(e) end\n        done =: l\n        io.accept(l) with\n            failed = do(e) end\n        done =: c\n            go c\n    endall\n    return n\nend\n'
+local pyramid = 'local f = do(n: U32): U32\n    tasks:\n        spawn:\n            io.listen(0) with\n                failed = do(e) end\n                done = do(l)\n                    io.accept(l) with\n                        failed = do(e) end\n                        done = do(c)\n                            go c\n                        end\n                    end\n                end\n            end\n        end\n    end\n    return n\nend\n'
+local folded = 'local f = do(n: U32): U32\n    tasks:\n    spawn:\n        io.listen 0 with\n            failed = do(e) end\n        done = do(l)\n        io.accept(l) with\n            failed = do(e) end\n        done = do(c)\n            go c\n    endall\n    return n\nend\n'
 formatted('fmt: a pyramid of handlers folds into endall', pyramid, folded)
 formatted('fmt: a folded chain stays folded', folded, folded)
-formatted('fmt: a short chain keeps its ends', 'a with\n    x = do end\n    y =: v\n        go v\n    end\nend\n',
-    'a with\n    x = do end\n    y =: v\n        go v\n    end\nend\n')
+formatted('fmt: a short chain keeps its ends', 'a with\n    x = do end\n    y = do(v)\n        go v\n    end\nend\n',
+    'a with\n    x = do end\n    y = do(v)\n        go v\n    end\nend\n')
 -- spine_style none keeps the staircase: the handlers' ends stay (the lambda wrappers still fold)
 formatted('fmt: spine_style none keeps the staircase', pyramid,
-    'local f = do(n: U32): U32\n    tasks:\n        spawn:\n            io.listen 0 with\n                failed = do(e) end\n                done =: l\n                    io.accept(l) with\n                        failed = do(e) end\n                        done =: c\n                            go c\n                        end\n                    end\n                end\n            end\n        endall\n    return n\nend\n',
+    'local f = do(n: U32): U32\n    tasks:\n        spawn:\n            io.listen 0 with\n                failed = do(e) end\n                done = do(l)\n                    io.accept(l) with\n                        failed = do(e) end\n                        done = do(c)\n                            go c\n                        end\n                    end\n                end\n            end\n        endall\n    return n\nend\n',
     { spine_style = 'none' })
 check('fmt: bad data style', not pcall(fmt.format, 'x = 1\n', { data_style = 'pretty' }))
 check('fmt: bad block style', not pcall(fmt.format, 'x = 1\n', { block_style = 'ruby' }))

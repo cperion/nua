@@ -15,7 +15,7 @@ Source becomes Lua in five steps (`nua.translate`, `nua.lua:148`):
 
 | Step | File | Does |
 |---|---|---|
-| 1 | `nua/colon.lua` `rewrite`, a lexer hook installed by `macro/nua.lua` | token rewrites: trailing colon, `=:`, `T with … end`, contextual `with`, `endall` |
+| 1 | `nua/colon.lua` `rewrite`, a lexer hook installed by `macro/nua.lua` | token rewrites: trailing colon, `T with … end`, contextual `with`, `endall` |
 | 2 | `macro/nua.lua`, a lexer hook | `.name` entries; keyed spread `{ ..base }` → `__nua_keyed{ [__nua_spread(1)] = base }` |
 | 3 | `macro/let.lua` | lambdas, opened `do(..)` (a `setfenv` environment), juxtaposition (token marks `__let_apply`), `ULL` literals, Lua's `do` vs a lambda |
 | 4 | `macro/nua.lua` → `nua/syntax.lua` | typed lambdas (`M.let_typed`), opened lambdas (`M.let_opened`), typed `function`, `struct`, `oneof`, `export`: parsed by syntax.lua's parser `P`, translated by its generator `G` into `__S.*` calls, spliced back as text padded to the source's line count |
@@ -78,8 +78,8 @@ loads.
 | `do(x) = e`, `do(x) … end`, `do … end`, currying | functions |
 | juxtaposition `f a b`, `f 21`, `f "x":rep 3`, `f (g x) y`, a newline ending a name chain | curried calls `f(a)(b)`, as macro.let gives today |
 | bare-name statement `f` | `f()` (today's `statement_calls`) |
-| trailing colon `f x:`, `xs:each: k v` | a trailing block lambda |
-| `key =: x` | as syntax.md describes it today |
+| trailing colon `f x:` | a trailing block lambda that opens the home (`do(..)`) |
+| `key = do(x) … end` | a block value: as syntax.md describes it today |
 | `T with … end` | `T{ … }` |
 | `with … end` where an expression starts | `__mua.with{ … }`: the identity by default (§4.5) |
 | `.name` entry | `name = name` |
@@ -108,7 +108,7 @@ comments and spacing are kept as tokens, so the formatter round-trips a file byt
 
 `mua/parse.lua`: a recursive-descent parser over those tokens, built from
 syntax.lua's `Reader` and `P`, extended to what steps 1–3 do today (the trailing colon,
-`with`, `endall`, `=:`, `.name`, spread, the Lua-`do` rules). Its AST is `P`'s, documented in
+`with`, `endall`, `.name`, spread, the Lua-`do` rules). Its AST is `P`'s, documented in
 the module (node kinds `name`, `call`, `method`, `lambda`, `table`, `local`, `assign`, … with
 source lines). Tools get the token list with the AST (comments, spelling, positions).
 

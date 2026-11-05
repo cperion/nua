@@ -9,8 +9,8 @@ local channel_nested_each = do(): U32
         outer:close
         inner:send 11
         inner:close
-        outer:each: a
-        inner:each: b
+        outer:each do(a)
+        inner:each do(b)
             total = total + a * b
         endall
     return total

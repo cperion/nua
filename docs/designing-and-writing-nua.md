@@ -857,7 +857,7 @@ local dispatch = do(table, request: Request): U32
 end
 ```
 
-**6. Let handlers be instruction blocks.** A colon block with no names opens what it is given, so a handler speaks the request's fields directly, as an activity body speaks its context's (§6.4):
+**6. Let handlers be instruction blocks.** A colon block opens what it is given, so a handler speaks the request's fields directly, as an activity body speaks its context's (§6.4):
 
 ```lua
 -- the sentences: each handler opens the request it is given
@@ -1030,7 +1030,7 @@ The scope body opens the file (a path is a `CString`, which no spawned task may 
 local line_count = do(workers, path: CString): U32
     local total: U32 = 0
     io.open(path, io.READ) with
-        done =: file
+        done = do(file)
             tasks:
                 local chunks = pool(Chunk, 8)
                 local filled = channel(Slot Chunk, 8)
@@ -1054,10 +1054,10 @@ local line_count = do(workers, path: CString): U32
                 end
                 -- the workers run in a scope of their own: when it ends, counts can close
                 spawn do
-                    tasks: crew
+                    tasks do(crew)
                         for _ = 1, workers do
                             crew.spawn do
-                                filled:each: slot
+                                filled:each do(slot)
                                     counts:send(count_lines chunks[slot])
                                     chunks:release slot
                                 end
@@ -1066,7 +1066,7 @@ local line_count = do(workers, path: CString): U32
                     end
                     counts:close
                 end
-                counts:each: lines
+                counts:each do(lines)
                     total = total + lines
                 end
             end
@@ -1315,7 +1315,7 @@ When a problem has structure (a grammar, a key map, a protocol), write the struc
 ```lua
 local apply = do(document: Ref Document, c: Command): Unit
     c with
-        move =: d
+        move = do(d)
             d with
                 left() = document:move_left()
                 right = do
@@ -1325,7 +1325,7 @@ local apply = do(document: Ref Document, c: Command): Unit
                 end
             end
         end
-        insert =: n
+        insert = do(n)
             document.length = document.length + n
             document.cursor = document.cursor + n
         end

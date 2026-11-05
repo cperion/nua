@@ -5,7 +5,7 @@ local libc = require "nua.libc"
 
 greeting.say = do(who: Str): Unit
     libc.say "hello, "
-    who:cstring(): c
+    who:cstring() do(c)
         libc.say c ("\n")
     end
 end

@@ -118,7 +118,7 @@ local clamp_sum = do(a: I32, b: I32): I32 = clamp a 0 10 + clamp b (-5) 5
 export clamp_sum
 
 -- generation-time unrolling with a native accumulator
-local horner =: coeffs
+local horner = do(coeffs)
     return do(x: I64): I64
         local acc: I64 = 0
         for i = 1, #coeffs do

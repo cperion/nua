@@ -9,7 +9,7 @@ road are, what is left and how to run things. Read it first, then `docs/design/m
    `~/.claude/projects/-home-cperion-ext-dev-nua/memory/` (loaded automatically).
 2. `docs/design/memory.md`: the memory model, milestones (§13) and decisions D1–D12 (§15).
 3. `docs/syntax.md`: the language contract. New in this stretch: §2.4 rules 11–12 (colon,
-   `=:`, `with`, contextual `with`), §10.9 (`endall`), §15 (maps), §9.x (owners).
+   `with`, contextual `with`), §10.9 (`endall`), §15 (maps), §9.x (owners).
 4. `docs/architecture.md` §7 (runtime model: stacks, owner slots, result region).
 
 ## 2. Repository state
@@ -23,7 +23,7 @@ road are, what is left and how to run things. Read it first, then `docs/design/m
 | `ukkkmnyr`, `tsutlrxq`, `vlnonmms`, `nkxwkltn`, `tukyywmu` | design draft; milestone 1 (stacks never move); milestone 2 (one borrow system) |
 | `xnyzppkz`, `ozxxkzkl` | the memory design as a whole; docs for borrows in arrays/stores |
 | `rrxssoyk`, `muxvmszz`, `zlwpounz` | milestone 3: the owner API, `U64` lengths, mutual recursion with owners |
-| `vvsrzlqm`, `lzzmzykk`, `lpnluows` | sugar: trailing colon `f x:`, `=:`, `with` blocks |
+| `vvsrzlqm`, `lzzmzykk`, `lpnluows` | sugar: trailing colon `f x:`, `with` blocks |
 | `opnnzorz` | `struct` and `oneof` replace `struct` and `oneof` |
 | `uymsyopt`, `uqwzkkul` | formatter writes multi-line tables as `with`; the code reformatted |
 | `ttroklsl`, `qxtopmmo`, `qnmyskyt` | milestone 4: Map slot layout and real borrows, `Map(Str, V)`, `Map.borrowing`, `m[k] = v`, Grow `pop`/`truncate`, remove rules, compile-time `each` check |
@@ -88,7 +88,7 @@ inside the compilation). `Text` is `Grow U8`: its `write`/`str` are words in `li
 with `chars_cap`, a `length` property word, a host `str` member and constructor). `Str` stays a
 compiler type by decision. `TODO "msg"` is a prelude builtin (an alias of `trap`).
 
-**Syntax added:** trailing colon (`f x:`, `xs:each: k v`, `tasks: scope..`), `key =: x`,
+**Syntax added:** the bare trailing colon (`f x:`), do lambdas for parameters (`xs:each do(k, v)`),
 `T with … end` (commas optional; entries by `name =`, `name:`, `.name`, a line of their own),
 contextual `with` (the expected type supplies the constructor), `struct`/`oneof`, `endall` over
 every Nua block. All of these are **token rewrites** in `nua/colon.lua` (see §5). The formatter
@@ -109,7 +109,7 @@ one or two plain entries that fits the column goes on one line in braces; `nua/c
 | `Text` words; `Chars`; `Str` (compiler type) | `lib/storage.nua`, `lib/chars.nua`, `nua/strings.lua` |
 | container and map algorithms (Nua) | `lib/storage.nua`, `lib/map.nua`, `lib/storage_layout.nua`, `lib/stacks.nua` |
 | borrow tokens, effects, checked places | `nua/stage.lua` (`h.place_tokens`, `S.retire`, `S.borrows`, `S.note_structure`, `h.check_use`) |
-| token rewrites (colon, `=:`, `with`, `endall`) and the formatter passes | `nua/colon.lua` |
+| token rewrites (colon, `with`, `endall`) and the formatter passes | `nua/colon.lua` |
 | formatter | `nua/fmt.lua`, `nua/fmt_cli.lua`, `nua/application.lua` |
 | typed-body parser (`endall` for lambdas) | `nua/syntax.lua` |
 | C runtime header and harnesses | `runtime/nua_rt.h`, `tests/map_reference.h`, `tests/*_main.c` |

@@ -425,7 +425,7 @@ export opening_result
 ]]
 local anonymous_program = fmt.format(opening_program)
 check('unused openings removed in semantic fixture', not anonymous_program:find('unused', 1, true))
-check('enclosing home preserved in semantic fixture', anonymous_program:find(': keep..', 1, true) ~= nil)
+check('enclosing home preserved in semantic fixture', anonymous_program:find('do(keep..)', 1, true) ~= nil)
 local original_opening_c = nua.compile(opening_program, 'opening.nua')
 local anonymous_opening_c = nua.compile(anonymous_program, 'opening.nua')
 -- Eliminating a named receiver can also eliminate an unused copy header.
@@ -501,9 +501,9 @@ formatted('inline_with: short tables take one line',
     'local a = Point with\n    x = 1\n    y = 2\nend\nlocal b = Point with x = 1 end\nlocal c = Point {\n    x = 1,\n    y = 2,\n}\n',
     'local a = Point { x = 1, y = 2 }\nlocal b = Point { x = 1 }\nlocal c = Point { x = 1, y = 2 }\n')
 formatted('inline_with: three entries, handlers and long lines stay with',
-    'local a = Point with\n    x = 1\n    y = 2\n    z = 3\nend\nlocal b = Point with\n    x = 1\n    found =: v\n        go v\n    end\nend\n'
+    'local a = Point with\n    x = 1\n    y = 2\n    z = 3\nend\nlocal b = Point with\n    x = 1\n    found = do(v)\n        go v\n    end\nend\n'
     .. 'local c = Point with\n    x = compute_something_long_enough(alpha, beta, gamma)\n    y = compute_other_long_thing(delta, epsilon, zeta, eta)\nend\n',
-    'local a = Point with\n    x = 1\n    y = 2\n    z = 3\nend\nlocal b = Point with\n    x = 1\n    found =: v\n        go v\n    end\nend\n'
+    'local a = Point with\n    x = 1\n    y = 2\n    z = 3\nend\nlocal b = Point with\n    x = 1\n    found = do(v)\n        go v\n    end\nend\n'
     .. 'local c = Point with\n    x = compute_something_long_enough(alpha, beta, gamma)\n    y = compute_other_long_thing(delta, epsilon, zeta, eta)\nend\n')
 formatted('inline_with: contextual with has no head for braces',
     'local a = with\n    x = 1\nend\n', 'local a = with\n    x = 1\nend\n')

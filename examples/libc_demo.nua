@@ -20,7 +20,7 @@ export report
 local checksum = do(path: CString): U32
     local c..
     local total: U32 = 0
-    local ok = each_byte path: b
+    local ok = each_byte path do(b)
         total = total + U32 b
     end
     if not ok then

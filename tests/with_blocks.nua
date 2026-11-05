@@ -45,7 +45,7 @@ local area = do(n: U32): U32
     local s = Shape.rect Point with x = n, y = 3 end
     return s with
         circle = do(r) = r * r
-        rect =: p
+        rect = do(p)
             local w = p.x
             return w * p.y
         end
@@ -59,15 +59,15 @@ local pair = do(n: U32): U32
     local b = Shape.rect Point with x = 7, y = 3 end
     local total: U32 = 0
     a with
-        rect =: r
+        rect = do(r)
             total = r.x
         end
-    circle =: r
+    circle = do(r)
     b with
-        circle =: q
+        circle = do(q)
             total = r + q
         end
-    rect =: p
+    rect = do(p)
         total = r + p.x + p.y
     endall
     return total + 1

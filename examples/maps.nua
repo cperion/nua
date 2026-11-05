@@ -82,7 +82,7 @@ local borrowed_keys = do(n: U32): U32
     local source = Text {}
     source:write "alpha beta gamma beta alpha beta"
     local seen = Tokens {}
-    source:str():split(U8 32): word
+    source:str():split(U8 32) do(word)
         local count = seen:find(word) { found(c) = c, missing() = U32 0 }
         seen[word] = count + 1
     end
@@ -179,7 +179,7 @@ local map_each_sum = do(n: U32): U64
     local m = Counts {}
     for i: U32 = 1, n do m:put(i, U64 i) end
     local total: U64 = 0
-    m:each: k v
+    m:each do(k, v)
         m:put(k, v + 100)
         m:ensure(k, 999)  -- the visited key: not a structural change
         total = total + v  -- callback received a snapshot before the replacement
@@ -195,8 +195,8 @@ local map_each_nested = do(n: U32): U64
     m:put(2, 2)
     local total: U64 = 0
     for i: U32 = 1, n do
-        m:each: k v
-            m:each: k2 v2
+        m:each do(k, v)
+            m:each do(k2, v2)
                 total = total + v2
                 if k2 == k then return end
                 total = total + 10
@@ -216,7 +216,7 @@ local map_task_each = do(n: U32): U64
         spawn do
             local m = Counts {}
             for i: U32 = 1, n do m:put(i, U64 i) end
-            m:each: k v
+            m:each do(k, v)
                 out:send v  -- suspends inside the loop
                 m[k] = v + 100
             end

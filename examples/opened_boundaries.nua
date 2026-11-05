@@ -17,7 +17,7 @@ local activity = do(c: Ref Counter, body): U32 = body c
 
 local opened_lexical = do(n: U32): U32
     local c = Counter { total = 1 }
-    return activity(Ref c): state..
+    return activity(Ref c) do(state..)
         call update(state, n)
         return call update state n
     end

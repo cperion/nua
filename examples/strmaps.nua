@@ -2,14 +2,14 @@
 local Counts = Map(Str, U32)
 local strmap_words = do(text: Str): U32
     local words = Counts {}
-    text:split " ": word
+    text:split " " do(word)
         if word.length > 0 then
             words:ensure(word, 0)
             words[word] = words[word] + 1
         end
     end
     local total: U32 = 0
-    words:each: key count
+    words:each do(key, count)
         total = total + count
         words:put(key, count + 1)  -- replacing the visited entry is safe while its key is borrowed
     end

@@ -6,7 +6,7 @@ local pipe_roundtrip = do(): U32
     local total: U32 = 0
     tasks:
         io.pipe() with
-            done =: p
+            done = do(p)
                 spawn do
                     io.write(p.writer, "hello, ") { done = do(n) end, failed = do(e) end }
                     io.write(p.writer, "world") { done = do(n) end, failed = do(e) end }
@@ -16,7 +16,7 @@ local pipe_roundtrip = do(): U32
                 local more: Bool = true
                 while more do
                     io.read(p.reader, buf) with
-                        done =: n
+                        done = do(n)
                             if n == 0 then more = false end
                             total = total + n
                         end
@@ -42,11 +42,11 @@ local file_roundtrip = do(path: CString): U32
         i = i + 1
     end
     io.open(path, bor io.READ_WRITE (bor io.CREATE io.TRUNCATE)) with
-        done =: f
+        done = do(f)
             io.write(f, out) { done = do(n) end, failed = do(e) end }
             local back: Array(U8, 100)
             io.read(f, back, 100, { at = 0 }) with
-                done =: n
+                done = do(n)
                     local j: U32 = 0
                     while j < n do
                         sum = sum + U32 back[j]
@@ -67,7 +67,7 @@ export file_roundtrip
 local timeout_then_data = do(): U32
     local outcome: U32 = 0
     io.pipe() with
-        done =: p
+        done = do(p)
             local buf: Array(U8, 8)
             io.read(p.reader, buf, 8, { deadline = ms 20 }) with
                 done = do(n) outcome = 100 end
@@ -94,17 +94,17 @@ local echo = do(clients: U32): U32
     local good: U32 = 0
     tasks:
         io.listen(io.LOOPBACK, 0) with
-            done =: l
+            done = do(l)
                 local port: U32 = io.local_port l
                 spawn do
                     local k: U32 = 0
                     while k < clients do
                         io.accept(l) with
-                            done =: conn
+                            done = do(conn)
                                 spawn do
                                     local buf: Array(U8, 64)
                                     io.read(conn, buf) with
-                                        done =: n
+                                        done = do(n)
                                             io.write(conn, buf, n) with
                                                 done = do(m) end
                                                 failed = do(e) end
@@ -126,7 +126,7 @@ local echo = do(clients: U32): U32
                     spawn do
                         local ok: Bool = false
                         io.connect(io.LOOPBACK, port, { deadline = seconds 5 }) with
-                            done =: s
+                            done = do(s)
                                 local msg = Array(U8, 4) { 112, 105, 110, 103 }  -- "ping"
                                 msg[3] = U8 c
                                 io.write(s, msg) { done = do(n) end, failed = do(e) end }
@@ -171,7 +171,7 @@ local zero_copy = do(chunks: U32): U32
         local buffers = pool(Chunk, 2)
         local filled = channel(Slot Chunk, 2)
         io.pipe() with
-            done =: p
+            done = do(p)
                 spawn do
                     local k: U32 = 0
                     while k < chunks do
@@ -201,7 +201,7 @@ local zero_copy = do(chunks: U32): U32
                     filled:close
                     io.close(p.reader) { done = do() end, failed = do(e) end }
                 end
-                filled:each: s
+                filled:each do(s)
                     total = total + buffers[s].n
                     buffers:release s
                 end
