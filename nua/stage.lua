@@ -4082,7 +4082,9 @@ function Builder:run_inline(frame)
         return nil
     end
     local result = self:finish_frame(frame)
-    self.dead = dead_before
+    -- Returning resumes the caller; a body with no returning path does not.
+    -- Matched producers resume through their separately owned handler landings.
+    if frame.matches or frame.direct_state or frame.label then self.dead = dead_before end
     return result
 end
 
@@ -4586,7 +4588,9 @@ function Builder:finish_frame(frame)
     end
     if frame.matches then return setmetatable({ frame = frame }, Matched) end
     if not frame.label then
-        self.state = frame.direct_state
+        -- A terminating body may have no return at all. Keep its path dead and
+        -- its state intact instead of inventing a caller continuation.
+        if frame.direct_state then self.state = frame.direct_state end
         return frame.direct
     end
     -- some returns jumped here: join their states with the base-level one
@@ -7267,6 +7271,9 @@ function S.trap(msg)
     local b = cur()
     b.fn.uses_rt = true
     b:emit { op = 'trap', msg = ev, what = 'a trap' }
+    -- No value or fallthrough is required from a path that stops the program.
+    -- In particular, a checked lookup can trap rather than fabricate a Ref.
+    b.dead = true
 end
 
 -- Ptr T viewed as Ptr (Atomic T): the same address, accessed atomically from here

@@ -394,6 +394,9 @@ check('reference-written loop state: invariants escapes and snapshots', okloop, 
 local okretain, errretain = pcall(dofile, root .. '/tests/staging_retention.lua')
 check('staging retention: local identities and rollback storage', okretain, errretain)
 
+local oktrap, errtrap = pcall(dofile, root .. '/tests/trap_staging.lua')
+check('trap paths: no fallthrough or fabricated return values', oktrap, errtrap)
+
 local okmatch, errmatch = pcall(dofile, root .. '/tests/immediate_matches.lua')
 check('immediate outcome matching: owned continuations and payload joins', okmatch, errmatch)
 
