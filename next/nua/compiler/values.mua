@@ -87,7 +87,10 @@ local Bits = struct { type: NativeType, operand: Operand }
 local Aggregate = struct { type: NativeType, packed: Optional(Operand), parts: Table }
 local Reference = struct { type: NativeType, borrow: BorrowId }
 local Owned = struct { type: NativeType, header: Operand }
-NativeValue { Bits, Aggregate, Reference, Owned }
+-- a sum value whose tag is known (syntax §11.3): its alternative, and its payload of any binding
+-- time (none for a Unit alternative). A sum whose tag is not known is Bits, an operand.
+local Tagged = struct { type: NativeType, alternative: String, payload: Optional(NativeValue) }
+NativeValue { Bits, Aggregate, Reference, Owned, Tagged }
 
 ------------------------------------------------------------------------------------------------
 -- Canonical operand identity, for maps keyed by operands (§3.4). A result is its value's
@@ -162,5 +165,6 @@ return define
     .Aggregate
     .Reference
     .Owned
+    .Tagged
     .operand_key
 end

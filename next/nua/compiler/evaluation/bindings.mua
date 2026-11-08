@@ -57,6 +57,9 @@ return do(E, core)
         if annotation ~= nil and not check(types.NativeType, annotation) then
             fail(path, ("the local '%s' is annotated with %s, not a native type"):format(name, tostring annotation))
         end
+        -- a sum value described at host level is a value of its sum type
+        local described = annotation == nil and not is_native value and types.variant_of value
+        if described then annotation = described.sum end
         if annotation == nil and not is_native value then
             if value == nil then fail(path, ("the local '%s' needs a type or a value"):format(name)) end
             return E.host_cell(path, name, value)
@@ -83,7 +86,7 @@ return do(E, core)
         if cells.Cell.is(cell, cells.PlaceCell) and types.owns(compilation.places[cell.place].type) then
             local previous = E.information(path, value)
             local info = memory.capture(path.flow, cell.place, previous)
-            if next(memory.payloads(info)) or next(memory.payloads(previous)) then
+            if E.is_aggregate value and (next(memory.payloads(info)) or next(memory.payloads(previous))) then
                 local operand = E.materialize(path, value)
                 path.writer.remember(operand, info)
                 value = data.Aggregate { ..value, packed = operand }

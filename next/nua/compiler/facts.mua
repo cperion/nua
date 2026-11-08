@@ -137,6 +137,11 @@ local SameValues = define
     Bits = |a, recurse, b| -> same_operand(a.operand, b.operand)
     Owned = |a, recurse, b| -> same_operand(a.header, b.header)
     Reference = |a, recurse, b| -> a.borrow == b.borrow
+    Tagged = do(a, recurse, b)
+        if a.alternative ~= b.alternative then return false end
+        if a.payload == nil or b.payload == nil then return a.payload == b.payload end
+        return same_value(a.payload, b.payload)
+    end
     Aggregate = do(a, recurse, b)
         local a_parts, b_parts = next(a.parts) ~= nil, next(b.parts) ~= nil
         if not a_parts and not b_parts then return a.packed ~= nil and b.packed ~= nil and same_operand(a.packed, b.packed) end

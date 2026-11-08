@@ -2,7 +2,8 @@
 --
 -- `word { name, source, line, requirements, result, body }` is what a typed lambda becomes: a
 -- word with its requirements (a native type, or none for host supply) and its native result,
--- both evaluated once, where the word is made. Applying a word or an application in Lua
+-- both evaluated once, where the word is made. An untyped lambda in a typed body is a word with
+-- no result type: it evaluates in place, its result whatever it returns (a match's handlers). Applying a word or an application in Lua
 -- supplies arguments and nothing else: `affine 4 3` is an application that remembers 4 and 3
 -- and runs no body. Evaluation happens only when an evaluation applies a saturated
 -- application (`evaluate.apply`), never by building one.
@@ -38,7 +39,7 @@ local word = do(description)
                 description.source, description.line, requirement.name, name, tostring requirement.type), 2)
         end
     end
-    if not check(types.NativeType, description.result) then
+    if description.result ~= nil and not check(types.NativeType, description.result) then
         error(("%s:%d: the result of %s is annotated with %s, not a native type"):format(
             description.source, description.line, name, tostring description.result), 2)
     end

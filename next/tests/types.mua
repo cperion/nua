@@ -51,3 +51,28 @@ test "constructors refuse what is not a native type":
     assert(not pcall(types.fixed_array, types.U8, -1))
     assert(not pcall(types.record, "Twice", { { name = "a", type = types.U8 }, { name = "a", type = types.U8 } }))
 end
+
+test "sums are structural: alternatives in canonical order, one type per set of alternatives":
+    local circle = types.record("Circle", { { name = "radius", type = types.U32 } })
+    local shape = types.sum("Shape", { { name = "rect", payload = types.U64 }, { name = "circle", payload = circle }, { name = "dot", payload = types.Unit } })
+    local again = types.sum("Figure", { { name = "dot", payload = types.Unit }, { name = "circle", payload = circle }, { name = "rect", payload = types.U64 } })
+    assert(shape == again and types.describe(again) == "Shape")
+    assert(shape.alternatives[1].name == "circle" and shape.alternatives[3].name == "rect")
+    local _, tag = types.alternative_of(shape, "rect")
+    assert(tag == 2)
+    -- a payload record of another declaration is another type
+    local other_circle = types.record("Circle", { { name = "radius", type = types.U32 } })
+    assert(types.sum("Shape", { { name = "circle", payload = other_circle }, { name = "dot", payload = types.Unit }, { name = "rect", payload = types.U64 } }) ~= shape)
+    assert(not pcall(types.sum, "Bad", { { name = "view", payload = types.Str } }))
+    assert(not pcall(types.sum, "Empty", {}))
+end
+
+test "a sum type answers its constructors, at host level as anywhere":
+    local option = types.sum("Option", { { name = "some", payload = types.U32 }, { name = "none", payload = types.Unit } })
+    local some = option.some 5
+    assert(check(types.Variant, some) and some.alternative == "some" and some.payload == 5)
+    assert(types.is_constructor(option.none) and option.none().alternative == "none")
+    assert(types.variant_of(option.none).alternative == "none" and types.variant_of(option.some) == nil)
+    assert(option.some == option.some and option.name == "Option" and option.missing == nil)
+    assert(not pcall(option.none, 3))
+end

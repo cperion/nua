@@ -22,6 +22,7 @@ local core = require "nua.compiler.evaluation.core"
 local parts = {
     require "nua.compiler.evaluation.values",
     require "nua.compiler.evaluation.records",
+    require "nua.compiler.evaluation.sums",
     require "nua.compiler.evaluation.joins",
     require "nua.compiler.evaluation.selections",
     require "nua.compiler.evaluation.bindings",

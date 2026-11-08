@@ -11,6 +11,7 @@ local data = require "nua.compiler.data"
 local graph = require "nua.compiler.graph"
 local rules = require "nua.compiler.rules"
 local platform = require "nua.compiler.platform"
+local verify = require "nua.compiler.verify"
 
 local NativeType, Instruction, Terminator, Operand = types.NativeType, data.Instruction, data.Terminator, data.Operand
 
@@ -24,7 +25,7 @@ local record_name = do(record)
     local found = record_names[record]
     if found then return found end
     record_count += 1
-    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or NativeType.is(record, types.ViewType) and "View" or record.name:gsub("[^%w_]", "_")
+    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or NativeType.is(record, types.ViewType) and "View" or (record.name:gsub("[^%w_]", "_"))
     found = ("%s_%d"):format(base_name, record_count)
     record_names[record] = found
     return found
@@ -41,7 +42,7 @@ local CSpelling = define
     ViewType = |node, recurse| -> record_name node
     FixedArrayType = unsupported
     RecordType = |node, recurse| -> record_name node
-    SumType = unsupported
+    SumType = |node, recurse| -> record_name node
     BufferType = |node, recurse| -> record_name node
     FunctionType = unsupported
 end
@@ -74,6 +75,21 @@ local Fields = define
 end
 local fields_of = NativeType.pass "the fields of a type C spells as a struct" with ..Fields end
 local is_record_like = native_type -> fields_of native_type ~= nil
+local is_sum = native_type -> NativeType.is(native_type, types.SumType)
+-- the C name of a sum's tag constant for an alternative
+local tag_name = |sum_type, name| -> record_name sum_type .. "_" .. name
+-- a sum in C (syntax §11.1): its tag constants, then a tag and a union of the payloads that are
+-- not Unit (no union when none has a payload)
+local sum_declaration = do(sum_type)
+    local name = record_name sum_type
+    local constants, members = {}, {}
+    for index, alternative in ipairs sum_type.alternatives do
+        constants[#constants + 1] = ("%s = %d"):format(tag_name(sum_type, alternative.name), index - 1)
+        if alternative.payload ~= types.Unit then members[#members + 1] = ("%s %s;"):format(c_type alternative.payload, alternative.name) end
+    end
+    local union = #members > 0 and (" union { %s } as;"):format(table.concat(members, " ")) or ""
+    return ("enum { %s };\ntypedef struct %s { uint32_t tag;%s } %s;"):format(table.concat(constants, ", "), name, union, name)
+end
 
 -- the C declarations of the records a program uses, each after the records it holds
 local record_declarations = do(program)
@@ -81,6 +97,12 @@ local record_declarations = do(program)
     local visit
     visit = do(native_type)
         if NativeType.is(native_type, types.PointerType) or NativeType.is(native_type, types.ReferenceType) then return visit(native_type.target) end
+        if is_sum native_type and not done[native_type] then
+            done[native_type] = true
+            for _, alternative in ipairs native_type.alternatives do visit(alternative.payload) end
+            order[#order + 1] = sum_declaration native_type
+            return
+        end
         if not is_record_like native_type or done[native_type] then return end
         done[native_type] = true
         for _, field in ipairs(fields_of native_type) do visit(field.type) end
@@ -284,6 +306,12 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             return value_name(node.result, node.type) .. " = " .. spell(node, node.arguments[1], node.arguments[2])
         end
         Pack = do(node, recurse)
+            -- a sum: its tag, and the payload in the union member of its alternative
+            if is_sum node.type then
+                local alternative = node.type.alternatives[tonumber(node.components[1].bits.bits) + 1]
+                local payload = node.components[2] and (", .as.%s = %s"):format(alternative.name, operand node.components[2]) or ""
+                return ("%s = (%s){ .tag = %s%s };"):format(value_name(node.result, node.type), c_type node.type, tag_name(node.type, alternative.name), payload)
+            end
             if not is_record_like node.type then fail("packing " .. types.describe node.type .. " has no C spelling yet") end
             local components = {}
             for index, component in ipairs node.components do components[index] = operand component end
@@ -292,8 +320,13 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         Extract = do(node, recurse)
             local text = operand node.aggregate
             for _, component in ipairs node.path do
-                if not data.Component.is(component, data.FieldComponent) then fail "extracting an element or alternative has no C spelling yet" end
-                text = text .. "." .. component.name
+                if data.Component.is(component, data.FieldComponent) then
+                    text = text .. "." .. component.name
+                elseif data.Component.is(component, data.AlternativeComponent) then
+                    text = text .. ".as." .. component.name
+                else
+                    fail "extracting an element has no C spelling yet"
+                end
             end
             return ("%s = %s;"):format(value_name(node.result, node.type), text)
         end
@@ -364,14 +397,99 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
     end
     local ending = Terminator.pass "write a terminator as C" with ..Endings end
 
+    -- A chain of tests of one operand against constants prints as a `switch` (syntax §11.3):
+    -- a block whose branch tests `x == k`, its false edge into blocks that hold only the next
+    -- test of the same `x` and reach nowhere else first. A sum's tag is spelled by its constants.
+    local uses, defined_by, predecessors = {}, {}, {}
+    for _, block in ipairs definition.blocks do
+        for _, instruction in ipairs block.instructions do
+            if instruction.result then defined_by[instruction.result] = instruction end
+            for _, used in ipairs(verify.operands_of instruction) do
+                if Operand.is(used, data.Result) then uses[used.value] = (uses[used.value] or 0) + 1 end
+            end
+        end
+        for _, used in ipairs(verify.terminator_operands block.terminator) do
+            if Operand.is(used, data.Result) then uses[used.value] = (uses[used.value] or 0) + 1 end
+        end
+        for _, edge in ipairs(graph.edges_of block.terminator) do predecessors[edge.target] = (predecessors[edge.target] or 0) + 1 end
+    end
+    -- the test a block ends with: `x == k` computed last, used only by its branch
+    local test_of = do(block)
+        local terminator, last = block.terminator, block.instructions[#block.instructions]
+        if not Terminator.is(terminator, data.Branch) or not last or not Instruction.is(last, data.Compute) or last.opcode ~= "equal" then return nil end
+        if not Operand.is(terminator.condition, data.Result) or terminator.condition.value ~= last.result or uses[last.result] ~= 1 then return nil end
+        local subject, constant = last.arguments[1], last.arguments[2]
+        if Operand.is(subject, data.Constant) or not Operand.is(constant, data.Constant) then return nil end
+        if #terminator.when_true.arguments > 0 or #terminator.when_false.arguments > 0 then return nil end
+        return { .subject, .constant, edge = terminator.when_true, otherwise = terminator.when_false }
+    end
+    local switches, absorbed = {}, {}
+    for _, block in ipairs definition.blocks do
+        local first = not absorbed[block.id] and test_of block
+        if first then
+            local cases, otherwise = { first }, first.otherwise
+            while true do
+                local next_block = blocks_by_id[otherwise.target]
+                local test = next_block and #next_block.arguments == 0 and #next_block.instructions == 1 and predecessors[next_block.id] == 1 and test_of next_block
+                if not test or data.operand_key(test.subject) ~= data.operand_key(first.subject) then break end
+                cases[#cases + 1] = test
+                absorbed[next_block.id] = true
+                otherwise = test.otherwise
+            end
+            if #cases >= 2 then
+                switches[block.id] = { subject = first.subject, .cases, .otherwise }
+            else
+                for _, case in ipairs cases do absorbed[case.otherwise.target] = nil end
+            end
+        end
+    end
+    -- the sum whose tag a subject is, if it is one
+    local tag_sum = do(subject)
+        local extract = Operand.is(subject, data.Result) and defined_by[subject.value]
+        if extract and Instruction.is(extract, data.Extract) and #extract.path == 1 and data.Component.is(extract.path[1], data.FieldComponent)
+            and extract.path[1].name == "tag" and NativeType.is(extract.aggregate.type, types.SumType) then
+            return extract.aggregate.type
+        end
+        return nil
+    end
+    -- the spelling of a case: a tag constant when the subject is a sum's tag
+    local case_text = do(subject, constant)
+        local sum_type = tag_sum subject
+        local alternative = sum_type and sum_type.alternatives[tonumber(constant.bits.bits) + 1]
+        if alternative then return tag_name(sum_type, alternative.name) end
+        return constant_text constant
+    end
+    -- what the default of a switch on a tag stands for: the one alternative no case names
+    local default_comment = do(switch)
+        local sum_type = tag_sum switch.subject
+        if sum_type == nil or #switch.cases ~= #sum_type.alternatives - 1 then return "" end
+        local named = {}
+        for _, case in ipairs switch.cases do named[tonumber(case.constant.bits.bits) + 1] = true end
+        for index, alternative in ipairs sum_type.alternatives do
+            if not named[index] then return (" /* %s */"):format(tag_name(sum_type, alternative.name)) end
+        end
+        return ""
+    end
+    local switch_text = do(switch)
+        local lines = { ("switch (%s) {"):format(operand switch.subject) }
+        for _, case in ipairs switch.cases do lines[#lines + 1] = ("    case %s: %s"):format(case_text(switch.subject, case.constant), go case.edge) end
+        lines[#lines + 1] = ("    default:%s %s"):format(default_comment switch, go switch.otherwise)
+        lines[#lines + 1] = "    }"
+        return table.concat(lines, "\n")
+    end
+
     local body = {}
     for _, block in ipairs definition.blocks do
-        body[#body + 1] = labels[block.id] .. ":;"
-        for _, instruction in ipairs block.instructions do
-            local text = statement instruction
-            if text then body[#body + 1] = "    " .. text end
+        if not absorbed[block.id] then
+            body[#body + 1] = labels[block.id] .. ":;"
+            local switch = switches[block.id]
+            local count = switch and #block.instructions - 1 or #block.instructions
+            for position = 1, count do
+                local text = statement(block.instructions[position])
+                if text then body[#body + 1] = "    " .. text end
+            end
+            body[#body + 1] = "    " .. (switch and switch_text switch or ending block.terminator)
         end
-        body[#body + 1] = "    " .. ending block.terminator
     end
     local signature = definition.signature
     local parameters = {}

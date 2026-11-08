@@ -1,0 +1,293 @@
+-- The evaluation vocabulary, part: sums (syntax §11). A sum value whose tag is known is Tagged:
+-- its alternative and a payload of any binding time, so only the selected handler of a match
+-- runs. A sum whose tag is not known is an operand: its tag and payload are read by Extract.
+-- A host description (types.Variant, or a Unit constructor) becomes a native value where it
+-- meets its sum type.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local rules = require "nua.compiler.rules"
+local provenance = require "nua.compiler.provenance"
+local paths_of = require "nua.compiler.evaluation.path"
+local hosting = require "nua.compiler.hosting"
+local NativeValue = data.NativeValue
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local fresh, fail, site, append = core.fresh, core.fail, core.site, core.append
+
+    E.is_sum = native_type -> types.NativeType.is(native_type, types.SumType)
+    E.is_tagged = value -> is_native value and NativeValue.is(value, data.Tagged)
+
+    -- the alternative of a sum by name, or a refusal naming the sum
+    E.alternative = do(path, sum_type, name)
+        local alternative, tag = types.alternative_of(sum_type, name)
+        if alternative == nil then fail(path, ("%s has no alternative '%s'"):format(types.describe sum_type, tostring name)) end
+        return alternative, tag
+    end
+
+    -- the native value a host description stands for: its payload converted to the
+    -- alternative's payload type (a record payload from its table of fields)
+    E.from_variant = do(path, sum_type, described, what)
+        if described.sum ~= sum_type then fail(path, ("%s is %s, not %s"):format(what, types.describe described.sum, types.describe sum_type)) end
+        local alternative = E.alternative(path, sum_type, described.alternative)
+        local payload = nil
+        if alternative.payload ~= types.Unit then
+            if described.payload == nil then fail(path, ("%s.%s needs a payload of %s"):format(types.describe sum_type, alternative.name, types.describe alternative.payload)) end
+            payload = E.from_host(path, alternative.payload, described.payload, ("the payload of %s.%s"):format(types.describe sum_type, alternative.name))
+            payload = E.stored_borrow(path, payload)
+        end
+        return data.Tagged { type = sum_type, alternative = alternative.name, .payload }
+    end
+
+    -- the tag of an alternative as a U32 constant
+    E.tag_constant = do(path, sum_type, name)
+        local _, tag = E.alternative(path, sum_type, name)
+        return rules.integer(types.U32, tag)
+    end
+
+    -- the operand holding a whole tagged value: a Pack of its tag and payload
+    E.materialize_tagged = do(path, value)
+        local components = { E.tag_constant(path, value.type, value.alternative) }
+        if value.payload then components[2] = E.materialize(path, value.payload) end
+        local result = fresh identity.ValueId
+        append(path, data.Pack { site = site path, .result, type = value.type, .components })
+        local operand = data.Result { value = result, type = value.type }
+        path.writer.remember(operand, E.information(path, value))
+        return operand
+    end
+
+    -- a tagged value's facts: its payload's, under its alternative
+    E.tagged_information = do(path, value)
+        local components = {}
+        if value.payload then
+            for key, component in pairs E.information(path, value.payload).components do
+                components[provenance.concat({ data.AlternativeComponent { name = value.alternative } }, key)] = component
+            end
+        end
+        return data.ValueInfo { type = value.type, .components, proofs = {} }
+    end
+
+    -- the tag of a sum value, as a U32 value: known for a tagged value, read otherwise
+    E.tag_of = do(path, value)
+        if E.is_tagged value then return E.known(E.tag_constant(path, value.type, value.alternative)) end
+        local result = fresh identity.ValueId
+        append(path, data.Extract { site = site path, .result, type = types.U32, aggregate = value.operand, path = { data.FieldComponent { name = "tag" } } })
+        return E.bits(types.U32, data.Result { value = result, type = types.U32 })
+    end
+
+    -- the payload of an alternative of a sum value whose tag is that alternative: a tagged
+    -- value's own, else read from its operand with the facts of its components there
+    E.payload_of = do(path, value, name)
+        local alternative = E.alternative(path, value.type, name)
+        if alternative.payload == types.Unit then return nil end
+        if E.is_tagged value then
+            if value.alternative ~= name then fail(path, ("the payload of '%s' is read from a %s.%s"):format(name, types.describe value.type, value.alternative)) end
+            return value.payload
+        end
+        local result = fresh identity.ValueId
+        local component = data.AlternativeComponent { .name }
+        append(path, data.Extract { site = site path, .result, type = alternative.payload, aggregate = value.operand, path = { component } })
+        local extracted = data.Result { value = result, type = alternative.payload }
+        local info = path.writer.information(value.operand)
+        local selected = info and provenance.components_under(info, { component }) or {}
+        return E.restore(path, alternative.payload, extracted, data.ValueInfo { type = alternative.payload, components = selected, proofs = {} })
+    end
+
+    -- a constructor applied inside a typed body: the native value at once
+    E.construct_variant = do(path, constructor, arguments)
+        if #arguments > 1 then fail(path, tostring constructor .. " takes one payload") end
+        local payload = arguments[1]
+        if E.is_cell payload then payload = E.peek(path, payload) end
+        local described = types.Variant { sum = constructor.sum, alternative = constructor.alternative.name, .payload }
+        if constructor.alternative.payload == types.Unit and payload ~= nil then fail(path, tostring constructor .. " takes no payload") end
+        return E.from_variant(path, constructor.sum, described, tostring constructor)
+    end
+
+    -- releasing a sum: its payload, if the alternative it holds owns storage; on a runtime tag,
+    -- a test per alternative
+    E.release_sum = do(path, value)
+        local release = do(at, name)
+            local alternative = E.alternative(at, value.type, name)
+            if types.owns alternative.payload then E.release_value(at, E.payload_of(at, value, name)) end
+            return nil
+        end
+        if E.is_tagged value then return release(path, value.alternative) end
+        E.dispatch_tag(path, value, release, "the release of " .. types.describe value.type)
+    end
+
+    -- a value matching is applied to: a sum value, native or described at host level
+    E.is_sum_value = do(value)
+        if is_native value then return E.is_sum value.type end
+        return types.variant_of value ~= nil
+    end
+
+    -- The values several exits yield meet at one type (syntax §11.3): a host value takes the
+    -- type of the native ones, so the result does not depend on their order; host values alone
+    -- must agree, and fold to the one they agree on. Answers the type (nil when every value is
+    -- a host value) and, for host values alone, the value; native values replace host ones in
+    -- the states.
+    E.agree_results = do(path, states, what)
+        local value_type = nil
+        for _, state in ipairs states do
+            if is_native state.value then
+                if value_type == nil then value_type = state.value.type end
+                if state.value.type ~= value_type then
+                    fail(path, ("%s yield different types: %s and %s"):format(what, types.describe value_type, types.describe state.value.type))
+                end
+            end
+        end
+        if value_type == nil then
+            local first = states[1] and states[1].value
+            for _, state in ipairs states do
+                if state.value ~= first then fail(path, what .. " yield different host values and no native type to meet at") end
+            end
+            return nil, first
+        end
+        for _, state in ipairs states do
+            if not is_native state.value then state.value = E.from_host(path, value_type, state.value, what) end
+        end
+        return value_type, nil
+    end
+
+    -- the handlers of a match: a table naming each alternative exactly once (syntax §11.2)
+    local check_handlers = do(path, sum_type, handlers)
+        if lua_type handlers ~= "table" or is_native handlers or types.variant_of handlers then
+            fail(path, ("matching %s takes a table of handlers, one per alternative"):format(types.describe sum_type))
+        end
+        for name in pairs handlers do
+            if lua_type name ~= "string" or types.alternative_of(sum_type, name) == nil then
+                fail(path, ("%s has no alternative '%s' to handle"):format(types.describe sum_type, tostring name))
+            end
+        end
+        for _, alternative in ipairs sum_type.alternatives do
+            if handlers[alternative.name] == nil then fail(path, ("the match of %s has no handler for '%s'"):format(types.describe sum_type, alternative.name)) end
+        end
+    end
+
+    -- the handler of one alternative applied to its payload (none for a Unit alternative)
+    local handle = do(path, handlers, value, name)
+        local payload = E.payload_of(path, value, name)
+        return E.apply(path, handlers[name], payload and { payload } or {}, false)
+    end
+
+    -- A match: keyed application of a sum value, one handler per alternative. A known tag runs
+    -- only its handler, in place. A runtime tag tests each alternative in canonical order (the
+    -- last is what remains), each arm built from the same facts with its payload projected
+    -- inside it, and the arms' results meet at one type and join.
+    E.match = do(path, subject, arguments, place)
+        local value = subject
+        if not is_native value then
+            local described = types.variant_of value
+            value = E.from_variant(path, described.sum, described, "the matched value")
+        end
+        if #arguments ~= 1 then fail(path, ("matching %s takes one table of handlers"):format(types.describe value.type)) end
+        local handlers = arguments[1]
+        check_handlers(path, value.type, handlers)
+        -- a payload is received as a copy; an owner cannot be copied, so matching a local
+        -- holding an owning sum moves it, and its payload to the handler
+        if place and types.owns value.type then value = E.get(path, place) end
+        if E.is_tagged value then return handle(path, handlers, value, value.alternative) end
+        return E.dispatch_tag(path, value, |arm, name| -> handle(arm, handlers, value, name), "the handlers of a match of " .. types.describe value.type)
+    end
+
+    -- On a runtime tag: `run(arm, alternative)` for each alternative, in canonical order, each
+    -- arm built from the same facts, a test per alternative leading to it (the last is what
+    -- remains). The arms' results meet at one type and join; answers the joined result.
+    E.dispatch_tag = do(path, value, run, what)
+        local alternatives = value.type.alternatives
+        local tag = E.tag_of(path, value)
+        local arms = {}
+        for index, alternative in ipairs alternatives do
+            local entry, state = E.build_arm(path, alternative.name, arm -> run(arm, alternative.name))
+            arms[index] = { .entry, .state }
+        end
+        for _, arm in ipairs arms do
+            if arm.state.request then
+                path.request, path.dead = arm.state.request, true
+                return nil
+            end
+        end
+        -- the tests: each in a block of its own after the first, the last alternative the default
+        local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
+        local test_path = path
+        for index = 1, #alternatives - 1 do
+            local condition = E.operate(test_path, "equal", tag, E.known(rules.integer(types.U32, index - 1)))
+            local next_block = index < #alternatives - 1 and path.writer.block "test" or nil
+            local otherwise = next_block or arms[#alternatives].entry
+            core.terminate(test_path, data.Branch { origin = core.origin_of path, condition = condition.operand, when_true = edge(arms[index].entry), when_false = edge otherwise })
+            if next_block then
+                test_path = paths_of.continuing(path, nil, next_block, path.flow)
+                core.enter test_path
+            end
+        end
+        if #alternatives == 1 then core.terminate(path, data.Jump { origin = core.origin_of path, edge = edge(arms[1].entry) }) end
+        local states = {}
+        for _, arm in ipairs arms do
+            if not arm.state.dead then states[#states + 1] = arm.state end
+        end
+        local value_type, host_value = E.agree_results(path, states, what)
+        local joined = E.join(path, states, value_type)
+        -- an arm that left (returned, broke) makes what follows depend on the tag
+        if #states < #arms then path.guarded = path.guarded + 1 end
+        if value_type == nil then return host_value end
+        return joined
+    end
+
+    -- A producer's returns consumed in place: grouped by known tag (unknown tags together, last),
+    -- each group joins its own state and is consumed there; the results meet at one type and
+    -- join. Equal known payloads stay known; differing ones join in a typed slot.
+    E.continue_returns = do(path, exits, result_type, continuation)
+        local groups = {}
+        for _, exit in ipairs exits do
+            local key = E.is_tagged exit.value and exit.value.alternative or "unknown tag"
+            groups[key] = groups[key] or {}
+            table.insert(groups[key], exit)
+        end
+        local order = {}
+        for _, alternative in ipairs result_type.alternatives do
+            if groups[alternative.name] then order[#order + 1] = alternative.name end
+        end
+        if groups["unknown tag"] then order[#order + 1] = "unknown tag" end
+        local results = {}
+        for _, key in ipairs order do
+            local at = paths_of.continuing(path, nil, nil, nil)
+            local value = E.join(at, groups[key], result_type)
+            local consumed = not at.dead and continuation(at, value)
+            if at.request then
+                path.request, path.dead = at.request, true
+                return nil
+            end
+            if not at.dead then results[#results + 1] = { block = at.block, flow = at.flow, value = consumed } end
+            if at.guarded > path.guarded then path.guarded = at.guarded end
+        end
+        local value_type, host_value = E.agree_results(path, results, "the handlers consuming " .. types.describe result_type)
+        local joined = E.join(path, results, value_type)
+        if #results < #order then path.guarded = path.guarded + 1 end
+        if value_type == nil then return host_value end
+        return joined
+    end
+
+    -- `producer(args) { handlers }`: when the producer is a word the arguments saturate, whose
+    -- result is a sum, the handlers consume its returns in place; anything else is ordinary
+    -- application (a table that saturates a word stays its argument)
+    E.apply_continued = do(path, callee, arguments, boundary, handlers, outer_boundary)
+        if path.dead then return nil end
+        local producer = E.is_cell callee and E.peek(path, callee) or callee
+        local word, supplied = hosting.supplied_of producer
+        if word and not boundary and not outer_boundary and word.result and E.is_sum word.result then
+            local application = hosting.supply(hosting.application(word, supplied), arguments)
+            if hosting.saturated application then
+                check_handlers(path, word.result, handlers)
+                return E.invoke(path, word, application.supplied, |at, value| -> E.match(at, value, { handlers }, nil))
+            end
+        end
+        return E.apply(path, E.apply(path, callee, arguments, boundary), { handlers }, outer_boundary)
+    end
+
+    return E
+end

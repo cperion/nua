@@ -182,7 +182,7 @@ return do(E, core)
     local generalizing = do(path)
         local places_carried = {}
         for place, contents in pairs path.flow.contents do
-            if Contents.is(contents, data.Tracked) and (NativeValue.is(contents.value, data.Bits) or E.is_aggregate contents.value or E.is_reference contents.value) then
+            if Contents.is(contents, data.Tracked) and (NativeValue.is(contents.value, data.Bits) or E.is_aggregate contents.value or E.is_reference contents.value or E.is_tagged contents.value) then
                 places_carried[#places_carried + 1] = place
             end
         end

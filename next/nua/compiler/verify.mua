@@ -274,6 +274,11 @@ local component_type = do(type, component)
     local Component = data.Component
     if Component.is(component, data.PayloadComponent) or Component.is(component, data.AnyElementComponent) then return nil, "a payload/wildcard component is provenance, not an executable projection" end
     if Component.is(component, data.FieldComponent) then
+        -- a sum's tag is its one field; its payloads are reached as alternatives
+        if NativeType.is(type, types.SumType) then
+            if component.name == "tag" then return types.U32 end
+            return nil, types.describe(type) .. " has no field " .. component.name .. "; its payload is reached by matching"
+        end
         if NativeType.is(type, types.RecordType) then
             for _, field in ipairs type.fields do
                 if field.name == component.name then return field.type end
@@ -289,10 +294,9 @@ local component_type = do(type, component)
         if NativeType.is(type, types.FixedArrayType) and rules.is_integer(component.index.type) then return type.element end
         return nil, "an element of " .. types.describe(type) .. " needs a fixed array and an integer index"
     end
-    if NativeType.is(type, types.SumType) then
-        for _, alternative in ipairs type.alternatives do
-            if alternative.name == component.name then return alternative.payload end
-        end
+    if NativeType.is(type, types.SumType) and Component.is(component, data.AlternativeComponent) then
+        local alternative = types.alternative_of(type, component.name)
+        if alternative then return alternative.payload end
     end
     return nil, types.describe(type) .. " has no alternative " .. tostring(component.name)
 end
@@ -328,8 +332,18 @@ local verify_types = do(program, capabilities)
             Pack = do(node, recurse)
                 local parts = parts_of node.type
                 if NativeType.is(node.type, types.SumType) then
-                    if #node.components ~= 2 or node.components[1].type ~= types.U32 then
-                        report(definition, "a sum is packed from its U32 tag and a payload", node.site.origin)
+                    -- a constant tag naming an alternative, then that alternative's payload (none
+                    -- for a Unit alternative)
+                    local tag = node.components[1]
+                    local alternative = tag and Operand.is(tag, data.Constant) and tag.type == types.U32 and node.type.alternatives[tonumber(tag.bits.bits) + 1]
+                    if not alternative then
+                        report(definition, "a sum is packed from a constant U32 tag naming one of its alternatives", node.site.origin)
+                    elseif alternative.payload == types.Unit then
+                        if #node.components ~= 1 then report(definition, "a Unit alternative of a sum is packed from its tag alone", node.site.origin) end
+                    elseif #node.components ~= 2 then
+                        report(definition, ("the alternative '%s' of %s is packed from its tag and its payload"):format(alternative.name, types.describe node.type), node.site.origin)
+                    else
+                        expect(node.components[2], alternative.payload, "the payload of " .. alternative.name, node.site.origin)
                     end
                 elseif parts == nil then
                     report(definition, types.describe(node.type) .. " is not packed from parts", node.site.origin)

@@ -40,6 +40,7 @@ return do(E, core)
     -- arguments give, requested from the compilation; known arguments key it, the others are
     -- passed. `generalized[index]` forces an argument dynamic even when it is known.
     E.call_definition = do(path, word, arguments, generalized)
+        if word.result == nil then fail(path, word.name .. " is untyped: it evaluates in place, and has no native boundary") end
         for index, argument in ipairs arguments do
             if E.is_reference argument and types.NativeType.is(argument.type, types.ReferenceType) and data.BorrowForm.is(compilation.borrows[argument.borrow].form, data.Selected) then
                 return E.dispatch_reference(path, argument, do(arm, selected)
@@ -172,7 +173,9 @@ return do(E, core)
     -- A re-entry under dynamic control (syntax §6.2, §6.5) generalizes the known arguments that
     -- changed since the active invocation and becomes a native call; under known control it
     -- keeps unfolding.
-    E.invoke = do(path, word, arguments)
+    -- `continuation(at, value)`, when given, consumes the word's returns where they are: the
+    -- returns of one known tag join at it, separately from the others (syntax §11.2)
+    E.invoke = do(path, word, arguments, continuation)
         local active = E.active_invocation(path, word)
         local dynamic_control = active and (path.depth > active.entry_depth or path.guarded > active.entry_guarded)
         if dynamic_control then
@@ -190,8 +193,16 @@ return do(E, core)
         local bind_arguments = do(invocation, callee)
             for index, requirement in ipairs word.requirements do
                 local argument = arguments[index]
-                if requirement.type == nil then
+                -- an owner given to an untyped requirement is held in a place of its own type, so
+                -- it is released with the invocation
+                local owned = requirement.type == nil and check(data.NativeValue, argument) and types.owns argument.type
+                if requirement.type == nil and not owned then
                     invocation.arguments[index] = E.host_cell(callee, requirement.name, argument)
+                elseif owned then
+                    local place = E.new_place(callee, requirement.name, argument.type)
+                    callee.flow.contents[place.id] = data.Tracked { value = argument }
+                    E.install_payload(callee, place.id, argument)
+                    invocation.arguments[index] = E.place_cell(place.id, requirement.name)
                 else
                     local value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
                     invocation.argument_values[index] = value
@@ -211,16 +222,25 @@ return do(E, core)
         local run_body = do(invocation, callee)
             word.body(E, callee)
             if not callee.dead then
-                if word.result ~= types.Unit then fail(callee, word.name .. " can reach its end without returning " .. types.describe word.result) end
+                if word.result ~= types.Unit and word.result ~= nil then fail(callee, word.name .. " can reach its end without returning " .. types.describe word.result) end
                 E.return_value(callee, nil)
             end
+        end
+        -- the exits joined; a word evaluated in place yields the type its exits agree on
+        local join_exits = do(invocation)
+            if continuation then return E.continue_returns(path, invocation.exits, word.result, continuation) end
+            if word.result ~= nil then return E.join(path, invocation.exits, word.result) end
+            local value_type, host_value = E.agree_results(path, invocation.exits, "the returns of " .. word.name)
+            local joined = E.join(path, invocation.exits, value_type)
+            if value_type == nil then return host_value end
+            return joined
         end
         if not word.tail_calls then
             local invocation = new_invocation()
             local callee = paths_of.callee(path, invocation, path.writer, path.block, path.flow, word)
             bind_arguments(invocation, callee)
             run_body(invocation, callee)
-            return E.join(path, invocation.exits, word.result)
+            return join_exits invocation
         end
         -- a word with tail applications is built as a child construction: a tail re-entry under
         -- dynamic control discards the first attempt, and the second runs the body as a loop over
@@ -258,7 +278,7 @@ return do(E, core)
         -- Adopt graph and facts together, even for a straight-line invocation (§4.3).
         local entry = path.writer.adopt fragment
         terminate(path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = {} } })
-        return E.join(path, invocation.exits, word.result)
+        return join_exits invocation
     end
 
 end

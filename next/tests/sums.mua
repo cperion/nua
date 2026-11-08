@@ -1,0 +1,348 @@
+-- Sums and matching (syntax §11): structural sums of named alternatives, constructed by member
+-- selection on the type, matched by keyed application with one handler per alternative. A
+-- known tag runs only its handler; a runtime tag tests each alternative, the payload projected
+-- inside its arm, and the handlers' results join.
+
+local ffi = require "ffi"
+local compile = require "nua.compile"
+local native = require "tests.support.native"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+local shapes = [[
+local Circle = struct { radius: U32 }
+local Rect = struct { width: U32, height: U32 }
+local Shape = oneof { circle: Circle, rect: Rect, dot: Unit }
+local area = do(s: Shape): U32 = s with
+    circle = do(c) = c.radius * c.radius * 3
+    rect = do(r)
+        local w = r.width
+        return w * r.height
+    end
+    dot = do() = 0
+end
+]]
+
+test "a runtime tag tests each alternative and joins the handlers' results":
+    local library, text = native("sum_area", shapes .. [[
+export area
+local make_rect = do(w: U32, h: U32): Shape = Shape.rect { width = w, height = h }
+export make_rect
+local make_circle = do(r: U32): Shape = Shape.circle { radius = r }
+export make_circle
+local make_dot = do(): Shape = Shape.dot
+export make_dot
+]])
+    assert(library.area(library.make_rect(4, 5)) == 20)
+    assert(library.area(library.make_circle(2)) == 12)
+    assert(library.area(library.make_dot()) == 0)
+    -- the C layout of syntax §11.1: tag constants, a tag and a union of the payloads
+    assert(text:find("enum { Shape_%d+_circle = 0, Shape_%d+_dot = 1, Shape_%d+_rect = 2 };"), text)
+    assert(text:find("union { Circle_%d+ circle; Rect_%d+ rect; } as;"), text)
+    assert(text:find(".as.rect", 1, true) and text:find(".tag", 1, true))
+    -- a chain of tests on one tag prints as a switch over its constants
+    assert(text:find("switch (", 1, true) and text:find("case Shape_%d+_circle:") and text:find("default: /%* Shape_%d+_rect %*/"), text)
+end
+
+test "a known tag runs only its handler, whatever the payload's binding time":
+    local library, text = native("sum_strip", shapes .. [[
+local strip = do(k: U32): U32 = area(Shape.rect { width = k, height = 1 })
+export strip
+]])
+    assert(library.strip(9) == 9)
+    assert(not text:find(".tag", 1, true), text)
+    assert(not text:find("Pack", 1, true))
+end
+
+test "handlers that agree on one Lua number fold to it":
+    local library, text = native("sum_number", [[
+local Choice = oneof { yes: Unit, no: Unit }
+local weight = do(c: Choice): U32 = c with
+    yes = do() = 1
+    no = do() = 1
+end
+export weight
+local choose_by = do(flag: Bool): Choice
+    if flag then return Choice.yes end
+    return Choice.no
+end
+export choose_by
+]])
+    assert(library.weight(library.choose_by(true)) == 1 and library.weight(library.choose_by(false)) == 1)
+end
+
+test "a sum constructed at host level becomes native where it meets its type":
+    local library = native("sum_host", shapes .. [[
+local unit_square = Shape.rect { width = 1, height = 1 }
+local known_area = do(): U32 = area unit_square
+export known_area
+local with_dot = do(): U32 = area(Shape.dot)
+export with_dot
+]])
+    assert(library.known_area() == 1 and library.with_dot() == 0)
+end
+
+test "a sum in a local keeps its known tag; disagreeing paths join it as a value":
+    local library, text = native("sum_local", shapes .. [[
+local chosen = do(wide: Bool, side: U32): U32
+    local s = Shape.circle { radius = side }
+    if wide then
+        s = Shape.rect { width = side, height = 2 }
+    end
+    return area s
+end
+export chosen
+local same = do(flag: Bool, side: U32): U32
+    local s = Shape.rect { width = side, height = 3 }
+    if flag then
+        s = Shape.rect { width = side, height = 3 }
+    end
+    return area s
+end
+export same
+]])
+    assert(library.chosen(false, 2) == 12 and library.chosen(true, 5) == 10)
+    assert(library.same(true, 2) == 6 and library.same(false, 4) == 12)
+end
+
+test "describe, then run: commands as data and one interpreter (syntax §11.4)":
+    local library, text = native("sum_commands", [[
+local Editor = struct { cursor: U32, length: U32, undos: U32 }
+local Direction = oneof { left: Unit, right: Unit }
+local Command = oneof { move: Direction, insert: U32, undo: Unit }
+local apply = do(e: Ref Editor, c: Command): Unit
+    c with
+        move = do(d)
+            d with
+                left = do
+                    if e.cursor > 0 then e.cursor = e.cursor - 1 end
+                end
+                right = do
+                    if e.cursor < e.length then e.cursor = e.cursor + 1 end
+                end
+            end
+        end
+        insert = do(n)
+            e.length = e.length + n
+            e.cursor = e.cursor + n
+        end
+        undo = do
+            e.undos = e.undos + 1
+        end
+    end
+end
+local script = {
+    Command.insert 5,
+    Command.move(Direction.left()),
+    Command.move(Direction.left()),
+    Command.undo(),
+    Command.insert 2,
+}
+local run_script = do(e: Ref Editor): Unit
+    for i = 1, #script do
+        apply(e, script[i])
+    end
+end
+export run_script
+local step = do(e: Ref Editor, c: Command): Unit = apply(e, c)
+export step
+local insert = do(n: U32): Command = Command.insert n
+export insert
+local left = do(): Command = Command.move(Direction.left())
+export left
+]])
+    local editor = ffi.new("Editor_" .. text:match("typedef struct Editor_(%d+)") .. "[1]")
+    library.run_script(editor)
+    assert(editor[0].cursor == 5 and editor[0].length == 7 and editor[0].undos == 1)
+    -- over a known script the interpreter dissolves: no tag is read
+    local script_body = text:match("void run_script%(.-\n}")
+    assert(not script_body:find(".tag", 1, true), script_body)
+    local fresh = ffi.new("Editor_" .. text:match("typedef struct Editor_(%d+)") .. "[1]")
+    library.step(fresh, library.insert(3))
+    library.step(fresh, library.left())
+    assert(fresh[0].cursor == 2 and fresh[0].length == 3)
+end
+
+test "over a program known only at run time, the interpreter is a loop over runtime tags":
+    local library, text = native("sum_machine", [[
+local Editor = struct { cursor: U32, length: U32, undos: U32 }
+local Direction = oneof { left: Unit, right: Unit }
+local Command = oneof { move: Direction, insert: U32, undo: Unit }
+local apply = do(e: Ref Editor, c: Command): Unit
+    c with
+        move = do(d)
+            d with
+                left = do
+                    if e.cursor > 0 then e.cursor = e.cursor - 1 end
+                end
+                right = do
+                    if e.cursor < e.length then e.cursor = e.cursor + 1 end
+                end
+            end
+        end
+        insert = do(n)
+            e.length = e.length + n
+            e.cursor = e.cursor + n
+        end
+        undo = do
+            e.undos = e.undos + 1
+        end
+    end
+end
+local run_program = do(e: Ref Editor, prog: Ref Grow(Command)): Unit
+    local i: U64 = 0
+    while i < prog.length do
+        apply(e, prog[i])
+        i = i + 1
+    end
+end
+-- the program arrives at run time: each step's kind and count are arguments
+local run_steps = do(e: Ref Editor, inserted: U32, lefts: U32): Unit
+    local prog = Grow(Command) {}
+    prog:push(Command.insert inserted)
+    local k: U32 = 0
+    while k < lefts do
+        prog:push(Command.move(Direction.left()))
+        k = k + 1
+    end
+    prog:push(Command.undo)
+    run_program(e, Ref prog)
+end
+export run_steps
+]])
+    local editor = ffi.new("Editor_" .. text:match("typedef struct Editor_(%d+)") .. "[1]")
+    library.run_steps(editor, 6, 2)
+    assert(editor[0].cursor == 4 and editor[0].length == 6 and editor[0].undos == 1, tostring(editor[0].cursor))
+    library.run_steps(editor, 1, 9)
+    assert(editor[0].length == 7 and editor[0].cursor == 0 and editor[0].undos == 2)
+end
+
+local documents = [[
+local Doc = oneof { empty: Unit, text: Grow(U32) }
+local filled = do(n: U32): Grow(U32)
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push(i)
+    end
+    return xs
+end
+local size = do(d: Doc): U64 = d with
+    empty = do() = 0
+    text = do(t) = t.length
+end
+]]
+
+test "a payload that owns is released with its sum, by its tag":
+    local library = native("sum_owners", documents .. [[
+-- a owner_known tag: the payload is released where the sum's scope ends
+local hold = do(n: U32): Unit
+    local d = Doc.text(filled n)
+end
+local owner_known = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    hold n
+    return platform.ledger_mapped_bytes() - before
+end
+export owner_known
+-- a runtime tag: the release tests it
+local hold_if = do(flag: Bool, n: U32): Unit
+    local d = Doc.empty
+    if flag then d = Doc.text(filled n) end
+end
+local owner_chosen = do(flag: Bool, n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    hold_if(flag, n)
+    return platform.ledger_mapped_bytes() - before
+end
+export owner_chosen
+-- matching consumes the sum: its payload moves to the handler, which releases it
+local owner_measured = do(flag: Bool, n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local d = Doc.empty
+    if flag then d = Doc.text(filled n) end
+    local count = size d
+    return (platform.ledger_mapped_bytes() - before) * 1000000 + count
+end
+export owner_measured
+]])
+    -- the first allocation maps the allocator's storage context, which stays
+    library.owner_known(1)
+    assert(library.owner_known(100000) == 0)
+    assert(library.owner_chosen(true, 100000) == 0 and library.owner_chosen(false, 100000) == 0)
+    assert(library.owner_measured(true, 100000) == 100000, tostring(library.owner_measured(true, 100000)))
+    assert(library.owner_measured(false, 100000) == 0)
+end
+
+test "handlers applied to an in-place producer consume its returns where they are":
+    local library, text = native("sum_producer", [[
+local Draft = struct { size: U32 }
+local Outcome = oneof { commit: Unit, abort: U32 }
+local body = do(d: Ref Draft): Outcome
+    if d.size > 10 then return Outcome.abort(d.size) end
+    d.size = d.size + 1
+    return Outcome.commit
+end
+local settle = do(n: U32): U32
+    local draft = Draft { size = n }
+    return body(Ref draft) with
+        commit = do() = draft.size
+        abort = do(reason) = reason * 100
+    end
+end
+export settle
+]])
+    assert(library.settle(3) == 4 and library.settle(20) == 2000)
+    -- the returns of a known tag join at that tag's handler: no runtime sum is built or tested
+    local settled = text:match("uint32_t settle%(.-\n}")
+    assert(not settled:find(".tag", 1, true) and not settled:find("Outcome", 1, true), settled)
+end
+
+test "every alternative is handled exactly once":
+    refuses(shapes .. [[
+local partial = do(s: Shape): U32 = s with
+    circle = do(c) = 1
+    rect = do(r) = 2
+end
+export partial
+]], "has no handler for 'dot'")
+    refuses(shapes .. [[
+local extra = do(s: Shape): U32 = s with
+    circle = do(c) = 1
+    rect = do(r) = 2
+    dot = do() = 3
+    square = do() = 4
+end
+export extra
+]], "has no alternative 'square'")
+    refuses(shapes .. [[
+local twice = do(s: Shape): U32 = s with
+    circle = do(c) = 1
+    rect = do(r) = 2
+    dot = do() = 3
+    dot = do() = 4
+end
+export twice
+]], "the entry 'dot' is given twice")
+end
+
+test "a payload is reached only by matching":
+    refuses(shapes .. [[
+local peek = do(s: Shape): U32 = s.rect.width
+export peek
+]], "rect")
+end
+
+test "handlers meet at one type":
+    refuses([[
+local Pair = oneof { small: U8, big: U32 }
+local widen = do(p: Pair): U32 = p with
+    small = do(v) = v
+    big = do(v) = v
+end
+export widen
+]], "yield different types")
+end

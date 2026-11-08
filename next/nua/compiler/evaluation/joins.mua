@@ -125,6 +125,23 @@ return do(E, core)
             for index, value in ipairs values do operands[index] = E.materialize(edge_paths[index], value) end
             return E.value_of_operand(native_type, parameter(native_type, operands))
         end
+        -- sums of one alternative join as that alternative, their payloads merged; sums of
+        -- several join as one value of the sum
+        local merge_sums = do(native_type, values)
+            local alternative = E.is_tagged values[1] and values[1].alternative
+            for _, value in ipairs values do
+                if not E.is_tagged value or value.alternative ~= alternative then alternative = nil end
+            end
+            if alternative then
+                local payloads = {}
+                for index, value in ipairs values do payloads[index] = value.payload end
+                local payload = payloads[1] and merge(payloads[1].type, payloads)
+                return data.Tagged { type = native_type, .alternative, .payload }
+            end
+            local operands = {}
+            for index, value in ipairs values do operands[index] = E.materialize(edge_paths[index], value) end
+            return E.value_of_operand(native_type, parameter(native_type, operands))
+        end
         -- the incoming values of one thing as one value: itself where they are the same
         merge = do(native_type, values)
             local all_same = true
@@ -134,6 +151,7 @@ return do(E, core)
             if all_same then return values[1] end
             if E.is_reference values[1] then return merge_references(native_type, values) end
             if E.is_record native_type then return merge_records(native_type, values) end
+            if E.is_sum native_type then return merge_sums(native_type, values) end
             local operands = {}
             for index, value in ipairs values do operands[index] = value.operand end
             return E.bits(native_type, parameter(native_type, operands))

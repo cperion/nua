@@ -45,7 +45,10 @@ return do(E, core)
         if path.dead then return nil end
         local invocation = path.invocation
         local result_type = invocation.word.result
-        if result_type == types.Unit then
+        -- a word evaluated in place yields what it returns; returning nothing is Unit
+        if result_type == nil then
+            if value == nil then value = E.from_host(path, types.Unit, nil, "the result") end
+        elseif result_type == types.Unit then
             if value ~= nil and not (is_native value and value.type == types.Unit) then fail(path, invocation.word.name .. " yields Unit and returns no value") end
             value = E.from_host(path, types.Unit, nil, "the result")
         else

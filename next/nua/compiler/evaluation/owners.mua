@@ -36,6 +36,7 @@ return do(E, core)
             path.flow.contents[holder.id] = data.Moved { at = origin_of path }
             return
         end
+        if is_native value and E.is_sum value.type then return E.release_sum(path, value) end
         if E.is_aggregate value and types.owns value.type then
             for _, field in ipairs(E.fields_of value.type) do
                 if types.owns field.type then E.release_value(path, E.part(path, value, field.name)) end

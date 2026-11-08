@@ -1,7 +1,9 @@
 -- Native types: what a native value can be. A closed family; the compiler's questions about a
 -- type (its name, whether it owns or borrows storage, its layout on a target) are passes over
 -- it. Constructed types are interned, so one type is one record and compares by identity.
--- Records and sums are nominal: each declaration is a new type.
+-- Records are nominal: each declaration is a new type. Sums are structural (syntax §11.1): their
+-- alternatives in canonical order, by name, so two spellings of the same alternatives (the
+-- same names with the same payload types) are one type.
 --
 -- `Buffer T` is the one storage primitive (docs/design/buffers.md); the containers (`Grow`,
 -- `Text`, `Store`, `Map`) are records over buffers, declared by the Nua library, not here.
@@ -117,16 +119,82 @@ local record = do(name, fields)
     end
     return RecordType { .name, fields = checked }
 end
+local sums = interned()
+local borrows      -- a pass below: does a type hold a borrow
+-- a sum of named alternatives, each with a payload type (`Unit` for none); its name is the one
+-- it was first declared with
 local sum = do(name, alternatives)
-    local seen = {}
-    local checked = {}
+    local seen, sorted = {}, {}
     for _, entry in ipairs alternatives do
         if seen[entry.name] then error(("sum %s: two alternatives are named %s"):format(name, entry.name), 2) end
         seen[entry.name] = true
-        checked[#checked + 1] = Alternative { name = entry.name, payload = entry.payload }
+        need_type(entry.payload, ("the alternative '%s' of %s"):format(entry.name, name))
+        if borrows entry.payload then
+            error(("sum %s: the payload of '%s' holds a borrow; a payload may hold owners, never references"):format(name, entry.name), 2)
+        end
+        sorted[#sorted + 1] = entry
     end
-    if #checked == 0 then error(("sum %s needs at least one alternative"):format(name), 2) end
-    return SumType { .name, alternatives = checked }
+    if #sorted == 0 then error(("sum %s needs at least one alternative"):format(name), 2) end
+    table.sort(sorted, |a, b| -> a.name < b.name)
+    local key = {}
+    for _, entry in ipairs sorted do
+        key[#key + 1] = entry.name
+        key[#key + 1] = entry.payload
+    end
+    return sums(key, do()
+        local checked = {}
+        for _, entry in ipairs sorted do checked[#checked + 1] = Alternative { name = entry.name, payload = entry.payload } end
+        return SumType { .name, alternatives = checked }
+    end)
+end
+
+-- the alternative of a sum by name, and its tag (its position in canonical order, from 0)
+local alternative_of = do(sum_type, name)
+    for index, alternative in ipairs sum_type.alternatives do
+        if alternative.name == name then return alternative, index - 1 end
+    end
+    return nil
+end
+
+-- A sum value described at host level: the alternative and its payload (a host value, or a
+-- native value inside a typed body). It becomes a native value where it meets the sum type.
+local Variant = struct { sum: SumType, alternative: String, payload: Any }
+
+-- A constructor: `Shape.rect { … }`, `Opt.some x`, and for a Unit alternative `Opt.none` or
+-- `Direction.left()`. Applied, it answers the variant; a Unit constructor stands for its variant
+-- where a value is meant. It is a callable host value, as a primitive is.
+local Constructor = {}
+Constructor.__tostring = constructor -> ("%s.%s"):format(constructor.sum.name, constructor.alternative.name)
+Constructor.__call = do(constructor, payload)
+    if constructor.alternative.payload == Unit and payload ~= nil then
+        error(("%s takes no payload"):format(tostring constructor), 2)
+    end
+    return Variant { sum = constructor.sum, alternative = constructor.alternative.name, .payload }
+end
+local is_constructor = value -> getmetatable value == Constructor
+local constructors = setmetatable({}, { __mode = "k" })
+-- the members of a sum type its fields do not answer are its constructors
+function SumType:__index(member)
+    local alternative = alternative_of(self, member)
+    if alternative == nil then return nil end
+    local by_name = constructors[self]
+    if by_name == nil then
+        by_name = {}
+        constructors[self] = by_name
+    end
+    local found = by_name[member]
+    if found == nil then
+        found = setmetatable({ sum = self, .alternative }, Constructor)
+        by_name[member] = found
+    end
+    return found
+end
+-- the host description a value stands for, if it describes a sum value: a variant, or a Unit
+-- constructor not applied
+local variant_of = do(value)
+    if check(Variant, value) then return value end
+    if is_constructor value and value.alternative.payload == Unit then return Variant { sum = value.sum, alternative = value.alternative.name, payload = nil } end
+    return nil
 end
 
 ------------------------------------------------------------------------------------------------
@@ -192,7 +260,7 @@ local Borrowing = define ..Owning
     ViewType = do(node, recurse) return true end
     BufferType = do(node, recurse) return false end
 end
-local borrows = NativeType.pass "does a native type hold a borrow" with ..Borrowing end
+borrows = NativeType.pass "does a native type hold a borrow" with ..Borrowing end
 
 ------------------------------------------------------------------------------------------------
 -- Layout on a target: size, alignment and the offsets of the parts a native value has.
@@ -306,6 +374,10 @@ return define
     .function_type
     .record
     .sum
+    .alternative_of
+    .Variant
+    .is_constructor
+    .variant_of
     .describe
     .owns
     .borrows

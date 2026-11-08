@@ -191,18 +191,35 @@ local generating = do(filename, start_line)
             if node.fn.k == "name" and node.fn.name == "Ref" and #node.args == 1 and node.args[1].k == "name" and lookup(node.args[1].name) == "cell" then
                 return ("__E.apply(__path, Ref, { %s }, false)"):format(node.args[1].name)
             end
-            local callee = callee_of node
+            -- `producer(args) { handlers }`: the evaluator decides whether the table consumes the
+            -- producer's returns in place or is an ordinary argument (syntax §11.2)
+            if node.fn.k == "call" and #node.args == 1 and node.args[1].k == "table" then
+                local inner = node.fn
+                local producer = inner.fn.k == "name" and lookup(inner.fn.name) == "cell" and inner.fn.name or callee_of inner
+                return ("__E.apply_continued(__path, %s, { %s }, %s, %s, %s)"):format(producer, list(inner.args, expression), boundary_flag inner, expression(node.args[1]), boundary_flag node)
+            end
+            -- a local applied keeps its cell: a sum matched in place lends its payload to `Ref`
+            -- handlers (syntax §11.2)
+            local callee = node.fn.k == "name" and lookup(node.fn.name) == "cell" and node.fn.name or callee_of node
             return ("__E.apply(__path, %s, { %s }, %s)"):format(callee, list(node.args, expression), boundary_flag node)
         end
         method = node -> ("__E.method(__path, %s, %q, { %s }, %s)"):format(base node.obj, node.name, list(node.args, expression), boundary_flag node)
+        -- a table of a typed body names each entry once: Lua would keep the last of two, and a
+        -- match must handle each alternative exactly once (syntax §11.2)
         table = do(node)
             if node.define then fail("table is not available in a typed body yet", node.line) end
+            local named = {}
+            for _, item in ipairs node.items do
+                if item.kind == "named" then
+                    if named[item.name] then fail(("the entry '%s' is given twice"):format(item.name), item.e and item.e.line or node.line) end
+                    named[item.name] = true
+                end
+            end
             return table_text(node, expression, "a spread is not available in a typed body yet")
         end
-        lambda = do(node)
-            if not node.fn.result then fail("an untyped lambda is not available in a typed body yet", node.line) end
-            return function_text(node.fn)
-        end
+        -- a typed lambda is a word; an untyped one a word evaluated in place, whose result is
+        -- what it returns
+        lambda = node -> function_text(node.fn)
     end
     Expressions["nil"], Expressions["true"], Expressions["false"] = keyword, keyword, keyword
     expression = dispatching(Expressions, "%s is not available in a typed body yet")
@@ -331,7 +348,9 @@ local generating = do(filename, start_line)
         end
         -- `return f args`: a tail application, which may re-enter the word as a loop round
         local returned = node.exprs[1]
-        if returned.k == "call" and not returned.boundary then
+        -- (handlers applied to a producer consume its returns: not a re-entry of the word)
+        local continued = returned.k == "call" and returned.fn.k == "call" and #returned.args == 1 and returned.args[1].k == "table"
+        if returned.k == "call" and not returned.boundary and not continued then
             tail_calls = true
             emit(("do return __E.return_tail(__path, %s, { %s }) end;"):format(callee_of returned, list(returned.args, expression)))
             return
@@ -368,7 +387,7 @@ local generating = do(filename, start_line)
             local annotation = parameter.type and host_expression parameter.type or "nil"
             requirements[index] = ("{ name = %q, type = %s }"):format(parameter.name, annotation)
         end
-        local result = host_expression fn.result
+        local result = fn.result and host_expression fn.result or "nil"
         local outer_tail_calls = tail_calls
         tail_calls = false
         local body = captured(|| -> inner_scope(do()
@@ -440,6 +459,15 @@ local host = do(filename)
                 fields[index] = ("{ name = %q, type = %s }"):format(field.name, generator.host_expression field.type)
             end
             return ("__nua.record(%q, { %s }, %d)"):format(node.name or "struct", table.concat(fields, ", "), node.line or 0)
+        end
+        -- `oneof { … }` declares a native sum; its payload types are host expressions
+        sum = do(node)
+            local generator = generating(filename, node.line)
+            local alternatives = {}
+            for index, alternative in ipairs node.fields do
+                alternatives[index] = ("{ name = %q, payload = %s }"):format(alternative.name, generator.host_expression alternative.type)
+            end
+            return ("__nua.sum(%q, { %s }, %d)"):format(node.name or "oneof", table.concat(alternatives, ", "), node.line or 0)
         end
         typed_function = do(node)
             if node.k == "localfunction" then

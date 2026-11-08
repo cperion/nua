@@ -89,6 +89,11 @@ local hosting_environment = do(compilation, filename)
             if not ok then error(("%s:%d: %s"):format(filename, line, tostring record_or_problem), 0) end
             return record_or_problem
         end
+        sum = do(name, alternatives, line)
+            local ok, sum_or_problem = pcall(types.sum, name, alternatives)
+            if not ok then error(("%s:%d: %s"):format(filename, line, tostring sum_or_problem), 0) end
+            return sum_or_problem
+        end
         export = do(value, c_name, line)
             if not (hosting.is_word value or hosting.is_application value) then
                 error(("%s:%d: export needs a word, got %s"):format(filename, line, tostring value), 0)

@@ -39,6 +39,8 @@ return do(E, core)
         if types.NativeType.is(type, types.RecordType) and not is_native value and lua_type value == "table" then
             return E.construct_record(path, type, value)
         end
+        local described = not is_native value and types.variant_of value
+        if described and types.NativeType.is(type, types.SumType) then return E.from_variant(path, type, described, what) end
         if is_native value and NativeValue.is(value, data.Reference) and types.NativeType.is(value.type, types.ReferenceType) and not types.NativeType.is(type, types.ReferenceType) then
             value = E.deref(path, value)
         end

@@ -148,6 +148,16 @@ return do(E, core)
     -- application: a reference of a local, a primitive, a native type, a mechanism, or a word
     E.apply = do(path, callee, arguments, boundary)
         if path.dead then return nil end
+        -- a local applied: a sum it holds is matched in place, anything else applied as its value
+        local place = nil
+        if E.is_cell callee then
+            place = callee
+            callee = E.peek(path, callee)
+        end
+        -- a constructor applied builds (a Unit one too: `Direction.left()`); a sum value applied
+        -- is matched
+        if types.is_constructor callee then return E.construct_variant(path, callee, arguments) end
+        if E.is_sum_value callee then return E.match(path, callee, arguments, place) end
         if callee == types.reference and E.is_cell(arguments[1]) then return E.reference_to(path, arguments[1]) end
         if hosting.is_primitive callee then
             local apply_primitive = Primitives[callee.name]
