@@ -1,0 +1,122 @@
+local native = require "tests.support.native"
+
+local library, text = nil, nil
+local build = do()
+    if library then return library end
+    library, text = native("buffers", [[
+local sum_of_squares = do(n: U32): U64
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push(i * i)
+    end
+    local total: U64 = 0
+    local i: U64 = 0
+    while i < xs.length do
+        total = total + U64(xs[i])
+        i = i + 1
+    end
+    return total
+end
+export sum_of_squares
+
+local initial = do(): U32
+    local xs = Grow(U32) { 3, 4, 5 }
+    xs[1] = 40
+    return xs[0] + xs[1] + xs[2] + U32(xs.length)
+end
+export initial
+
+local pops = do(n: U32): U32
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push(i)
+    end
+    local last = xs:pop()
+    xs:truncate(2)
+    return last * 100 + U32(xs.length)
+end
+export pops
+
+-- the ledger's mapped bytes after a buffer that maps its own pages has come and gone
+local ledger_after = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local count = sum_of_squares n
+    return platform.ledger_mapped_bytes() - before
+end
+export ledger_after
+
+-- an owner moved on one arm only is released on the other before they join
+local pick = do(flag: Bool, n: U32): U64
+    local a = Grow(U32) {}
+    for i: U32 = 1, n do
+        a:push(i)
+    end
+    local b = Grow(U32) {}
+    if flag then b = a end
+    return b.length
+end
+export pick
+local pick_ledger = do(flag: Bool, n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local length = pick(flag, n)
+    return platform.ledger_mapped_bytes() - before
+end
+export pick_ledger
+
+-- an owner assigned over another releases the old one; a return releases what is live
+local replace = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push(i)
+    end
+    xs = Grow(U32) { 1 }
+    return xs.length
+end
+export replace
+local replace_ledger = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local length = replace n
+    return platform.ledger_mapped_bytes() - before
+end
+export replace_ledger
+
+local out_of_range = do(i: U64): U32
+    local xs = Grow(U32) { 1, 2 }
+    return xs[i]
+end
+export out_of_range
+]])
+    return library
+end
+
+test "a Grow is pushed, indexed and read in Nua words":
+    local buffers = build()
+    assert(buffers.sum_of_squares(3) == 14)
+    assert(buffers.sum_of_squares(1000) == 333833500)
+    assert(buffers.initial() == 3 + 40 + 5 + 3)
+end
+
+test "pop and truncate shrink the buffer":
+    local buffers = build()
+    assert(buffers.pops(5) == 502)
+end
+
+test "a buffer is released when its block ends: the ledger returns to where it was":
+    local buffers = build()
+    assert(buffers.ledger_after(100000) == 0)
+    assert(buffers.ledger_after(300000) == 0)
+end
+
+test "a conditional move releases the owner on the arm that kept it":
+    local buffers = build()
+    -- 50000 U32 elements map their own pages; whichever arm runs, nothing stays mapped
+    assert(buffers.pick(true, 50000) == 50000 and buffers.pick(false, 50000) == 0)
+    assert(buffers.pick_ledger(true, 50000) == 0 and buffers.pick_ledger(false, 50000) == 0)
+end
+
+test "replacing an owner releases the old one, and a return releases what is live":
+    local buffers = build()
+    assert(buffers.replace(10) == 1)
+    assert(buffers.replace_ledger(100000) == 0)
+end

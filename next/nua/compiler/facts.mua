@@ -38,6 +38,19 @@ local paths_overlap = do(left, right)
     return true
 end
 
+-- does an event at `event` affect a borrow of `borrowed`? When the borrow lies within the
+-- event's storage, yes; when the event lies deeper than the borrow, only if it does not pass
+-- through the contents of a buffer: ending a buffer's contents leaves a borrow of its header
+-- (`Ref g`) live (buffers §2.3), while moving a whole place ends borrows of its parts.
+local affects = do(event, borrowed)
+    if not paths_overlap(event, borrowed) then return false end
+    if #borrowed >= #event then return true end
+    for position = #borrowed + 1, #event do
+        if AccessStep.is(event[position], data.ContentsStep) then return false end
+    end
+    return true
+end
+
 ------------------------------------------------------------------------------------------------
 -- Outcomes of the verbs
 
@@ -67,6 +80,56 @@ local fork = do(flow)
     return data.FlowFacts { .contents, .borrows, .live_lifetimes }
 end
 
+-- two operands denote the same value: one operand, or constants of one type with the same bits
+local same_constant
+same_constant = do(a, b)
+    if a == b then return true end
+    if getmetatable a ~= getmetatable b then return false end
+    local NativeConstant = data.NativeConstant
+    if NativeConstant.is(a, data.IntegerBits) then return a.bits == b.bits end
+    if NativeConstant.is(a, data.FloatBits) or NativeConstant.is(a, data.BooleanBit) then return a.value == b.value end
+    if NativeConstant.is(a, data.UnitBits) then return true end
+    if NativeConstant.is(a, data.StaticBytes) then return a.bytes == b.bytes end
+    if NativeConstant.is(a, data.SymbolAddress) then return a.name == b.name and a.offset == b.offset end
+    if NativeConstant.is(a, data.DefinitionAddress) then return a.definition == b.definition end
+    if #a.parts ~= #b.parts then return false end
+    for index, part in ipairs a.parts do
+        if not same_constant(part, b.parts[index]) then return false end
+    end
+    return true
+end
+local same_operand = do(a, b)
+    if a == b then return true end
+    if data.Operand.is(a, data.Constant) and data.Operand.is(b, data.Constant) then
+        return a.type == b.type and same_constant(a.bits, b.bits)
+    end
+    if getmetatable a ~= getmetatable b then return false end
+    if data.Operand.is(a, data.Result) then return a.value == b.value end
+    if data.Operand.is(a, data.BlockArgument) then return a.block == b.block and a.index == b.index end
+    return a.definition == b.definition and a.index == b.index
+end
+
+-- two native values are the same: the same operand, or records whose parts are all the same
+-- (or that are one packed operand)
+local same_value
+same_value = do(a, b)
+    if a == b then return true end
+    if getmetatable a ~= getmetatable b or a.type ~= b.type then return false end
+    if data.NativeValue.is(a, data.Bits) then return same_operand(a.operand, b.operand) end
+    if data.NativeValue.is(a, data.Owned) then return same_operand(a.header, b.header) end
+    if data.NativeValue.is(a, data.Reference) then return a.borrow == b.borrow end
+    local a_parts, b_parts = next(a.parts) ~= nil, next(b.parts) ~= nil
+    if not a_parts and not b_parts then return a.packed ~= nil and b.packed ~= nil and same_operand(a.packed, b.packed) end
+    if not a_parts or not b_parts then return false end
+    for name, part in pairs a.parts do
+        if b.parts[name] == nil or not same_value(part, b.parts[name]) then return false end
+    end
+    for name in pairs b.parts do
+        if a.parts[name] == nil then return false end
+    end
+    return true
+end
+
 -- contents agree when they are the same record, or track the same native value or operand
 local same_contents = do(left, right)
     if left == right then return true end
@@ -74,11 +137,12 @@ local same_contents = do(left, right)
     if Contents.is(left, data.Tracked) then
         local a, b = left.value, right.value
         if a == b then return true end
+        if data.NativeValue.is(a, data.Aggregate) then return same_value(a, b) end
         if data.NativeValue.is(a, data.Bits) and data.NativeValue.is(b, data.Bits) then
-            return a.type == b.type and a.operand == b.operand
+            return a.type == b.type and same_operand(a.operand, b.operand)
         end
         if data.NativeValue.is(a, data.Owned) and data.NativeValue.is(b, data.Owned) then
-            return a.type == b.type and a.header == b.header
+            return a.type == b.type and same_operand(a.header, b.header)
         end
         if data.NativeValue.is(a, data.Reference) and data.NativeValue.is(b, data.Reference) then
             return a.type == b.type and a.borrow == b.borrow
@@ -103,7 +167,8 @@ local tracking = do(capabilities)
     end
     local touches = do(info, access)
         for _, origin in ipairs info.origins do
-            if accesses_overlap(origin, access) then return true end
+            local same_storage = origin.place == access.place or may_alias(origin.place, access.place)
+            if same_storage and affects(access.path, origin.path) then return true end
         end
         return false
     end
@@ -290,6 +355,9 @@ return define
     .empty
     .fork
     .same_contents
+    .same_operand
+    .same_value
     .paths_overlap
+    .affects
     .tracking
 end

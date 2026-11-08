@@ -1,0 +1,473 @@
+-- The front end: Nua as a host of Mua (compiler activities §5.1). Mua parses every source; this
+-- host gives meaning to the forms only Nua has: typed lambdas and typed functions (native words),
+-- `export` and the `call` boundary. Everything else is Mua's.
+--
+-- A typed lambda becomes `__nua.word { … }` whose `body` is a hosted body, a Lua closure
+-- `function(__E, __path, __arguments)` that performs the word's statements through the
+-- evaluation vocabulary `__E`. The path is an argument of every operation: nothing consults a
+-- current path. A path is a handle whose state a join replaces, so expressions never reassign
+-- it; branch arms and loop bodies are closures that receive their own. A statement that may end
+-- its path (a call, a branch, a loop) is followed by a check of `__path.dead`.
+--
+-- Every `local` of a typed body is a binding cell made by `__E.bind`: a native initializer makes
+-- it a place, a host value a host binding. A typed `for` is the native loop of syntax §6.3; an
+-- untyped one is ordinary Lua, run while the body is evaluated (syntax §6.1). Annotations are
+-- host expressions, evaluated once where the word is made. Generated code stays on its source
+-- lines, so LuaJIT's error positions are the source's.
+
+local quote = text -> ("%q"):format(text)
+
+local binary_operators = {
+    ["+"] = "add", ["-"] = "subtract", ["*"] = "multiply", ["/"] = "divide", ["%"] = "remainder",
+    ["=="] = "equal", ["~="] = "not_equal", ["<"] = "less", ["<="] = "less_equal",
+    [">"] = "greater", [">="] = "greater_equal",
+    ["&"] = "bit_and", ["|"] = "bit_or", ["~"] = "bit_xor", ["<<"] = "shift_left", [">>"] = "shift_right",
+    [".."] = "concatenate",
+}
+
+-- one code generator per typed lambda: its output, the line it has reached, and the scopes of
+-- the names its body declares
+local generating = do(filename, start_line)
+    local out = {}
+    local line = start_line or 1
+    local scopes = { {} }
+
+    local emit = text -> do out[#out + 1] = text end
+    local at = do(target)
+        if target and target > line then
+            emit(("\n"):rep(target - line))
+            line = target
+        end
+    end
+    local fail = do(message, where)
+        error(("%s:%s: %s"):format(filename, tostring(where or line), message), 0)
+    end
+    local orders = { {} }
+    local push = || -> do
+        scopes[#scopes + 1] = {}
+        orders[#orders + 1] = {}
+    end
+    local pop = || -> do
+        scopes[#scopes] = nil
+        orders[#orders] = nil
+    end
+    -- `cell` names a binding cell of the body; `host` a Lua local of a generation-time loop
+    local declare = |name, kind| -> do
+        scopes[#scopes][name] = kind
+        if kind == "cell" then table.insert(orders[#orders], name) end
+    end
+    -- the end of the innermost scope: its cells, for the evaluator to release their owners
+    local scope_end = do()
+        local names = orders[#orders]
+        if #names == 0 then return "" end
+        return (" __E.scope_end(__path, { %s });"):format(table.concat(names, ", "))
+    end
+    local lookup = do(name)
+        for depth = #scopes, 1, -1 do
+            local kind = scopes[depth][name]
+            if kind then return kind end
+        end
+        return nil
+    end
+
+    local expression, host_expression, host_or_value, statements, block_body
+    local tail_calls = false
+
+    local list = do(nodes, emitter)
+        local texts = {}
+        for index, node in ipairs nodes do texts[index] = emitter node end
+        return table.concat(texts, ", ")
+    end
+
+    -- a host expression: plain Lua, for annotations and the callees of applications
+    host_expression = do(node)
+        at node.line
+        local kind = node.k
+        if kind == "name" then return node.name end
+        if kind == "num" or kind == "str" then return node.text end
+        if kind == "nil" or kind == "true" or kind == "false" then return kind end
+        if kind == "paren" then return "(" .. host_expression node.e .. ")" end
+        if kind == "field" then return host_expression node.obj .. "." .. node.name end
+        if kind == "index" then return host_expression node.obj .. "[" .. host_expression node.key .. "]" end
+        if kind == "call" then return host_expression node.fn .. "(" .. list(node.args, host_expression) .. ")" end
+        if kind == "method" then return host_expression node.obj .. ":" .. node.name .. "(" .. list(node.args, host_expression) .. ")" end
+        if kind == "binop" then return "(" .. host_expression node.a .. " " .. node.op .. " " .. host_expression node.b .. ")" end
+        if kind == "unop" then return "(" .. node.op .. " " .. host_expression node.a .. ")" end
+        if kind == "table" and not node.define then
+            local items = {}
+            for _, item in ipairs node.items do
+                if item.kind == "pos" then items[#items + 1] = host_expression item.e
+                elseif item.kind == "named" then items[#items + 1] = item.name .. " = " .. host_expression item.e
+                elseif item.kind == "keyed" then items[#items + 1] = "[" .. host_expression item.key .. "] = " .. host_expression item.e
+                else fail("a spread is not available in an annotation", node.line) end
+            end
+            return "{ " .. table.concat(items, ", ") .. " }"
+        end
+        fail(("%s is not available in an annotation"):format(kind), node.line)
+    end
+
+    -- a name read in a typed body: a cell of the body, a Lua local of a generation-time loop, or
+    -- a host value from around the word
+    local name_value = do(name)
+        local kind = lookup name
+        if kind == "cell" then return ("__E.get(__path, %s)"):format(name) end
+        return name
+    end
+
+    -- the operand of a member or element access: a cell keeps its place, anything else its value
+    local base = do(node)
+        if node.k == "name" and lookup(node.name) == "cell" then return node.name end
+        return expression node
+    end
+
+    local function_text
+    local lambda_arm = do(node)
+        return ("function(__path) return %s end"):format(expression node)
+    end
+
+    expression = do(node)
+        at node.line
+        local kind = node.k
+        if kind == "name" then return name_value node.name end
+        if kind == "num" or kind == "str" then return node.text end
+        if kind == "nil" or kind == "true" or kind == "false" then return kind end
+        if kind == "paren" then return "(" .. expression node.e .. ")" end
+        if kind == "binop" then
+            if node.op == "and" then return ("__E.both(__path, %s, %s)"):format(expression node.a, lambda_arm node.b) end
+            if node.op == "or" then return ("__E.either(__path, %s, %s)"):format(expression node.a, lambda_arm node.b) end
+            local operator = binary_operators[node.op]
+            if operator == nil then fail(("the operator %s is not available in a typed body"):format(node.op), node.line) end
+            return ("__E.operate(__path, %q, %s, %s)"):format(operator, expression node.a, expression node.b)
+        end
+        if kind == "unop" then
+            if node.op == "-" then return ("__E.operate(__path, \"negate\", %s)"):format(expression node.a) end
+            if node.op == "not" then return ("__E.operate(__path, \"not\", %s)"):format(expression node.a) end
+            if node.op == "~" then return ("__E.operate(__path, \"bit_not\", %s)"):format(expression node.a) end
+            if node.op == "#" then return ("__E.length(__path, %s)"):format(base node.a) end
+            fail(("the operator %s is not available in a typed body"):format(node.op), node.line)
+        end
+        if kind == "cond" then
+            return ("__E.choose(__path, %s, %s, %s)"):format(expression node.c, lambda_arm node.a, lambda_arm node.b)
+        end
+        if kind == "field" then return ("__E.dot(__path, %s, %q)"):format(base node.obj, node.name) end
+        if kind == "index" then return ("__E.element(__path, %s, %s)"):format(base node.obj, expression node.key) end
+        if kind == "call" then
+            -- `Ref x` borrows the local itself: its cell, not its value (which would move an owner)
+            if node.fn.k == "name" and node.fn.name == "Ref" and #node.args == 1 and node.args[1].k == "name" and lookup(node.args[1].name) == "cell" then
+                return ("__E.apply(__path, Ref, { %s }, false)"):format(node.args[1].name)
+            end
+            local callee = node.fn.k == "call" and expression node.fn or host_or_value(node.fn)
+            return ("__E.apply(__path, %s, { %s }, %s)"):format(callee, list(node.args, expression), node.boundary and "true" or "false")
+        end
+        if kind == "method" then
+            return ("__E.method(__path, %s, %q, { %s }, %s)"):format(base node.obj, node.name, list(node.args, expression), node.boundary and "true" or "false")
+        end
+        if kind == "table" and not node.define then
+            local items = {}
+            for _, item in ipairs node.items do
+                if item.kind == "pos" then items[#items + 1] = expression item.e
+                elseif item.kind == "named" then items[#items + 1] = item.name .. " = " .. expression item.e
+                elseif item.kind == "keyed" then items[#items + 1] = "[" .. expression item.key .. "] = " .. expression item.e
+                else fail("a spread is not available in a typed body yet", node.line) end
+            end
+            return "{ " .. table.concat(items, ", ") .. " }"
+        end
+        if kind == "lambda" then
+            if node.fn.result then return function_text(node.fn) end
+            fail("an untyped lambda is not available in a typed body yet", node.line)
+        end
+        fail(("%s is not available in a typed body yet"):format(kind), node.line)
+    end
+
+    -- the callee of an application: a cell's value, else the host value as Lua names it
+    host_or_value = do(node)
+        if node.k == "name" then return name_value node.name end
+        return expression node
+    end
+
+    -- the place an assignment writes; a nested target (`o.left.value`) is a chain of cells
+    local target
+    target = do(node)
+        if node.k == "name" then
+            if lookup(node.name) ~= "cell" then
+                fail(("cannot assign '%s': a typed body assigns only the locals it declares"):format(node.name), node.line)
+            end
+            return node.name
+        end
+        local target_base = inner -> (inner.k == "field" or inner.k == "index") and target(inner) or base(inner)
+        if node.k == "field" then return ("__E.member(__path, %s, %q)"):format(target_base node.obj, node.name) end
+        if node.k == "index" then return ("__E.member_at(__path, %s, %s)"):format(target_base node.obj, expression node.key) end
+        fail("this is not something a typed body can assign", node.line)
+    end
+
+    local dead_check = || -> " if __path.dead then return __E.stop(__path) end"
+
+    local statement = do(node)
+        at node.line
+        local kind = node.k
+        if kind == "local" then
+            local values = {}
+            for index, value in ipairs(node.exprs or {}) do values[index] = expression value end
+            local temporaries = {}
+            for index in ipairs values do temporaries[index] = "__value" .. index end
+            if #values > 0 then emit(("local %s = %s;"):format(table.concat(temporaries, ", "), table.concat(values, ", "))) end
+            for index, name in ipairs node.names do
+                at name.line
+                local annotation = name.type and host_expression name.type or "nil"
+                local initial = temporaries[index] or "nil"
+                emit((" local %s = __E.bind(__path, %q, %s, %s);"):format(name.name, name.name, annotation, initial))
+                declare(name.name, "cell")
+            end
+            emit(dead_check())
+            return
+        end
+        if kind == "assign" then
+            local values = {}
+            for index, value in ipairs node.exprs do values[index] = expression value end
+            local temporaries = {}
+            for index in ipairs values do temporaries[index] = "__value" .. index end
+            emit(("do local %s = %s;"):format(table.concat(temporaries, ", "), table.concat(values, ", ")))
+            for index, written in ipairs node.targets do
+                emit((" __E.set(__path, %s, %s);"):format(target written, temporaries[index] or "nil"))
+            end
+            emit(" end;" .. dead_check())
+            return
+        end
+        if kind == "compound" then
+            local operator = binary_operators[node.op]
+            if operator == nil then fail(("the compound operator %s= is not available in a typed body"):format(node.op), node.line) end
+            local written = target node.target
+            emit(("do local __place = %s; __E.set(__path, __place, __E.operate(__path, %q, __E.get(__path, __place), %s)) end;"):format(written, operator, expression node.e))
+            emit(dead_check())
+            return
+        end
+        if kind == "callstat" then
+            emit(("do local _ = %s end;"):format(expression node.e) .. dead_check())
+            return
+        end
+        if kind == "if" then
+            local clause
+            clause = do(position)
+                local current = node.clauses[position]
+                if current == nil then
+                    if node.els then return block_body(node.els) end
+                    return "function(__path) return __E.fall(__path) end"
+                end
+                local condition = expression current.cond
+                local when_true = block_body(current.body)
+                local when_false = clause(position + 1)
+                return ("function(__path) __E.branch(__path, %s, %s, %s); if __path.dead then return __E.stop(__path) end return __E.fall(__path) end"):format(condition, when_true, when_false)
+            end
+            local first = node.clauses[1]
+            local condition = expression first.cond
+            local when_true = block_body(first.body)
+            local when_false = clause 2
+            emit(("__E.branch(__path, %s, %s, %s);"):format(condition, when_true, when_false) .. dead_check())
+            return
+        end
+        if kind == "while" then
+            emit(("__E.loop(__path, %s, %s);"):format(lambda_arm(node.cond), block_body(node.body)) .. dead_check())
+            return
+        end
+        if kind == "numfor" then
+            if node.type then
+                local annotation = host_expression node.type
+                local step = node.step and expression node.step or "nil"
+                push()
+                declare(node.var, "cell")
+                local body = block_body(node.body, node.var)
+                pop()
+                emit(("__E.count(__path, %q, %s, %s, %s, %s, %s);"):format(node.var, annotation, expression node.lo, expression node.hi, step, body) .. dead_check())
+                return
+            end
+            -- an untyped for is a generation-time loop over host numbers
+            local low = ("__E.host_number(__path, %s)"):format(expression node.lo)
+            local high = ("__E.host_number(__path, %s)"):format(expression node.hi)
+            local step = node.step and (", __E.host_number(__path, %s)"):format(expression node.step) or ""
+            emit(("for %s = %s, %s%s do "):format(node.var, low, high, step))
+            push()
+            declare(node.var, "host")
+            statements node.body
+            emit(scope_end())
+            pop()
+            emit(" end;" .. dead_check())
+            return
+        end
+        if kind == "genfor" then
+            local names = {}
+            for index, name in ipairs node.names do names[index] = type name == "table" and name.name or name end
+            emit(("for %s in %s do "):format(table.concat(names, ", "), list(node.exprs, host_or_value)))
+            push()
+            for _, name in ipairs names do declare(name, "host") end
+            statements node.body
+            emit(scope_end())
+            pop()
+            emit(" end;" .. dead_check())
+            return
+        end
+        if kind == "return" then
+            if #node.exprs > 1 then fail("a word returns one value", node.line) end
+            if #node.exprs == 0 then
+                emit "do return __E.return_value(__path, nil) end;"
+                return
+            end
+            -- `return f args`: a tail application, which may re-enter the word as a loop round
+            local returned = node.exprs[1]
+            if returned.k == "call" and not returned.boundary then
+                tail_calls = true
+                local callee = returned.fn.k == "call" and expression returned.fn or host_or_value(returned.fn)
+                emit(("do return __E.return_tail(__path, %s, { %s }) end;"):format(callee, list(returned.args, expression)))
+                return
+            end
+            emit(("do return __E.return_value(__path, %s) end;"):format(expression returned))
+            return
+        end
+        if kind == "break" then
+            emit "do return __E.break_loop(__path) end;"
+            return
+        end
+        if kind == "continue" then
+            emit "do return __E.next_loop(__path) end;"
+            return
+        end
+        if kind == "do" then
+            emit "do "
+            push()
+            statements node.body
+            emit(scope_end())
+            pop()
+            emit " end;"
+            return
+        end
+        if kind == "localfunction" and node.fn.result then
+            declare(node.name, "host")
+            emit(("local %s; %s = %s;"):format(node.name, node.name, function_text(node.fn, node.name)))
+            return
+        end
+        fail(("the statement %s is not available in a typed body yet"):format(kind), node.line)
+    end
+
+    statements = do(nodes)
+        for _, node in ipairs nodes do statement node end
+    end
+
+    -- a block as a closure over its own path; a loop variable is a cell it receives
+    block_body = do(nodes, variable)
+        local parameters = variable and ("__path, " .. variable) or "__path"
+        local saved = out
+        out = {}
+        push()
+        if variable then declare(variable, "cell") end
+        statements nodes
+        emit(scope_end())
+        pop()
+        local text = table.concat out
+        out = saved
+        return ("function(%s) %s return __E.fall(__path) end"):format(parameters, text)
+    end
+
+    -- a typed lambda or typed function: `__nua.word { … }`
+    function_text = do(fn, name)
+        local requirements = {}
+        for index, parameter in ipairs fn.params do
+            if parameter.rest then fail("a rest requirement is not available yet", parameter.line) end
+            local annotation = parameter.type and host_expression parameter.type or "nil"
+            requirements[index] = ("{ name = %q, type = %s }"):format(parameter.name, annotation)
+        end
+        local result = host_expression fn.result
+        local saved, saved_tail = out, tail_calls
+        out = {}
+        tail_calls = false
+        push()
+        local bindings = {}
+        for index, parameter in ipairs fn.params do
+            bindings[#bindings + 1] = ("local %s = __E.argument(__path, %d);"):format(parameter.name, index)
+            declare(parameter.name, "cell")
+        end
+        emit(table.concat(bindings, " "))
+        if fn.expr then
+            statement { k = "return", exprs = { fn.expr }, line = fn.expr.line }
+        else
+            statements fn.body
+        end
+        emit(scope_end())
+        pop()
+        local body = table.concat out
+        local has_tail_calls = tail_calls
+        out, tail_calls = saved, saved_tail
+        return ("__nua.word { name = %s, source = %q, line = %d, requirements = { %s }, result = %s, tail_calls = %s, body = function(__E, __path) %s return __E.fall(__path) end }"):format(
+            quote(name or fn.name or "a word"), filename, fn.line or line, table.concat(requirements, ", "), result, tostring has_tail_calls, body)
+    end
+
+    return define
+        .function_text
+        .host_expression
+        result = || -> table.concat out
+        .emit
+    end
+end
+
+-- the host: what Mua's parser and emitter consult
+local host = do(filename)
+    local statements, prefixes, emit_statements = {}, {}, {}
+    -- `export name`, `export name as "c_name"`
+    statements.export = do(parser, token)
+        local reader = parser.r
+        reader:next()
+        local name = reader:name("after export").v
+        local c_name = name
+        local next_token = reader:peek(1)
+        if next_token.t == "name" and next_token.v == "as" and not next_token.nl then
+            reader:next()
+            local text = reader:next()
+            if text.t ~= "string" then reader:error("export ... as expects a string naming the C function", text) end
+            c_name = assert(loadstring("return " .. text.v))()
+        end
+        return { k = "export", .name, .c_name, line = token.line }
+    end
+    emit_statements.export = node -> ("__nua.export(%s, %q, %d)"):format(node.name, node.c_name, node.line)
+    -- `call f x` in a typed body: the application crosses a native boundary
+    prefixes.call = do(parser, token)
+        local next_token = parser.r:peek(2)
+        if (parser.typed_depth or 0) == 0 or next_token.t ~= "name" or next_token.nl or next_token.kw then return nil end
+        parser.r:next()
+        local applied = parser:suffixed()
+        if applied.k ~= "call" and applied.k ~= "method" then parser.r:error("call needs an application: call f x", token) end
+        local innermost = applied
+        while innermost.k == "call" and (innermost.fn.k == "call" or innermost.fn.k == "method") do innermost = innermost.fn end
+        applied.boundary = true
+        return applied
+    end
+    local typed = do(fn, line, name)
+        local generator = generating(filename, line)
+        return generator.function_text(fn, name)
+    end
+    return define
+        id = "nua-next-front-1"
+        .statements
+        .prefixes
+        .emit_statements
+        typed_lambda = node -> typed(node.fn, node.line, nil)
+        -- `struct { … }` declares a native record; its field types are host expressions
+        struct = do(node)
+            local generator = generating(filename, node.line)
+            local fields = {}
+            for index, field in ipairs node.fields do
+                fields[index] = ("{ name = %q, type = %s }"):format(field.name, generator.host_expression field.type)
+            end
+            return ("__nua.record(%q, { %s }, %d)"):format(node.name or "struct", table.concat(fields, ", "), node.line or 0)
+        end
+        typed_function = do(node)
+            if node.k == "localfunction" then
+                return ("local %s; %s = %s"):format(node.name, node.name, typed(node.fn, node.line, node.name))
+            end
+            if node.method then error(("%s:%d: a typed method is not available yet"):format(filename, node.line), 0) end
+            local path = table.concat(node.path, ".")
+            return ("%s = %s"):format(path, typed(node.fn, node.line, path))
+        end
+    end
+end
+
+return define
+    .host
+end

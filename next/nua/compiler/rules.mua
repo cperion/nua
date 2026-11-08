@@ -279,8 +279,26 @@ local fold_reinterpret = do(result, argument)
     return FoldingDecision.not_foldable()
 end
 
--- fold a computation whose operands are all constants; types must already be checked
+-- undefined behaviour the known operands alone prove, whatever the unknown ones hold: a known
+-- zero integer divisor, a known shift count outside the width
+local proven_undefined = do(opcode, arguments)
+    local first, right = arguments[1], arguments[2]
+    if right == nil or not data.Operand.is(right, data.Constant) or not is_integer(right.type) then return nil end
+    local value = right.type.signed and signed_value(right.bits.bits, right.type.bits) or unsigned_value(right.bits.bits, right.type.bits)
+    if (opcode == "divide" or opcode == "remainder") and is_integer(first.type) and value == 0 then
+        return opcode == "divide" and "division by zero (undefined behaviour in C)" or "remainder by zero (undefined behaviour in C)"
+    end
+    if (opcode == "shift_left" or opcode == "shift_right_signed" or opcode == "shift_right_unsigned") and (value < 0 or value >= first.type.bits) then
+        return ("a shift by %s is undefined for %s"):format((tostring(value):gsub("U?LL$", "")), types.describe(first.type))
+    end
+    return nil
+end
+
+-- fold a computation whose operands are all constants; types must already be checked. A
+-- computation with unknown operands is refused when its known ones prove undefined behaviour.
 local fold = do(opcode, result, arguments)
+    local undefined = proven_undefined(opcode, arguments)
+    if undefined then return invalid undefined end
     for _, argument in ipairs arguments do
         if not data.Operand.is(argument, data.Constant) then return FoldingDecision.not_foldable() end
     end

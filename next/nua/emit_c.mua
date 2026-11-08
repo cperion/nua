@@ -1,0 +1,369 @@
+-- The C backend: a ready program as C text. An instruction pass and a terminator pass answer
+-- statements; every value and block parameter is declared at the top of its function, so a
+-- `goto` never enters the scope of a declaration. Edge arguments are assigned at once, through
+-- temporaries. Narrow integers compute in 32 bits and are cast back to their width, so C's
+-- promotions cannot introduce undefined behaviour (syntax §7.1); a residual operation is
+-- otherwise the C operation itself.
+
+local bit = require "bit"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local rules = require "nua.compiler.rules"
+local platform = require "nua.compiler.platform"
+
+local NativeType, Instruction, Terminator, Operand = types.NativeType, data.Instruction, data.Terminator, data.Operand
+
+local fail = message -> error("C backend: " .. message, 2)
+
+-- records are named once per process, so the C types of separate compilations never clash
+-- (a host declaring them through the FFI cannot redefine a struct)
+local record_names = setmetatable({}, { __mode = "k" })
+local record_count = 0
+local record_name = do(record)
+    local found = record_names[record]
+    if found then return found end
+    record_count += 1
+    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or record.name:gsub("[^%w_]", "_")
+    found = ("%s_%d"):format(base_name, record_count)
+    record_names[record] = found
+    return found
+end
+
+local unsupported = |node, recurse| -> fail(types.describe node .. " has no C spelling yet")
+local CSpelling = define
+    IntegerType = |node, recurse| -> (node.signed and "int" or "uint") .. node.bits .. "_t"
+    FloatType = |node, recurse| -> node.bits == 32 and "float" or "double"
+    BooleanType = |node, recurse| -> "bool"
+    UnitType = |node, recurse| -> "void"
+    PointerType = |node, recurse| -> recurse node.target .. " *"
+    ReferenceType = |node, recurse| -> recurse node.target .. " *"
+    ViewType = unsupported
+    FixedArrayType = unsupported
+    RecordType = |node, recurse| -> record_name node
+    SumType = unsupported
+    BufferType = |node, recurse| -> record_name node
+    FunctionType = unsupported
+end
+local c_type = NativeType.pass "spell a native type in C" with ..CSpelling end
+
+-- the fields of a record, or of a buffer's header
+local fields_of = do(native_type)
+    if NativeType.is(native_type, types.RecordType) then return native_type.fields end
+    local fields = {
+        { name = "data", type = types.pointer native_type.element },
+        { name = "length", type = types.U64 },
+        { name = "capacity", type = types.U64 },
+    }
+    if native_type.pinned then fields[4] = { name = "limit", type = types.U64 } end
+    return fields
+end
+local is_record_like = native_type -> NativeType.is(native_type, types.RecordType) or NativeType.is(native_type, types.BufferType)
+
+-- the C declarations of the records a program uses, each after the records it holds
+local record_declarations = do(program)
+    local done, order = {}, {}
+    local visit
+    visit = do(native_type)
+        if not is_record_like native_type or done[native_type] then return end
+        done[native_type] = true
+        for _, field in ipairs(fields_of native_type) do visit(field.type) end
+        local fields = {}
+        for _, field in ipairs(fields_of native_type) do fields[#fields + 1] = ("%s %s;"):format(c_type field.type, field.name) end
+        order[#order + 1] = ("typedef struct %s { %s } %s;"):format(record_name native_type, table.concat(fields, " "), record_name native_type)
+    end
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        for _, parameter in ipairs definition.signature.parameters do visit(parameter) end
+        visit(definition.signature.result)
+        for _, block in ipairs definition.blocks do
+            for _, argument in ipairs block.arguments do visit(argument.type) end
+            for _, instruction in ipairs block.instructions do
+                if instruction.type then visit(instruction.type) end
+            end
+        end
+    end
+    return order
+end
+
+local narrow = type -> rules.is_integer type and type.bits < 32
+local wide_of = type -> type.signed and "int32_t" or "uint32_t"
+
+-- a constant as a C expression of its exact type
+local constant_text = do(constant)
+    local type = constant.type
+    local constant_bits = constant.bits
+    if data.NativeConstant.is(constant_bits, data.BooleanBit) then return constant_bits.value and "true" or "false" end
+    if data.NativeConstant.is(constant_bits, data.FloatBits) then
+        local value = constant_bits.value
+        if value ~= value then return type.bits == 32 and "NAN" or "(double)NAN" end
+        if value == math.huge then return type.bits == 32 and "INFINITY" or "(double)INFINITY" end
+        if value == -math.huge then return type.bits == 32 and "(-INFINITY)" or "(-(double)INFINITY)" end
+        local text = ("%.17g"):format(value)
+        if not text:find("[%.eEn]") then text = text .. ".0" end
+        return type.bits == 32 and text .. "f" or text
+    end
+    if data.NativeConstant.is(constant_bits, data.UnitBits) then return "0" end
+    if rules.is_pointer type then
+        if constant_bits.bits ~= 0ULL then fail "a pointer constant other than null has no C spelling" end
+        return ("((%s)0)"):format(c_type type)
+    end
+    if not data.NativeConstant.is(constant_bits, data.IntegerBits) then fail("a constant of " .. types.describe type .. " has no C spelling yet") end
+    local value = rules.integer_value constant
+    local digits = tostring(value):gsub("U?LL$", "")
+    if not type.signed then
+        if type.bits == 64 then return "UINT64_C(" .. digits .. ")" end
+        if type.bits == 32 then return digits .. "u" end
+        return ("(%s)%su"):format(c_type type, digits)
+    end
+    local minimum = -bit.lshift(1LL, type.bits - 1)
+    if type.bits == 64 then
+        if value == minimum then return "INT64_MIN" end
+        return "INT64_C(" .. digits .. ")"
+    end
+    if value == minimum then return ("(%s)(%s - 1)"):format(c_type type, tostring(value + 1):gsub("LL$", "")) end
+    if type.bits == 32 then return value < 0 and "(" .. digits .. ")" or digits end
+    return ("(%s)%s"):format(c_type type, digits)
+end
+
+local binary_symbols = define
+    add = "+"
+    subtract = "-"
+    multiply = "*"
+    divide = "/"
+    remainder = "%"
+    bit_and = "&"
+    bit_or = "|"
+    bit_xor = "^"
+    shift_left = "<<"
+    shift_right_signed = ">>"
+    shift_right_unsigned = ">>"
+    equal = "=="
+    not_equal = "!="
+    less = "<"
+    less_equal = "<="
+end
+
+-- one definition's C function
+local place_text
+local emit_definition = do(definition, c_name, program, names_of_definitions)
+    local names = {}
+    local declarations = {}
+    local value_count, block_count = 0, 0
+    local value_name = do(id, type)
+        local found = names[id]
+        if found then return found end
+        value_count += 1
+        found = "v" .. value_count
+        names[id] = found
+        if type ~= types.Unit then declarations[#declarations + 1] = ("    %s %s;"):format(c_type type, found) end
+        return found
+    end
+    local labels, parameters_of = {}, {}
+    for _, block in ipairs definition.blocks do
+        block_count += 1
+        labels[block.id] = "block" .. block_count
+        parameters_of[block.id] = {}
+        for index, parameter in ipairs block.arguments do
+            local name = ("block%d_%d"):format(block_count, index)
+            parameters_of[block.id][index] = name
+            declarations[#declarations + 1] = ("    %s %s;"):format(c_type parameter.type, name)
+        end
+    end
+    local operand
+    -- the C lvalue of a place: a raw place is its pointer dereferenced
+    place_text = do(place)
+        if data.PlaceRoot.is(place.root, data.RawRoot) then return "*" .. operand place.root.pointer end
+        fail("a place rooted in " .. tostring(getmetatable(place.root)) .. " has no C spelling yet")
+    end
+    local Naming = define
+        Constant = |node, recurse| -> constant_text node
+        Parameter = |node, recurse| -> "p" .. node.index
+        BlockArgument = |node, recurse| -> parameters_of[node.block][node.index]
+        Result = |node, recurse| -> value_name(node.value, node.type)
+    end
+    operand = Operand.pass "spell an operand in C" with ..Naming end
+
+    local Statements = define
+        Compute = do(node, recurse)
+            local target = value_name(node.result, node.type) .. " = "
+            local a, b = node.arguments[1], node.arguments[2]
+            local opcode = node.opcode
+            if opcode == "convert" then return target .. ("(%s)%s;"):format(c_type node.type, operand a) end
+            if opcode == "pointer_offset" then return target .. ("%s + %s;"):format(operand a, operand b) end
+            if opcode == "pointer_difference" then return target .. ("(int64_t)(%s - %s);"):format(operand a, operand b) end
+            if opcode == "reinterpret" then
+                local from, to = a.type, node.type
+                if rules.is_pointer from and rules.is_pointer to then return target .. ("(%s)%s;"):format(c_type to, operand a) end
+                if rules.is_pointer from then return target .. ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
+                if rules.is_pointer to then return target .. ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
+                return target .. ("nua_reinterpret_%s_%s(%s);"):format(c_type from, c_type to, operand a)
+            end
+            if opcode == "negate" then
+                if rules.is_float node.type then return target .. "-" .. operand a .. ";" end
+                if narrow node.type then return target .. ("(%s)(-(%s)%s);"):format(c_type node.type, wide_of node.type, operand a) end
+                if not node.type.signed then return target .. ("(%s)0 - %s;"):format(c_type node.type, operand a) end
+                return target .. "-" .. operand a .. ";"
+            end
+            if opcode == "bit_not" then
+                if node.type == types.Bool then return target .. "!" .. operand a .. ";" end
+                if narrow node.type then return target .. ("(%s)~(%s)%s;"):format(c_type node.type, wide_of node.type, operand a) end
+                return target .. "~" .. operand a .. ";"
+            end
+            local symbol = binary_symbols[opcode]
+            if symbol == nil then fail("the opcode " .. opcode .. " has no C spelling yet") end
+            if node.type == types.Bool and (opcode == "bit_and" or opcode == "bit_or" or opcode == "bit_xor") then
+                return target .. ("%s %s %s;"):format(operand a, opcode == "bit_xor" and "!=" or symbol, operand b)
+            end
+            local result_type = node.type
+            if narrow result_type and result_type == a.type then
+                local wide = wide_of result_type
+                return target .. ("(%s)((%s)%s %s (%s)%s);"):format(c_type result_type, wide, operand a, symbol, wide, operand b)
+            end
+            return target .. ("%s %s %s;"):format(operand a, symbol, operand b)
+        end
+        Pack = do(node, recurse)
+            if not is_record_like node.type then fail("packing " .. types.describe node.type .. " has no C spelling yet") end
+            local components = {}
+            for index, component in ipairs node.components do components[index] = operand component end
+            return ("%s = (%s){ %s };"):format(value_name(node.result, node.type), c_type node.type, table.concat(components, ", "))
+        end
+        Extract = do(node, recurse)
+            local text = operand node.aggregate
+            for _, component in ipairs node.path do
+                if not data.Component.is(component, data.FieldComponent) then fail "extracting an element or alternative has no C spelling yet" end
+                text = text .. "." .. component.name
+            end
+            return ("%s = %s;"):format(value_name(node.result, node.type), text)
+        end
+        Load = do(node, recurse)
+            local place = definition.places[node.place]
+            return ("%s = %s;"):format(value_name(node.result, place.type), place_text place)
+        end
+        Store = |node, recurse| -> ("%s = %s;"):format(place_text(definition.places[node.place]), operand node.value)
+        Address = |node, recurse| -> fail "address has no C spelling yet"
+        Check = |node, recurse| -> fail "check has no C spelling yet"
+        Invoke = do(node, recurse)
+            if not data.Callee.is(node.callee, data.DirectNua) then fail "an indirect or foreign call has no C spelling yet" end
+            local arguments = {}
+            for index, argument in ipairs node.arguments do arguments[index] = operand argument end
+            local call = ("%s(%s);"):format(names_of_definitions[node.callee.definition], table.concat(arguments, ", "))
+            if node.result then
+                local callee = program.definitions[node.callee.definition]
+                return value_name(node.result, callee.signature.result) .. " = " .. call
+            end
+            return call
+        end
+        Atomic = |node, recurse| -> fail "atomic has no C spelling yet"
+        Fence = |node, recurse| -> fail "fence has no C spelling yet"
+        LifetimeStart = |node, recurse| -> nil
+        LifetimeEnd = |node, recurse| -> nil
+        Moves = |node, recurse| -> nil
+        Ends = |node, recurse| -> nil
+        Budget = |node, recurse| -> nil
+        Mechanism = do(node, recurse)
+            local binding = platform.bindings[node.binding]
+            if binding == nil then fail("the mechanism " .. node.binding .. " is not declared") end
+            local arguments = {}
+            for index, argument in ipairs node.arguments do arguments[index] = operand argument end
+            local call = ("%s(%s);"):format(binding.c_symbol, table.concat(arguments, ", "))
+            if node.result then return value_name(node.result, binding.result) .. " = " .. call end
+            return call
+        end
+    end
+    local statement = Instruction.pass "write an instruction as C" with ..Statements end
+
+    local go = do(edge)
+        if #edge.arguments == 0 then return "goto " .. labels[edge.target] .. ";" end
+        local temporaries, assignments = {}, {}
+        local target_parameters = parameters_of[edge.target]
+        local target_block = nil
+        for _, block in ipairs definition.blocks do
+            if block.id == edge.target then target_block = block end
+        end
+        for index, argument in ipairs edge.arguments do
+            temporaries[index] = ("%s t%d = %s;"):format(c_type(target_block.arguments[index].type), index, operand argument)
+            assignments[index] = ("%s = t%d;"):format(target_parameters[index], index)
+        end
+        return ("{ %s %s } goto %s;"):format(table.concat(temporaries, " "), table.concat(assignments, " "), labels[edge.target])
+    end
+    local Endings = define
+        Jump = |node, recurse| -> go node.edge
+        Branch = |node, recurse| -> ("if (%s) %s else %s"):format(operand node.condition, go node.when_true, go node.when_false)
+        Return = do(node, recurse)
+            if node.value == nil or node.value.type == types.Unit then return "return;" end
+            return "return " .. operand node.value .. ";"
+        end
+        Trap = do(node, recurse)
+            local message = node.message
+            if data.Operand.is(message, data.Constant) and data.NativeConstant.is(message.bits, data.StaticBytes) then
+                local bytes = message.bits.bytes
+                local escaped = bytes:gsub('[%c"\\]', character -> ("\\%03o"):format(character:byte()))
+                return ('nua_fatal_trap((uint8_t *)"%s", %d); __builtin_unreachable();'):format(escaped, #bytes)
+            end
+            return "__builtin_trap();"
+        end
+    end
+    local ending = Terminator.pass "write a terminator as C" with ..Endings end
+
+    local body = {}
+    for _, block in ipairs definition.blocks do
+        body[#body + 1] = labels[block.id] .. ":;"
+        for _, instruction in ipairs block.instructions do
+            local text = statement instruction
+            if text then body[#body + 1] = "    " .. text end
+        end
+        body[#body + 1] = "    " .. ending block.terminator
+    end
+    local signature = definition.signature
+    local parameters = {}
+    for index, type in ipairs signature.parameters do parameters[index] = ("%s p%d"):format(c_type type, index) end
+    local exported = program.exported[definition.id]
+    local header = ("%s%s %s(%s)"):format(exported and "" or "static ", c_type signature.result, c_name, #parameters > 0 and table.concat(parameters, ", ") or "void")
+    local text = header .. " {\n" .. table.concat(declarations, "\n") .. (#declarations > 0 and "\n" or "") .. table.concat(body, "\n") .. "\n}\n"
+    return text, header .. ";"
+end
+
+-- the whole program: exported definitions under their C names, the others named after their
+-- word; every prototype first, so definitions may call one another in any order
+local emit = do(program)
+    local parts = { "#include \"nua_platform.h\"\n#include <stdint.h>\n#include <stdbool.h>\n#include <math.h>\n" }
+    local names, exported = {}, {}
+    for _, export in ipairs program.exports do
+        names[export.definition] = export.name
+        exported[export.definition] = true
+    end
+    local ordered = graph.definitions_in_order program
+    local count = 0
+    for _, definition in ipairs ordered do
+        if names[definition.id] == nil then
+            count += 1
+            local info = program.words[definition.word]
+            local word_name = info and info.name:gsub("[^%w_]", "_") or "definition"
+            names[definition.id] = ("%s_%d"):format(word_name, count)
+        end
+    end
+    local view = { ..program, .exported }
+    local bodies, prototypes, exported_prototypes = {}, {}, {}
+    for _, definition in ipairs ordered do
+        local text, prototype = emit_definition(definition, names[definition.id], view, names)
+        bodies[#bodies + 1] = text
+        prototypes[#prototypes + 1] = prototype
+        if exported[definition.id] then exported_prototypes[#exported_prototypes + 1] = prototype end
+    end
+    local declarations = record_declarations program
+    if #declarations > 0 then parts[#parts + 1] = table.concat(declarations, "\n") .. "\n" end
+    parts[#parts + 1] = table.concat(prototypes, "\n") .. "\n"
+    -- a host declaring the exports needs the records they use first
+    local interface = {}
+    for _, declaration in ipairs declarations do interface[#interface + 1] = declaration end
+    for _, prototype in ipairs exported_prototypes do interface[#interface + 1] = prototype end
+    exported_prototypes = interface
+    for _, text in ipairs bodies do parts[#parts + 1] = text end
+    return table.concat(parts, "\n"), exported_prototypes
+end
+
+return define
+    .emit
+    .c_type
+    .constant_text
+end

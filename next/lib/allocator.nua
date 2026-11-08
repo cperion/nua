@@ -1,0 +1,73 @@
+-- The storage allocator (docs/design/buffers.md §3.2), in Nua over the platform's pages.
+--
+-- Size classes run from 16 bytes to 64 KiB in powers of two. Each class has a free list whose
+-- head lives in the storage context, the per-thread region the platform supplies; a free block
+-- holds the next one in its first word. A class with an empty list carves from the current
+-- 1 MiB chunk of mapped pages. Larger allocations map and unmap their own pages. There is no
+-- header per block: `release` is told the size, as a buffer always knows its capacity.
+--
+-- Context layout (pointer-sized slots): 0..12 the heads of the classes, 13 the chunk cursor,
+-- 14 the chunk limit.
+
+local largest = 65536
+local chunk_bytes = 1048576
+local cursor_slot = 13
+local limit_slot = 14
+
+local slots = do(): Ptr (Ptr U8) = Ptr(Ptr U8)(platform.storage_context())
+
+-- the smallest class whose blocks hold `bytes`
+local class_of = do(bytes: U64): U64
+    local class: U64 = 0
+    local size: U64 = 16
+    while size < bytes do
+        size = size + size
+        class = class + 1
+    end
+    return class
+end
+
+local class_bytes = do(class: U64): U64
+    local smallest: U64 = 16
+    return smallest << class
+end
+
+local pages_of = do(bytes: U64): U64 = (bytes + 4095) / 4096 * 4096
+
+local allocate = do(bytes: U64): Ptr U8
+    if bytes > largest then return platform.map_pages(pages_of bytes) end
+    local class = class_of bytes
+    local heads = slots()
+    local head = heads[class]
+    if head ~= 0 then
+        heads[class] = Ptr(Ptr U8)(head)[0]
+        return head
+    end
+    local cursor = heads[cursor_slot]
+    local limit = heads[limit_slot]
+    local size = class_bytes class
+    if cursor == 0 or U64(limit) - U64(cursor) < size then
+        cursor = platform.map_pages(chunk_bytes)
+        heads[limit_slot] = cursor + chunk_bytes
+    end
+    heads[cursor_slot] = cursor + size
+    return cursor
+end
+
+local release = do(pointer: Ptr U8, bytes: U64): Unit
+    if bytes > largest then
+        platform.unmap_pages(pointer, pages_of bytes)
+        return
+    end
+    local heads = slots()
+    local class = class_of bytes
+    Ptr(Ptr U8)(pointer)[0] = heads[class]
+    heads[class] = pointer
+end
+
+return {
+    allocate = allocate,
+    release = release,
+    class_of = class_of,
+    class_bytes = class_bytes,
+}

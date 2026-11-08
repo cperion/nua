@@ -1,0 +1,90 @@
+local ffi = require "ffi"
+local native = require "tests.support.native"
+
+local library, text = nil, nil
+local build = do()
+    if library then return library end
+    library, text = native("allocator", [[
+local allocator = import "allocator"
+
+local take = do(bytes: U64): Ptr U8 = allocator.allocate bytes
+export take
+local give = do(pointer: Ptr U8, bytes: U64): Unit
+    allocator.release(pointer, bytes)
+end
+export give
+local mapped = do(): U64 = platform.ledger_mapped_bytes()
+export mapped
+local class_of = do(bytes: U64): U64 = allocator.class_of bytes
+export class_of
+
+-- allocate, write and release many times: a block is reused, the mapping stays bounded
+local churn = do(rounds: U64, bytes: U64): U64
+    local i: U64 = 0
+    while i < rounds do
+        local block = allocator.allocate bytes
+        block[0] = U8(i)
+        block[bytes - 1] = U8(i)
+        allocator.release(block, bytes)
+        i = i + 1
+    end
+    return platform.ledger_mapped_bytes()
+end
+export churn
+
+-- a large allocation maps its own pages and returns them
+local large = do(bytes: U64): Bool
+    local before = platform.ledger_mapped_bytes()
+    local block = allocator.allocate bytes
+    block[bytes - 1] = 7
+    local during = platform.ledger_mapped_bytes()
+    allocator.release(block, bytes)
+    local after = platform.ledger_mapped_bytes()
+    return during - before >= bytes and after == before
+end
+export large
+]])
+    return library
+end
+
+test "size classes are powers of two from 16 bytes":
+    local allocator = build()
+    assert(allocator.class_of(1) == 0 and allocator.class_of(16) == 0 and allocator.class_of(17) == 1)
+    assert(allocator.class_of(4096) == 8 and allocator.class_of(65536) == 12)
+end
+
+test "a released block is the next allocation of its class, across calls":
+    local allocator = build()
+    local first = allocator.take(24)
+    allocator.give(first, 24)
+    local second = allocator.take(24)
+    assert(second == first, "the free list of the class gave the block back")
+    local third = allocator.take(24)
+    assert(third ~= first, "a live block is not handed out twice")
+    allocator.give(second, 24)
+    allocator.give(third, 24)
+end
+
+test "blocks of one class do not overlap":
+    local allocator = build()
+    local blocks = {}
+    for index = 1, 100 do blocks[index] = allocator.take(48) end
+    local addresses = {}
+    for index, block in ipairs blocks do addresses[index] = tonumber(ffi.cast("uintptr_t", block)) end
+    table.sort(addresses)
+    for index = 2, #addresses do assert(addresses[index] - addresses[index - 1] >= 64, "48 bytes take a 64-byte block") end
+    for _, block in ipairs blocks do allocator.give(block, 48) end
+end
+
+test "churn reuses one block: the platform maps nothing more":
+    local allocator = build()
+    local before = allocator.mapped()
+    local after = allocator.churn(100000, 200)
+    assert(after - before <= 1048576, ("mapped %d more bytes"):format(tonumber(after - before)))
+end
+
+test "large allocations map and unmap their own pages":
+    local allocator = build()
+    assert(allocator.large(200000) == true)
+    assert(allocator.large(65537) == true)
+end

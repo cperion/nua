@@ -1,0 +1,1287 @@
+-- Evaluation (compiler activities §5.2, §6): the vocabulary hosted bodies call. One handler set
+-- serves known and unknown values: a known computation folds, an unknown one becomes residual
+-- code, in source order, and a known result never erases an effect that must still execute.
+--
+-- `evaluating(compilation)` makes the vocabulary once per compilation. What varies within it
+-- is the path, an argument of every verb: a mutable handle holding the writer and block code
+-- goes to, the flow facts, the invocation, the innermost loop and the source line. A join
+-- replaces a path's state; a branch arm or loop round gets a path of its own.
+--
+-- Control (§6): a dynamic branch builds each arm as a child construction and joins the arms that
+-- continue. A loop runs rounds at compile time while each round stays entirely known (syntax
+-- §6.2: no residual statement, every place it writes still known); the first round that is not
+-- is rolled back and the loop becomes residual from there, its header generalizing exactly the
+-- carried places whose contents disagree on a continuing edge, until the header holds.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+-- the markers a hosted body returns; the path's state, not the marker, carries the outcome
+local FELL, STOPPED, RETURNED, BROKE, CONTINUED = { "fell" }, { "stopped" }, { "returned" }, { "broke" }, { "continued" }
+
+local evaluating = do(compilation)
+    local supply = compilation.supply
+    local fresh = supply.fresh
+    local tracking = facts.tracking { .supply, borrows = compilation.borrows }
+
+    local fail = do(path, message)
+        error(("%s:%s: %s"):format(path.source or "?", tostring(path.line or "?"), message), 0)
+    end
+    local site = path -> data.Site { id = fresh identity.InstructionId, origin = compilation.origin(path.source, path.line) }
+    local origin_of = path -> compilation.origin(path.source, path.line)
+
+    --------------------------------------------------------------------------------------------
+    -- values
+
+    local constant_of = do(value)
+        if is_native value and NativeValue.is(value, data.Bits) and Operand.is(value.operand, data.Constant) then return value.operand end
+        return nil
+    end
+    local bits = |type, operand| -> data.Bits { .type, .operand }
+    local known = constant -> bits(constant.type, constant)
+
+    -- a host value met by a native type (syntax §7.2): numbers range-checked, booleans as Bool,
+    -- a table of fields as a record
+    local construct_record, with_leaf
+    local from_host = do(path, type, value, what)
+        if types.NativeType.is(type, types.RecordType) and not is_native value and lua_type value == "table" then
+            return construct_record(path, type, value)
+        end
+        if is_native value and NativeValue.is(value, data.Reference) and not types.NativeType.is(type, types.ReferenceType) then
+            value = compilation.deref(path, value)
+        end
+        if is_native value then
+            if value.type ~= type then fail(path, ("%s is %s, not %s"):format(what, types.describe value.type, types.describe type)) end
+            return value
+        end
+        if rules.is_integer type then
+            local is_number = lua_type(value) == "number" and value == math.floor value
+            local is_cdata = lua_type(value) == "cdata" and (ffi.istype("int64_t", value) or ffi.istype("uint64_t", value))
+            if not is_number and not is_cdata then fail(path, ("%s expects %s, got %s"):format(what, types.describe type, tostring value)) end
+            local constant = rules.integer(type, is_number and (value < 0 and ffi.cast("int64_t", value) or ffi.cast("uint64_t", value)) or value)
+            local back = rules.integer_value constant
+            local same = is_number and tonumber back == value or back == value
+            if not same then fail(path, ("%s does not fit %s"):format(tostring value, types.describe type)) end
+            return known constant
+        end
+        if rules.is_float type then
+            if lua_type(value) ~= "number" then fail(path, ("%s expects %s, got %s"):format(what, types.describe type, tostring value)) end
+            return known(rules.float(type, value))
+        end
+        if rules.is_boolean type then
+            if lua_type(value) ~= "boolean" then fail(path, ("%s expects Bool, got %s"):format(what, tostring value)) end
+            return known(rules.boolean value)
+        end
+        if type == types.Unit and value == nil then return known(data.Constant { type = types.Unit, bits = data.UnitBits {} }) end
+        if rules.is_pointer type and value == 0 then return known(data.Constant { .type, bits = data.IntegerBits { bits = 0ULL } }) end
+        fail(path, ("%s expects %s, got %s"):format(what, types.describe type, tostring value))
+    end
+
+    local truth = do(path, value)
+        if not is_native value then return nil, value ~= nil and value ~= false end
+        if NativeValue.is(value, data.Reference) then value = compilation.deref(path, value) end
+        if value.type ~= types.Bool then fail(path, "a condition must be Bool, got " .. types.describe value.type) end
+        local constant = constant_of value
+        if constant then return nil, constant.bits.value end
+        return value.operand
+    end
+
+    local emit_compute = do(path, opcode, type, operands)
+        local result = fresh identity.ValueId
+        path.writer.append(path.block, data.Compute { site = site path, .result, .type, .opcode, arguments = operands })
+        return bits(type, data.Result { value = result, .type })
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- records: a record value is an Aggregate of its parts, packed only where a whole value must
+    -- exist (a native call, a return, a record-typed block parameter); a packed value's fields
+    -- are read by Extract
+
+    local is_aggregate = value -> is_native value and NativeValue.is(value, data.Aggregate)
+    local is_buffer = native_type -> types.NativeType.is(native_type, types.BufferType)
+    -- records, and buffers (whose header is a record of its data, length and capacity)
+    local is_record = native_type -> types.NativeType.is(native_type, types.RecordType) or is_buffer native_type
+    local header_fields = setmetatable({}, { __mode = "k" })
+    local fields_of = do(native_type)
+        if not is_buffer native_type then return native_type.fields end
+        local found = header_fields[native_type]
+        if found == nil then
+            found = {
+                { name = "data", type = types.pointer native_type.element },
+                { name = "length", type = types.U64 },
+                { name = "capacity", type = types.U64 },
+            }
+            if native_type.pinned then found[4] = { name = "limit", type = types.U64 } end
+            header_fields[native_type] = found
+        end
+        return found
+    end
+    local field_of = do(record, name)
+        for _, field in ipairs(fields_of record) do
+            if field.name == name then return field end
+        end
+        return nil
+    end
+
+    -- a value of `native_type` held by `operand`: a record's parts are read from it on demand
+    local value_of_operand = do(native_type, operand)
+        if is_record native_type then return data.Aggregate { type = native_type, packed = operand, parts = {} } end
+        return bits(native_type, operand)
+    end
+
+    local part = do(path, value, name)
+        local field = field_of(value.type, name)
+        if field == nil then fail(path, ("%s has no field '%s'"):format(types.describe value.type, name)) end
+        local found = value.parts[name]
+        if found then return found end
+        if value.packed == nil then fail(path, ("the field '%s' of %s has no value"):format(name, types.describe value.type)) end
+        local result = fresh identity.ValueId
+        path.writer.append(path.block, data.Extract { site = site path, .result, type = field.type, aggregate = value.packed, path = { data.FieldComponent { .name } } })
+        return value_of_operand(field.type, data.Result { value = result, type = field.type })
+    end
+
+    -- every part present: a packed value's fields extracted
+    local explode = do(path, value)
+        local parts = {}
+        for _, field in ipairs(fields_of value.type) do parts[field.name] = part(path, value, field.name) end
+        return data.Aggregate { type = value.type, packed = nil, .parts }
+    end
+
+    -- the operand holding a whole value: a record's parts packed (or its packed operand)
+    local materialize
+    materialize = do(path, value)
+        if not is_aggregate value then return value.operand end
+        if value.packed and next(value.parts) == nil then return value.packed end
+        local components = {}
+        for index, field in ipairs(fields_of value.type) do components[index] = materialize(path, part(path, value, field.name)) end
+        local result = fresh identity.ValueId
+        path.writer.append(path.block, data.Pack { site = site path, .result, type = value.type, .components })
+        return data.Result { value = result, type = value.type }
+    end
+    compilation.materialize = materialize
+    compilation.value_of_operand = value_of_operand
+
+    local zero_value
+    zero_value = do(native_type)
+        if is_record native_type then
+            local parts = {}
+            for _, field in ipairs(fields_of native_type) do parts[field.name] = zero_value(field.type) end
+            return data.Aggregate { type = native_type, packed = nil, .parts }
+        end
+        if rules.is_pointer native_type then return known(data.Constant { type = native_type, bits = data.IntegerBits { bits = 0ULL } }) end
+        if rules.is_integer native_type then return known(rules.integer(native_type, 0)) end
+        if rules.is_float native_type then return known(rules.float(native_type, 0)) end
+        if rules.is_boolean native_type then return known(rules.boolean false) end
+        error(("a %s field has no zero value; give it one"):format(types.describe native_type), 0)
+    end
+
+    -- `Record { … }`: named entries, or positional ones in field order; omitted fields zeroed
+    local construct = do(path, record, entries)
+        if lua_type entries ~= "table" or is_native entries then fail(path, types.describe record .. " is built from a table of its fields") end
+        for key in pairs entries do
+            if lua_type key == "string" and field_of(record, key) == nil then fail(path, ("%s has no field '%s'"):format(types.describe record, key)) end
+        end
+        local parts = {}
+        for index, field in ipairs record.fields do
+            local given = entries[field.name]
+            if given == nil then given = entries[index] end
+            if given == nil then
+                parts[field.name] = zero_value(field.type)
+            else
+                parts[field.name] = from_host(path, field.type, given, ("the field '%s' of %s"):format(field.name, types.describe record))
+            end
+        end
+        return data.Aggregate { type = record, packed = nil, .parts }
+    end
+    construct_record = construct
+
+    --------------------------------------------------------------------------------------------
+    -- paths
+
+    local child_path = do(path, writer, block, flow)
+        return {
+            .writer, .block, .flow, invocation = path.invocation, loop = path.loop,
+            depth = path.depth + 1, guarded = path.guarded or 0, source = path.source, line = path.line, dead = false,
+        }
+    end
+
+    -- a place of the current invocation, declared on the writer and remembered by the compilation
+    local new_place = do(path, name, type)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            .type
+            root = data.LocalRoot { invocation = path.invocation.id, local_index = #path.invocation.places + 1 }
+            path = {}
+            lifetime = path.invocation.lifetime
+            origin = origin_of path
+        end
+        path.invocation.places[#path.invocation.places + 1] = place.id
+        compilation.places[place.id] = place
+        path.writer.declare place
+        return place
+    end
+
+    -- join the states that continue into one; each is { block, flow, value }. Values merge
+    -- field by field: an equal leaf keeps its value, a differing scalar leaf becomes a block
+    -- parameter, and a record that is not exploded on every edge is packed on each edge into
+    -- one record parameter.
+    local join = do(path, states, value_type)
+        local live = {}
+        for _, state in ipairs states do live[#live + 1] = state end
+        if #live == 0 then
+            path.dead = true
+            return nil
+        end
+        if #live == 1 then
+            path.block, path.flow, path.dead = live[1].block, live[1].flow, false
+            return live[1].value
+        end
+        local flows = {}
+        for index, state in ipairs live do flows[index] = state.flow end
+        local decision = tracking.agree flows
+        local target = path.writer.block "join"
+        local edge_arguments = {}
+        for index in ipairs live do edge_arguments[index] = {} end
+        -- each incoming state as a path, to emit what its edge needs (packing) in its block
+        local edge_paths = {}
+        for index, state in ipairs live do
+            edge_paths[index] = { writer = path.writer, block = state.block, flow = state.flow, source = path.source, line = path.line, invocation = path.invocation, depth = path.depth, guarded = path.guarded, dead = false }
+        end
+        local parameter = do(native_type, operands)
+            local argument = path.writer.add_parameter(target, native_type)
+            for index, operand in ipairs operands do edge_arguments[index][#edge_arguments[index] + 1] = operand end
+            return argument
+        end
+        local merge
+        merge = do(native_type, values)
+            local all_same = true
+            for position = 2, #values do
+                if not facts.same_value(values[1], values[position]) then all_same = false end
+            end
+            if all_same then return values[1] end
+            if is_record native_type then
+                local exploded = true
+                for _, value in ipairs values do
+                    if value.packed and next(value.parts) == nil then exploded = false end
+                end
+                if exploded then
+                    local parts = {}
+                    for _, field in ipairs(fields_of native_type) do
+                        local field_values = {}
+                        for index, value in ipairs values do field_values[index] = part(edge_paths[index], value, field.name) end
+                        parts[field.name] = merge(field.type, field_values)
+                    end
+                    return data.Aggregate { type = native_type, packed = nil, .parts }
+                end
+                local operands = {}
+                for index, value in ipairs values do operands[index] = materialize(edge_paths[index], value) end
+                return value_of_operand(native_type, parameter(native_type, operands))
+            end
+            local operands = {}
+            for index, value in ipairs values do operands[index] = value.operand end
+            return bits(native_type, parameter(native_type, operands))
+        end
+        local flow = decision.flow
+        -- an owner moved on some edges only is released on the others before they join (§9.2)
+        for _, place in ipairs decision.differing do
+            local moved_somewhere, moved_at = false, nil
+            for _, incoming in ipairs flows do
+                local contents = incoming.contents[place]
+                if contents and Contents.is(contents, data.Moved) then moved_somewhere, moved_at = true, contents.at end
+            end
+            if moved_somewhere and types.owns(compilation.places[place].type) then
+                for index, edge_path in ipairs edge_paths do
+                    local contents = edge_path.flow.contents[place]
+                    if contents and Contents.is(contents, data.Tracked) then compilation.release_place(edge_path, place) end
+                end
+                flow.contents[place] = data.Moved { at = moved_at }
+            end
+        end
+        for _, place in ipairs decision.differing do
+            local values, everywhere = {}, true
+            for index, incoming in ipairs flows do
+                local contents = incoming.contents[place]
+                if contents == nil or not Contents.is(contents, data.Tracked) then everywhere = false else values[index] = contents.value end
+            end
+            if everywhere then flow.contents[place] = data.Tracked { value = merge(compilation.places[place].type, values) } end
+        end
+        local joined_value = nil
+        if value_type then
+            local values = {}
+            for index, state in ipairs live do values[index] = state.value end
+            joined_value = merge(value_type, values)
+        end
+        for index, edge_path in ipairs edge_paths do
+            path.writer.terminate(edge_path.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, .target, arguments = edge_arguments[index] } })
+        end
+        path.block, path.flow, path.dead = target, flow, false
+        return joined_value
+    end
+
+    -- build one arm of a dynamic branch: a child construction from the path's facts
+    local build_arm = do(path, label, run)
+        local state = nil
+        local outcome = graph.building(nil, supply, do(writer)
+            local block = writer.block(label)
+            local arm = child_path(path, writer, block, facts.fork path.flow)
+            local value = run arm
+            state = { block = arm.block, flow = arm.flow, .value, dead = arm.dead }
+            return "adopt"
+        end)
+        local fragment = outcome { built = f -> f, discarded = || -> nil }
+        local entry = path.writer.adopt fragment
+        return entry, state
+    end
+
+    local E = {}
+
+    -- a branch on an operand: both arms built and joined; `value_type` when the arms yield values
+    local residual_branch = do(path, condition, run_true, run_false, wants_value)
+        local true_entry, true_state = build_arm(path, "then", run_true)
+        local false_entry, false_state = build_arm(path, "else", run_false)
+        local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
+        path.writer.terminate(path.block, data.Branch { origin = origin_of path, .condition, when_true = edge true_entry, when_false = edge false_entry })
+        local states = {}
+        for _, state in ipairs { true_state, false_state } do
+            if not state.dead then states[#states + 1] = state end
+        end
+        local value = join(path, states, wants_value and states[1] and states[1].value.type or nil)
+        -- an arm that left (returned, broke) makes what follows depend on the condition
+        if #states == 1 then path.guarded = (path.guarded or 0) + 1 end
+        return value
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- bindings
+
+    local raw_place, load
+    local Cell = {}
+    Cell.__index = Cell
+    local is_cell = value -> getmetatable value == Cell
+
+    local place_cell = |place, name| -> setmetatable({ kind = "place", .place, .name }, Cell)
+    local host_cell = |path, name, value| -> setmetatable({ kind = "host", .name, .value, depth = path.depth }, Cell)
+
+    E.bind = do(path, name, annotation, value)
+        if annotation ~= nil and not check(types.NativeType, annotation) then
+            fail(path, ("the local '%s' is annotated with %s, not a native type"):format(name, tostring annotation))
+        end
+        if annotation == nil and not is_native value then
+            if value == nil then fail(path, ("the local '%s' needs a type or a value"):format(name)) end
+            return host_cell(path, name, value)
+        end
+        local type = annotation or value.type
+        local place = new_place(path, name, type)
+        if value ~= nil then
+            path.flow.contents[place.id] = data.Tracked { value = from_host(path, type, value, "the value of '" .. name .. "'") }
+        else
+            path.flow.contents[place.id] = data.Uninitialized {}
+        end
+        return place_cell(place.id, name)
+    end
+
+    E.argument = |path, index| -> path.invocation.arguments[index]
+
+    -- references: `Ref x` is a held borrow of x's place; reading through it reads that place's
+    -- current contents, writing writes them (buffers §2.3)
+    local is_reference = value -> is_native value and NativeValue.is(value, data.Reference)
+    local reference_to = do(path, cell)
+        if not (is_cell cell and cell.kind == "place") then fail(path, "Ref takes a local of the body") end
+        local place_type = compilation.places[cell.place].type
+        local contents = path.flow.contents[cell.place]
+        if types.NativeType.is(place_type, types.ReferenceType) and contents and Contents.is(contents, data.Tracked) then return contents.value end
+        local lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = cell.place, steps = {} }, true, lifetime, origin_of path)
+        return data.Reference { type = types.reference place_type, borrow = info.id }
+    end
+    local target_of = do(path, reference)
+        local use = tracking.use(path.flow, reference.borrow)
+        return use with
+            derive = borrow_path -> borrow_path.root
+            cached = pointer -> compilation.borrows[reference.borrow].form.path.root
+            fixed = pointer -> fail(path, "a stored reference is not available yet")
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+        end
+    end
+    -- the value a reference reaches (a reference to a reference reaches through both)
+    local deref
+    deref = do(path, value)
+        if not is_reference value then return value end
+        local contents = path.flow.contents[target_of(path, value)]
+        if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
+        return deref(path, contents.value)
+    end
+    E.reference_to = reference_to
+    compilation.deref = deref
+
+    local peek
+    E.get = do(path, cell)
+        local value = peek(path, cell)
+        -- using an owner as a value moves it (syntax §9.2)
+        if is_cell cell and cell.kind == "place" and types.owns(compilation.places[cell.place].type) then
+            tracking.move_owner(path.flow, cell.place, origin_of path)
+        end
+        return value
+    end
+
+    peek = do(path, cell)
+        if not is_cell cell then return cell end
+        if cell.kind == "host" then return cell.value end
+        if cell.kind == "field" then
+            local whole = deref(path, peek(path, cell.base))
+            if not is_aggregate whole then fail(path, ("'.%s' of a value that is not a record"):format(cell.name)) end
+            return part(path, whole, cell.name)
+        end
+        if cell.kind == "raw" then return load(path, cell.place) end
+        if cell.kind == "element" then return E.method(path, cell.base, "get", { cell.key }, false) end
+        local contents = path.flow.contents[cell.place]
+        if contents == nil or Contents.is(contents, data.Uninitialized) then fail(path, ("'%s' is read before it is assigned"):format(cell.name)) end
+        if Contents.is(contents, data.Moved) then fail(path, ("'%s' was moved"):format(cell.name)) end
+        return contents.value
+    end
+
+    E.set = do(path, cell, value)
+        if not is_cell cell then fail(path, "this is not something a typed body can assign") end
+        if cell.kind == "element" then
+            E.method(path, cell.base, "set", { cell.key, value }, false)
+            return
+        end
+        if cell.kind == "field" then
+            local whole = deref(path, peek(path, cell.base))
+            if not is_aggregate whole then fail(path, ("'.%s' of a value that is not a record"):format(cell.name)) end
+            local field = field_of(whole.type, cell.name)
+            if field == nil then fail(path, ("%s has no field '%s'"):format(types.describe whole.type, cell.name)) end
+            local exploded = explode(path, whole)
+            local parts = {}
+            for name, existing in pairs exploded.parts do parts[name] = existing end
+            parts[cell.name] = from_host(path, field.type, value, ("the field '%s'"):format(cell.name))
+            E.set(path, cell.base, data.Aggregate { type = whole.type, packed = nil, .parts })
+            return
+        end
+        if cell.kind == "raw" then
+            local stored = from_host(path, cell.place.type, value, "the stored value")
+            path.writer.append(path.block, data.Store { site = site path, place = cell.place.id, value = materialize(path, stored) })
+            return
+        end
+        if cell.kind == "host" then
+            if path.depth > cell.depth and not is_native value and value ~= cell.value then
+                fail(path, ("the host binding '%s' cannot be rebound under dynamic control"):format(cell.name))
+            end
+            if is_native value then fail(path, ("'%s' holds a host value and cannot take a native one"):format(cell.name)) end
+            cell.value = value
+            return
+        end
+        local type = compilation.places[cell.place].type
+        if types.NativeType.is(type, types.ReferenceType) and not is_reference value then
+            local current = path.flow.contents[cell.place]
+            local target = target_of(path, current.value)
+            local target_type = compilation.places[target].type
+            path.flow.contents[target] = data.Tracked { value = from_host(path, target_type, value, "the value written through '" .. cell.name .. "'") }
+            return
+        end
+        local converted = from_host(path, type, value, "the value assigned to '" .. cell.name .. "'")
+        -- replacing an owner ends the old one there (syntax §9.2)
+        if types.owns type then compilation.release_place(path, cell.place) end
+        path.flow.contents[cell.place] = data.Tracked { value = converted }
+    end
+
+    E.host_number = do(path, value)
+        if lua_type value == "number" then return value end
+        local constant = constant_of value
+        if constant and rules.is_integer constant.type then return tonumber(rules.integer_value constant) end
+        fail(path, "a generation-time for needs host numbers or known integers; use a typed for with a dynamic bound")
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- computation
+
+    local host_operations = define
+        add = |a, b| -> a + b
+        subtract = |a, b| -> a - b
+        multiply = |a, b| -> a * b
+        divide = |a, b| -> a / b
+        remainder = |a, b| -> a % b
+        equal = |a, b| -> a == b
+        not_equal = |a, b| -> a ~= b
+        less = |a, b| -> a < b
+        less_equal = |a, b| -> a <= b
+        greater = |a, b| -> a > b
+        greater_equal = |a, b| -> a >= b
+        concatenate = |a, b| -> a .. b
+        negate = a -> -a
+    end
+    host_operations["not"] = a -> not a
+
+    E.operate = do(path, operator, left, right)
+        if is_native left then left = deref(path, left) end
+        if is_native right then right = deref(path, right) end
+        local unary = right == nil and (operator == "negate" or operator == "not" or operator == "bit_not")
+        if not is_native left and (unary or not is_native right) then
+            local host = host_operations[operator]
+            if host == nil then fail(path, ("the operator %s needs a native operand"):format(operator)) end
+            return host(left, right)
+        end
+        if unary then
+            local opcode = operator == "not" and "bit_not" or operator
+            if operator == "not" and left.type ~= types.Bool then fail(path, "'not' needs a Bool, got " .. types.describe left.type) end
+            return E.compute(path, opcode, left.type, { left })
+        end
+        -- pointer arithmetic: a pointer and a count of elements, or the distance of two pointers
+        if is_native left and rules.is_pointer left.type then
+            if is_native right and rules.is_pointer right.type then
+                if operator == "subtract" then return E.compute(path, "pointer_difference", types.I64, { left, right }) end
+            elseif operator == "add" or operator == "subtract" then
+                local count = is_native right and right or from_host(path, types.I64, right, "the pointer offset")
+                if operator == "subtract" then count = E.compute(path, "negate", count.type, { count }) end
+                return E.compute(path, "pointer_offset", left.type, { left, count })
+            end
+        end
+        -- a shift's count keeps its own type; any other host operand takes its partner's type
+        local shift = operator == "shift_left" or operator == "shift_right"
+        local type = is_native left and left.type or right.type
+        if shift then
+            if not is_native left then fail(path, "a shift needs a native left operand") end
+            if not is_native right then right = from_host(path, types.U32, right, "the shift count") end
+        else
+            left = from_host(path, type, left, "the left operand")
+            right = from_host(path, type, right, "the right operand")
+        end
+        if operator == "greater" then return E.compute(path, "less", types.Bool, { right, left }) end
+        if operator == "greater_equal" then return E.compute(path, "less_equal", types.Bool, { right, left }) end
+        if operator == "shift_right" then operator = type.signed and "shift_right_signed" or "shift_right_unsigned" end
+        if operator == "concatenate" then fail(path, "'..' joins host strings; native text has its own words") end
+        local comparison = operator == "equal" or operator == "not_equal" or operator == "less" or operator == "less_equal"
+        return E.compute(path, operator, comparison and types.Bool or type, { left, right })
+    end
+
+    -- a native computation: folded when its operands are known, else residual
+    E.compute = do(path, opcode, type, operands_values)
+        local argument_types, operands = {}, {}
+        for index, value in ipairs operands_values do
+            argument_types[index] = value.type
+            operands[index] = value.operand
+        end
+        local reason = rules.check_types(opcode, type, argument_types)
+        if reason then fail(path, reason) end
+        local decision = rules.fold(opcode, type, operands)
+        return decision with
+            folded = constant_bits -> known(data.Constant { .type, bits = constant_bits })
+            not_foldable = || -> emit_compute(path, opcode, type, operands)
+            invalid = reason_text -> fail(path, reason_text)
+        end
+    end
+
+    -- `a and b`, `a or b`: control, not eager operations
+    E.both = do(path, left, right)
+        local operand, value = truth(path, left)
+        if operand == nil then
+            if not value then return left end
+            return right path
+        end
+        return E.choose(path, left, right, || -> known(rules.boolean false))
+    end
+    E.either = do(path, left, right)
+        local operand, value = truth(path, left)
+        if operand == nil then
+            if value then return left end
+            return right path
+        end
+        return E.choose(path, left, || -> known(rules.boolean true), right)
+    end
+
+    -- `c ? a : b`: only the selected arm runs when `c` is known
+    E.choose = do(path, condition, when_true, when_false)
+        local operand, value = truth(path, condition)
+        if operand == nil then
+            if value then return when_true path end
+            return when_false path
+        end
+        -- the arms meet at one native type: a host value takes the type of the native one
+        local value_type = nil
+        local typed = do(run)
+            return do(arm)
+                local result = run arm
+                if arm.dead then return nil end
+                if not is_native result then
+                    if value_type == nil then fail(arm, "a dynamic choice needs a native value in its first arm to type the other") end
+                    result = from_host(arm, value_type, result, "an arm of the choice")
+                end
+                value_type = value_type or result.type
+                if result.type ~= value_type then fail(arm, "the arms of a choice yield different types") end
+                return result
+            end
+        end
+        return residual_branch(path, operand, typed when_true, typed when_false, true)
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- statements of control
+
+    E.fall = path -> FELL
+    E.stop = path -> STOPPED
+
+    E.branch = do(path, condition, when_true, when_false)
+        local operand, value = truth(path, condition)
+        if operand == nil then
+            if value then when_true path else when_false path end
+            return
+        end
+        residual_branch(path, operand, when_true, when_false, nil)
+    end
+
+    E.return_value = do(path, value)
+        local invocation = path.invocation
+        local result_type = invocation.word.result
+        if result_type == types.Unit then
+            if value ~= nil and not (is_native value and value.type == types.Unit) then fail(path, invocation.word.name .. " yields Unit and returns no value") end
+            value = from_host(path, types.Unit, nil, "the result")
+        else
+            if value == nil then fail(path, invocation.word.name .. " must return " .. types.describe result_type) end
+            value = from_host(path, result_type, value, "the result of " .. invocation.word.name)
+        end
+        compilation.release_live(path, invocation.places, 1)
+        invocation.exits[#invocation.exits + 1] = { block = path.block, flow = path.flow, .value }
+        path.dead = true
+        return RETURNED
+    end
+
+    -- `return f args`: a tail re-entry of the invocation under dynamic control is the next round
+    -- of its loop; the first one met discards the attempt that found it (syntax §6.2)
+    E.return_tail = do(path, callee, arguments)
+        local invocation = path.invocation
+        local word, supplied = hosting.supplied_of callee
+        if word ~= nil and word == invocation.word then
+            local application = hosting.supply(hosting.application(word, supplied), arguments)
+            local dynamic_control = path.depth > invocation.entry_depth or (path.guarded or 0) > invocation.entry_guarded
+            if hosting.saturated application and (dynamic_control or invocation.loop_mode) then
+                if not invocation.loop_mode then error({ tail_reentry = invocation }, 0) end
+                -- the next arguments, all captured before any parameter is assigned
+                local values = {}
+                for index, requirement in ipairs word.requirements do
+                    local argument = application.supplied[index]
+                    values[index] = requirement.type and from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name)) or argument
+                end
+                for index in ipairs word.requirements do E.set(path, invocation.arguments[index], values[index]) end
+                local work = invocation.tail_loop
+                work.continues[#work.continues + 1] = { block = path.block, flow = path.flow }
+                path.dead = true
+                return CONTINUED
+            end
+        end
+        return E.return_value(path, E.apply(path, callee, arguments, false))
+    end
+
+    E.break_loop = do(path)
+        if path.loop == nil then fail(path, "break is not inside a loop") end
+        if path.invocation then compilation.release_live(path, path.invocation.places, (path.loop.places_mark or 0) + 1) end
+        path.loop.breaks[#path.loop.breaks + 1] = { block = path.block, flow = path.flow }
+        path.dead = true
+        return BROKE
+    end
+    E.next_loop = do(path)
+        if path.loop == nil then fail(path, "continue is not inside a loop") end
+        if path.invocation then compilation.release_live(path, path.invocation.places, (path.loop.places_mark or 0) + 1) end
+        path.loop.continues[#path.loop.continues + 1] = { block = path.block, flow = path.flow }
+        path.dead = true
+        return CONTINUED
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- loops
+
+    -- the leaves of carried state: a scalar part of a place, or a whole record where it is only
+    -- packed. A leaf is { place, fields, key }.
+    local leaf_value = do(value, fields)
+        for _, name in ipairs fields do
+            if not is_aggregate value then return nil end
+            value = value.parts[name]
+            if value == nil then return nil end
+        end
+        return value
+    end
+    with_leaf = do(value, fields, replacement)
+        if #fields == 0 then return replacement end
+        local parts = {}
+        for name, existing in pairs value.parts do parts[name] = existing end
+        local rest = {}
+        for position = 2, #fields do rest[#rest + 1] = fields[position] end
+        parts[fields[1]] = with_leaf(value.parts[fields[1]], rest, replacement)
+        return data.Aggregate { type = value.type, packed = nil, .parts }
+    end
+    local leaves_of
+    leaves_of = do(place, value, fields, out)
+        if is_aggregate value and next(value.parts) ~= nil then
+            for _, field in ipairs(fields_of value.type) do
+                local extended = {}
+                for index, name in ipairs fields do extended[index] = name end
+                extended[#extended + 1] = field.name
+                leaves_of(place, value.parts[field.name], extended, out)
+            end
+            return out
+        end
+        out[#out + 1] = { .place, .fields, type = value.type, key = place.serial .. "." .. table.concat(fields, ".") }
+        return out
+    end
+
+    -- one round from `path`'s state, built as a child construction: the condition, the body and
+    -- the latch. Answers the fragment and the round's outcome.
+    local run_round = do(path, header_types, assumed, condition, body, latch)
+        local round = nil
+        local outcome = graph.building(nil, supply, do(writer)
+            local header = writer.block("loop", header_types)
+            local flow = facts.fork path.flow
+            for index, leaf in ipairs assumed do
+                local current = flow.contents[leaf.place].value
+                local parameter_value = value_of_operand(header_types[index], writer.parameter(header, index))
+                flow.contents[leaf.place] = data.Tracked { value = with_leaf(current, leaf.fields, parameter_value) }
+            end
+            local work = { breaks = {}, continues = {}, nexts = {}, places_mark = path.invocation and #path.invocation.places or 0 }
+            local round_path = child_path(path, writer, header, flow)
+            round_path.loop = work
+            local entry_flow = facts.fork flow
+            local operand, value = truth(round_path, condition round_path)
+            local exits_at_false = nil
+            if operand ~= nil then
+                local body_entry, body_state = build_arm(round_path, "round", do(arm)
+                    body arm
+                    if not arm.dead then E.next_loop arm end
+                end)
+                local exit_entry, exit_state = build_arm(round_path, "leave", arm -> nil)
+                local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
+                writer.terminate(round_path.block, data.Branch { origin = origin_of round_path, condition = operand, when_true = edge body_entry, when_false = edge exit_entry })
+                exits_at_false = exit_state
+            elseif value then
+                body round_path
+                if not round_path.dead then E.next_loop round_path end
+            else
+                exits_at_false = { block = round_path.block, flow = round_path.flow }
+            end
+            -- the latch runs after the body falls through or continues; its fall is the next round
+            if latch and #work.continues > 0 then
+                local latch_path = child_path(round_path, writer, nil, nil)
+                latch_path.loop = work
+                join(latch_path, work.continues, nil)
+                work.continues = {}
+                if not latch_path.dead then
+                    latch latch_path
+                    if not latch_path.dead then work.nexts[#work.nexts + 1] = { block = latch_path.block, flow = latch_path.flow } end
+                end
+                for _, next_state in ipairs work.continues do work.nexts[#work.nexts + 1] = next_state end
+            else
+                for _, next_state in ipairs work.continues do work.nexts[#work.nexts + 1] = next_state end
+            end
+            local leaving = {}
+            if exits_at_false then leaving[#leaving + 1] = exits_at_false end
+            for _, state in ipairs work.breaks do leaving[#leaving + 1] = state end
+            round = { .header, .writer, nexts = work.nexts, .leaving, .entry_flow }
+            return "adopt"
+        end)
+        return outcome { built = f -> f, discarded = || -> nil }, round
+    end
+
+    -- is a round entirely known: no residual code, and every place it changed still known?
+    local known_round = do(fragment, round, start_flow)
+        if #fragment.order ~= 1 then return false end
+        local only = fragment.blocks[fragment.order[1]]
+        if #only.instructions > 0 or only.terminator ~= nil then return false end
+        local states = {}
+        for _, state in ipairs round.nexts do states[#states + 1] = state end
+        for _, state in ipairs round.leaving do states[#states + 1] = state end
+        if #states == 0 then return true, nil, false end
+        if #states ~= 1 then return false end
+        for place, contents in pairs states[1].flow.contents do
+            local before = start_flow.contents[place]
+            if not (before and facts.same_contents(before, contents)) then
+                if Contents.is(contents, data.Tracked) and not constant_of contents.value then return false end
+            end
+        end
+        return true, states[1], #round.nexts == 1
+    end
+
+    local loop = do(path, condition, body, latch)
+        local invocation = path.invocation
+        -- rounds at compile time, while each stays entirely known
+        while true do
+            local exits_before = #invocation.exits
+            local fragment, round = run_round(path, {}, {}, condition, body, latch)
+            local accepted, state, continues = known_round(fragment, round, path.flow)
+            -- exits a known round registered stand at the loop's own block
+            for position = exits_before + 1, #invocation.exits do
+                if accepted then invocation.exits[position].block = path.block end
+            end
+            if not accepted then
+                for position = #invocation.exits, exits_before + 1, -1 do invocation.exits[position] = nil end
+                break
+            end
+            -- a known round that returned ends the loop and the path
+            if state == nil then
+                path.dead = true
+                return
+            end
+            path.flow = state.flow
+            if not continues then return end
+        end
+        -- residual from here: generalize the carried leaves that disagree on a continuing edge,
+        -- until the header holds
+        local places_carried = {}
+        for place, contents in pairs path.flow.contents do
+            if Contents.is(contents, data.Tracked) and (NativeValue.is(contents.value, data.Bits) or is_aggregate contents.value) then
+                places_carried[#places_carried + 1] = place
+            end
+        end
+        table.sort(places_carried, |a, b| -> a.serial < b.serial)
+        local weakened, whole = {}, {}
+        while true do
+            -- the leaves as the entry state has them; a place generalized whole is one leaf
+            local assumed, header_types = {}, {}
+            for _, place in ipairs places_carried do
+                local value = path.flow.contents[place].value
+                local leaves = whole[place] and { { .place, fields = {}, type = value.type, key = place.serial .. "." } } or leaves_of(place, value, {}, {})
+                for _, leaf in ipairs leaves do
+                    if weakened[leaf.key] or whole[place] then
+                        assumed[#assumed + 1] = leaf
+                        header_types[#header_types + 1] = leaf.type
+                    end
+                end
+            end
+            local exits_before = #invocation.exits
+            local fragment, round = run_round(path, header_types, assumed, condition, body, latch)
+            local header_flow = round.entry_flow
+            local grew = false
+            for _, next_state in ipairs round.nexts do
+                for _, place in ipairs places_carried do
+                    if not whole[place] then
+                        local header_value = header_flow.contents[place].value
+                        local next_contents = next_state.flow.contents[place]
+                        local next_value = next_contents and next_contents.value
+                        for _, leaf in ipairs(leaves_of(place, header_value, {}, {})) do
+                            if not weakened[leaf.key] then
+                                local now = next_value and leaf_value(next_value, leaf.fields)
+                                if now == nil then
+                                    whole[place] = true
+                                    grew = true
+                                elseif not facts.same_value(leaf_value(header_value, leaf.fields), now) then
+                                    weakened[leaf.key] = true
+                                    grew = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if not grew then
+                local entry = path.writer.adopt fragment
+                local arguments = {}
+                for _, leaf in ipairs assumed do arguments[#arguments + 1] = materialize(path, leaf_value(path.flow.contents[leaf.place].value, leaf.fields)) end
+                path.writer.terminate(path.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, .arguments } })
+                for _, next_state in ipairs round.nexts do
+                    local next_path = { writer = path.writer, block = next_state.block, flow = next_state.flow, source = path.source, line = path.line }
+                    local values = {}
+                    for _, leaf in ipairs assumed do values[#values + 1] = materialize(next_path, leaf_value(next_state.flow.contents[leaf.place].value, leaf.fields)) end
+                    path.writer.terminate(next_state.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = values } })
+                end
+                join(path, round.leaving, nil)
+                return
+            end
+            for position = #invocation.exits, exits_before + 1, -1 do invocation.exits[position] = nil end
+        end
+    end
+
+    E.loop = |path, condition, body| -> loop(path, condition, body, nil)
+
+    -- `for name: T = low, high, step do … end` (syntax §6.3): if low reaches high, loop with the
+    -- variable at low; after the body, leave at the last value, else step
+    E.count = do(path, name, type, low, high, step, body)
+        if not rules.is_integer type then fail(path, "a typed for counts with an integer type, not " .. types.describe type) end
+        local first = from_host(path, type, low, "the start of the for")
+        local last = from_host(path, type, high, "the limit of the for")
+        local by = step == nil and 1 or E.host_number(path, step)
+        if by == 0 then fail(path, "a for steps by a nonzero amount") end
+        local variable = E.bind(path, name, type, first)
+        local reaches = by > 0 and E.operate(path, "less_equal", first, last) or E.operate(path, "greater_equal", first, last)
+        E.branch(path, reaches, do(inside)
+            loop(inside, || -> true, round -> body(round, variable), do(latch)
+                local current = E.get(latch, variable)
+                local at_end
+                if by == 1 or by == -1 then
+                    at_end = E.operate(latch, "equal", current, last)
+                else
+                    -- the remaining distance, in the unsigned type, is less than the step
+                    local unsigned = types[("U%d"):format(type.bits)]
+                    local remaining = by > 0 and E.operate(latch, "subtract", E.compute(latch, "convert", unsigned, { last }), E.compute(latch, "convert", unsigned, { current }))
+                        or E.operate(latch, "subtract", E.compute(latch, "convert", unsigned, { current }), E.compute(latch, "convert", unsigned, { last }))
+                    at_end = E.operate(latch, "less", remaining, math.abs by)
+                end
+                E.branch(latch, at_end, E.break_loop, do(stepping)
+                    E.set(stepping, variable, E.operate(stepping, by > 0 and "add" or "subtract", E.get(stepping, variable), math.abs by))
+                end)
+            end)
+        end, inside -> nil)
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- application
+
+    -- a native call (compiler activities §6.3): the definition of the specification the
+    -- arguments give, requested from the compilation; known arguments key it, the others are
+    -- passed. `generalized[index]` forces an argument dynamic even when it is known.
+    local call_definition = do(path, word, arguments, generalized)
+        local specification, passed = {}, {}
+        for index, requirement in ipairs word.requirements do
+            local argument = arguments[index]
+            if requirement.type == nil then
+                specification[index] = { kind = "host", value = argument }
+            else
+                local value = from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
+                if is_reference value then fail(path, "a Ref across a native boundary is not available yet") end
+                if constant_of value and not (generalized and generalized[index]) then
+                    specification[index] = { kind = "native", .value }
+                else
+                    specification[index] = { kind = "dynamic", type = requirement.type }
+                    passed[#passed + 1] = materialize(path, value)
+                end
+            end
+        end
+        local definition = compilation.request(word, specification, "nua_boundary", path.source, path.line)
+        local result = nil
+        if word.result ~= types.Unit then result = fresh identity.ValueId end
+        path.writer.append(path.block, data.Invoke with
+            site = site path
+            .result
+            callee = data.DirectNua { .definition }
+            arguments = passed
+            boundary = fresh identity.BoundaryId
+        end)
+        if result == nil then return nil end
+        return value_of_operand(word.result, data.Result { value = result, type = word.result })
+    end
+
+    -- the invocation of `word` active on this path's chain, if any
+    local active_invocation = do(path, word)
+        local invocation = path.invocation
+        while invocation do
+            if invocation.word == word then return invocation end
+            invocation = invocation.parent
+        end
+        return nil
+    end
+
+    -- evaluate a saturated application in place (compiler activities §5.2): the callee's body
+    -- runs on the caller's block and facts; its returns join into the caller's continuation.
+    -- A re-entry under dynamic control (syntax §6.2, §6.5) generalizes the known arguments that
+    -- changed since the active invocation and becomes a native call; under known control it
+    -- keeps unfolding.
+    local invoke = do(path, word, arguments)
+        local active = active_invocation(path, word)
+        local dynamic_control = active and (path.depth > active.entry_depth or (path.guarded or 0) > active.entry_guarded)
+        if dynamic_control then
+            local generalized = {}
+            for index, requirement in ipairs word.requirements do
+                if requirement.type ~= nil then
+                    local now = from_host(path, requirement.type, arguments[index], ("the argument '%s' of %s"):format(requirement.name, word.name))
+                    local before = active.argument_values[index]
+                    local same = constant_of now and before and constant_of before and facts.same_operand(now.operand, before.operand)
+                    generalized[index] = not same
+                end
+            end
+            return call_definition(path, word, arguments, generalized)
+        end
+        local bind_arguments = do(invocation, callee)
+            for index, requirement in ipairs word.requirements do
+                local argument = arguments[index]
+                if requirement.type == nil then
+                    invocation.arguments[index] = host_cell(callee, requirement.name, argument)
+                else
+                    local value = from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
+                    invocation.argument_values[index] = value
+                    local place = new_place(callee, requirement.name, requirement.type)
+                    callee.flow.contents[place.id] = data.Tracked { .value }
+                    invocation.arguments[index] = place_cell(place.id, requirement.name)
+                end
+            end
+        end
+        local new_invocation = || -> {
+            id = fresh identity.InvocationId, .word, arguments = {}, argument_values = {}, exits = {}, places = {},
+            lifetime = fresh identity.LifetimeId, parent = path.invocation, entry_depth = path.depth,
+            entry_guarded = path.guarded or 0, loop_mode = false,
+        }
+        local run_body = do(invocation, callee)
+            word.body(E, callee)
+            if not callee.dead then
+                if word.result ~= types.Unit then fail(callee, word.name .. " can reach its end without returning " .. types.describe word.result) end
+                E.return_value(callee, nil)
+            end
+        end
+        if not word.tail_calls then
+            local invocation = new_invocation()
+            local callee = {
+                writer = path.writer, block = path.block, flow = path.flow, .invocation, loop = nil,
+                depth = path.depth, guarded = path.guarded or 0, source = word.source, line = word.line, dead = false,
+            }
+            bind_arguments(invocation, callee)
+            run_body(invocation, callee)
+            return join(path, invocation.exits, word.result)
+        end
+        -- a word with tail applications is built as a child construction: a tail re-entry under
+        -- dynamic control discards the first attempt, and the second runs the body as a loop over
+        -- the invocation's parameters (syntax §6.2)
+        local attempt = do(invocation)
+            local outcome = graph.building(nil, supply, do(writer)
+                local block = writer.block("call " .. word.name)
+                local callee = {
+                    .writer, .block, flow = facts.fork path.flow, .invocation, loop = nil,
+                    depth = path.depth, guarded = path.guarded or 0, source = word.source, line = word.line, dead = false,
+                }
+                bind_arguments(invocation, callee)
+                if invocation.loop_mode then
+                    loop(callee, || -> true, do(round)
+                        invocation.tail_loop = round.loop
+                        run_body(invocation, round)
+                    end, nil)
+                else
+                    run_body(invocation, callee)
+                end
+                return "adopt"
+            end)
+            return outcome { built = f -> f, discarded = || -> nil }
+        end
+        local invocation = new_invocation()
+        local done, fragment = pcall(attempt, invocation)
+        if not done then
+            if not (lua_type fragment == "table" and fragment.tail_reentry == invocation) then error(fragment, 0) end
+            invocation = new_invocation()
+            invocation.loop_mode = true
+            fragment = attempt invocation
+        end
+        -- a straight-line invocation is spliced into the caller's block; anything else is entered
+        if #fragment.order == 1 and fragment.blocks[fragment.order[1]].terminator == nil then
+            local only = fragment.blocks[fragment.order[1]]
+            for _, instruction in ipairs only.instructions do path.writer.append(path.block, instruction) end
+            for id, place in pairs fragment.places do path.writer.declare place end
+            for _, exit in ipairs invocation.exits do
+                if exit.block == only.id then exit.block = path.block end
+            end
+        else
+            local entry = path.writer.adopt fragment
+            path.writer.terminate(path.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = {} } })
+        end
+        return join(path, invocation.exits, word.result)
+    end
+    compilation.invoke = invoke
+
+    --------------------------------------------------------------------------------------------
+    -- releasing owners (syntax §9.2): a buffer through its library's release word, a record
+    -- through its owning fields; the place is moved, its borrows end
+
+    local release_value
+    release_value = do(path, value)
+        if is_aggregate value and is_buffer value.type then
+            local words = compilation.buffer_words(value.type.element)
+            local holder = new_place(path, "released", value.type)
+            path.flow.contents[holder.id] = data.Tracked { .value }
+            invoke(path, words.release, { reference_to(path, place_cell(holder.id, "released")) })
+            path.flow.contents[holder.id] = data.Moved { at = origin_of path }
+            return
+        end
+        if is_aggregate value and types.owns value.type then
+            for _, field in ipairs(fields_of value.type) do
+                if types.owns field.type then release_value(path, part(path, value, field.name)) end
+            end
+        end
+    end
+    local release_place = do(path, place)
+        local contents = path.flow.contents[place]
+        if not (contents and Contents.is(contents, data.Tracked)) then return end
+        path.flow.contents[place] = data.Moved { at = origin_of path }
+        tracking.ends(path.flow, data.Access { .place, path = {} }, "released", origin_of path)
+        release_value(path, contents.value)
+    end
+    -- release the live owners among `places`, from index `first`, newest first
+    local release_live = do(path, places, first)
+        for position = #places, first, -1 do
+            local place = places[position]
+            if types.owns(compilation.places[place].type) then release_place(path, place) end
+        end
+    end
+    compilation.release_place = release_place
+    compilation.release_live = release_live
+
+    -- the end of a block: its owners that are still live are released, newest first
+    E.scope_end = do(path, cells)
+        if path.dead then return end
+        for position = #cells, 1, -1 do
+            local cell = cells[position]
+            if is_cell cell and cell.kind == "place" and types.owns(compilation.places[cell.place].type) then release_place(path, cell.place) end
+        end
+    end
+
+    -- `trap "why"`: the path ends here, at run time, with the message
+    E.trap = do(path, message)
+        local constant = data.Constant { type = types.Str, bits = data.StaticBytes { bytes = tostring message } }
+        path.writer.terminate(path.block, data.Trap { origin = origin_of path, message = constant })
+        path.dead = true
+        return nil
+    end
+
+    -- `value:name(arguments)`: a method of the value's type, given a reference to the value
+    E.method = do(path, base, name, arguments, boundary)
+        local value = is_cell base and deref(path, peek(path, base)) or deref(path, base)
+        if not (is_aggregate value and is_buffer value.type) then fail(path, ("':%s' of %s is not available yet"):format(name, is_native value and types.describe value.type or tostring value)) end
+        local words = compilation.buffer_words(value.type.element)
+        local word = words[name]
+        if word == nil then fail(path, ("%s has no method '%s'"):format(types.describe value.type, name)) end
+        local receiver = is_cell base and reference_to(path, base) or base
+        if not is_reference receiver then fail(path, ("':%s' needs a local holding the %s"):format(name, types.describe value.type)) end
+        local supplied = { receiver }
+        for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
+        return E.apply(path, word, supplied, boundary)
+    end
+
+    E.length = do(path, base)
+        local value = is_cell base and deref(path, peek(path, base)) or deref(path, base)
+        if is_aggregate value and is_buffer value.type then return part(path, value, "length") end
+        if not is_native value and lua_type value == "table" then return #value end
+        fail(path, "'#' of this value is not available yet")
+    end
+
+    E.apply = do(path, callee, arguments, boundary)
+        if callee == types.reference and is_cell(arguments[1]) then return reference_to(path, arguments[1]) end
+        if callee == compilation.trap then return E.trap(path, arguments[1]) end
+        -- the effect declarations of a library word (buffers §4.1): the storage a reference
+        -- reaches may relocate, or its borrows end
+        if callee == compilation.moves or callee == compilation.ends then
+            local reference = arguments[1]
+            if is_cell reference then reference = peek(path, reference) end
+            if not is_reference reference then fail(path, "an effect declaration names a reference to the storage it affects") end
+            local target = data.Access { place = target_of(path, reference), path = { data.ContentsStep {} } }
+            if callee == compilation.moves then
+                tracking.moves(path.flow, target, origin_of path)
+                path.writer.append(path.block, data.Moves { site = site path, .target })
+            else
+                local reason = arguments[2]
+                tracking.ends(path.flow, target, reason, origin_of path)
+                path.writer.append(path.block, data.Ends { site = site path, .target, .reason })
+            end
+            return nil
+        end
+        if check(types.NativeType, callee) then
+            if #arguments ~= 1 then fail(path, types.describe callee .. " takes one argument") end
+            -- `Grow(T) { … }`: an empty buffer, then each entry pushed
+            if is_buffer callee then
+                local entries = arguments[1]
+                if lua_type entries ~= "table" or is_native entries then fail(path, types.describe callee .. " is built from a table of its elements") end
+                local holder = new_place(path, "built", callee)
+                path.flow.contents[holder.id] = data.Tracked { value = zero_value callee }
+                local cell = place_cell(holder.id, "built")
+                for _, entry in ipairs entries do E.method(path, cell, "push", { entry }, false) end
+                return E.get(path, cell)
+            end
+            if is_record callee then return construct_record(path, callee, arguments[1]) end
+            local value = arguments[1]
+            if is_cell value then value = peek(path, value) end
+            value = deref(path, value)
+            if not is_native value then return from_host(path, callee, value, "the converted value") end
+            if value.type == callee then return value end
+            -- a pointer's bits as another pointer or as an integer: reinterpreted, never converted
+            if rules.is_pointer callee or rules.is_pointer value.type then return E.compute(path, "reinterpret", callee, { value }) end
+            return E.compute(path, "convert", callee, { value })
+        end
+        if platform.is_mechanism callee then
+            if #arguments ~= #callee.parameters then fail(path, ("%s takes %d arguments"):format(tostring callee, #callee.parameters)) end
+            local operands = {}
+            for index, parameter in ipairs callee.parameters do
+                local value = arguments[index]
+                if is_cell value then value = peek(path, value) end
+                operands[index] = materialize(path, from_host(path, parameter, value, ("argument %d of %s"):format(index, tostring callee)))
+            end
+            local result = callee.result ~= types.Unit and fresh identity.ValueId or nil
+            path.writer.append(path.block, data.Mechanism { site = site path, .result, binding = callee.name, arguments = operands })
+            if result == nil then return nil end
+            return value_of_operand(callee.result, data.Result { value = result, type = callee.result })
+        end
+        local word, supplied = hosting.supplied_of callee
+        if word == nil then
+            if lua_type callee == "function" then return callee(unpack(arguments)) end
+            fail(path, tostring callee .. " is not something to apply")
+        end
+        local application = hosting.supply(hosting.application(word, supplied), arguments)
+        if not hosting.saturated application then
+            if boundary then fail(path, ("call needs a saturated application: %s takes %d arguments"):format(word.name, #word.requirements)) end
+            return application
+        end
+        if boundary then return call_definition(path, word, application.supplied, nil) end
+        return invoke(path, word, application.supplied)
+    end
+
+    E.dot = do(path, base, name)
+        if is_cell base then base = peek(path, base) end
+        base = deref(path, base)
+        if is_aggregate base then return part(path, base, name) end
+        if not is_native base and lua_type base == "table" then return base[name] end
+        fail(path, ("'.%s' of %s is not available yet"):format(name, tostring base))
+    end
+    -- the place `p[i]` names when `p` is a raw pointer: storage under the raw contract
+    raw_place = do(path, base, key)
+        if is_cell base then base = peek(path, base) end
+        base = deref(path, base)
+        if not (is_native base and rules.is_pointer base.type) then return nil end
+        local index = is_native key and key or from_host(path, types.I64, key, "the index")
+        local address = E.compute(path, "pointer_offset", base.type, { base, index })
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = base.type.target
+            root = data.RawRoot { pointer = address.operand }
+            path = {}
+            lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        path.writer.declare place
+        return place
+    end
+    load = do(path, place)
+        local result = fresh identity.ValueId
+        path.writer.append(path.block, data.Load { site = site path, .result, place = place.id })
+        return value_of_operand(place.type, data.Result { value = result, type = place.type })
+    end
+
+    E.element = do(path, base, key)
+        local place = raw_place(path, base, key)
+        if place then return load(path, place) end
+        local value = is_cell base and deref(path, peek(path, base)) or base
+        if is_aggregate value and is_buffer value.type then return E.method(path, base, "get", { key }, false) end
+        if is_cell base then base = peek(path, base) end
+        if not is_native base and lua_type base == "table" then return base[key] end
+        fail(path, "indexing a native value is not available yet")
+    end
+    -- the field `name` of the record a cell (or a field cell) holds, as a cell to assign
+    E.member = do(path, base, name)
+        if not is_cell base then fail(path, ("'.%s' is assigned through a local of the body"):format(name)) end
+        return setmetatable({ kind = "field", .base, .name }, Cell)
+    end
+    E.member_at = do(path, base, key)
+        local place = raw_place(path, base, key)
+        if place then return setmetatable({ kind = "raw", .place, name = "an element" }, Cell) end
+        local value = is_cell base and deref(path, peek(path, base)) or nil
+        if value and is_aggregate value and is_buffer value.type then return setmetatable({ kind = "element", .base, .key, name = "an element" }, Cell) end
+        fail(path, "assigning an element is not available yet")
+    end
+
+    E.constant_of = constant_of
+    E.from_host = from_host
+    return E
+end
+
+return define
+    .evaluating
+end

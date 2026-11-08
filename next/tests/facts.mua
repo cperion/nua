@@ -161,3 +161,16 @@ test "distinct places overlap only where the activity says they may alias":
     a.tracking.ends(flow, contents_of second, "cleared", a.origin)
     assert(kind(a.tracking.use(flow, view.id)) == "ended cleared")
 end
+
+test "ending a buffer's contents leaves a borrow of its header live":
+    local a = activity()
+    local buffer = a.place()
+    local flow = facts.empty()
+    local header = a.tracking.borrow(flow, data.BorrowPath { root = buffer, steps = {} }, true, a.lifetime, a.origin)
+    local view = a.tracking.borrow(flow, held_path buffer, false, a.lifetime, a.origin)
+    a.tracking.ends(flow, contents_of buffer, "cleared", a.origin)
+    assert(kind(a.tracking.use(flow, header.id)) == "derive", "Ref g survives clear")
+    assert(kind(a.tracking.use(flow, view.id)) == "ended cleared")
+    a.tracking.ends(flow, data.Access { place = buffer, path = {} }, "moved", a.origin)
+    assert(kind(a.tracking.use(flow, header.id)) == "ended moved", "moving the owner ends it")
+end

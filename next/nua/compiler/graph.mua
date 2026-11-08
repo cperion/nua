@@ -69,6 +69,14 @@ local writer_for = do(fragment, supply)
             if argument == nil then fail(("parameter: %s has no parameter %d"):format(identity.describe block, index)) end
             return data.BlockArgument { .block, .index, type = argument.type }
         end
+        -- a parameter added to a block still being written, before any edge enters it
+        add_parameter = do(block, type)
+            open "add_parameter"
+            local draft = owned_block(block, "add_parameter")
+            draft.arguments[#draft.arguments + 1] = data.BlockParameter { .type }
+            local index = #draft.arguments
+            return data.BlockArgument { .block, .index, .type }
+        end
         declare = do(place)
             open "declare"
             if fragment.places[place.id] then fail("declare: " .. identity.describe(place.id) .. " is declared twice") end

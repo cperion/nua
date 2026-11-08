@@ -1,0 +1,34 @@
+-- The platform mechanisms (compiler activities §3.2; buffers §3.4): the declared bindings a
+-- Nua library may call, each with its native signature and C symbol. Everything above them
+-- (allocation policy, size classes, free lists, typed walks) is ordinary Nua. A binding not in
+-- this table cannot be named; applying one in a typed body emits a `Mechanism` instruction.
+--
+-- `storage_context` answers a zeroed per-thread region of `context_bytes` that the Nua
+-- allocator keeps its state in; a task will have its own. `ledger_mapped_bytes` reads the
+-- platform's own count of mapped bytes, an account kept independently of the Nua allocator
+-- for tests to check it against.
+
+local types = require "nua.types"
+
+local bytes = types.pointer types.U8
+
+local Mechanism = {}
+Mechanism.__index = Mechanism
+Mechanism.__tostring = mechanism -> "the mechanism " .. mechanism.name
+
+local declare = |name, parameters, result| -> setmetatable({ .name, .parameters, .result, c_symbol = "nua_" .. name }, Mechanism)
+
+local bindings = define
+    map_pages = declare("map_pages", { types.U64 }, bytes)
+    unmap_pages = declare("unmap_pages", { bytes, types.U64 }, types.Unit)
+    move_bytes = declare("move_bytes", { bytes, bytes, types.U64 }, types.Unit)
+    storage_context = declare("storage_context", {}, bytes)
+    fatal_trap = declare("fatal_trap", { bytes, types.U64 }, types.Unit)
+    ledger_mapped_bytes = declare("ledger_mapped_bytes", {}, types.U64)
+end
+
+return define
+    .bindings
+    context_bytes = 256
+    is_mechanism = value -> getmetatable value == Mechanism
+end

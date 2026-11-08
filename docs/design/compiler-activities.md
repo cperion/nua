@@ -59,15 +59,16 @@ marked *built* exist with tests; the others are implementation targets.
 | `nua/compiler/facts.mua` *built* | `fork`, `empty`, `tracking` (`borrow`, `use`, `cache`, `store`, `moves`, `ends`, `move_owner`, `agree`, `join_borrows`, `overlap`) | `data` |
 | `nua/compiler/verify.mua` *built* | `shape`, `graph`, `types`, `all` | `data`, `graph`, `rules` |
 | `nua/compiler/verify_lifetimes.mua` *built* | `lifetimes` | `data`, `graph`, `facts`, `verify` |
-| `nua/compiler/evaluate.mua` | `evaluating`, `apply`, `invoke`, `release` | `data`, `graph`, `facts`, `rules`; supplied definition capability and Nua word bindings |
+| `nua/compiler/evaluate.mua` *built (scalars, records, control, calls)* | `evaluating`: the vocabulary of §5.2, with branches and loops (§6.1, §6.2) | `data`, `graph`, `facts`, `rules`; supplied definition capability and Nua word bindings |
 | `nua/compiler/control.mua` | `branching`, `looping`, `complete_exits` | `data`, `graph`, `facts`; supplied evaluation capability |
-| `nua/compiler/definitions.mua` | `defining`, `request`, `agree_group` | `data`, `graph`, `facts`; supplied evaluation capability |
+| `nua/compiler/definitions.mua` *built (specialization, recursion, tail loops; contracts not yet)* | `defining`, `request`, `define_export` | `data`, `graph`, `facts`; supplied evaluation capability |
 | `nua/compiler/budgets.mua` | `budgets` | `data`, `graph`; supplied evaluation and the scheduler's budget word |
 | `nua/compiler/optimize.mua` | `fold`, `reach`, `sweep`, `optimize` | `data`, `graph`, `facts`, `rules`, `verify` |
 | `nua/compiler/diagnostics.mua` | `reporting`, `render` | `data`; supplied source text |
-| `nua/compiler/compile.mua` | `compiling`, `prepare` | Wires the preceding vocabularies and backend adapters |
-| `nua/front.mua` | The Mua host emitting hosted bodies (§5) | Mua parser/emitter; supplied hosting vocabulary |
-| `nua/emit_c.mua`, JIT adapter | `emit prepared target -> BackendProduct` | Ready program, native layouts and mechanism bindings |
+| `nua/compiler/hosting.mua` *built* | `word`, `supply`, applications (§5.1) | `types` |
+| `nua/compile.mua` *built* | `compile`, `compile_c` | Wires the preceding vocabularies and backend adapters |
+| `nua/front.mua` *built* | The Mua host emitting hosted bodies (§5) | Mua parser/emitter; supplied hosting vocabulary |
+| `nua/emit_c.mua` *built (scalars)*, JIT adapter | `emit prepared target -> BackendProduct` | Ready program, native layouts and mechanism bindings |
 
 `compile` wires the mutually cooperating activities by passing functions; their
 modules do not recursively `require` one another or consult a global current
@@ -729,9 +730,12 @@ perform this push/pop or resource cleanup implicitly.
 
 ### 5.2 Evaluation: exact entries
 
-`evaluating` creates these verbs once for one invocation. They capture the invocation's
-writer, identity supplier, diagnostics, native rules and explicit definition/storage
-capabilities. The current path is an argument, not a field swapped in those modules.
+`evaluating` creates these verbs once for one compilation: they capture what belongs to the
+whole activity (identity supply, origins, the place and borrow registries, diagnostics, native
+rules, definition capability). Everything that varies within it is on the path, an argument of
+every verb: a mutable handle holding the writer and block code goes to, the flow facts, the
+invocation, the innermost loop and the source line. A join replaces a path's state; a branch arm
+or loop round gets a path of its own. Nothing consults a current path.
 
 ```text
 evaluating : Word -> List Argument -> Path -> EvaluationServices -> InvocationResult

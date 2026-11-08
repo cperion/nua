@@ -1,0 +1,176 @@
+-- The compilation root (compiler activities §7.5): it creates the compilation's identities,
+-- origins and place registry, makes the evaluation vocabulary, loads the source through Mua with
+-- the Nua host, and closes each export into a definition. The program it answers has passed
+-- every verifier; a refusal is an error naming the source line.
+--
+--   compile(source, filename) -> { program, exports }
+--   compile_c(source, filename) -> C text, prototypes, program
+
+local mua = require "mua"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local hosting = require "nua.compiler.hosting"
+local evaluate = require "nua.compiler.evaluate"
+local definitions_module = require "nua.compiler.definitions"
+local verify = require "nua.compiler.verify"
+local verify_lifetimes = require "nua.compiler.verify_lifetimes"
+local front = require "nua.front"
+local emit_c = require "nua.emit_c"
+local platform = require "nua.compiler.platform"
+
+-- the Nua libraries of the replacement live beside its compiler, in next/lib
+local library_directory = (debug.getinfo(1, "S").source:match("^@(.*)/nua/compile%.mua$") or "next") .. "/lib"
+
+-- the names a Nua source sees besides Lua's: the native types and their constructors
+local prelude = define
+    U8 = types.U8
+    U16 = types.U16
+    U32 = types.U32
+    U64 = types.U64
+    I8 = types.I8
+    I16 = types.I16
+    I32 = types.I32
+    I64 = types.I64
+    F32 = types.F32
+    F64 = types.F64
+    Bool = types.Bool
+    Unit = types.Unit
+    Str = types.Str
+    Ptr = types.pointer
+    Ref = types.reference
+    Buffer = types.buffer
+    Grow = types.buffer
+    size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
+end
+
+local compiling = do(source, filename)
+    local supply = identity.supply()
+    local origins, origin_ids = {}, {}
+    local compilation = define
+        .supply
+        places = {}
+        borrows = {}
+        exports = {}
+        origin = do(origin_source, line)
+            local key = tostring origin_source .. ":" .. tostring line
+            local found = origin_ids[key]
+            if found then return found end
+            found = supply.fresh identity.OriginId
+            origin_ids[key] = found
+            origins[found] = data.Origin { id = found, span = data.Span { source = origin_source or "?", line = math.max(line or 1, 1) } }
+            return found
+        end
+    end
+    local E = evaluate.evaluating compilation
+    local registry = definitions_module.defining compilation
+    compilation.request = registry.request
+
+    local runtime = define
+        word = hosting.word
+        trap = setmetatable({}, { __tostring = || -> "trap" })
+        moves = setmetatable({}, { __tostring = || -> "moves" })
+        ends = setmetatable({}, { __tostring = || -> "ends" })
+        record = do(name, fields, line)
+            for _, field in ipairs fields do
+                if not check(types.NativeType, field.type) then
+                    error(("%s:%d: the field '%s' of %s is %s, not a native type"):format(filename, line, field.name, name, tostring field.type), 0)
+                end
+            end
+            local ok, record_or_problem = pcall(types.record, name, fields)
+            if not ok then error(("%s:%d: %s"):format(filename, line, tostring record_or_problem), 0) end
+            return record_or_problem
+        end
+        export = do(value, c_name, line)
+            if not (hosting.is_word value or hosting.is_application value) then
+                error(("%s:%d: export needs a word, got %s"):format(filename, line, tostring value), 0)
+            end
+            compilation.exports[#compilation.exports + 1] = { .value, .c_name, .line }
+        end
+    end
+    local environment = setmetatable({ __nua = runtime, platform = platform.bindings, ..prelude }, { __index = _G })
+    local load_nua = do(text, name)
+        local chunk, problem = mua.load(text, "@" .. name, { host = front.host name })
+        if not chunk then error(problem, 0) end
+        setfenv(chunk, environment)
+        return chunk()
+    end
+    -- `import "allocator"`: a Nua library from next/lib, compiled once in this compilation
+    local imported = {}
+    environment.import = do(name)
+        if imported[name] == nil then
+            local path = ("%s/%s.nua"):format(library_directory, name)
+            local file = io.open(path, "rb")
+            if not file then error(("import: no Nua library %s (looked for %s)"):format(name, path), 2) end
+            local text = file:read "*a"
+            file:close()
+            imported[name] = { value = load_nua(text, path) }
+        end
+        return imported[name].value
+    end
+    -- the words of buffers of each element type, from the Nua library
+    compilation.buffer_words = element -> environment.import("buffer").words(element)
+    compilation.trap, compilation.moves, compilation.ends = runtime.trap, runtime.moves, runtime.ends
+    environment.trap, environment.moves, environment.ends = runtime.trap, runtime.moves, runtime.ends
+    load_nua(source, filename)
+
+    -- each export closed into a definition: its known supply stays known, the native
+    -- requirements still unsupplied are its parameters
+    local exports = {}
+    for _, export in ipairs compilation.exports do
+        local word, supplied = hosting.supplied_of export.value
+        local specification = {}
+        for index, requirement in ipairs word.requirements do
+            local argument = supplied[index]
+            if index <= #supplied then
+                if requirement.type == nil then
+                    specification[index] = { kind = "host", value = argument }
+                else
+                    local path = { source = filename, line = export.line }
+                    specification[index] = { kind = "native", value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name)) }
+                end
+            else
+                if requirement.type == nil then
+                    error(("%s:%d: export %s: the parameter '%s' needs a native type"):format(filename, export.line, export.c_name, requirement.name), 0)
+                end
+                specification[index] = { kind = "dynamic", type = requirement.type }
+            end
+        end
+        local id = registry.define_export(word, specification, filename, export.line)
+        exports[#exports + 1] = data.Export { name = export.c_name, definition = id }
+    end
+    local definitions = registry.definitions()
+    local program = data.Program with
+        revision = 0
+        .definitions
+        words = registry.words()
+        globals = {}
+        .exports
+        lifetimes = {}
+        .origins
+    end
+    local problems = verify.all program
+    for _, problem in ipairs(verify_lifetimes.lifetimes(program, {})) do problems[#problems + 1] = problem end
+    if #problems > 0 then
+        local lines = {}
+        for _, problem in ipairs problems do lines[#lines + 1] = ("%s: %s"):format(problem.verifier, problem.message) end
+        error(filename .. ": the compiled program does not verify:\n" .. table.concat(lines, "\n"), 0)
+    end
+    return define
+        .program
+        .exports
+    end
+end
+
+local compile_c = do(source, filename)
+    local compiled = compiling(source, filename)
+    local text, prototypes = emit_c.emit compiled.program
+    return text, prototypes, compiled.program
+end
+
+return define
+    compile = compiling
+    .compile_c
+end

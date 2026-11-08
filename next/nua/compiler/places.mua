@@ -41,7 +41,9 @@ local GlobalRoot = struct { global: GlobalId }
 local ParameterRoot = struct { definition: DefinitionId, parameter: Positive }
 local IndirectRoot = struct { pointer: Operand, borrow: BorrowId }
 local ForeignRoot = struct { pointer: Operand, contract: ForeignAccess }
-PlaceRoot { LocalRoot, GlobalRoot, ParameterRoot, IndirectRoot, ForeignRoot }
+-- storage reached through a raw pointer, under its unsafe contract: no facts are kept for it
+local RawRoot = struct { pointer: Operand }
+PlaceRoot { LocalRoot, GlobalRoot, ParameterRoot, IndirectRoot, ForeignRoot, RawRoot }
 
 local Place = struct { id: PlaceId, type: NativeType, root: PlaceRoot, path: ComponentPath, lifetime: LifetimeId, origin: OriginId }
 
@@ -91,6 +93,7 @@ return define
     .ParameterRoot
     .IndirectRoot
     .ForeignRoot
+    .RawRoot
     .Place
     .ValueInfo
     .Contents

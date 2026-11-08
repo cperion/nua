@@ -1,0 +1,73 @@
+-- Hosting (compiler activities §5.1): the host-level values of words and applications.
+--
+-- `word { name, source, line, requirements, result, body }` is what a typed lambda becomes: a
+-- word with its requirements (a native type, or none for host supply) and its native result,
+-- both evaluated once, where the word is made. Applying a word or an application in Lua
+-- supplies arguments and nothing else: `affine 4 3` is an application that remembers 4 and 3
+-- and runs no body. Evaluation happens only when an evaluation applies a saturated
+-- application (`evaluate.apply`), never by building one.
+
+local types = require "nua.types"
+
+local Word = {}
+local Application = {}
+
+local is_word = value -> getmetatable value == Word
+local is_application = value -> getmetatable value == Application
+
+local supply = do(application, arguments)
+    local supplied = {}
+    for index, argument in ipairs application.supplied do supplied[index] = argument end
+    for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
+    if #supplied > #application.word.requirements then
+        error(("%s takes %d arguments, %d supplied"):format(application.word.name, #application.word.requirements, #supplied), 3)
+    end
+    return setmetatable({ word = application.word, .supplied }, Application)
+end
+
+Word.__call = |word, ...| -> supply(setmetatable({ .word, supplied = {} }, Application), { ... })
+Word.__tostring = word -> "word " .. word.name
+Application.__call = |application, ...| -> supply(application, { ... })
+Application.__tostring = application -> ("application of %s (%d of %d supplied)"):format(application.word.name, #application.supplied, #application.word.requirements)
+
+local word = do(description)
+    local name = description.name
+    for index, requirement in ipairs description.requirements do
+        if requirement.type ~= nil and not check(types.NativeType, requirement.type) then
+            error(("%s:%d: the parameter '%s' of %s is annotated with %s, not a native type"):format(
+                description.source, description.line, requirement.name, name, tostring requirement.type), 2)
+        end
+    end
+    if not check(types.NativeType, description.result) then
+        error(("%s:%d: the result of %s is annotated with %s, not a native type"):format(
+            description.source, description.line, name, tostring description.result), 2)
+    end
+    return setmetatable(define
+        .name
+        source = description.source
+        line = description.line
+        requirements = description.requirements
+        result = description.result
+        body = description.body
+        tail_calls = description.tail_calls == true
+    end, Word)
+end
+
+-- the word and its supplied arguments, of a word or an application
+local supplied_of = do(value)
+    if is_word value then return value, {} end
+    if is_application value then return value.word, value.supplied end
+    return nil
+end
+
+local saturated = application -> #application.supplied == #application.word.requirements
+
+return define
+    .word
+    .is_word
+    .is_application
+    .supply
+    .supplied_of
+    .saturated
+    application = |word_value, arguments| -> supply(setmetatable({ word = word_value, supplied = {} }, Application), arguments)
+end

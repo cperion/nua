@@ -1,0 +1,38 @@
+-- Compile Nua source with the replacement compiler, build the C into a shared library under
+-- build/next/, and load it: `native(name, source)` answers the loaded library, with each
+-- export's prototype declared, and the C text. Dead block parameters are tolerated until the
+-- optimizer sweeps them (compiler activities §7.3).
+
+local ffi = require "ffi"
+local compile = require "nua.compile"
+
+local here = package.searchpath("nua.compile", package.path:gsub("%.lua", ".mua")) or debug.getinfo(1, "S").source:sub(2)
+local root = (package.searchpath("nua.compile", "./next/?.mua") and ".") or here:match("^(.*)/next/") or "."
+local build = root .. "/build/next"
+local compiler = os.getenv("CC") or (root .. "/.local/bin/gcc")
+
+local declared = {}
+
+return do(name, source)
+    local text, prototypes = compile.compile_c(source, name .. ".nua")
+    os.execute("mkdir -p " .. build)
+    local c_path = ("%s/%s.c"):format(build, name)
+    local library = ("%s/lib%s.so"):format(build, name)
+    local file = assert(io.open(c_path, "w"))
+    file:write(text)
+    file:close()
+    -- the exit status is captured in the output: this LuaJIT's popen close does not report it
+    local command = ("%s -std=c11 -O1 -I%s -Wall -Werror -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -fPIC -shared -o %s %s 2>&1; printf '\\n__STATUS__%%d' $?"):format(compiler, root .. "/next/runtime", library, c_path)
+    local pipe = io.popen(command)
+    local output = pipe:read "*a"
+    pipe:close()
+    local messages, status = output:match("^(.-)\n__STATUS__(%d+)$")
+    if status ~= "0" then error("the C compiler refused " .. c_path .. ":\n" .. tostring(messages or output) .. "\n" .. text, 0) end
+    for _, prototype in ipairs prototypes do
+        if not declared[prototype] then
+            ffi.cdef(prototype)
+            declared[prototype] = true
+        end
+    end
+    return ffi.load(library), text
+end

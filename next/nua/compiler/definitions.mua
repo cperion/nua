@@ -1,0 +1,152 @@
+-- Native definitions (compiler activities §6.3): the registry of a compilation's native
+-- functions, each the specialization of a word on the known part of its supply.
+--
+-- A specification gives each requirement either a known argument (a host value, or a known
+-- native constant), which becomes part of the key, or a dynamic native type, which becomes a
+-- parameter. `request` answers the definition of a specification, building it the first time:
+-- the identity is registered before the body is evaluated, so a recursive request inside it
+-- answers the same identity instead of building again. A build evaluates the word in place on
+-- a fresh entry block, with the known arguments as constants and the others as parameters.
+
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+
+-- host values in keys: numbers, strings and booleans by value, anything else by identity
+local host_serials = setmetatable({}, { __mode = "k" })
+local host_count = 0
+local host_key = do(value)
+    local kind = type value
+    if kind == "number" or kind == "string" or kind == "boolean" or kind == "nil" then return kind .. ":" .. tostring value end
+    local serial = host_serials[value]
+    if serial == nil then
+        host_count += 1
+        serial = host_count
+        host_serials[value] = serial
+    end
+    return "host:" .. serial
+end
+
+local defining = do(compilation)
+    local supply = compilation.supply
+    local fresh = supply.fresh
+    local entries = {}      -- key -> { id, state }
+    local definitions = {}  -- DefinitionId -> Definition
+    local words = {}        -- word -> WordId
+    local word_infos = {}   -- WordId -> WordInfo
+
+    local word_id = do(word)
+        local found = words[word]
+        if found then return found end
+        found = fresh identity.WordId
+        words[word] = found
+        local requirements = {}
+        for index, requirement in ipairs word.requirements do
+            requirements[index] = data.Requirement { name = requirement.name, native_type = requirement.type, opened = false }
+        end
+        word_infos[found] = data.WordInfo { id = found, name = word.name, .requirements, result_type = word.result, origin = compilation.origin(word.source, word.line) }
+        return found
+    end
+
+    -- the key of a specification: the word, then each argument known by its value or dynamic by
+    -- its type; the ABI and the word's identity keep different boundaries apart
+    local constant_key = do(constant)
+        local constant_bits = constant.bits
+        if data.NativeConstant.is(constant_bits, data.IntegerBits) then return tostring constant_bits.bits end
+        if data.NativeConstant.is(constant_bits, data.FloatBits) then return ("%.17g"):format(constant_bits.value) end
+        if data.NativeConstant.is(constant_bits, data.BooleanBit) then return tostring constant_bits.value end
+        if data.NativeConstant.is(constant_bits, data.UnitBits) then return "unit" end
+        error("definitions: a known argument of " .. types.describe constant.type .. " cannot key a definition yet", 3)
+    end
+    local key_of = do(word, specification, abi)
+        local parts = { tostring(word_id(word).serial), abi }
+        for index, entry in ipairs specification do
+            if entry.kind == "dynamic" then
+                parts[#parts + 1] = "dynamic " .. types.describe entry.type
+            elseif entry.kind == "native" then
+                parts[#parts + 1] = ("known %s %s"):format(types.describe entry.value.type, constant_key(entry.value.operand))
+            else
+                parts[#parts + 1] = host_key(entry.value)
+            end
+        end
+        return table.concat(parts, "|")
+    end
+
+    local build = do(id, word, specification, abi, kind, source, line)
+        local parameter_types, arguments = {}, {}
+        for index, entry in ipairs specification do
+            if entry.kind == "dynamic" then
+                parameter_types[#parameter_types + 1] = entry.type
+                arguments[index] = compilation.value_of_operand(entry.type, data.Parameter { definition = id, index = #parameter_types, type = entry.type })
+            else
+                arguments[index] = entry.value
+            end
+        end
+        local outcome = graph.building(nil, supply, do(writer)
+            local entry = writer.block "entry"
+            local path = { .writer, block = entry, flow = facts.empty(), invocation = nil, loop = nil, depth = 0, .source, .line, dead = false, definition = id }
+            local value = compilation.invoke(path, word, arguments)
+            if not path.dead then
+                local returned = (value == nil or word.result == types.Unit) and nil or compilation.materialize(path, value)
+                writer.terminate(path.block, data.Return { origin = compilation.origin(source, line), value = returned })
+            end
+            return "adopt"
+        end)
+        local fragment = outcome { built = f -> f, discarded = || -> error "a definition's construction was discarded" }
+        local blocks = graph.seal fragment
+        definitions[id] = data.Definition with
+            .id
+            word = word_id word
+            .kind
+            signature = data.Signature { parameters = parameter_types, result = word.result, .abi, variadic = false }
+            entry = blocks[1].id
+            .blocks
+            places = fragment.places
+            origin = compilation.origin(source, line)
+        end
+        return id
+    end
+
+    -- the definition of a specification, built the first time it is requested
+    local request = do(word, specification, abi, source, line)
+        local key = key_of(word, specification, abi)
+        local found = entries[key]
+        if found then return found.id end
+        local id = fresh identity.DefinitionId
+        entries[key] = { .id, state = "building" }
+        build(id, word, specification, abi, "native_word", source or word.source, line or word.line)
+        entries[key].state = "complete"
+        return id
+    end
+
+    -- an export, built with its own C name. When nothing in its interface owns storage, its C
+    -- ABI is the Nua boundary's (they differ only for owning results, §3.1), so it is also the
+    -- definition a recursive request for the same specification finds.
+    local define_export = do(word, specification, source, line)
+        local id = fresh identity.DefinitionId
+        local owning = types.owns word.result
+        for index, entry in ipairs specification do
+            if entry.kind == "dynamic" and types.owns entry.type then owning = true end
+        end
+        local key = not owning and key_of(word, specification, "nua_boundary")
+        if key and entries[key] == nil then entries[key] = { .id, state = "building" } end
+        build(id, word, specification, "c_boundary", "native_word", source, line)
+        if key and entries[key].id == id then entries[key].state = "complete" end
+        return id
+    end
+
+    return define
+        .request
+        .define_export
+        .word_id
+        definitions = || -> definitions
+        words = || -> word_infos
+    end
+end
+
+return define
+    .defining
+end

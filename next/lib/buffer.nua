@@ -1,0 +1,89 @@
+-- Buffers (docs/design/buffers.md §2.2, §4.1): the one storage primitive, as Nua words.
+--
+-- A buffer is a header { data, length, capacity } and one allocation of `capacity` elements, the
+-- first `length` initialized. `words(T)` makes the words of buffers of T once: each takes the
+-- buffer by reference and declares its effect on the borrows of the contents: growth `moves`
+-- them (a held view survives, a stored one ends), shrinking and clearing `ends` them.
+--
+-- Every operation builds its new storage, writes the header, then releases what it replaced:
+-- at a trap every header describes valid storage (buffers §2.5).
+
+local allocator = import "allocator"
+
+local made = {}
+
+local words = do(T)
+    if made[T] then return made[T] end
+    local size = size_of T
+    local B = Buffer T
+
+    local bytes_of = do(count: U64): U64 = count * size
+
+    -- capacity at least `wanted`: doubling, from 4
+    local reserve = do(self: Ref B, wanted: U64): Unit
+        if wanted <= self.capacity then return end
+        local capacity: U64 = self.capacity + self.capacity
+        if capacity < 4 then capacity = 4 end
+        if capacity < wanted then capacity = wanted end
+        local fresh = Ptr(T)(allocator.allocate(bytes_of capacity))
+        if self.length > 0 then
+            platform.move_bytes(Ptr(U8)(fresh), Ptr(U8)(self.data), bytes_of self.length)
+        end
+        local old_data = self.data
+        local old_capacity = self.capacity
+        self.data = fresh
+        self.capacity = capacity
+        if old_capacity > 0 then allocator.release(Ptr(U8)(old_data), bytes_of old_capacity) end
+        moves self
+    end
+
+    local push = do(self: Ref B, value: T): Unit
+        reserve(self, self.length + 1)
+        self.data[self.length] = value
+        self.length = self.length + 1
+    end
+
+    local get = do(self: Ref B, index: U64): T
+        if index >= self.length then trap "index out of range" end
+        return self.data[index]
+    end
+
+    local set = do(self: Ref B, index: U64, value: T): Unit
+        if index >= self.length then trap "index out of range" end
+        self.data[index] = value
+    end
+
+    local pop = do(self: Ref B): T
+        if self.length == 0 then trap "pop of an empty buffer" end
+        self.length = self.length - 1
+        ends(self, "shrank")
+        return self.data[self.length]
+    end
+
+    local truncate = do(self: Ref B, length: U64): Unit
+        if length > self.length then trap "truncate past the length" end
+        self.length = length
+        ends(self, "shrank")
+    end
+
+    local clear = do(self: Ref B): Unit
+        self.length = 0
+        ends(self, "cleared")
+    end
+
+    local release = do(self: Ref B): Unit
+        if self.capacity > 0 then allocator.release(Ptr(U8)(self.data), bytes_of self.capacity) end
+    end
+
+    local length = do(self: Ref B): U64 = self.length
+
+    made[T] = {
+        reserve = reserve, push = push, get = get, set = set, pop = pop,
+        truncate = truncate, clear = clear, release = release, length = length,
+    }
+    return made[T]
+end
+
+return {
+    words = words,
+}
