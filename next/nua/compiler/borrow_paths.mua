@@ -1,0 +1,152 @@
+-- Finite schemas for selected borrows (compiler activities §2.4). This module manipulates
+-- data only: evaluation supplies the SSA parameter/capture operations. Shapes never contain
+-- an iteration's coordinate values in their identity, and selections are always flat.
+local data = require "nua.compiler.data"
+local types = require "nua.types"
+
+local element = step -> data.AccessStep.is(step, data.KnownElement) or data.AccessStep.is(step, data.AnyElement)
+local path_key = do(path, shape)
+    local parts = {}
+    for _, step in ipairs path do
+        if element step then
+            parts[#parts + 1] = shape and "element" or (step.index and "element:" .. step.index or "element:*")
+        elseif data.AccessStep.is(step, data.ContentsStep) then
+            parts[#parts + 1] = "contents"
+        elseif data.AccessStep.is(step, data.FieldStep) then
+            parts[#parts + 1] = "field:" .. step.name
+        else
+            parts[#parts + 1] = "alternative:" .. step.name
+        end
+    end
+    return table.concat(parts, "/")
+end
+local origins_key = do(origins, shape)
+    local keys = {}
+    for _, origin in ipairs origins do keys[#keys + 1] = origin.place.serial .. ":" .. path_key(origin.path, shape) end
+    table.sort keys
+    return table.concat(keys, "|")
+end
+local covers = do(a, b)
+    if a.place ~= b.place or #a.path ~= #b.path then return false end
+    for index, left in ipairs a.path do
+        local right = b.path[index]
+        if data.AccessStep.is(left, data.AnyElement) and element right then
+        elseif getmetatable(left) ~= getmetatable(right) or left.name ~= right.name or left.index ~= right.index then
+            return false
+        end
+    end
+    return true
+end
+local union = do(left, right)
+    local result = {}
+    for _, list in ipairs { left, right } do
+        for _, origin in ipairs list do
+            local present = false
+            for _, known in ipairs result do if covers(known, origin) then present = true end end
+            if not present then
+                for index = #result, 1, -1 do if covers(origin, result[index]) then table.remove(result, index) end end
+                result[#result + 1] = origin
+            end
+        end
+    end
+    table.sort(result, |a, b| -> origins_key({ a }, false) < origins_key({ b }, false))
+    return result
+end
+local alternatives = do(info)
+    if data.BorrowForm.is(info.form, data.Selected) then return info.form.alternatives end
+    return { data.BorrowAlternative { form = info.form, origins = info.origins } }
+end
+local key = do(alternative)
+    local form = alternative.form
+    if data.BorrowForm.is(form, data.Held) then
+        return "held:" .. form.path.root.serial .. ":" .. path_key(form.path.steps, true) .. (form.path.range and ":range" or "")
+    end
+    assert(data.BorrowForm.is(form, data.Stored), "a selected borrow must have leaf alternatives")
+    assert(form.pointer, "resident provenance is not a selected value")
+    return "stored:" .. types.describe(form.pointer.type) .. ":" .. origins_key(alternative.origins, true)
+end
+local schema = do(infos, previous)
+    local by_key = {}
+    local add = do(alternative)
+        local name = key alternative
+        local prior = by_key[name]
+        by_key[name] = data.BorrowAlternative { form = alternative.form, origins = union(prior and prior.origins or {}, alternative.origins) }
+    end
+    for _, alternative in ipairs(previous or {}) do add alternative end
+    for _, info in ipairs infos do for _, alternative in ipairs(alternatives info) do add alternative end end
+    local keys, result = {}, {}
+    for name in pairs by_key do keys[#keys + 1] = name end
+    table.sort keys
+    for _, name in ipairs keys do result[#result + 1] = by_key[name] end
+    return result
+end
+local same_schema = do(a, b)
+    if #a ~= #b then return false end
+    for index, alternative in ipairs a do
+        if key(alternative) ~= key(b[index]) or origins_key(alternative.origins, false) ~= origins_key(b[index].origins, false) then return false end
+    end
+    return true
+end
+-- The operands of a leaf, in stable shape order. A held path never contributes an address.
+local coordinates = do(alternative)
+    local form = alternative.form
+    if data.BorrowForm.is(form, data.Stored) then return { form.pointer } end
+    local operands = {}
+    for _, index in ipairs(form.path.indices or {}) do operands[#operands + 1] = index end
+    if form.path.range then
+        operands[#operands + 1] = form.path.range.first
+        operands[#operands + 1] = form.path.range.count
+    end
+    return operands
+end
+-- Rebuild a leaf using new SSA coordinates; element alias facts generalize to AnyElement.
+local instantiate = do(alternative, operand)
+    local form = alternative.form
+    if data.BorrowForm.is(form, data.Stored) then return data.Stored { pointer = operand(form.pointer.type) } end
+    local indices, steps = {}, {}
+    for _, step in ipairs form.path.steps do
+        steps[#steps + 1] = element(step) and data.AnyElement {} or step
+        if element step then indices[#indices + 1] = operand(types.U64) end
+    end
+    local range = nil
+    if form.path.range then range = data.Range { first = operand(types.U64), count = operand(types.U64) } end
+    return data.Held { path = data.BorrowPath { root = form.path.root, .steps, .indices, .range } }
+end
+local validate = do(info)
+    if not data.BorrowForm.is(info.form, data.Selected) then return nil end
+    local selected = info.form
+    if selected.selector.type ~= types.U64 then return "a borrow selector must be U64" end
+    if #selected.alternatives < 2 then return "a selected borrow needs at least two alternatives" end
+    if data.Operand.is(selected.selector, data.Constant) then
+        if not data.NativeConstant.is(selected.selector.bits, data.IntegerBits) or selected.selector.bits.bits >= #selected.alternatives then return "a borrow selector is outside its alternatives" end
+    end
+    local seen, origins = {}, {}
+    for _, alternative in ipairs selected.alternatives do
+        if data.BorrowForm.is(alternative.form, data.Selected) then return "selected borrow alternatives must be flat" end
+        if data.BorrowForm.is(alternative.form, data.Stored) and alternative.form.pointer == nil then return "resident provenance cannot be a selected value" end
+        local name = key alternative
+        if seen[name] then return "a selected borrow has duplicate path shapes" end
+        seen[name] = true
+        origins = union(origins, alternative.origins)
+        if data.BorrowForm.is(alternative.form, data.Held) then
+            local path = alternative.form.path
+            local count = 0
+            for _, step in ipairs path.steps do if element step then count += 1 end end
+            if #(path.indices or {}) ~= count then return "a held path needs a coordinate for every element step" end
+            for _, index in ipairs(path.indices or {}) do if index.type ~= types.U64 then return "a held element coordinate must be U64" end end
+            if path.range and (path.range.first.type ~= types.U64 or path.range.count.type ~= types.U64) then return "held range coordinates must be U64" end
+        end
+    end
+    if origins_key(origins, false) ~= origins_key(info.origins, false) then return "selected borrow origins must be the union of its alternatives" end
+    return nil
+end
+return define
+    .validate
+    .alternatives
+    .key
+    .schema
+    .same_schema
+    .coordinates
+    .instantiate
+    .union
+end

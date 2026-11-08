@@ -150,6 +150,7 @@ NativeValue = Bits       { type: NativeType, operand: Operand }
 
 ComponentPath = List Component
 Component     = Field(name: String) | Element(index: Operand) | Alternative(name: String)
+              | Payload | AnyElement
 
 Operand = Constant       { type: NativeType, bits: NativeConstant }
         | Parameter      { definition: DefinitionId, index: Positive, type: NativeType }
@@ -218,12 +219,15 @@ place needs the dominating bounds/active-tag checks recorded in `ValueInfo.proof
 These are the compiler facts of the [buffer model](buffers.md#33-compiler-facts):
 
 ```text
-BorrowPath   { root: PlaceId, steps: AccessPath, range: Option Range }
+BorrowPath   { root: PlaceId, steps: AccessPath, indices: List Operand,
+               range: Option Range }
 Range        { first: Operand, count: Operand }
 BorrowInfo   { id: BorrowId, form: BorrowForm, origins: List Access,
                mutable: Bool, lifetime: LifetimeId, acquired: OriginId }
 BorrowForm   = Held(path: BorrowPath)
-             | Stored(pointer: Operand)
+             | Stored(pointer: Option Operand)
+             | Selected(selector: Operand, alternatives: List BorrowAlternative)
+BorrowAlternative { form: BorrowForm, origins: List Access }
 BorrowState  = Live(pointer: Option Operand) | Ended(at: OriginId, reason: EndReason)
 EndReason    = Grew | Shrank | Removed | Cleared | Replaced | Moved | Released
 ```
@@ -242,6 +246,31 @@ shortest owner lifetime among the origins, checked by the lifetime rule (syntax 
 | owner moved out of, replaced in or released from a place | `Ended(Moved / Replaced / Released)` | same |
 
 Using an `Ended` borrow is a diagnostic naming the event and the use.
+
+**Approved selected-path amendment.** A local control join does not turn a held borrow
+into a stored pointer. `Selected` preserves the finite alternatives and a zero-based U64
+SSA selector. Each alternative is a leaf `Held` or `Stored`, never another `Selected`:
+composition flattens and coalesces equal path shapes. `indices` carries the actual operand
+for each element step; `AnyElement` remains the alias fact, not the runtime index. Held
+shape identity excludes index/range values. Joins transport the selector and the coordinates
+of each shape as simultaneous block arguments, never a cached payload pointer for a held
+path. Inactive coordinates are zero and are never used to derive an address. Stored
+alternatives retain their fixed native value; joining one with a held alternative does not
+make either acquire the other's storage guarantee. Per-alternative origins distinguish a
+move affecting stored storage from one affecting only held storage.
+
+At use, the selected path is derived through the current headers, using ordinary Program
+control. There is no runtime borrow object, heap allocation, ownership-only control graph,
+or arbitrary limit on alternative count. Loop agreement widens the finite set of source
+path shapes and origins, while changing coordinates become SSA parameters; it does not
+accumulate iteration-specific borrow identities or coordinate values. Actual incoming
+`EdgeFacts` and destination contents associate the source and joined `Reference`s (also
+for compiler-created reference temporaries), so lifetime replay transports their states
+without treating scalar path coordinates as borrowed pointers. `join_borrows` receives the
+explicitly constructed result form; it must not inherit the first input's form merely
+because it has unioned their origins. A stale reference on an edge stays stale; a fresh
+reference acquired after invalidation is live. Transport alone
+is not a dereference. These facts belong to the same tentative construction as the graph.
 
 **Owners are linear values.** An `Owned` operand must be consumed exactly once on every
 path: moved into a place, passed to an owning parameter, returned, or released. A
@@ -418,6 +447,26 @@ runtime iteration.
 `Analysis` has no executable control of its own. Ordered checking follows the
 actual blocks, instructions and edges of `Program`. It does not execute an
 ownership-only copy of that program.
+
+**Approved memory-provenance amendment.** `Stored(None)` describes a borrowed component
+whose address has not been observed as an SSA operand: resident memory or an unprojected
+aggregate component. It retains its origins, lifetime and ordinary live/ended state. It is not a null pointer and cannot be materialized, selected,
+or used as a `NativeValue.Reference`. A load makes a fresh `Stored(Some loaded_operand)`
+observation with the resident provenance and state; loading does not revive an ended borrow.
+
+`Payload` and `AnyElement` are component-path steps for storage facts. They distinguish a
+buffer's payload from its header and describe unknown elements without invented indices.
+They are not executable `Extract` paths. Resident component facts live in `FlowFacts.contents`
+under canonical places; there is no parallel container-to-borrow set. Known-index writes
+replace the addressed component, unknown-index writes join possible contents, and branches
+and loops agree on finite component shapes and origins. Clearing/replacing storage removes
+its resident contents, not observations already captured from it.
+
+Native calls interpret effects and stores along the callee's actual CFG. Memory-origin
+substitution uses the stored value's component facts, never a dummy pointer or a deduplicated
+list of stores and invalidations. Equal effects at different sites remain distinct; prefixes
+ending in traps still participate in checks, but only normal exits contribute caller facts.
+All these facts are owned and published with the accepted construction.
 
 ### 3.5 Effects and native boundary contracts
 
@@ -649,7 +698,8 @@ output. Constants and formal/block parameters have no defining instruction, henc
 `definitions_of` uses `Option`; their own kind records establish their definition.
 
 ```text
-BorrowUse = Derive(path: BorrowPath) | Cached(pointer: Operand) | Fixed(pointer: Operand)
+BorrowUse = Derive(path: BorrowPath) | Select(form: Selected)
+          | Cached(pointer: Operand) | Fixed(pointer: Operand)
 ```
 
 `borrow` records a new held borrow. `use` checks that a borrow is live and says how

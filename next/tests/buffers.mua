@@ -120,3 +120,466 @@ test "replacing an owner releases the old one, and a return releases what is liv
     assert(buffers.replace(10) == 1)
     assert(buffers.replace_ledger(100000) == 0)
 end
+
+local compile = require "nua.compile"
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "rule 1: growth never ends a view you hold; it reads the new storage":
+    local views = native("held_views", [[
+local held = do(n: U32): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local head = xs:view(0, 2)
+    for i: U32 = 1, n do
+        xs:push(i)
+    end
+    return head[0] + head[1] + U32(#head) + U32(xs.length)
+end
+export held
+local sum_view = do(n: U32): U64
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push(i)
+    end
+    local all = xs:all()
+    xs:push(1000)
+    local total: U64 = 0
+    local i: U64 = 0
+    while i < all.length do
+        total = total + U64(all[i])
+        i = i + 1
+    end
+    return total
+end
+export sum_view
+local out_of_view = do(i: U64): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local head = xs:view(0, 2)
+    return head[i]
+end
+export out_of_view
+]])
+    -- each push past the capacity moved the storage; the view is derived again from the header
+    assert(views.held(0) == 1 + 2 + 2 + 3 and views.held(1000) == 1 + 2 + 2 + 1003)
+    assert(views.sum_view(10000) == 10000 * 10001 / 2)
+end
+
+test "rule 2: clearing, popping or moving the buffer ends its views":
+    refuses([[
+local broken = do(): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local head = xs:all()
+    xs:clear()
+    return head[0]
+end
+export broken
+]], "a borrow is used after it ended (cleared)")
+    refuses([[
+local broken = do(): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local head = xs:view(0, 1)
+    local last = xs:pop()
+    return head[0] + last
+end
+export broken
+]], "a borrow is used after it ended (shrank)")
+    refuses([[
+local broken = do(): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local head = xs:all()
+    local ys = xs
+    return head[0] + U32(ys.length)
+end
+export broken
+]], "a borrow is used after it ended (moved)")
+end
+
+test "a view that is not used afterwards is no obstacle (liveness, not scope)":
+    local views = native("dead_views", [[
+local fine = do(): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local head = xs:all()
+    local first = head[0]
+    xs:clear()
+    xs:push(9)
+    return first + xs[0]
+end
+export fine
+]])
+    assert(views.fine() == 10)
+end
+
+test "owners inside owners: elements are reached by reference and released with their buffer":
+    local nested = native("nested_owners", [[
+local rows = do(count: U32, width: U32): U64
+    local grid = Grow(Grow U32) {}
+    for r: U32 = 1, count do
+        local row = Grow(U32) {}
+        for c: U32 = 1, width do
+            row:push(r * c)
+        end
+        grid:push(row)
+    end
+    -- grow one element through its reference: only its own storage moves
+    grid[0]:push(7)
+    local total: U64 = 0
+    local r: U64 = 0
+    while r < grid.length do
+        local row = grid[r]
+        local c: U64 = 0
+        while c < row.length do
+            total = total + U64(row[c])
+            c = c + 1
+        end
+        r = r + 1
+    end
+    return total
+end
+export rows
+local rows_ledger = do(count: U32, width: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local total = rows(count, width)
+    return platform.ledger_mapped_bytes() - before
+end
+export rows_ledger
+local cleared_ledger = do(count: U32, width: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local grid = Grow(Grow U32) {}
+    for r: U32 = 1, count do
+        local row = Grow(U32) {}
+        for c: U32 = 1, width do
+            row:push(c)
+        end
+        grid:push(row)
+    end
+    grid:clear()
+    local after_clear = platform.ledger_mapped_bytes() - before
+    grid:push(Grow(U32) { 1 })
+    return after_clear
+end
+export cleared_ledger
+]])
+    -- sum over r, c of r * c, plus the 7 pushed onto the first row
+    assert(nested.rows(3, 4) == (1 + 2 + 3) * (1 + 2 + 3 + 4) + 7)
+    -- rows wide enough to map their own pages: all released with the grid
+    assert(nested.rows_ledger(4, 20000) == 0)
+    assert(nested.cleared_ledger(4, 20000) == 0)
+end
+
+test "rule 3: a view stored in a container ends when its buffer grows":
+    refuses([[
+local broken = do(): U32
+    local source = Grow(U32) { 1, 2, 3 }
+    local tokens = Grow(Slice U32) {}
+    tokens:push(source:view(0, 2))
+    source:push(4)
+    local first = tokens[0]
+    return first[0]
+end
+export broken
+]], "a borrow is used after it ended (grew)")
+    -- the same stored view, its source not grown: it is read through its stored pointer
+    local stored = native("stored_views", [[
+local fine = do(): U32
+    local source = Grow(U32) { 10, 20, 30 }
+    local tokens = Grow(Slice U32) {}
+    tokens:push(source:view(1, 2))
+    tokens:push(source:view(0, 1))
+    local first = tokens[0]
+    local second = tokens[1]
+    return first[0] + first[1] + second[0] + U32(#first) * 1000
+end
+export fine
+]])
+    assert(stored.fine() == 20 + 30 + 10 + 2000)
+end
+
+test "what a container holds is a fact of each path, joined like the others":
+    -- stored on one arm, grown on the other: valid on every path, accepted, and correct
+    local per_path = native("per_path_holds", [[
+local either = do(flag: Bool): U32
+    local source = Grow(U32) { 5, 6 }
+    local tokens = Grow(Slice U32) {}
+    if flag then
+        tokens:push(source:view(0, 1))
+    else
+        source:push(7)
+    end
+    if tokens.length > 0 then
+        local first = tokens[0]
+        return first[0]
+    end
+    return U32(source.length)
+end
+export either
+]])
+    assert(per_path.either(true) == 5 and per_path.either(false) == 3)
+    -- stored on one arm, grown after the join: that arm's stored view ended
+    refuses([[
+local broken = do(flag: Bool): U32
+    local source = Grow(U32) { 5, 6 }
+    local tokens = Grow(Slice U32) {}
+    if flag then tokens:push(source:view(0, 1)) end
+    source:push(7)
+    if tokens.length > 0 then
+        local first = tokens[0]
+        return first[0]
+    end
+    return 0
+end
+export broken
+]], "a borrow is used after it ended (grew)")
+    -- stored before the branch, grown on one arm only: ended on that edge, so ended after
+    refuses([[
+local broken = do(flag: Bool): U32
+    local source = Grow(U32) { 5, 6 }
+    local tokens = Grow(Slice U32) {}
+    tokens:push(source:view(0, 1))
+    if flag then source:push(7) end
+    local first = tokens[0]
+    return first[0]
+end
+export broken
+]], "a borrow is used after it ended (grew)")
+end
+
+test "borrows across a native boundary: references, views, and the callee's contract":
+    local boundary = native("boundary_borrows", [[
+local append = do(xs: Ref (Grow U32), value: U32): Unit
+    xs:push(value)
+end
+local wipe = do(xs: Ref (Grow U32)): Unit
+    xs:clear()
+end
+local total = do(values: Slice U32): U64
+    local sum: U64 = 0
+    local i: U64 = 0
+    while i < values.length do
+        sum = sum + U64(values[i])
+        i = i + 1
+    end
+    return sum
+end
+-- a compiled word fills a buffer through a reference; a view of it crosses another call
+local filled = do(n: U32): U64
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        call append (Ref xs) i
+    end
+    return call total (xs:all())
+end
+export filled
+-- the callee's push moves the storage: a held view in the caller survives it
+local survives = do(): U32
+    local xs = Grow(U32) { 1, 2 }
+    local head = xs:view(0, 2)
+    for i: U32 = 1, 100 do
+        call append (Ref xs) i
+    end
+    return head[0] + head[1] + U32(xs.length)
+end
+export survives
+-- a recursive definition that pushes: its contract grows after its own call saw it
+local function fill_down(xs: Ref (Grow U32), n: U32): Unit
+    if n == 0 then return end
+    xs:push(n)
+    fill_down(xs, n - 1)
+end
+local recursive = do(n: U32): U64
+    local xs = Grow(U32) {}
+    local head = xs:all()
+    fill_down(Ref xs, n)
+    return U64(xs.length) * 1000 + U64(#head)
+end
+export recursive
+local filled_ledger = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local sum = filled n
+    return platform.ledger_mapped_bytes() - before
+end
+export filled_ledger
+]])
+    assert(boundary.filled(100) == 5050)
+    assert(boundary.survives() == 1 + 2 + 102)
+    assert(boundary.recursive(50) == 50 * 1000 + 0)
+    assert(boundary.filled_ledger(100000) == 0)
+    -- the callee's clear ends the caller's view
+    refuses([[
+local wipe = do(xs: Ref (Grow U32)): Unit
+    xs:clear()
+end
+local broken = do(): U32
+    local xs = Grow(U32) { 1, 2 }
+    local head = xs:all()
+    call wipe (Ref xs)
+    return head[0]
+end
+export broken
+]], "a borrow is used after it ended (cleared)")
+    -- a call that moves storage it also receives a view of
+    refuses([[
+local grow_beside = do(xs: Ref (Grow U32), values: Slice U32): U32
+    xs:push(1)
+    return values[0]
+end
+local broken = do(): U32
+    local xs = Grow(U32) { 1, 2 }
+    return call grow_beside (Ref xs) (xs:all())
+end
+export broken
+]], "may move storage it also receives a view of")
+end
+
+test "the lifetime rule: a word returns borrows of what it received, never of its locals":
+    refuses([[
+local first_two = do(): Slice U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    return xs:view(0, 2)
+end
+local broken = do(): U32
+    local view = first_two()
+    return view[0]
+end
+export broken
+]], "first_two returns a borrow of its own local 'xs', which ends with it")
+    local returned = native("returned_views", [[
+local head = do(xs: Ref (Grow U32)): Slice U32 = xs:view(0, 1)
+local fine = do(): U32
+    local xs = Grow(U32) { 7, 8 }
+    local h = head(Ref xs)
+    return h[0] + U32(#h)
+end
+export fine
+]])
+    assert(returned.fine() == 8)
+end
+
+test "the lifetime rule: a borrow is stored only in a place its owner outlives":
+    refuses([[
+local broken = do(): U32
+    local tokens = Grow(Slice U32) {}
+    local source = Grow(U32) { 1, 2 }
+    tokens:push(source:all())
+    return 0
+end
+export broken
+]], "a borrow of 'source' cannot be stored in 'tokens', which outlives it")
+    refuses([[
+local broken = do(flag: Bool): U32
+    local tokens = Grow(Slice U32) {}
+    if flag then
+        local source = Grow(U32) { 1, 2 }
+        tokens:push(source:all())
+    end
+    return 0
+end
+export broken
+]], "cannot be stored in 'tokens', which outlives it")
+    -- the same storing through references, the container declared after its source: accepted
+    local stored = native("stored_through_references", [[
+local keep = do(tokens: Ref (Grow (Slice U32)), source: Ref (Grow U32)): Unit
+    tokens:push(source:all())
+end
+local fine = do(): U32
+    local source = Grow(U32) { 4, 5 }
+    local tokens = Grow(Slice U32) {}
+    keep(Ref tokens, Ref source)
+    local first = tokens[0]
+    return first[0] + first[1]
+end
+export fine
+]])
+    assert(stored.fine() == 9)
+end
+
+test "a view written into a record's field is stored (syntax §9.4, §9.7)":
+    refuses([[
+local Token = struct { kind: U32, text: Slice U8 }
+local broken = do(): U8
+    local src = Grow(U8) { 104, 105 }
+    local tok = Token { kind = 1, text = src:view(0, 1) }
+    src:push(33)
+    return tok.text[0]
+end
+export broken
+]], "a borrow is used after it ended (grew)")
+    local tokens = native("record_views", [[
+local Token = struct { kind: U32, text: Slice U8 }
+local fine = do(): U32
+    local src = Grow(U8) { 104, 105 }
+    local tok = Token { kind = 1, text = src:view(1, 1) }
+    return U32(tok.text[0]) + tok.kind
+end
+export fine
+]])
+    assert(tokens.fine() == 106)
+end
+
+test "storing a borrow of one parameter's storage into another's crosses call through the contract":
+    local across = native("stores_across", [[
+local keep = do(tokens: Ref (Grow (Slice U32)), source: Ref (Grow U32)): Unit
+    tokens:push(source:all())
+end
+local fine = do(): U32
+    local source = Grow(U32) { 4, 5 }
+    local tokens = Grow(Slice U32) {}
+    call keep (Ref tokens) (Ref source)
+    local first = tokens[0]
+    return first[0] + first[1]
+end
+export fine
+-- a recursion under dynamic control is a native function by itself: it stores on every level
+local function split(tokens: Ref (Grow (Slice U32)), source: Ref (Grow U32), at: U64): Unit
+    if at == 0 then return end
+    tokens:push(source:view(0, at))
+    split(tokens, source, at - 1)
+end
+local prefixes = do(n: U64): U64
+    local source = Grow(U32) { 1, 2, 3, 4, 5 }
+    local tokens = Grow(Slice U32) {}
+    split(Ref tokens, Ref source, n)
+    local total: U64 = 0
+    local i: U64 = 0
+    while i < tokens.length do
+        local token = tokens[i]
+        total = total + U64(#token)
+        i = i + 1
+    end
+    return total
+end
+export prefixes
+]])
+    assert(across.fine() == 9)
+    assert(across.prefixes(5) == 5 + 4 + 3 + 2 + 1)
+    -- the source grows after the call: the view the callee stored has ended
+    refuses([[
+local keep = do(tokens: Ref (Grow (Slice U32)), source: Ref (Grow U32)): Unit
+    tokens:push(source:all())
+end
+local broken = do(): U32
+    local source = Grow(U32) { 4, 5 }
+    local tokens = Grow(Slice U32) {}
+    call keep (Ref tokens) (Ref source)
+    source:push(6)
+    local first = tokens[0]
+    return first[0]
+end
+export broken
+]], "a borrow is used after it ended (grew)")
+    -- the container outlives the source: refused at the call, with the actual places
+    refuses([[
+local keep = do(tokens: Ref (Grow (Slice U32)), source: Ref (Grow U32)): Unit
+    tokens:push(source:all())
+end
+local broken = do(): U32
+    local tokens = Grow(Slice U32) {}
+    local source = Grow(U32) { 4, 5 }
+    call keep (Ref tokens) (Ref source)
+    return 0
+end
+export broken
+]], "a borrow of 'source' cannot be stored in 'tokens', which outlives it")
+end

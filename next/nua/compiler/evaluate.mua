@@ -22,6 +22,10 @@ local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
 local hosting = require "nua.compiler.hosting"
 local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
 
 local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
 local is_native = value -> check(NativeValue, value)
@@ -33,13 +37,63 @@ local FELL, STOPPED, RETURNED, BROKE, CONTINUED = { "fell" }, { "stopped" }, { "
 local evaluating = do(compilation)
     local supply = compilation.supply
     local fresh = supply.fresh
+    local E = {}
     local tracking = facts.tracking { .supply, borrows = compilation.borrows }
+    local memory = provenance.working(compilation, tracking, facts.paths_overlap)
+    compilation.memory = memory
+    local information, restore, check_store
 
     local fail = do(path, message)
         error(("%s:%s: %s"):format(path.source or "?", tostring(path.line or "?"), message), 0)
     end
     local site = path -> data.Site { id = fresh identity.InstructionId, origin = compilation.origin(path.source, path.line) }
     local origin_of = path -> compilation.origin(path.source, path.line)
+
+    local remember_borrows = do(path)
+        for id in pairs path.flow.borrows do path.writer.borrow(compilation.borrows[id]) end
+        for id in pairs path.flow.contents do
+            local place = compilation.places[id]
+            if place and provenance.is_memory(place) and not path.writer.has_place(id) then path.writer.declare(place) end
+        end
+    end
+    local enter = do(path)
+        remember_borrows path
+        path.writer.enter(path.block, facts.fork path.flow)
+    end
+    local append = do(path, instruction)
+        remember_borrows path
+        local before = facts.fork path.flow
+        if data.Instruction.is(instruction, data.Moves) or data.Instruction.is(instruction, data.Ends) then
+            for _, base in ipairs provenance.accesses(compilation.places[instruction.target.place], compilation.places, compilation.borrows) do
+                local target = data.Access { place = base.place, path = provenance.concat(base.path, instruction.target.path) }
+                if data.Instruction.is(instruction, data.Moves) then tracking.moves(path.flow, target, instruction.site.origin)
+                else
+                    tracking.ends(path.flow, target, instruction.reason, instruction.site.origin)
+                    if instruction.reason == "cleared" or instruction.reason == "released" or instruction.reason == "replaced" or instruction.reason == "moved" then memory.forget(path.flow, target) end
+                end
+            end
+        end
+        if data.Instruction.is(instruction, data.Store) and (types.borrows(instruction.value.type) or types.owns(instruction.value.type)) then
+            local place = assert(compilation.places[instruction.place])
+            local targets = provenance.accesses(place, compilation.places, compilation.borrows)
+            local info = Operand.is(instruction.value, data.Constant) and provenance.plain(instruction.value.type) or assert(path.writer.information(instruction.value), "a stored value needs component facts")
+            check_store(path, targets, info)
+            memory.store(path, targets, info, instruction.site.origin)
+            remember_borrows(path)
+        end
+        path.writer.append(path.block, instruction)
+        path.writer.observe(instruction.site.id, data.SiteFacts { .before, after = facts.fork path.flow, effects = effects.of instruction })
+    end
+    local terminate = do(path, terminator)
+        remember_borrows path
+        path.writer.terminal_flow(path.block, facts.fork path.flow)
+        path.writer.terminate(path.block, terminator)
+    end
+    compilation.enter, compilation.terminate = enter, terminate
+    local remember_reference = do(path, operand, borrow)
+        path.writer.borrow(compilation.borrows[borrow])
+        path.writer.remember(operand, data.ValueInfo { type = operand.type, components = { [{}] = data.Borrowed { .borrow } }, proofs = {} })
+    end
 
     --------------------------------------------------------------------------------------------
     -- values
@@ -58,7 +112,7 @@ local evaluating = do(compilation)
         if types.NativeType.is(type, types.RecordType) and not is_native value and lua_type value == "table" then
             return construct_record(path, type, value)
         end
-        if is_native value and NativeValue.is(value, data.Reference) and not types.NativeType.is(type, types.ReferenceType) then
+        if is_native value and NativeValue.is(value, data.Reference) and types.NativeType.is(value.type, types.ReferenceType) and not types.NativeType.is(type, types.ReferenceType) then
             value = compilation.deref(path, value)
         end
         if is_native value then
@@ -99,7 +153,7 @@ local evaluating = do(compilation)
 
     local emit_compute = do(path, opcode, type, operands)
         local result = fresh identity.ValueId
-        path.writer.append(path.block, data.Compute { site = site path, .result, .type, .opcode, arguments = operands })
+        append(path, data.Compute { site = site path, .result, .type, .opcode, arguments = operands })
         return bits(type, data.Result { value = result, .type })
     end
 
@@ -109,6 +163,9 @@ local evaluating = do(compilation)
     -- are read by Extract
 
     local is_aggregate = value -> is_native value and NativeValue.is(value, data.Aggregate)
+    local is_reference = value -> is_native value and NativeValue.is(value, data.Reference)
+    local is_view = value -> is_reference value and types.NativeType.is(value.type, types.ViewType)
+    local check_local_borrow
     local is_buffer = native_type -> types.NativeType.is(native_type, types.BufferType)
     -- records, and buffers (whose header is a record of its data, length and capacity)
     local is_record = native_type -> types.NativeType.is(native_type, types.RecordType) or is_buffer native_type
@@ -147,8 +204,17 @@ local evaluating = do(compilation)
         if found then return found end
         if value.packed == nil then fail(path, ("the field '%s' of %s has no value"):format(name, types.describe value.type)) end
         local result = fresh identity.ValueId
-        path.writer.append(path.block, data.Extract { site = site path, .result, type = field.type, aggregate = value.packed, path = { data.FieldComponent { .name } } })
-        return value_of_operand(field.type, data.Result { value = result, type = field.type })
+        append(path, data.Extract { site = site path, .result, type = field.type, aggregate = value.packed, path = { data.FieldComponent { .name } } })
+        local extracted = data.Result { value = result, type = field.type }
+        local components = {}
+        for component_path, component in pairs information(path, value).components do
+            if component_path[1] and data.Component.is(component_path[1], data.FieldComponent) and component_path[1].name == name then
+                local rest = {}
+                for index = 2, #component_path do rest[#rest + 1] = component_path[index] end
+                components[rest] = component
+            end
+        end
+        return restore(path, field.type, extracted, data.ValueInfo { type = field.type, .components, proofs = {} })
     end
 
     -- every part present: a packed value's fields extracted
@@ -161,16 +227,60 @@ local evaluating = do(compilation)
     -- the operand holding a whole value: a record's parts packed (or its packed operand)
     local materialize
     materialize = do(path, value)
+        if is_native value and NativeValue.is(value, data.Reference) and types.NativeType.is(value.type, types.ViewType) then
+            return compilation.pack_view(path, value)
+        end
+        if is_reference value then return compilation.pack_reference(path, value) end
         if not is_aggregate value then return value.operand end
         if value.packed and next(value.parts) == nil then return value.packed end
         local components = {}
         for index, field in ipairs(fields_of value.type) do components[index] = materialize(path, part(path, value, field.name)) end
         local result = fresh identity.ValueId
-        path.writer.append(path.block, data.Pack { site = site path, .result, type = value.type, .components })
-        return data.Result { value = result, type = value.type }
+        append(path, data.Pack { site = site path, .result, type = value.type, .components })
+        local operand = data.Result { value = result, type = value.type }
+        path.writer.remember(operand, information(path, value))
+        return operand
     end
     compilation.materialize = materialize
     compilation.value_of_operand = value_of_operand
+
+    information = do(path, value)
+        if is_reference value then return data.ValueInfo { type = value.type, components = { [{}] = data.Borrowed { borrow = value.borrow } }, proofs = {} } end
+        if not is_aggregate(value) then
+            return value.operand and not Operand.is(value.operand, data.Constant) and path.writer.information(value.operand) or provenance.plain(value.type)
+        end
+        local components = is_buffer(value.type) and { [{}] = data.Owning {} } or {}
+        if value.packed then
+            local packed = path.writer.information(value.packed)
+            if packed then for key, part in pairs packed.components do components[key] = part end end
+        end
+        for name, part in pairs value.parts do
+            for key in pairs components do if key[1] and key[1].name == name then components[key] = nil end end
+            for key, component in pairs information(path, part).components do
+                components[provenance.concat({ data.FieldComponent { .name } }, key)] = component
+            end
+        end
+        return data.ValueInfo { type = value.type, .components, proofs = {} }
+    end
+    restore = do(path, native_type, operand, info)
+        info = info or provenance.plain(native_type)
+        path.writer.remember(operand, info)
+        if types.NativeType.is(native_type, types.ViewType) or types.NativeType.is(native_type, types.ReferenceType) then
+            local source = nil
+            for key, component in pairs info.components do
+                if #key == 0 and data.ComponentInfo.is(component, data.Borrowed) then source = component.borrow end
+            end
+            if source == nil then fail(path, "a borrowed observation has no component provenance") end
+            local previous = assert(compilation.borrows[source])
+            local observed = data.BorrowInfo { ..previous, id = fresh(identity.BorrowId), form = data.Stored { pointer = operand }, acquired = origin_of(path) }
+            compilation.borrows[observed.id] = observed
+            path.flow.borrows[observed.id] = assert(path.flow.borrows[source])
+            remember_reference(path, operand, observed.id)
+            return data.Reference { type = native_type, borrow = observed.id }
+        end
+        return value_of_operand(native_type, operand)
+    end
+    compilation.information, compilation.restore = information, restore
 
     local zero_value
     zero_value = do(native_type)
@@ -199,7 +309,7 @@ local evaluating = do(compilation)
             if given == nil then
                 parts[field.name] = zero_value(field.type)
             else
-                parts[field.name] = from_host(path, field.type, given, ("the field '%s' of %s"):format(field.name, types.describe record))
+                parts[field.name] = compilation.stored_borrow(path, from_host(path, field.type, given, ("the field '%s' of %s"):format(field.name, types.describe record)))
             end
         end
         return data.Aggregate { type = record, packed = nil, .parts }
@@ -210,26 +320,97 @@ local evaluating = do(compilation)
     -- paths
 
     local child_path = do(path, writer, block, flow)
-        return {
+        local child = {
             .writer, .block, .flow, invocation = path.invocation, loop = path.loop,
             depth = path.depth + 1, guarded = path.guarded or 0, source = path.source, line = path.line, dead = false,
         }
+        if block and flow then enter child end
+        return child
     end
 
-    -- a place of the current invocation, declared on the writer and remembered by the compilation
-    local new_place = do(path, name, type)
+    -- An invocation local, or a completion temporary with its result's explicit lifetime.
+    -- Both are declared on the writer; a temporary needs only a fresh local identity namespace.
+    local new_place = do(path, name, type, lifetime)
+        local invocation = path.invocation
+        local ordinal = invocation and #invocation.places + 1 or 1
         local place = data.Place with
             id = fresh identity.PlaceId
             .type
-            root = data.LocalRoot { invocation = path.invocation.id, local_index = #path.invocation.places + 1 }
+            root = data.LocalRoot { invocation = invocation and invocation.id or fresh(identity.InvocationId), local_index = ordinal }
             path = {}
-            lifetime = path.invocation.lifetime
+            lifetime = invocation and invocation.lifetime or assert(lifetime, "a completion temporary needs its result lifetime")
             origin = origin_of path
         end
-        path.invocation.places[#path.invocation.places + 1] = place.id
+        if invocation then invocation.places[ordinal] = place.id end
         compilation.places[place.id] = place
+        local chain = {}
+        for position, scope in ipairs(invocation and invocation.scopes or {}) do chain[position] = scope end
+        compilation.place_scope[place.id] = { level = invocation and invocation.level or 0, scopes = chain, .ordinal, .name }
         path.writer.declare place
         return place
+    end
+
+    -- Selected borrows carry a finite schema and SSA coordinates, not payload pointers.
+    local zero_operand = do(native_type)
+        if types.NativeType.is(native_type, types.ViewType) then
+            return data.Constant { type = native_type, bits = data.AggregateBits { parts = { data.IntegerBits { bits = 0ULL }, data.IntegerBits { bits = 0ULL } } } }
+        end
+        return data.Constant { type = native_type, bits = data.IntegerBits { bits = 0ULL } }
+    end
+    local capture_borrow = do(path, value, schema)
+        local info = compilation.borrows[value.borrow]
+        local alternatives = borrow_paths.alternatives info
+        local positions, by_key = {}, {}
+        for index, alternative in ipairs schema do positions[borrow_paths.key alternative] = index - 1 end
+        for _, alternative in ipairs alternatives do by_key[borrow_paths.key alternative] = alternative end
+        local mapped = do(index) return known(rules.integer(types.U64, assert(positions[borrow_paths.key(alternatives[index])], "borrow schema has not reached agreement"))) end
+        local selected = mapped(1)
+        if data.BorrowForm.is(info.form, data.Selected) then
+            local choose
+            choose = do(at, index)
+                if index == #alternatives then return mapped(index) end
+                return E.choose(at, E.operate(at, "equal", bits(types.U64, info.form.selector), index - 1), arm -> mapped(index), arm -> choose(arm, index + 1))
+            end
+            local identity_mapping = true
+            for index in ipairs alternatives do if positions[borrow_paths.key(alternatives[index])] ~= index - 1 then identity_mapping = false end end
+            selected = identity_mapping and bits(types.U64, info.form.selector) or choose(path, 1)
+        end
+        local operands = { selected.operand }
+        for _, alternative in ipairs schema do
+            local incoming = by_key[borrow_paths.key alternative]
+            local coordinates = incoming and borrow_paths.coordinates(incoming)
+            for index, exemplar in ipairs(borrow_paths.coordinates alternative) do
+                operands[#operands + 1] = coordinates and coordinates[index] or zero_operand(exemplar.type)
+            end
+        end
+        return operands
+    end
+    local instantiate_borrow = do(path, native_type, schema, take, state, lifetime)
+        local selector = take(types.U64)
+        local alternatives, origins = {}, {}
+        for _, alternative in ipairs schema do
+            local form = borrow_paths.instantiate(alternative, take)
+            alternatives[#alternatives + 1] = data.BorrowAlternative { .form, origins = alternative.origins }
+            origins = borrow_paths.union(origins, alternative.origins)
+        end
+        local form = #alternatives == 1 and alternatives[1].form or data.Selected { .selector, .alternatives }
+        local info = data.BorrowInfo { id = fresh identity.BorrowId, .form, .origins, mutable = native_type.mutable == true or types.NativeType.is(native_type, types.ReferenceType), .lifetime, acquired = origin_of path }
+        compilation.borrows[info.id] = info
+        path.flow.borrows[info.id] = state or data.Live {}
+        path.writer.borrow info
+        for _, alternative in ipairs alternatives do
+            if data.BorrowForm.is(alternative.form, data.Stored) then remember_reference(path, alternative.form.pointer, info.id) end
+        end
+        return data.Reference { type = native_type, borrow = info.id }
+    end
+
+    local resident_places = do(flow)
+        local places = {}
+        for place, contents in pairs flow.contents do
+            if Contents.is(contents, data.Resident) and not provenance.is_memory(compilation.places[place]) then places[#places + 1] = place end
+        end
+        table.sort(places, |a, b| -> a.serial < b.serial)
+        return places
     end
 
     -- join the states that continue into one; each is { block, flow, value }. Values merge
@@ -250,6 +431,7 @@ local evaluating = do(compilation)
         local flows = {}
         for index, state in ipairs live do flows[index] = state.flow end
         local decision = tracking.agree flows
+        memory.agree(flows, decision.flow, path.writer.information)
         local target = path.writer.block "join"
         local edge_arguments = {}
         for index in ipairs live do edge_arguments[index] = {} end
@@ -258,9 +440,20 @@ local evaluating = do(compilation)
         for index, state in ipairs live do
             edge_paths[index] = { writer = path.writer, block = state.block, flow = state.flow, source = path.source, line = path.line, invocation = path.invocation, depth = path.depth, guarded = path.guarded, dead = false }
         end
+        for _, place in ipairs(resident_places(decision.flow)) do
+            for _, edge_path in ipairs edge_paths do compilation.resident_place(edge_path, compilation.places[place]) end
+        end
         local parameter = do(native_type, operands)
             local argument = path.writer.add_parameter(target, native_type)
             for index, operand in ipairs operands do edge_arguments[index][#edge_arguments[index] + 1] = operand end
+            if types.borrows(native_type) then
+                local rows = {}
+                for index, operand in ipairs operands do
+                    local info = not Operand.is(operand, data.Constant) and path.writer.information(operand) or provenance.plain(native_type)
+                    rows[#rows + 1] = { info = info or provenance.plain(native_type), flow = flows[index] }
+                end
+                path.writer.remember(argument, memory.merge_info(rows, decision.flow))
+            end
             return argument
         end
         local merge
@@ -270,6 +463,31 @@ local evaluating = do(compilation)
                 if not facts.same_value(values[1], values[position]) then all_same = false end
             end
             if all_same then return values[1] end
+            if is_reference values[1] then
+                local infos, state = {}, data.Live {}
+                for index, value in ipairs values do
+                    infos[index] = compilation.borrows[value.borrow]
+                    local incoming = assert(flows[index].borrows[value.borrow])
+                    if data.BorrowState.is(incoming, data.Ended) then state = incoming end
+                end
+                local schema = borrow_paths.schema infos
+                local captured = {}
+                for index, value in ipairs values do captured[index] = capture_borrow(edge_paths[index], value, schema) end
+                local position = 0
+                local destination = { ..path, flow = decision.flow }
+                local joined = instantiate_borrow(destination, native_type, schema, do(type)
+                    position += 1
+                    local operands = {}
+                    for index in ipairs values do operands[index] = captured[index][position] end
+                    return parameter(type, operands)
+                end, state, infos[1].lifetime)
+                -- A temporary place relates the incoming references to their joined value in
+                -- the actual edge rows, without assigning borrow facts to numeric coordinates.
+                local temporary = new_place(path, "joined reference", native_type, infos[1].lifetime)
+                for index, value in ipairs values do flows[index].contents[temporary.id] = data.Tracked { .value } end
+                decision.flow.contents[temporary.id] = data.Tracked { value = joined }
+                return joined
+            end
             if is_record native_type then
                 local exploded = true
                 for _, value in ipairs values do
@@ -303,7 +521,7 @@ local evaluating = do(compilation)
             if moved_somewhere and types.owns(compilation.places[place].type) then
                 for index, edge_path in ipairs edge_paths do
                     local contents = edge_path.flow.contents[place]
-                    if contents and Contents.is(contents, data.Tracked) then compilation.release_place(edge_path, place) end
+                    if contents and (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)) then compilation.release_place(edge_path, place) end
                 end
                 flow.contents[place] = data.Moved { at = moved_at }
             end
@@ -323,9 +541,10 @@ local evaluating = do(compilation)
             joined_value = merge(value_type, values)
         end
         for index, edge_path in ipairs edge_paths do
-            path.writer.terminate(edge_path.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, .target, arguments = edge_arguments[index] } })
+            terminate(edge_path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, .target, arguments = edge_arguments[index] } })
         end
         path.block, path.flow, path.dead = target, flow, false
+        enter path
         return joined_value
     end
 
@@ -338,20 +557,18 @@ local evaluating = do(compilation)
             local value = run arm
             state = { block = arm.block, flow = arm.flow, .value, dead = arm.dead }
             return "adopt"
-        end)
+        end, path.writer)
         local fragment = outcome { built = f -> f, discarded = || -> nil }
         local entry = path.writer.adopt fragment
         return entry, state
     end
-
-    local E = {}
 
     -- a branch on an operand: both arms built and joined; `value_type` when the arms yield values
     local residual_branch = do(path, condition, run_true, run_false, wants_value)
         local true_entry, true_state = build_arm(path, "then", run_true)
         local false_entry, false_state = build_arm(path, "else", run_false)
         local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
-        path.writer.terminate(path.block, data.Branch { origin = origin_of path, .condition, when_true = edge true_entry, when_false = edge false_entry })
+        terminate(path, data.Branch { origin = origin_of path, .condition, when_true = edge true_entry, when_false = edge false_entry })
         local states = {}
         for _, state in ipairs { true_state, false_state } do
             if not state.dead then states[#states + 1] = state end
@@ -362,10 +579,42 @@ local evaluating = do(compilation)
         return value
     end
 
+    -- Dispatch a selected reference with ordinary control. Each arm's entry relates the
+    -- selected value to its leaf through one temporary place, for independent lifetime replay.
+    local dispatch_reference = do(path, reference, run)
+        local info = compilation.borrows[reference.borrow]
+        local state = assert(path.flow.borrows[reference.borrow])
+        if data.BorrowState.is(state, data.Ended) then fail(path, ("a borrow is used after it ended (%s)"):format(state.reason)) end
+        if not data.BorrowForm.is(info.form, data.Selected) then return run(path, reference) end
+        local temporary = new_place(path, "selected reference", reference.type, info.lifetime)
+        path.flow.contents[temporary.id] = data.Tracked { value = reference }
+        local leaf = do(arm, index)
+            local alternative = info.form.alternatives[index]
+            local selected = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = alternative.form, origins = alternative.origins }
+            compilation.borrows[selected.id] = selected
+            arm.flow.borrows[selected.id] = arm.flow.borrows[reference.borrow]
+            local value = data.Reference { type = reference.type, borrow = selected.id }
+            arm.flow.contents[temporary.id] = data.Tracked { .value }
+            enter arm
+            local result = run(arm, value)
+            arm.flow.contents[temporary.id] = nil
+            return result or known(data.Constant { type = types.Unit, bits = data.UnitBits {} })
+        end
+        local choose
+        choose = do(at, index)
+            local condition = E.operate(at, "equal", bits(types.U64, info.form.selector), index - 1)
+            return residual_branch(at, condition.operand, arm -> leaf(arm, index), do(arm)
+                if index + 1 == #info.form.alternatives then return leaf(arm, index + 1) end
+                return choose(arm, index + 1)
+            end, true)
+        end
+        return choose(path, 1)
+    end
+
     --------------------------------------------------------------------------------------------
     -- bindings
 
-    local raw_place, load
+    local raw_place
     local Cell = {}
     Cell.__index = Cell
     local is_cell = value -> getmetatable value == Cell
@@ -374,6 +623,7 @@ local evaluating = do(compilation)
     local host_cell = |path, name, value| -> setmetatable({ kind = "host", .name, .value, depth = path.depth }, Cell)
 
     E.bind = do(path, name, annotation, value)
+        if path.dead then return nil end
         if annotation ~= nil and not check(types.NativeType, annotation) then
             fail(path, ("the local '%s' is annotated with %s, not a native type"):format(name, tostring annotation))
         end
@@ -384,7 +634,10 @@ local evaluating = do(compilation)
         local type = annotation or value.type
         local place = new_place(path, name, type)
         if value ~= nil then
-            path.flow.contents[place.id] = data.Tracked { value = from_host(path, type, value, "the value of '" .. name .. "'") }
+            local converted = from_host(path, type, value, "the value of '" .. name .. "'")
+            check_local_borrow(path, place.id, converted)
+            path.flow.contents[place.id] = data.Tracked { value = converted }
+            if types.owns(type) then compilation.install_payload(path, place.id, converted) end
         else
             path.flow.contents[place.id] = data.Uninitialized {}
         end
@@ -395,7 +648,6 @@ local evaluating = do(compilation)
 
     -- references: `Ref x` is a held borrow of x's place; reading through it reads that place's
     -- current contents, writing writes them (buffers §2.3)
-    local is_reference = value -> is_native value and NativeValue.is(value, data.Reference)
     local reference_to = do(path, cell)
         if not (is_cell cell and cell.kind == "place") then fail(path, "Ref takes a local of the body") end
         local place_type = compilation.places[cell.place].type
@@ -405,31 +657,166 @@ local evaluating = do(compilation)
         local info = tracking.borrow(path.flow, data.BorrowPath { root = cell.place, steps = {} }, true, lifetime, origin_of path)
         return data.Reference { type = types.reference place_type, borrow = info.id }
     end
-    local target_of = do(path, reference)
+    -- where a reference reaches: a tracked place, or (for an element path) a raw place
+    -- derived from the root's current header, element by element
+    local load
+    local reach_path = do(path, borrow_path, borrow)
+        if #borrow_path.steps == 0 then return { kind = "tracked", place = borrow_path.root } end
+        local contents = path.flow.contents[borrow_path.root]
+        local header
+        if contents and Contents.is(contents, data.Resident) then
+            header = load(path, compilation.places[borrow_path.root])
+        elseif contents and Contents.is(contents, data.Tracked) then
+            header = compilation.deref(path, contents.value)
+        else
+            fail(path, "a reference reaches a place that holds no value")
+        end
+        local element_type = compilation.places[borrow_path.root].type
+        local place = nil
+        local index_position = 0
+        for position = 1, #borrow_path.steps, 2 do
+            if place then header = load(path, place) end
+            element_type = header.type.element
+            index_position += 1
+            local data_pointer = part(path, header, "data")
+            local index = bits(types.U64, borrow_path.indices[index_position])
+            place = data.Place with
+                id = fresh identity.PlaceId
+                type = element_type
+                root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index }).operand, .borrow }
+                path = {}
+                lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+                origin = origin_of path
+            end
+            compilation.places[place.id] = place
+            path.writer.declare place
+        end
+        return { kind = "raw", .place }
+    end
+    local reach = do(path, reference)
         local use = tracking.use(path.flow, reference.borrow)
         return use with
-            derive = borrow_path -> borrow_path.root
-            cached = pointer -> compilation.borrows[reference.borrow].form.path.root
-            fixed = pointer -> fail(path, "a stored reference is not available yet")
+            derive = p -> reach_path(path, p, reference.borrow)
+            cached = pointer -> reach_path(path, compilation.borrows[reference.borrow].form.path, reference.borrow)
+            select = selected -> error("a selected reference must be dispatched before reaching its place", 0)
+            fixed = do(pointer)
+                local place = data.Place {
+                    id = fresh identity.PlaceId, type = reference.type.target,
+                    root = data.IndirectRoot { .pointer, borrow = reference.borrow }, path = {},
+                    lifetime = compilation.borrows[reference.borrow].lifetime, origin = origin_of path,
+                }
+                compilation.places[place.id] = place
+                path.writer.declare place
+                return { kind = "raw", .place }
+            end
             ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
         end
+    end
+    compilation.resident_place = do(path, place)
+        local contents = path.flow.contents[place.id]
+        if contents and Contents.is(contents, data.Tracked) then
+            local info = information(path, contents.value)
+            append(path, data.Store { site = site(path), place = place.id, value = materialize(path, contents.value) })
+            if not types.borrows(place.type) then path.flow.contents[place.id] = data.Resident { .info } end
+        end
+    end
+    compilation.pack_reference = do(path, reference)
+        if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return materialize(path, dispatch_reference(path, reference, |arm, leaf| -> bits(reference.type, compilation.pack_reference(arm, leaf))))
+        end
+        local reached = reach(path, reference)
+        local pointer
+        if reached.kind == "raw" then pointer = reached.place.root.pointer
+        else
+            local place = compilation.places[reached.place]
+            compilation.resident_place(path, place)
+            local result = fresh(identity.ValueId)
+            append(path, data.Address { site = site(path), .result, place = place.id })
+            pointer = data.Result { value = result, type = types.pointer(place.type) }
+        end
+        local operand = E.compute(path, "reinterpret", reference.type, { bits(pointer.type, pointer) }).operand
+        local stored = tracking.store(path.flow, reference.borrow, operand, origin_of(path))
+        remember_reference(path, operand, stored.id)
+        return operand
     end
     -- the value a reference reaches (a reference to a reference reaches through both)
     local deref
     deref = do(path, value)
-        if not is_reference value then return value end
-        local contents = path.flow.contents[target_of(path, value)]
+        if not is_reference value or not types.NativeType.is(value.type, types.ReferenceType) then return value end
+        if data.BorrowForm.is(compilation.borrows[value.borrow].form, data.Selected) then
+            return dispatch_reference(path, value, deref)
+        end
+        local reached = reach(path, value)
+        if reached.kind == "raw" then return load(path, reached.place) end
+        local contents = path.flow.contents[reached.place]
+        if contents and Contents.is(contents, data.Resident) then
+            local loaded = load(path, compilation.places[reached.place])
+            return loaded
+        end
         if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
         return deref(path, contents.value)
+    end
+    -- a reference to element `index` of the buffer `reference` reaches (buffers §2.3)
+    local element_reference
+    element_reference = do(path, reference, index)
+        if is_reference reference and data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return dispatch_reference(path, reference, |arm, selected| -> element_reference(arm, selected, index))
+        end
+        local base_path
+        if is_reference reference then
+            local info = compilation.borrows[reference.borrow]
+            local use = tracking.use(path.flow, reference.borrow)
+            base_path = use with
+                derive = p -> p
+                select = selected -> error("a selected element reference must be dispatched", 0)
+                cached = pointer -> info.form.path
+                fixed = pointer -> fail(path, "a stored reference is not available yet")
+                ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+            end
+        else
+            fail(path, "an element reference starts from a reference to a buffer")
+        end
+        index = from_host(path, types.U64, index, "the index")
+        local steps, indices = {}, {}
+        for position, step in ipairs base_path.steps do steps[position] = step end
+        for position, operand in ipairs(base_path.indices or {}) do indices[position] = operand end
+        local constant = constant_of index
+        steps[#steps + 1] = data.ContentsStep {}
+        steps[#steps + 1] = constant and data.KnownElement { index = tonumber(rules.integer_value constant) } or data.AnyElement {}
+        indices[#indices + 1] = index.operand
+        local element_type = reference.type.target.element
+        local base_info = compilation.borrows[reference.borrow]
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, .steps, .indices }, true, base_info.lifetime, origin_of path)
+        local origins = {}
+        for _, origin in ipairs base_info.origins do
+            local extended = {}
+            for position, step in ipairs origin.path do extended[position] = step end
+            extended[#extended + 1] = data.ContentsStep {}
+            extended[#extended + 1] = steps[#steps]
+            origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+        end
+        info = data.BorrowInfo { ..info, .origins }
+        compilation.borrows[info.id] = info
+        return data.Reference { type = types.reference element_type, borrow = info.id }
     end
     E.reference_to = reference_to
     compilation.deref = deref
 
     local peek
     E.get = do(path, cell)
+        if path.dead then return nil end
         local value = peek(path, cell)
         -- using an owner as a value moves it (syntax §9.2)
         if is_cell cell and cell.kind == "place" and types.owns(compilation.places[cell.place].type) then
+            local previous = information(path, value)
+            local info = memory.capture(path.flow, cell.place, previous)
+            if next(memory.payloads(info)) or next(memory.payloads(previous)) then
+                local operand = materialize(path, value)
+                path.writer.remember(operand, info)
+                value = data.Aggregate { ..value, packed = operand }
+            end
+            if Contents.is(path.flow.contents[cell.place], data.Resident) then path.flow.contents[cell.place] = data.Tracked { .value } end
+            append(path, data.Ends { site = site path, target = data.Access { place = cell.place, path = {} }, reason = "moved" })
             tracking.move_owner(path.flow, cell.place, origin_of path)
         end
         return value
@@ -448,10 +835,28 @@ local evaluating = do(compilation)
         local contents = path.flow.contents[cell.place]
         if contents == nil or Contents.is(contents, data.Uninitialized) then fail(path, ("'%s' is read before it is assigned"):format(cell.name)) end
         if Contents.is(contents, data.Moved) then fail(path, ("'%s' was moved"):format(cell.name)) end
+        if Contents.is(contents, data.Resident) then return load(path, compilation.places[cell.place]) end
         return contents.value
     end
 
+    local write_reference
+    write_reference = do(path, reference, value, name)
+        if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return dispatch_reference(path, reference, |arm, selected| -> write_reference(arm, selected, value, name))
+        end
+        local reached = reach(path, reference)
+        local place = reached.kind == "raw" and reached.place or compilation.places[reached.place]
+        local written = from_host(path, place.type, value, "the value written through '" .. name .. "'")
+        local contents = path.flow.contents[place.id]
+        if reached.kind == "raw" or (contents and Contents.is(contents, data.Resident)) then
+            append(path, data.Store { site = site path, place = place.id, value = materialize(path, written) })
+        else
+            path.flow.contents[place.id] = data.Tracked { value = written }
+        end
+    end
+
     E.set = do(path, cell, value)
+        if path.dead then return nil end
         if not is_cell cell then fail(path, "this is not something a typed body can assign") end
         if cell.kind == "element" then
             E.method(path, cell.base, "set", { cell.key, value }, false)
@@ -465,13 +870,13 @@ local evaluating = do(compilation)
             local exploded = explode(path, whole)
             local parts = {}
             for name, existing in pairs exploded.parts do parts[name] = existing end
-            parts[cell.name] = from_host(path, field.type, value, ("the field '%s'"):format(cell.name))
+            parts[cell.name] = compilation.stored_borrow(path, from_host(path, field.type, value, ("the field '%s'"):format(cell.name)))
             E.set(path, cell.base, data.Aggregate { type = whole.type, packed = nil, .parts })
             return
         end
         if cell.kind == "raw" then
             local stored = from_host(path, cell.place.type, value, "the stored value")
-            path.writer.append(path.block, data.Store { site = site path, place = cell.place.id, value = materialize(path, stored) })
+            append(path, data.Store { site = site path, place = cell.place.id, value = materialize(path, stored) })
             return
         end
         if cell.kind == "host" then
@@ -483,17 +888,20 @@ local evaluating = do(compilation)
             return
         end
         local type = compilation.places[cell.place].type
-        if types.NativeType.is(type, types.ReferenceType) and not is_reference value then
-            local current = path.flow.contents[cell.place]
-            local target = target_of(path, current.value)
-            local target_type = compilation.places[target].type
-            path.flow.contents[target] = data.Tracked { value = from_host(path, target_type, value, "the value written through '" .. cell.name .. "'") }
-            return
+        if types.NativeType.is(type, types.ReferenceType) and (not is_reference(value) or value.type ~= type) then
+            return write_reference(path, peek(path, cell), value, cell.name)
         end
         local converted = from_host(path, type, value, "the value assigned to '" .. cell.name .. "'")
-        -- replacing an owner ends the old one there (syntax §9.2)
+        check_local_borrow(path, cell.place, converted)
+        -- An addressed place remains resident while its value is live: subsequent writes
+        -- must reach references already stored elsewhere, not just a compiler-side cache.
+        local resident = path.flow.contents[cell.place] and Contents.is(path.flow.contents[cell.place], data.Resident)
         if types.owns type then compilation.release_place(path, cell.place) end
-        path.flow.contents[cell.place] = data.Tracked { value = converted }
+        if resident then
+            append(path, data.Store { site = site(path), place = cell.place, value = materialize(path, converted) })
+            if not types.borrows(type) then path.flow.contents[cell.place] = data.Resident { info = information(path, converted) } end
+        else path.flow.contents[cell.place] = data.Tracked { value = converted } end
+        if types.owns(type) then compilation.install_payload(path, cell.place, converted) end
     end
 
     E.host_number = do(path, value)
@@ -524,6 +932,7 @@ local evaluating = do(compilation)
     host_operations["not"] = a -> not a
 
     E.operate = do(path, operator, left, right)
+        if path.dead then return nil end
         if is_native left then left = deref(path, left) end
         if is_native right then right = deref(path, right) end
         local unary = right == nil and (operator == "negate" or operator == "not" or operator == "bit_not")
@@ -575,11 +984,13 @@ local evaluating = do(compilation)
         local reason = rules.check_types(opcode, type, argument_types)
         if reason then fail(path, reason) end
         local decision = rules.fold(opcode, type, operands)
-        return decision with
+        local result = decision with
             folded = constant_bits -> known(data.Constant { .type, bits = constant_bits })
             not_foldable = || -> emit_compute(path, opcode, type, operands)
             invalid = reason_text -> fail(path, reason_text)
         end
+
+        return result
     end
 
     -- `a and b`, `a or b`: control, not eager operations
@@ -641,6 +1052,7 @@ local evaluating = do(compilation)
     end
 
     E.return_value = do(path, value)
+        if path.dead then return STOPPED end
         local invocation = path.invocation
         local result_type = invocation.word.result
         if result_type == types.Unit then
@@ -650,7 +1062,20 @@ local evaluating = do(compilation)
             if value == nil then fail(path, invocation.word.name .. " must return " .. types.describe result_type) end
             value = from_host(path, result_type, value, "the result of " .. invocation.word.name)
         end
+        -- a word returns borrows of what it received, never of its own locals (syntax §9.5):
+        -- releasing the word's owners is what ends such a borrow, so a borrow live before the
+        -- releases and ended after them borrowed a local
+        local live_before = is_reference value and path.flow.borrows[value.borrow]
+            and data.BorrowState.is(path.flow.borrows[value.borrow], data.Live)
         compilation.release_live(path, invocation.places, 1)
+        if live_before then
+            local state = path.flow.borrows[value.borrow]
+            if state and data.BorrowState.is(state, data.Ended) then
+                local origin = compilation.borrows[value.borrow].origins[1]
+                local name = compilation.place_scope[origin.place] and compilation.place_scope[origin.place].name or "a local"
+                fail(path, ("%s returns a borrow of its own local '%s', which ends with it"):format(invocation.word.name, name))
+            end
+        end
         invocation.exits[#invocation.exits + 1] = { block = path.block, flow = path.flow, .value }
         path.dead = true
         return RETURNED
@@ -659,6 +1084,7 @@ local evaluating = do(compilation)
     -- `return f args`: a tail re-entry of the invocation under dynamic control is the next round
     -- of its loop; the first one met discards the attempt that found it (syntax §6.2)
     E.return_tail = do(path, callee, arguments)
+        if path.dead then return STOPPED end
         local invocation = path.invocation
         local word, supplied = hosting.supplied_of callee
         if word ~= nil and word == invocation.word then
@@ -736,14 +1162,22 @@ local evaluating = do(compilation)
 
     -- one round from `path`'s state, built as a child construction: the condition, the body and
     -- the latch. Answers the fragment and the round's outcome.
-    local run_round = do(path, header_types, assumed, condition, body, latch)
+    local run_round = do(path, header_types, assumed, condition, body, latch, memory_schema)
         local round = nil
         local outcome = graph.building(nil, supply, do(writer)
-            local header = writer.block("loop", header_types)
+            local header = writer.block "loop"
             local flow = facts.fork path.flow
+            if memory_schema then memory.seed(memory_schema, flow, writer) end
+            local header_path = { ..path, .writer, block = header, .flow }
             for index, leaf in ipairs assumed do
                 local current = flow.contents[leaf.place].value
-                local parameter_value = value_of_operand(header_types[index], writer.parameter(header, index))
+                local parameter_value
+                if leaf.schema then
+                    local incoming = leaf_value(current, leaf.fields)
+                    parameter_value = instantiate_borrow(header_path, leaf.type, leaf.schema, type -> writer.add_parameter(header, type), data.Live {}, compilation.borrows[incoming.borrow].lifetime)
+                else
+                    parameter_value = value_of_operand(header_types[index], writer.add_parameter(header, header_types[index]))
+                end
                 flow.contents[leaf.place] = data.Tracked { value = with_leaf(current, leaf.fields, parameter_value) }
             end
             local work = { breaks = {}, continues = {}, nexts = {}, places_mark = path.invocation and #path.invocation.places or 0 }
@@ -759,7 +1193,7 @@ local evaluating = do(compilation)
                 end)
                 local exit_entry, exit_state = build_arm(round_path, "leave", arm -> nil)
                 local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
-                writer.terminate(round_path.block, data.Branch { origin = origin_of round_path, condition = operand, when_true = edge body_entry, when_false = edge exit_entry })
+                terminate(round_path, data.Branch { origin = origin_of round_path, condition = operand, when_true = edge body_entry, when_false = edge exit_entry })
                 exits_at_false = exit_state
             elseif value then
                 body round_path
@@ -786,7 +1220,7 @@ local evaluating = do(compilation)
             for _, state in ipairs work.breaks do leaving[#leaving + 1] = state end
             round = { .header, .writer, nexts = work.nexts, .leaving, .entry_flow }
             return "adopt"
-        end)
+        end, path.writer)
         return outcome { built = f -> f, discarded = || -> nil }, round
     end
 
@@ -836,42 +1270,58 @@ local evaluating = do(compilation)
         -- until the header holds
         local places_carried = {}
         for place, contents in pairs path.flow.contents do
-            if Contents.is(contents, data.Tracked) and (NativeValue.is(contents.value, data.Bits) or is_aggregate contents.value) then
+            if Contents.is(contents, data.Tracked) and (NativeValue.is(contents.value, data.Bits) or is_aggregate contents.value or is_reference contents.value) then
                 places_carried[#places_carried + 1] = place
             end
         end
         table.sort(places_carried, |a, b| -> a.serial < b.serial)
-        local weakened, whole = {}, {}
+        local weakened, whole, schemas = {}, {}, {}
+        local memory_schema = facts.fork(path.flow)
         while true do
             -- the leaves as the entry state has them; a place generalized whole is one leaf
             local assumed, header_types = {}, {}
             for _, place in ipairs places_carried do
                 local value = path.flow.contents[place].value
-                local leaves = whole[place] and { { .place, fields = {}, type = value.type, key = place.serial .. "." } } or leaves_of(place, value, {}, {})
+                local resident = memory_schema.contents[place] and Contents.is(memory_schema.contents[place], data.Resident)
+                local leaves = resident and {} or whole[place] and { { .place, fields = {}, type = value.type, key = place.serial .. "." } } or leaves_of(place, value, {}, {})
                 for _, leaf in ipairs leaves do
                     if weakened[leaf.key] or whole[place] then
+                        leaf.schema = schemas[leaf.key]
                         assumed[#assumed + 1] = leaf
                         header_types[#header_types + 1] = leaf.type
                     end
                 end
             end
             local exits_before = #invocation.exits
-            local fragment, round = run_round(path, header_types, assumed, condition, body, latch)
+            local fragment, round = run_round(path, header_types, assumed, condition, body, latch, memory_schema)
             local header_flow = round.entry_flow
-            local grew = false
+            local memory_inputs = { memory_schema }
+            for _, state in ipairs round.nexts do memory_inputs[#memory_inputs + 1] = state.flow end
+            local widened_memory = facts.fork(memory_schema)
+            memory.agree(memory_inputs, widened_memory, operand -> round.writer.information(operand) or path.writer.information(operand))
+            local grew = not memory.same(memory_schema, widened_memory)
+            memory_schema = widened_memory
             for _, next_state in ipairs round.nexts do
                 for _, place in ipairs places_carried do
-                    if not whole[place] then
+                    if not whole[place] and Contents.is(header_flow.contents[place], data.Tracked) then
                         local header_value = header_flow.contents[place].value
                         local next_contents = next_state.flow.contents[place]
                         local next_value = next_contents and next_contents.value
                         for _, leaf in ipairs(leaves_of(place, header_value, {}, {})) do
-                            if not weakened[leaf.key] then
-                                local now = next_value and leaf_value(next_value, leaf.fields)
+                            local before = leaf_value(header_value, leaf.fields)
+                            local now = next_value and leaf_value(next_value, leaf.fields)
+                            if is_reference before and now and is_reference now then
+                                if schemas[leaf.key] or not facts.same_value(before, now) then
+                                    local widened = borrow_paths.schema({ compilation.borrows[before.borrow], compilation.borrows[now.borrow] }, schemas[leaf.key])
+                                    if schemas[leaf.key] == nil or not borrow_paths.same_schema(schemas[leaf.key], widened) then
+                                        schemas[leaf.key], weakened[leaf.key], grew = widened, true, true
+                                    end
+                                end
+                            elseif not weakened[leaf.key] then
                                 if now == nil then
                                     whole[place] = true
                                     grew = true
-                                elseif not facts.same_value(leaf_value(header_value, leaf.fields), now) then
+                                elseif not facts.same_value(before, now) then
                                     weakened[leaf.key] = true
                                     grew = true
                                 end
@@ -881,15 +1331,32 @@ local evaluating = do(compilation)
                 end
             end
             if not grew then
+                local residents = resident_places(memory_schema)
+                for _, place in ipairs residents do compilation.resident_place(path, compilation.places[place]) end
                 local entry = path.writer.adopt fragment
                 local arguments = {}
-                for _, leaf in ipairs assumed do arguments[#arguments + 1] = materialize(path, leaf_value(path.flow.contents[leaf.place].value, leaf.fields)) end
-                path.writer.terminate(path.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, .arguments } })
+                for _, leaf in ipairs assumed do
+                    local value = leaf_value(path.flow.contents[leaf.place].value, leaf.fields)
+                    if leaf.schema then
+                        for _, operand in ipairs(capture_borrow(path, value, leaf.schema)) do arguments[#arguments + 1] = operand end
+                    else
+                        arguments[#arguments + 1] = materialize(path, value)
+                    end
+                end
+                terminate(path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, .arguments } })
                 for _, next_state in ipairs round.nexts do
-                    local next_path = { writer = path.writer, block = next_state.block, flow = next_state.flow, source = path.source, line = path.line }
+                    local next_path = { ..path, block = next_state.block, flow = next_state.flow }
+                    for _, place in ipairs residents do compilation.resident_place(next_path, compilation.places[place]) end
                     local values = {}
-                    for _, leaf in ipairs assumed do values[#values + 1] = materialize(next_path, leaf_value(next_state.flow.contents[leaf.place].value, leaf.fields)) end
-                    path.writer.terminate(next_state.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = values } })
+                    for _, leaf in ipairs assumed do
+                        local value = leaf_value(next_state.flow.contents[leaf.place].value, leaf.fields)
+                        if leaf.schema then
+                            for _, operand in ipairs(capture_borrow(next_path, value, leaf.schema)) do values[#values + 1] = operand end
+                        else
+                            values[#values + 1] = materialize(next_path, value)
+                        end
+                    end
+                    terminate(next_path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = values } })
                 end
                 join(path, round.leaving, nil)
                 return
@@ -936,35 +1403,123 @@ local evaluating = do(compilation)
     -- a native call (compiler activities §6.3): the definition of the specification the
     -- arguments give, requested from the compilation; known arguments key it, the others are
     -- passed. `generalized[index]` forces an argument dynamic even when it is known.
-    local call_definition = do(path, word, arguments, generalized)
+    local call_definition
+    call_definition = do(path, word, arguments, generalized)
+        for index, argument in ipairs arguments do
+            if is_reference argument and types.NativeType.is(argument.type, types.ReferenceType) and data.BorrowForm.is(compilation.borrows[argument.borrow].form, data.Selected) then
+                return dispatch_reference(path, argument, do(arm, selected)
+                    local supplied = {}
+                    for position, value in ipairs arguments do supplied[position] = value end
+                    supplied[index] = selected
+                    return call_definition(arm, word, supplied, generalized)
+                end)
+            end
+        end
         local specification, passed = {}, {}
+        local references = {}       -- parameter index -> the reference argument
         for index, requirement in ipairs word.requirements do
             local argument = arguments[index]
             if requirement.type == nil then
                 specification[index] = { kind = "host", value = argument }
             else
                 local value = from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
-                if is_reference value then fail(path, "a Ref across a native boundary is not available yet") end
-                if constant_of value and not (generalized and generalized[index]) then
+                if is_reference value and types.NativeType.is(value.type, types.ReferenceType) then
+                    specification[index] = { kind = "dynamic", type = requirement.type }
+                    passed[#passed + 1] = compilation.pack_reference(path, value)
+                    references[#passed] = value
+                elseif constant_of value and not (generalized and generalized[index]) then
                     specification[index] = { kind = "native", .value }
                 else
                     specification[index] = { kind = "dynamic", type = requirement.type }
                     passed[#passed + 1] = materialize(path, value)
+                    if is_view value then references[#passed] = value end
                 end
             end
         end
         local definition = compilation.request(word, specification, "nua_boundary", path.source, path.line)
-        local result = nil
-        if word.result ~= types.Unit then result = fresh identity.ValueId end
-        path.writer.append(path.block, data.Invoke with
-            site = site path
-            .result
-            callee = data.DirectNua { .definition }
-            arguments = passed
-            boundary = fresh identity.BoundaryId
-        end)
+        local bundle = compilation.contract_of(definition)
+        local argument_info = {}
+        for index, operand in ipairs passed do argument_info[index] = path.writer.information(operand) or provenance.plain(operand.type) end
+        local result = word.result ~= types.Unit and fresh(identity.ValueId) or nil
+        local call_site = site(path)
+        local before = facts.fork(path.flow)
+        append(path, data.Invoke { site = call_site, .result, callee = data.DirectNua { .definition }, arguments = passed, boundary = fresh(identity.BoundaryId) })
+        path.writer.require_definition(definition)
+        local returned = provenance.plain(word.result)
+        if bundle then
+            local called_effects, continuing
+            returned, called_effects, continuing = boundaries.apply(bundle, path, argument_info, compilation, fail)
+            remember_borrows(path)
+            path.writer.observe(call_site.id, data.SiteFacts { .before, after = facts.fork(path.flow), effects = called_effects })
+            if not continuing then
+                terminate(path, data.Trap { origin = origin_of(path), message = data.Constant { type = types.Str, bits = data.StaticBytes { bytes = "a nonreturning call returned" } } })
+                path.dead = true
+                return nil
+            end
+        elseif types.borrows(word.result) then
+            -- Bottom interface of an unfinished recursive request; dependents are rebuilt
+            -- before publication when the group's return origins grow.
+            local info = data.BorrowInfo { id = fresh(identity.BorrowId), form = data.Stored {}, origins = {}, mutable = false, lifetime = fresh(identity.LifetimeId), acquired = origin_of(path) }
+            compilation.borrows[info.id], path.flow.borrows[info.id] = info, data.Live {}
+            returned = data.ValueInfo { type = word.result, components = { [{}] = data.Borrowed { borrow = info.id } }, proofs = {} }
+        end
         if result == nil then return nil end
-        return value_of_operand(word.result, data.Result { value = result, type = word.result })
+        local value = restore(path, word.result, data.Result { value = result, type = word.result }, returned)
+        if is_view(value) then return compilation.reroot_view(path, value, references) end
+        if is_reference(value) then return compilation.reroot_reference(path, value, references) end
+        return value
+    end
+
+    -- a view parameter of a compiled word is a stored borrow: its fixed pointer is the parameter
+    compilation.parameter_view = do(path, definition, index, view_type, operand)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = view_type
+            root = data.ParameterRoot { .definition, parameter = index }
+            path = {}
+            lifetime = fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        compilation.places[place.id] = place
+        path.writer.declare place
+        local info = data.BorrowInfo with
+            id = fresh identity.BorrowId
+            form = data.Stored { pointer = operand }
+            origins = { data.Access { place = place.id, path = { data.ContentsStep {} } } }
+            mutable = view_type.mutable
+            lifetime = place.lifetime
+            acquired = origin_of path
+        end
+        compilation.borrows[info.id] = info
+        path.flow.borrows[info.id] = data.Live {}
+        remember_reference(path, operand, info.id)
+        return data.Reference { type = view_type, borrow = info.id }
+    end
+
+    compilation.parameter_value = do(path, definition, index, native_type, operand)
+        local place = data.Place { id = fresh(identity.PlaceId), type = native_type, root = data.ParameterRoot { .definition, parameter = index }, path = {}, lifetime = fresh(identity.LifetimeId), origin = origin_of(path) }
+        compilation.places[place.id] = place
+        path.writer.declare(place)
+        local info = compilation.symbolic_info(path, native_type, data.Access { place = place.id, path = {} })
+        return restore(path, native_type, operand, info)
+    end
+    -- a reference parameter of a compiled word reaches a place rooted in that parameter, its
+    -- contents resident in memory: read by Load, written by Store
+    compilation.parameter_reference = do(path, definition, index, reference_type, operand)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = reference_type.target
+            root = data.ParameterRoot { .definition, parameter = index }
+            path = {}
+            lifetime = fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        compilation.places[place.id] = place
+        path.writer.declare place
+        path.flow.contents[place.id] = data.Resident { info = data.ValueInfo { type = place.type, components = {}, proofs = {} } }
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = place.id, steps = {} }, true, place.lifetime, origin_of path)
+        remember_reference(path, operand, info.id)
+        return data.Reference { type = reference_type, borrow = info.id }
     end
 
     -- the invocation of `word` active on this path's chain, if any
@@ -1007,6 +1562,7 @@ local evaluating = do(compilation)
                     invocation.argument_values[index] = value
                     local place = new_place(callee, requirement.name, requirement.type)
                     callee.flow.contents[place.id] = data.Tracked { .value }
+                    if types.owns(value.type) then compilation.install_payload(callee, place.id, value) end
                     invocation.arguments[index] = place_cell(place.id, requirement.name)
                 end
             end
@@ -1015,6 +1571,7 @@ local evaluating = do(compilation)
             id = fresh identity.InvocationId, .word, arguments = {}, argument_values = {}, exits = {}, places = {},
             lifetime = fresh identity.LifetimeId, parent = path.invocation, entry_depth = path.depth,
             entry_guarded = path.guarded or 0, loop_mode = false,
+            level = (path.invocation and path.invocation.level or 0) + 1, scopes = {}, scope_count = 0,
         }
         local run_body = do(invocation, callee)
             word.body(E, callee)
@@ -1043,6 +1600,7 @@ local evaluating = do(compilation)
                     .writer, .block, flow = facts.fork path.flow, .invocation, loop = nil,
                     depth = path.depth, guarded = path.guarded or 0, source = word.source, line = word.line, dead = false,
                 }
+                enter callee
                 bind_arguments(invocation, callee)
                 if invocation.loop_mode then
                     loop(callee, || -> true, do(round)
@@ -1064,18 +1622,9 @@ local evaluating = do(compilation)
             invocation.loop_mode = true
             fragment = attempt invocation
         end
-        -- a straight-line invocation is spliced into the caller's block; anything else is entered
-        if #fragment.order == 1 and fragment.blocks[fragment.order[1]].terminator == nil then
-            local only = fragment.blocks[fragment.order[1]]
-            for _, instruction in ipairs only.instructions do path.writer.append(path.block, instruction) end
-            for id, place in pairs fragment.places do path.writer.declare place end
-            for _, exit in ipairs invocation.exits do
-                if exit.block == only.id then exit.block = path.block end
-            end
-        else
-            local entry = path.writer.adopt fragment
-            path.writer.terminate(path.block, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = {} } })
-        end
+        -- Adopt graph and facts together, even for a straight-line invocation (§4.3).
+        local entry = path.writer.adopt fragment
+        terminate(path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = {} } })
         return join(path, invocation.exits, word.result)
     end
     compilation.invoke = invoke
@@ -1102,10 +1651,11 @@ local evaluating = do(compilation)
     end
     local release_place = do(path, place)
         local contents = path.flow.contents[place]
-        if not (contents and Contents.is(contents, data.Tracked)) then return end
+        if not contents or not (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)) then return end
+        local value = Contents.is(contents, data.Resident) and load(path, compilation.places[place]) or contents.value
         path.flow.contents[place] = data.Moved { at = origin_of path }
-        tracking.ends(path.flow, data.Access { .place, path = {} }, "released", origin_of path)
-        release_value(path, contents.value)
+        append(path, data.Ends { site = site path, target = data.Access { .place, path = {} }, reason = "released" })
+        release_value(path, value)
     end
     -- release the live owners among `places`, from index `first`, newest first
     local release_live = do(path, places, first)
@@ -1115,10 +1665,21 @@ local evaluating = do(compilation)
         end
     end
     compilation.release_place = release_place
+    compilation.release_value = release_value
     compilation.release_live = release_live
 
     -- the end of a block: its owners that are still live are released, newest first
+    -- blocks open and close scopes: a place's scope chain decides what it outlives (§9.5)
+    E.scope_begin = do(path)
+        local invocation = path.invocation
+        if invocation == nil then return end
+        invocation.scopes = invocation.scopes or {}
+        invocation.scope_count = (invocation.scope_count or 0) + 1
+        invocation.scopes[#invocation.scopes + 1] = invocation.scope_count
+    end
     E.scope_end = do(path, cells)
+        local invocation = path.invocation
+        if invocation and invocation.scopes and #invocation.scopes > 0 then invocation.scopes[#invocation.scopes] = nil end
         if path.dead then return end
         for position = #cells, 1, -1 do
             local cell = cells[position]
@@ -1129,13 +1690,18 @@ local evaluating = do(compilation)
     -- `trap "why"`: the path ends here, at run time, with the message
     E.trap = do(path, message)
         local constant = data.Constant { type = types.Str, bits = data.StaticBytes { bytes = tostring message } }
-        path.writer.terminate(path.block, data.Trap { origin = origin_of path, message = constant })
+        terminate(path, data.Trap { origin = origin_of path, message = constant })
         path.dead = true
         return nil
     end
 
     -- `value:name(arguments)`: a method of the value's type, given a reference to the value
     E.method = do(path, base, name, arguments, boundary)
+        if path.dead then return nil end
+        local receiver_value = is_cell base and peek(path, base) or base
+        if is_reference receiver_value and data.BorrowForm.is(compilation.borrows[receiver_value.borrow].form, data.Selected) then
+            return dispatch_reference(path, receiver_value, |arm, selected| -> E.method(arm, selected, name, arguments, boundary))
+        end
         local value = is_cell base and deref(path, peek(path, base)) or deref(path, base)
         if not (is_aggregate value and is_buffer value.type) then fail(path, ("':%s' of %s is not available yet"):format(name, is_native value and types.describe value.type or tostring value)) end
         local words = compilation.buffer_words(value.type.element)
@@ -1148,30 +1714,378 @@ local evaluating = do(compilation)
         return E.apply(path, word, supplied, boundary)
     end
 
+    --------------------------------------------------------------------------------------------
+    -- views (buffers §2.3): a held borrow of a buffer's contents is a path from the buffer's
+    -- place with a range; each use derives the pointer from the buffer's current header, so
+    -- growth never ends it, and shrinking or clearing does
+
+
+    -- `view_of(self, first, count)`: the primitive a buffer's words make views with
+    local make_view
+    make_view = do(path, reference, first, count)
+        if not (is_reference reference and types.NativeType.is(reference.type, types.ReferenceType)) then fail(path, "view_of takes a reference to a buffer") end
+        if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return dispatch_reference(path, reference, |arm, selected| -> make_view(arm, selected, first, count))
+        end
+        -- Constructing a held view records its path; it does not derive an address.
+        local state = assert(path.flow.borrows[reference.borrow])
+        if data.BorrowState.is(state, data.Ended) then fail(path, ("a borrow is used after it ended (%s)"):format(state.reason)) end
+        local buffer_type = reference.type.target
+        local base_info = compilation.borrows[reference.borrow]
+        local base = base_info.form
+        if not data.BorrowForm.is(base, data.Held) then fail(path, "a held view through this stored header reference is not available yet") end
+        local steps = {}
+        for index, step in ipairs base.path.steps do steps[index] = step end
+        steps[#steps + 1] = data.ContentsStep {}
+        if not is_buffer buffer_type then fail(path, "view_of takes a reference to a buffer") end
+        first = from_host(path, types.U64, first, "the first element of the view")
+        count = from_host(path, types.U64, count, "the length of the view")
+        local borrow_path = data.BorrowPath { root = base.path.root, .steps, indices = base.path.indices, range = data.Range { first = first.operand, count = count.operand } }
+        local info = tracking.borrow(path.flow, borrow_path, false, base_info.lifetime, origin_of path)
+        local origins = {}
+        for _, origin in ipairs base_info.origins do
+            local extended = {}
+            for position, step in ipairs origin.path do extended[position] = step end
+            extended[#extended + 1] = data.ContentsStep {}
+            origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+        end
+        info = data.BorrowInfo { ..info, .origins }
+        compilation.borrows[info.id] = info
+        return data.Reference { type = types.view(buffer_type.element), borrow = info.id }
+    end
+
+    -- the pointer to a view's first element here, and its count
+    local view_pair_types = {}
+    local view_parts
+    view_parts = do(path, view)
+        local info = compilation.borrows[view.borrow]
+        if data.BorrowForm.is(info.form, data.Selected) then
+            local pair_type = view_pair_types[view.type]
+            if pair_type == nil then
+                pair_type = types.record("view coordinates", { { name = "data", type = types.pointer(view.type.element) }, { name = "length", type = types.U64 } })
+                view_pair_types[view.type] = pair_type
+            end
+            local pair = dispatch_reference(path, view, do(arm, selected)
+                local start, count = view_parts(arm, selected)
+                return data.Aggregate { type = pair_type, parts = { data = start, length = count } }
+            end)
+            return part(path, pair, "data"), part(path, pair, "length")
+        end
+        local use = tracking.use(path.flow, view.borrow)
+        return use with
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+            fixed = do(packed)
+                local start, count = fresh identity.ValueId, fresh identity.ValueId
+                local pointer_type = types.pointer view.type.element
+                append(path, data.Extract { site = site path, result = start, type = pointer_type, aggregate = packed, path = { data.FieldComponent { name = "data" } } })
+                append(path, data.Extract { site = site path, result = count, type = types.U64, aggregate = packed, path = { data.FieldComponent { name = "length" } } })
+                return bits(pointer_type, data.Result { value = start, type = pointer_type }), bits(types.U64, data.Result { value = count, type = types.U64 })
+            end
+            select = selected -> error("a selected view must be dispatched", 0)
+            cached = pointer -> fail(path, "a cached view pointer is not available yet")
+            derive = do(borrow_path)
+                local steps = {}
+                for index = 1, #borrow_path.steps - 1 do steps[index] = borrow_path.steps[index] end
+                local reached = reach_path(path, data.BorrowPath { root = borrow_path.root, .steps, indices = borrow_path.indices }, view.borrow)
+                local contents = reached.kind == "tracked" and path.flow.contents[reached.place]
+                local header
+                if reached.kind == "raw" then
+                    header = load(path, reached.place)
+                elseif contents and Contents.is(contents, data.Resident) then
+                    header = load(path, compilation.places[reached.place])
+                elseif contents and Contents.is(contents, data.Tracked) then
+                    header = deref(path, contents.value)
+                else
+                    fail(path, "a view reaches a buffer that holds no value")
+                end
+                local first = bits(types.U64, borrow_path.range.first)
+                local data_pointer = part(path, header, "data")
+                local start = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, first })
+                return start, bits(types.U64, borrow_path.range.count)
+            end
+        end
+    end
+
+    local reached_type = do(origin, steps)
+        local type = compilation.places[origin.place].type
+        local position = 1
+        while position <= #steps do
+            if not is_buffer(type) or not data.AccessStep.is(steps[position], data.ContentsStep) or not steps[position + 1] then return nil end
+            type = type.element
+            position += 2
+        end
+        return type
+    end
+    local incoming_indices = do(origin, steps, arguments)
+        local indices = {}
+        local position = 0
+        for depth, step in ipairs steps do
+            if data.AccessStep.is(step, data.KnownElement) or data.AccessStep.is(step, data.AnyElement) then
+                position += 1
+                if data.AccessStep.is(step, data.KnownElement) then indices[position] = rules.integer(types.U64, step.index)
+                else
+                    for _, argument in pairs arguments do
+                        local form = compilation.borrows[argument.borrow].form
+                        if data.BorrowForm.is(form, data.Held) and form.path.root == origin.place and #form.path.steps >= depth and facts.paths_overlap(form.path.steps, steps) then
+                            indices[position] = form.path.indices and form.path.indices[position]
+                        end
+                    end
+                    if indices[position] == nil then return nil end
+                end
+            end
+        end
+        return indices
+    end
+    compilation.reroot_reference = do(path, reference, arguments)
+        local info = compilation.borrows[reference.borrow]
+        if #info.origins ~= 1 then return reference end
+        local origin = info.origins[1]
+        if reached_type(origin, origin.path) ~= reference.type.target then return reference end
+        local indices = incoming_indices(origin, origin.path, arguments)
+        if indices == nil and #origin.path >= 2 and data.AccessStep.is(origin.path[#origin.path], data.AnyElement) then
+            local steps = {}
+            for index = 1, #origin.path - 2 do steps[index] = origin.path[index] end
+            local parent_indices = incoming_indices(origin, steps, arguments)
+            if parent_indices then
+                local reached = reach_path(path, data.BorrowPath { root = origin.place, .steps, indices = parent_indices }, reference.borrow)
+                local header
+                if reached.kind == "raw" then header = load(path, reached.place)
+                else
+                    local contents = path.flow.contents[reached.place]
+                    header = contents and Contents.is(contents, data.Tracked) and contents.value or load(path, compilation.places[reached.place])
+                end
+                if is_buffer(header.type) then
+                    local pointer = emit_compute(path, "reinterpret", types.pointer(reference.type.target), { info.form.pointer })
+                    local distance = E.compute(path, "pointer_difference", types.I64, { pointer, part(path, header, "data") })
+                    local offset = E.compute(path, "convert", types.U64, { distance })
+                    indices = parent_indices
+                    indices[#indices + 1] = offset.operand
+                end
+            end
+        end
+        if indices == nil then return reference end
+        info = data.BorrowInfo { ..info, form = data.Held { path = data.BorrowPath { root = origin.place, steps = origin.path, .indices } }, lifetime = compilation.places[origin.place].lifetime }
+        compilation.borrows[info.id] = info
+        path.writer.borrow(info)
+        return reference
+    end
+    compilation.reroot_view = do(path, view, arguments)
+        local info = compilation.borrows[view.borrow]
+        if #info.origins ~= 1 then return view end
+        local origin = info.origins[1]
+        if not origin.path[#origin.path] or not data.AccessStep.is(origin.path[#origin.path], data.ContentsStep) then return view end
+        local steps = {}
+        for index = 1, #origin.path - 1 do steps[index] = origin.path[index] end
+        local type = reached_type(origin, steps)
+        if not type or not is_buffer(type) then return view end
+        local indices = incoming_indices(origin, steps, arguments)
+        if indices == nil then return view end
+        local start, count = view_parts(path, view)
+        local reached = reach_path(path, data.BorrowPath { root = origin.place, .steps, .indices }, view.borrow)
+        local header = reached.kind == "raw" and load(path, reached.place) or nil
+        if header == nil then
+            local contents = path.flow.contents[reached.place]
+            header = contents and Contents.is(contents, data.Tracked) and contents.value or load(path, compilation.places[reached.place])
+        end
+        if not is_buffer(header.type) then return view end
+        local offset = E.compute(path, "pointer_difference", types.I64, { start, part(path, header, "data") })
+        local first = E.compute(path, "convert", types.U64, { offset })
+        local form = data.Held { path = data.BorrowPath { root = origin.place, steps = origin.path, .indices, range = data.Range { first = first.operand, count = count.operand } } }
+        info = data.BorrowInfo { ..info, .form, lifetime = compilation.places[origin.place].lifetime }
+        compilation.borrows[info.id] = info
+        path.writer.borrow(info)
+        return view
+    end
+
+    -- A reference/view written into a record is stored: its pointer (and a view's
+    -- count) is fixed there, including when its source was selected or held.
+    compilation.stored_borrow = do(path, view)
+        if not is_reference(view) then return view end
+        local info = compilation.borrows[view.borrow]
+        if data.BorrowForm.is(info.form, data.Stored) then return view end
+        local packed = is_view(view) and compilation.pack_view(path, view) or compilation.pack_reference(path, view)
+        local stored = tracking.store(path.flow, view.borrow, packed, origin_of path)
+        remember_reference(path, packed, stored.id)
+        return data.Reference { type = view.type, borrow = stored.id }
+    end
+
+    -- a view as a value in memory: its current pointer and count, packed
+    compilation.pack_view = do(path, view)
+        local start, count = view_parts(path, view)
+        local result = fresh identity.ValueId
+        append(path, data.Pack { site = site path, .result, type = view.type, components = { start.operand, count.operand } })
+        local operand = data.Result { value = result, type = view.type }
+        remember_reference(path, operand, view.borrow)
+        return operand
+    end
+
+    -- a value written into a container's storage: each view it carries becomes a stored
+    -- borrow the container holds (rule 3: growth ends it)
+    -- does `a` outlive `b`? A place of an enclosing invocation outlives the callee's; within an
+    -- invocation, an enclosing block's outlives a nested one's, and in one block the earlier
+    -- declared outlives the later (releases run newest first)
+    local outlives = do(a, b)
+        local first, second = compilation.place_scope[a], compilation.place_scope[b]
+        if first == nil or second == nil then return nil end
+        if first.level ~= second.level then return first.level < second.level end
+        for position, scope in ipairs first.scopes do
+            if second.scopes[position] ~= scope then return false end
+        end
+        if #first.scopes < #second.scopes then return true end
+        if #first.scopes > #second.scopes then return false end
+        return first.ordinal < second.ordinal
+    end
+    local name_of = place -> compilation.place_scope[place] and compilation.place_scope[place].name or "a parameter's storage"
+
+    -- A held local may use a borrow in its owner's own scope (§9.5), but rebinding an
+    -- outer local cannot let a block-local owner escape. Check before loop agreement:
+    -- otherwise an illegal body-local root would acquire a new identity on every attempt.
+    check_local_borrow = do(path, holder, value)
+        if is_reference value then
+            local destination = compilation.place_scope[holder]
+            for _, origin in ipairs compilation.borrows[value.borrow].origins do
+                local source = compilation.place_scope[origin.place]
+                local same_scope = destination and source and destination.level == source.level and #destination.scopes == #source.scopes
+                if same_scope then
+                    for index, scope in ipairs source.scopes do if destination.scopes[index] ~= scope then same_scope = false end end
+                end
+                if not same_scope and outlives(holder, origin.place) then
+                    fail(path, ("a borrow of '%s' cannot be stored in '%s', which outlives it"):format(name_of(origin.place), name_of holder))
+                end
+            end
+        elseif is_aggregate value then
+            for _, part in pairs value.parts do check_local_borrow(path, holder, part) end
+        end
+    end
+
+    check_store = do(path, targets, info)
+        for _, target in ipairs targets do
+            for _, borrow in ipairs provenance.borrowed(info) do
+                for _, origin in ipairs compilation.borrows[borrow].origins do
+                    local root = compilation.places[target.place].root
+                    local source = compilation.places[origin.place].root
+                    local both_parameters = data.PlaceRoot.is(root, data.ParameterRoot) and data.PlaceRoot.is(source, data.ParameterRoot)
+                    local later = outlives(target.place, origin.place)
+                    if not both_parameters and (later or (later == nil and data.PlaceRoot.is(root, data.ParameterRoot))) then
+                        fail(path, ("a borrow of '%s' cannot be stored in '%s', which outlives it"):format(name_of(origin.place), name_of(target.place)))
+                    end
+                end
+            end
+        end
+    end
+    compilation.check_store = check_store
+    compilation.install_payload = do(path, holder, value)
+        for _, group in pairs memory.payloads(information(path, value)) do
+            local targets = { data.Access { place = holder, path = group.path } }
+            check_store(path, targets, group.info)
+            memory.store(path, targets, group.info, origin_of(path))
+        end
+    end
+
+    -- Symbolic provenance of unobserved components at a native entry. Paths through a
+    -- borrowed component are substituted with that component's actual origins at the call.
+    local symbolic_info
+    symbolic_info = do(path, native_type, target, component_path)
+        local components = {}
+        component_path = component_path or {}
+        if types.NativeType.is(native_type, types.ViewType) or types.NativeType.is(native_type, types.ReferenceType) then
+            local suffix = types.NativeType.is(native_type, types.ViewType) and { data.ContentsStep {} } or {}
+            local root = memory.intern(target, native_type, path.writer)
+            local info = data.BorrowInfo { id = fresh(identity.BorrowId), form = data.Stored {}, origins = { data.Access { place = root.id, path = suffix } }, mutable = native_type.mutable == true or types.NativeType.is(native_type, types.ReferenceType), lifetime = root.lifetime, acquired = origin_of(path) }
+            compilation.borrows[info.id], path.flow.borrows[info.id] = info, data.Live {}
+            components[component_path] = data.Borrowed { borrow = info.id }
+        elseif types.NativeType.is(native_type, types.BufferType) then
+            components[component_path] = data.Owning {}
+        elseif types.NativeType.is(native_type, types.RecordType) then
+            for _, field in ipairs native_type.fields do
+                local nested = symbolic_info(path, field.type, data.Access { place = target.place, path = provenance.concat(target.path, { data.FieldStep { name = field.name } }) }, provenance.concat(component_path, { data.FieldComponent { name = field.name } }))
+                for key, part in pairs nested.components do components[key] = part end
+            end
+        end
+        return data.ValueInfo { type = native_type, .components, proofs = {} }
+    end
+    compilation.symbolic_info = symbolic_info
+
+    local view_element = do(path, view, index)
+        local start, count = view_parts(path, view)
+        index = from_host(path, types.U64, index, "the index")
+        E.branch(path, E.operate(path, "greater_equal", index, count), at_end -> E.trap(at_end, "index out of range"), inside -> nil)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = view.type.element
+            root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", start.type, { start, index }).operand, borrow = view.borrow }
+            path = {}
+            lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        path.writer.declare place
+        return load(path, place)
+    end
+
     E.length = do(path, base)
+        if path.dead then return nil end
         local value = is_cell base and deref(path, peek(path, base)) or deref(path, base)
+        if is_view value then
+            local _, count = view_parts(path, value)
+            return count
+        end
         if is_aggregate value and is_buffer value.type then return part(path, value, "length") end
         if not is_native value and lua_type value == "table" then return #value end
         fail(path, "'#' of this value is not available yet")
     end
 
     E.apply = do(path, callee, arguments, boundary)
+        if path.dead then return nil end
         if callee == types.reference and is_cell(arguments[1]) then return reference_to(path, arguments[1]) end
         if callee == compilation.trap then return E.trap(path, arguments[1]) end
+        if callee == compilation.element_of then
+            local reference = arguments[1]
+            if is_cell reference then reference = peek(path, reference) end
+            return element_reference(path, reference, arguments[2])
+        end
+        -- `drop(r)`: release what a reference reaches; a local it reaches is moved
+        if callee == compilation.drop then
+            local reference = arguments[1]
+            if is_cell reference then reference = peek(path, reference) end
+            if not is_reference reference then fail(path, "drop takes a reference to what it releases") end
+            local reached = reach(path, reference)
+            if reached.kind == "tracked" then
+                compilation.release_place(path, reached.place)
+            else
+                compilation.release_value(path, load(path, reached.place))
+            end
+            return nil
+        end
+        if callee == compilation.view_of then
+            local reference = arguments[1]
+            if is_cell reference then reference = peek(path, reference) end
+            return make_view(path, reference, arguments[2], arguments[3])
+        end
         -- the effect declarations of a library word (buffers §4.1): the storage a reference
         -- reaches may relocate, or its borrows end
         if callee == compilation.moves or callee == compilation.ends then
             local reference = arguments[1]
             if is_cell reference then reference = peek(path, reference) end
             if not is_reference reference then fail(path, "an effect declaration names a reference to the storage it affects") end
-            local target = data.Access { place = target_of(path, reference), path = { data.ContentsStep {} } }
+            local info = compilation.borrows[reference.borrow]
+            local form = info.form
+            if data.BorrowForm.is(form, data.Selected) then
+                return dispatch_reference(path, reference, |arm, selected| -> E.apply(arm, callee, { selected, arguments[2] }, boundary))
+            end
+            local target
+            if data.BorrowForm.is(form, data.Stored) then
+                local place = data.Place { id = fresh(identity.PlaceId), type = reference.type.target, root = data.IndirectRoot { pointer = assert(form.pointer), borrow = reference.borrow }, path = {}, lifetime = info.lifetime, origin = origin_of(path) }
+                compilation.places[place.id] = place
+                path.writer.declare(place)
+                target = data.Access { place = place.id, path = { data.ContentsStep {} } }
+            else
+                target = data.Access { place = form.path.root, path = provenance.concat(form.path.steps, { data.ContentsStep {} }) }
+            end
             if callee == compilation.moves then
-                tracking.moves(path.flow, target, origin_of path)
-                path.writer.append(path.block, data.Moves { site = site path, .target })
+                append(path, data.Moves { site = site path, .target })
             else
                 local reason = arguments[2]
-                tracking.ends(path.flow, target, reason, origin_of path)
-                path.writer.append(path.block, data.Ends { site = site path, .target, .reason })
+                append(path, data.Ends { site = site path, .target, .reason })
             end
             return nil
         end
@@ -1206,7 +2120,7 @@ local evaluating = do(compilation)
                 operands[index] = materialize(path, from_host(path, parameter, value, ("argument %d of %s"):format(index, tostring callee)))
             end
             local result = callee.result ~= types.Unit and fresh identity.ValueId or nil
-            path.writer.append(path.block, data.Mechanism { site = site path, .result, binding = callee.name, arguments = operands })
+            append(path, data.Mechanism { site = site path, .result, binding = callee.name, arguments = operands })
             if result == nil then return nil end
             return value_of_operand(callee.result, data.Result { value = result, type = callee.result })
         end
@@ -1225,8 +2139,13 @@ local evaluating = do(compilation)
     end
 
     E.dot = do(path, base, name)
+        if path.dead then return nil end
         if is_cell base then base = peek(path, base) end
         base = deref(path, base)
+        if is_view base and name == "length" then
+            local _, count = view_parts(path, base)
+            return count
+        end
         if is_aggregate base then return part(path, base, name) end
         if not is_native base and lua_type base == "table" then return base[name] end
         fail(path, ("'.%s' of %s is not available yet"):format(name, tostring base))
@@ -1246,20 +2165,38 @@ local evaluating = do(compilation)
             lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
             origin = origin_of path
         end
+        compilation.places[place.id] = place
         path.writer.declare place
         return place
     end
     load = do(path, place)
         local result = fresh identity.ValueId
-        path.writer.append(path.block, data.Load { site = site path, .result, place = place.id })
-        return value_of_operand(place.type, data.Result { value = result, type = place.type })
+        append(path, data.Load { site = site path, .result, place = place.id })
+        local operand = data.Result { value = result, type = place.type }
+        local targets = provenance.accesses(place, compilation.places, compilation.borrows)
+        local info = memory.read(path.flow, targets, place.type, path.writer)
+        if types.borrows(place.type) then
+            if info == nil and #targets == 1 and data.PlaceRoot.is(compilation.places[targets[1].place].root, data.ParameterRoot) then
+                info = symbolic_info(path, place.type, targets[1])
+            end
+            if info == nil then fail(path, "a borrowed load has no resident component provenance") end
+        end
+        return restore(path, place.type, operand, info)
     end
 
     E.element = do(path, base, key)
+        if path.dead then return nil end
         local place = raw_place(path, base, key)
         if place then return load(path, place) end
-        local value = is_cell base and deref(path, peek(path, base)) or base
-        if is_aggregate value and is_buffer value.type then return E.method(path, base, "get", { key }, false) end
+        local value = is_cell base and deref(path, peek(path, base)) or deref(path, base)
+        if is_view value then return view_element(path, value, key) end
+        if is_aggregate value and is_buffer value.type then
+            if types.owns value.type.element then
+                local receiver = is_cell base and reference_to(path, base) or base
+                return E.method(path, receiver, "element", { key }, false)
+            end
+            return E.method(path, base, "get", { key }, false)
+        end
         if is_cell base then base = peek(path, base) end
         if not is_native base and lua_type base == "table" then return base[key] end
         fail(path, "indexing a native value is not available yet")
@@ -1270,6 +2207,7 @@ local evaluating = do(compilation)
         return setmetatable({ kind = "field", .base, .name }, Cell)
     end
     E.member_at = do(path, base, key)
+        if path.dead then return nil end
         local place = raw_place(path, base, key)
         if place then return setmetatable({ kind = "raw", .place, name = "an element" }, Cell) end
         local value = is_cell base and deref(path, peek(path, base)) or nil

@@ -1,0 +1,418 @@
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+local data = require "nua.compiler.data"
+local verify = require "nua.compiler.verify_lifetimes"
+
+local refuses = do(source, text)
+    local ok, problem = pcall(compile.compile, source, "selected_refused.nua")
+    assert(not ok and tostring(problem):find(text, 1, true), tostring problem)
+end
+
+test "a joined held view keeps its selected owner and range across growth":
+    local library = native("selected_views", [[
+local pick = do(flag: Bool, n: U32): U32
+    local a = (Grow U32) { 11, 12, 13 }
+    local b = (Grow U32) { 21, 22, 23 }
+    local view = a:view(1, 2)
+    if flag then view = b:view(0, 1) end
+    for i: U32 = 1, n do
+        a:push i
+        b:push i
+    end
+    return view[0] * 100 + U32(#view)
+end
+export pick
+local same_root = do(flag: Bool, first: U64): U32
+    local xs = (Grow U32) { 10, 20, 30, 40 }
+    local view = xs:view(first, 1)
+    if flag then view = xs:view(2, 2) end
+    xs:push 50
+    return view[0] + U32(#view)
+end
+export same_root
+]])
+    assert(library.pick(false, 1000) == 1202)
+    assert(library.pick(true, 1000) == 2101)
+    assert(library.same_root(false, 1) == 21)
+    assert(library.same_root(true, 0) == 32)
+end
+
+test "different nesting depths rederive through every current header":
+    local library = native("selected_nested", [[
+local nested = do(flag: Bool, row_index: U64, count: U32): U32
+    local flat = (Grow U32) { 10, 11 }
+    local rows = (Grow (Grow U32)) {}
+    rows:push ((Grow U32) { 20, 21 })
+    rows:push ((Grow U32) { 30, 31 })
+    local chosen = flat:view(1, 1)
+    if flag then
+        local row = rows[row_index]
+        chosen = row:view(1, 1)
+    end
+    for i: U32 = 1, count do
+        rows:push ((Grow U32) { i })
+        rows[row_index]:push i
+        flat:push i
+    end
+    return chosen[0]
+end
+export nested
+local inactive = do(flag: Bool): U32
+    local flat = (Grow U32) { 41 }
+    local rows = (Grow (Grow U32)) {}
+    local view = flat:all()
+    if flag then
+        rows:push ((Grow U32) { 43 })
+        local row = rows[0]
+        view = row:all()
+    end
+    return view[0]
+end
+export inactive
+]])
+    assert(library.inactive(false) == 41 and library.inactive(true) == 43)
+    assert(library.nested(false, 0, 100) == 11)
+    assert(library.nested(true, 0, 100) == 21)
+    assert(library.nested(true, 1, 100) == 31)
+end
+
+test "a refreshed view is carried by coordinates around the loop":
+    local library = native("selected_refresh", [[
+local refreshed = do(n: U32): U32
+    local xs = (Grow U32) { 1 }
+    local view = xs:all()
+    local total: U32 = 0
+    for i: U32 = 1, n do
+        total = total + view[0]
+        xs:clear
+        xs:push i
+        view = xs:all()
+    end
+    return total * 100 + view[0]
+end
+export refreshed
+local changing = do(n: U32): U32
+    local a = (Grow U32) { 2, 3 }
+    local b = (Grow U32) { 5, 7 }
+    local c = (Grow U32) { 11, 13 }
+    local view = a:view(0, 1)
+    local total: U32 = 0
+    for i: U32 = 1, n do
+        total = total + view[0]
+        if i % 3 == 0 then view = a:view(1, 1)
+        elseif i % 3 == 1 then view = b:view(0, 2)
+        else view = c:view(1, 1) end
+        a:push i
+        b:push i
+        c:push i
+    end
+    return total * 100 + view[0] * 10 + U32(#view)
+end
+export changing
+]])
+    assert(library.refreshed(0) == 1)
+    assert(library.refreshed(4) == 704)
+    for n = 0, 15 do
+        local total, first, count = 0, 2, 1
+        for i = 1, n do
+            total += first
+            if i % 3 == 0 then first, count = 3, 1
+            elseif i % 3 == 1 then first, count = 5, 2
+            else first, count = 13, 1 end
+        end
+        assert(library.changing(n) == total * 100 + first * 10 + count)
+    end
+end
+
+test "selected references write the chosen place, including native calls":
+    local library = native("selected_refs", [[
+local bump = do(target: Ref U32): Unit
+    target = target + 10
+end
+local refs = do(flag: Bool): U32
+    local a: U32 = 1
+    local b: U32 = 2
+    local target = Ref a
+    if flag then target = Ref b end
+    target = target + 3
+    call bump target
+    return a * 100 + b
+end
+export refs
+local buffers = do(flag: Bool): U32
+    local a = (Grow U32) { 11 }
+    local b = (Grow U32) { 22 }
+    local target = Ref a
+    if flag then target = Ref b end
+    local view = target:all()
+    for i: U32 = 1, 100 do target:push i end
+    return view[0] * 1000 + U32(a.length) * 10 + U32(b.length)
+end
+export buffers
+]])
+    assert(library.refs(false) == 1402 and library.refs(true) == 115)
+    assert(library.buffers(false) == 11 * 1000 + 1010 + 1)
+    assert(library.buffers(true) == 22 * 1000 + 10 + 101)
+end
+
+test "stored and held alternatives retain their distinct invalidation rules":
+    local library = native("selected_mixed", [[
+local Token = struct { view: Slice U32 }
+local mixed = do(flag: Bool): U32
+    local a = (Grow U32) { 17 }
+    local b = (Grow U32) { 29 }
+    local token = Token { view = b:all() }
+    local view = a:all()
+    if flag then view = token.view end
+    for i: U32 = 1, 100 do a:push i end
+    return view[0]
+end
+export mixed
+]])
+    assert(library.mixed(false) == 17 and library.mixed(true) == 29)
+    refuses([[
+local Token = struct { view: Slice U32 }
+local bad = do(flag: Bool): U32
+    local a = (Grow U32) { 17 }
+    local b = (Grow U32) { 29 }
+    local token = Token { view = b:all() }
+    local view = a:all()
+    if flag then view = token.view end
+    b:push 30
+    return view[0]
+end
+export bad
+]], "after it ended (grew)")
+end
+
+test "a cleared alternative ends a joined view, but an unused stale view is harmless":
+    refuses([[
+local bad = do(flag: Bool): U32
+    local a = (Grow U32) { 1 }
+    local b = (Grow U32) { 2 }
+    local view = a:all()
+    if flag then view = b:all() end
+    b:clear
+    return view[0]
+end
+export bad
+]], "after it ended (cleared)")
+    local library = native("selected_unused", [[
+local unused = do(flag: Bool): U32
+    local a = (Grow U32) { 1 }
+    local b = (Grow U32) { 2 }
+    local view = a:all()
+    a:clear
+    if flag then view = b:all() end
+    return 99
+end
+export unused
+]])
+    assert(library.unused(false) == 99 and library.unused(true) == 99)
+end
+
+test "stale loop-carried borrows are refused while fresh ones pass":
+    refuses([[
+local stale = do(n: U32): U32
+    local xs = (Grow U32) { 1 }
+    local view = xs:all()
+    local total: U32 = 0
+    for i: U32 = 1, n do
+        total = total + view[0]
+        xs:clear
+        xs:push i
+    end
+    return total
+end
+export stale
+]], "after it ended (cleared)")
+end
+
+test "loop-local owners cannot escape into carried borrows, even unused ones":
+    for _, use in ipairs { "total = total + view[0]", "" } do
+        refuses(([[
+local bad = do(n: U32): U32
+    local xs = (Grow U32) { 1 }
+    local view = xs:all()
+    local total: U32 = 0
+    for i: U32 = 1, n do
+        %s
+        local temporary = (Grow U32) { i }
+        view = temporary:all()
+    end
+    return total
+end
+export bad
+]]):format(use), "a borrow of 'temporary' cannot be stored in 'view', which outlives it")
+    end
+    local library = native("selected_scope", [[
+local same_scope = do(flag: Bool): U32
+    local a = (Grow U32) { 11 }
+    local view = a:all()
+    local b = (Grow U32) { 13 }
+    if flag then view = b:all() end
+    return view[0]
+end
+export same_scope
+local move_to_outer = do(n: U32): U32
+    local xs = (Grow U32) { 1 }
+    local view = xs:all()
+    local total: U32 = 0
+    for i: U32 = 1, n do
+        total = total + view[0]
+        local temporary = (Grow U32) { i }
+        xs = temporary
+        view = xs:all()
+    end
+    return total * 100 + view[0]
+end
+export move_to_outer
+]])
+    assert(library.same_scope(false) == 11 and library.same_scope(true) == 13)
+    assert(library.move_to_outer(0) == 1 and library.move_to_outer(4) == 704)
+end
+
+test "nested joins flatten rather than accumulating borrow identities":
+    local source = { "local many = do(which: U32): U32" }
+    for i = 1, 24 do source[#source + 1] = ("local v%d: U32 = %d"):format(i, i) end
+    source[#source + 1] = "local selected = Ref v1"
+    for i = 2, 24 do source[#source + 1] = ("if which == %d then selected = Ref v%d end"):format(i, i) end
+    source[#source + 1] = "return selected\nend\nexport many"
+    local text = table.concat(source, "\n")
+    local compiled = compile.compile(text, "many.nua")
+    local largest = 0
+    for _, facts in pairs compiled.analysis.definitions do
+        for _, info in pairs facts.borrows do
+            if data.BorrowForm.is(info.form, data.Selected) then
+                largest = math.max(largest, #info.form.alternatives)
+                for _, alternative in ipairs info.form.alternatives do assert(not data.BorrowForm.is(alternative.form, data.Selected)) end
+            end
+        end
+    end
+    assert(largest == 24)
+    assert(#verify.lifetimes(compiled.program, compiled.analysis) == 0)
+    local library = native("selected_many", text)
+    for i = 1, 24 do assert(library.many(i) == i) end
+end
+
+test "inline return joins and break/continue exits keep reference coordinates":
+    local library = native("selected_exits", [[
+local choose = do(a: Ref (Grow U32), b: Ref (Grow U32), flag: Bool): Slice U32
+    if flag then return a:view(1, 1) end
+    return b:all()
+end
+local returned = do(flag: Bool): U32
+    local a = (Grow U32) { 1, 3 }
+    local b = (Grow U32) { 5, 7 }
+    local view = choose (Ref a) (Ref b) flag
+    for i: U32 = 1, 100 do
+        a:push i
+        b:push i
+    end
+    return view[0] * 10 + U32(#view)
+end
+export returned
+local exits = do(n: U32): U32
+    local a = (Grow U32) { 11, 13 }
+    local b = (Grow U32) { 17, 19 }
+    local view = a:view(0, 1)
+    local i: U32 = 0
+    while i < n do
+        i = i + 1
+        if i % 2 == 0 then
+            view = b:all()
+            continue
+        end
+        view = a:view(1, 1)
+        if i == 5 then break end
+    end
+    return view[0] * 100 + U32(#view) * 10 + i
+end
+export exits
+]])
+    assert(library.returned(true) == 31 and library.returned(false) == 52)
+    assert(library.exits(0) == 1110)
+    assert(library.exits(2) == 1722)
+    assert(library.exits(3) == 1313)
+    assert(library.exits(100) == 1315)
+    refuses([[
+local incomplete_refresh = do(n: U32, flag: Bool): U32
+    local xs = (Grow U32) { 1 }
+    local view = xs:all()
+    local total: U32 = 0
+    for i: U32 = 1, n do
+        total = total + view[0]
+        xs:clear
+        xs:push i
+        if flag then view = xs:all() end
+    end
+    return total
+end
+export incomplete_refresh
+]], "after it ended (cleared)")
+end
+
+test "a native result join transports stored views without a caller invocation":
+    local library, text = native("selected_native_result", [[
+local choose_view = do(flag: Bool, a: Slice U32, b: Slice U32): Slice U32
+    if flag then return a end
+    return b
+end
+export choose_view
+]])
+    local ffi = require "ffi"
+    local view_type = assert(text:match("(View_%d+) choose_view%("))
+    local a, b = ffi.new("uint32_t[2]", { 23, 29 }), ffi.new("uint32_t[1]", { 31 })
+    local first = ffi.new(view_type, { data = a, length = 2 })
+    local second = ffi.new(view_type, { data = b, length = 1 })
+    local left, right = library.choose_view(true, first, second), library.choose_view(false, first, second)
+    assert(left.length == 2 and left.data[0] == 23 and left.data[1] == 29)
+    assert(right.length == 1 and right.data[0] == 31)
+end
+
+test "lifetime replay checks selected paths independently and refuses malformed choices":
+    local types = require "nua.types"
+    local graph = require "nua.compiler.graph"
+    local compiled = compile.compile([[
+local selected = do(flag: Bool, n: U32): U32
+    local a = (Grow U32) { 1 }
+    local b = (Grow U32) { 2 }
+    local view = a:all()
+    if flag then view = b:all() end
+    for i: U32 = 1, n do
+        a:push i
+        b:push i
+    end
+    return view[0]
+end
+export selected
+]], "selected_replay.nua")
+    local has = do(problems, text)
+        for _, problem in ipairs problems do if problem.message:find(text, 1, true) then return true end end
+        return false
+    end
+    local mutate = data.Instruction.pass "invalidate selected paths" with ..graph.Unchanged
+        Moves = |node, recurse| -> { data.Ends { site = node.site, target = node.target, reason = "cleared" } }
+    end
+    local changed = graph.rewrite(mutate, compiled.program)
+    local analysis = data.Analysis { ..compiled.analysis, revision = changed.revision }
+    assert(has(verify.lifetimes(changed, analysis), "after it ended (cleared)"))
+    assert(#verify.lifetimes(compiled.program, compiled.analysis) == 0)
+    local alter = do(change)
+        local definitions = {}
+        for id, facts in pairs compiled.analysis.definitions do
+            local borrows = {}
+            for borrow, info in pairs facts.borrows do
+                borrows[borrow] = data.BorrowForm.is(info.form, data.Selected) and change(info) or info
+            end
+            definitions[id] = data.DefinitionFacts { ..facts, .borrows }
+        end
+        return data.Analysis { ..compiled.analysis, .definitions }
+    end
+    local wrong_type = alter(info -> data.BorrowInfo { ..info, form = data.Selected { ..info.form, selector = data.Constant { type = types.Bool, bits = data.BooleanBit { value = false } } } })
+    assert(has(verify.lifetimes(compiled.program, wrong_type), "selector must be U64"))
+    local wrong_origins = alter(info -> data.BorrowInfo { ..info, origins = {} })
+    assert(has(verify.lifetimes(compiled.program, wrong_origins), "union of its alternatives"))
+    local nested = alter(info -> data.BorrowInfo { ..info, form = data.Selected { ..info.form, alternatives = { data.BorrowAlternative { form = info.form, origins = info.origins }, info.form.alternatives[1] } } })
+    assert(has(verify.lifetimes(compiled.program, nested), "must be flat"))
+end

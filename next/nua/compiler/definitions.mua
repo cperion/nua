@@ -14,6 +14,8 @@ local data = require "nua.compiler.data"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
+local analysis = require "nua.compiler.analysis"
+local boundaries = require "nua.compiler.boundaries"
 
 -- host values in keys: numbers, strings and booleans by value, anything else by identity
 local host_serials = setmetatable({}, { __mode = "k" })
@@ -35,8 +37,11 @@ local defining = do(compilation)
     local fresh = supply.fresh
     local entries = {}      -- key -> { id, state }
     local definitions = {}  -- DefinitionId -> Definition
+    local definition_facts = {}
     local words = {}        -- word -> WordId
     local word_infos = {}   -- WordId -> WordInfo
+    local bundles, jobs, order = {}, {}, {}
+    local current = nil
 
     local word_id = do(word)
         local found = words[word]
@@ -76,22 +81,40 @@ local defining = do(compilation)
     end
 
     local build = do(id, word, specification, abi, kind, source, line)
-        local parameter_types, arguments = {}, {}
+        local parent = current
+        current = id
+        jobs[id].dependencies = {}
+        local parameter_types = {}
         for index, entry in ipairs specification do
-            if entry.kind == "dynamic" then
-                parameter_types[#parameter_types + 1] = entry.type
-                arguments[index] = compilation.value_of_operand(entry.type, data.Parameter { definition = id, index = #parameter_types, type = entry.type })
-            else
-                arguments[index] = entry.value
-            end
+            if entry.kind == "dynamic" then parameter_types[#parameter_types + 1] = entry.type end
         end
         local outcome = graph.building(nil, supply, do(writer)
             local entry = writer.block "entry"
             local path = { .writer, block = entry, flow = facts.empty(), invocation = nil, loop = nil, depth = 0, .source, .line, dead = false, definition = id }
+            local arguments, position = {}, 0
+            for index, entry_specification in ipairs specification do
+                if entry_specification.kind == "dynamic" then
+                    position += 1
+                    local operand = data.Parameter { definition = id, index = position, type = entry_specification.type }
+                    if types.NativeType.is(entry_specification.type, types.ReferenceType) then
+                        arguments[index] = compilation.parameter_reference(path, id, position, entry_specification.type, operand)
+                    elseif types.NativeType.is(entry_specification.type, types.ViewType) then
+                        arguments[index] = compilation.parameter_view(path, id, position, entry_specification.type, operand)
+                    elseif types.borrows(entry_specification.type) then
+                        arguments[index] = compilation.parameter_value(path, id, position, entry_specification.type, operand)
+                    else
+                        arguments[index] = compilation.value_of_operand(entry_specification.type, operand)
+                    end
+                else
+                    arguments[index] = entry_specification.value
+                end
+            end
+            compilation.enter path
             local value = compilation.invoke(path, word, arguments)
             if not path.dead then
-                local returned = (value == nil or word.result == types.Unit) and nil or compilation.materialize(path, value)
-                writer.terminate(path.block, data.Return { origin = compilation.origin(source, line), value = returned })
+                local returned = nil
+                if value ~= nil and word.result ~= types.Unit then returned = compilation.materialize(path, value) end
+                compilation.terminate(path, data.Return { origin = compilation.origin(source, line), value = returned })
             end
             return "adopt"
         end)
@@ -107,17 +130,54 @@ local defining = do(compilation)
             places = fragment.places
             origin = compilation.origin(source, line)
         end
+        definition_facts[id] = analysis.publish(definitions[id], fragment)
+        bundles[id] = { definition = definitions[id], facts = definition_facts[id], contract = boundaries.project(definitions[id], definition_facts[id], 0) }
+        jobs[id].fingerprint = boundaries.fingerprint(bundles[id])
+        local used = {}
+        for _, block in ipairs definitions[id].blocks do
+            for _, instruction in ipairs block.instructions do
+                if data.Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then used[instruction.callee.definition] = true end
+            end
+        end
+        for dependency in pairs jobs[id].dependencies do if not used[dependency] then jobs[id].dependencies[dependency] = nil end end
+        current = parent
         return id
     end
 
-    -- the definition of a specification, built the first time it is requested
+    compilation.bundle_of = id -> bundles[id]
+    compilation.contract_of = do(id)
+        if current then jobs[current].dependencies[id] = jobs[id].fingerprint or "pending" end
+        return bundles[id]
+    end
+    local register = do(id, word, specification, abi, source, line)
+        jobs[id] = { .word, .specification, .abi, source = source or word.source, line = line or word.line, dependencies = {} }
+        order[#order + 1] = id
+    end
+    local rebuild = do(id)
+        local job = jobs[id]
+        build(id, job.word, job.specification, job.abi, "native_word", job.source, job.line)
+    end
+    local close = do()
+        local changed = true
+        while changed do
+            changed = false
+            for _, id in ipairs order do
+                local stale = false
+                for dependency, seen in pairs jobs[id].dependencies do
+                    if seen ~= jobs[dependency].fingerprint then stale = true end
+                end
+                if stale then rebuild(id); changed = true end
+            end
+        end
+    end
     local request = do(word, specification, abi, source, line)
         local key = key_of(word, specification, abi)
         local found = entries[key]
         if found then return found.id end
         local id = fresh identity.DefinitionId
         entries[key] = { .id, state = "building" }
-        build(id, word, specification, abi, "native_word", source or word.source, line or word.line)
+        register(id, word, specification, abi, source, line)
+        rebuild(id)
         entries[key].state = "complete"
         return id
     end
@@ -133,7 +193,9 @@ local defining = do(compilation)
         end
         local key = not owning and key_of(word, specification, "nua_boundary")
         if key and entries[key] == nil then entries[key] = { .id, state = "building" } end
-        build(id, word, specification, "c_boundary", "native_word", source, line)
+        register(id, word, specification, "c_boundary", source, line)
+        rebuild(id)
+        close()
         if key and entries[key].id == id then entries[key].state = "complete" end
         return id
     end
@@ -143,6 +205,12 @@ local defining = do(compilation)
         .define_export
         .word_id
         definitions = || -> definitions
+        facts = || -> definition_facts
+        contracts = do()
+            local result = {}
+            for id, bundle in pairs bundles do result[id] = bundle.contract end
+            return result
+        end
         words = || -> word_infos
     end
 end

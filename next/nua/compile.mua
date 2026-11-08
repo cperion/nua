@@ -1,9 +1,10 @@
 -- The compilation root (compiler activities §7.5): it creates the compilation's identities,
 -- origins and place registry, makes the evaluation vocabulary, loads the source through Mua with
 -- the Nua host, and closes each export into a definition. The program it answers has passed
--- every verifier; a refusal is an error naming the source line.
+-- the implemented graph/type/lifetime checks; this is not yet a backend readiness certificate.
+-- A refusal is an error naming the source line.
 --
---   compile(source, filename) -> { program, exports }
+--   compile(source, filename) -> { program, analysis, exports }
 --   compile_c(source, filename) -> C text, prototypes, program
 
 local mua = require "mua"
@@ -43,6 +44,7 @@ local prelude = define
     Ref = types.reference
     Buffer = types.buffer
     Grow = types.buffer
+    Slice = types.view
     size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
 end
 
@@ -52,6 +54,7 @@ local compiling = do(source, filename)
     local compilation = define
         .supply
         places = {}
+        place_scope = {}
         borrows = {}
         exports = {}
         origin = do(origin_source, line)
@@ -73,6 +76,9 @@ local compiling = do(source, filename)
         trap = setmetatable({}, { __tostring = || -> "trap" })
         moves = setmetatable({}, { __tostring = || -> "moves" })
         ends = setmetatable({}, { __tostring = || -> "ends" })
+        view_of = setmetatable({}, { __tostring = || -> "view_of" })
+        element_of = setmetatable({}, { __tostring = || -> "element_of" })
+        drop = setmetatable({}, { __tostring = || -> "drop" })
         record = do(name, fields, line)
             for _, field in ipairs fields do
                 if not check(types.NativeType, field.type) then
@@ -114,6 +120,10 @@ local compiling = do(source, filename)
     compilation.buffer_words = element -> environment.import("buffer").words(element)
     compilation.trap, compilation.moves, compilation.ends = runtime.trap, runtime.moves, runtime.ends
     environment.trap, environment.moves, environment.ends = runtime.trap, runtime.moves, runtime.ends
+    compilation.view_of, environment.view_of = runtime.view_of, runtime.view_of
+    compilation.element_of, environment.element_of = runtime.element_of, runtime.element_of
+    compilation.drop, environment.drop = runtime.drop, runtime.drop
+    environment.owns = types.owns
     load_nua(source, filename)
 
     -- each export closed into a definition: its known supply stays known, the native
@@ -141,7 +151,25 @@ local compiling = do(source, filename)
         local id = registry.define_export(word, specification, filename, export.line)
         exports[#exports + 1] = data.Export { name = export.c_name, definition = id }
     end
-    local definitions = registry.definitions()
+    -- only definitions reachable from the exports are kept (compiler activities §6.3): one
+    -- requested by a construction that was later discarded is not part of the program
+    local built = registry.definitions()
+    local definitions, pending = {}, {}
+    for _, export in ipairs exports do pending[#pending + 1] = export.definition end
+    while #pending > 0 do
+        local id = table.remove pending
+        if definitions[id] == nil then
+            local definition = built[id]
+            definitions[id] = definition
+            for _, block in ipairs definition.blocks do
+                for _, instruction in ipairs block.instructions do
+                    if data.Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then
+                        pending[#pending + 1] = instruction.callee.definition
+                    end
+                end
+            end
+        end
+    end
     local program = data.Program with
         revision = 0
         .definitions
@@ -151,8 +179,13 @@ local compiling = do(source, filename)
         lifetimes = {}
         .origins
     end
+    local published = {}
+    for id in pairs definitions do published[id] = assert(registry.facts()[id]) end
+    local contracts, completed_contracts = {}, registry.contracts()
+    for id in pairs definitions do contracts[id] = assert(completed_contracts[id]) end
+    local analysis = data.Analysis { revision = program.revision, definitions = published, .contracts }
     local problems = verify.all program
-    for _, problem in ipairs(verify_lifetimes.lifetimes(program, {})) do problems[#problems + 1] = problem end
+    for _, problem in ipairs(verify_lifetimes.lifetimes(program, analysis)) do problems[#problems + 1] = problem end
     if #problems > 0 then
         local lines = {}
         for _, problem in ipairs problems do lines[#lines + 1] = ("%s: %s"):format(problem.verifier, problem.message) end
@@ -160,6 +193,7 @@ local compiling = do(source, filename)
     end
     return define
         .program
+        .analysis
         .exports
     end
 end

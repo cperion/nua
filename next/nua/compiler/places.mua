@@ -61,12 +61,19 @@ Contents { Uninitialized, Tracked, Resident, Moved }
 local EndReason, end_reasons = names("reason a borrow ended", { "grew", "shrank", "removed", "cleared", "replaced", "moved", "released" })
 
 local Range = struct { first: Operand, count: Operand }
-local BorrowPath = struct { root: PlaceId, steps: AccessPath, range: Optional(Range) }
+-- `indices` holds the operand of each element step in order: the facts see KnownElement or
+-- AnyElement, deriving a pointer needs the actual index
+local BorrowPath = struct { root: PlaceId, steps: AccessPath, range: Optional(Range), indices: Optional(list_of(Operand)) }
 
 local BorrowForm = family "form of a borrow"
 local Held = struct { path: BorrowPath }
-local Stored = struct { pointer: Operand }
-BorrowForm { Held, Stored }
+-- A missing pointer is resident memory provenance, never a materializable reference.
+local Stored = struct { pointer: Optional(Operand) }
+local BorrowAlternative = struct { form: BorrowForm, origins: list_of(Access) }
+-- Normalized choices contain only Held/Stored leaves. Coordinates, not held pointers,
+-- cross control edges (compiler activities §2.4, selected-path amendment).
+local Selected = struct { selector: Operand, alternatives: list_of(BorrowAlternative) }
+BorrowForm { Held, Stored, Selected }
 
 local BorrowInfo = struct { id: BorrowId, form: BorrowForm, origins: list_of(Access), mutable: Boolean, lifetime: LifetimeId, acquired: OriginId }
 
@@ -108,6 +115,8 @@ return define
     .BorrowForm
     .Held
     .Stored
+    .Selected
+    .BorrowAlternative
     .BorrowInfo
     .BorrowState
     .Live

@@ -1,0 +1,41 @@
+-- Ordered site effects for the graph currently emitted by the replacement. Native-call
+-- effects remain conservative until boundary contracts close; this is not a readiness proof.
+local data = require "nua.compiler.data"
+
+local empty = || -> data.Effects {
+    reads = {}, writes = {}, moves = {}, ends = {}, consumes = {},
+    may_trap = false, may_wait = false, may_switch = false,
+    foreign_extent = false, nonreturning = false,
+}
+local ending = node -> data.Effects { ..empty(), may_trap = data.Terminator.is(node, data.Trap), nonreturning = data.Terminator.is(node, data.Trap) }
+local access = place -> data.Access { .place, path = {} }
+local of = data.Instruction.pass "site effects" with
+    Compute = do(node, recurse)
+        local result = empty()
+        -- Invalid arithmetic may trap; folding can prove particular computations safe.
+        return data.Effects { ..result, may_trap = node.opcode == "divide" or node.opcode == "remainder" }
+    end
+    Pack = |node, recurse| -> empty()
+    Extract = |node, recurse| -> empty()
+    Load = |node, recurse| -> data.Effects { ..empty(), reads = { access node.place } }
+    Store = |node, recurse| -> data.Effects { ..empty(), writes = { access node.place } }
+    Address = |node, recurse| -> empty()
+    Check = |node, recurse| -> data.Effects { ..empty(), may_trap = true }
+    Invoke = |node, recurse| -> data.Effects {
+        ..empty(), may_trap = true, may_wait = true, may_switch = true,
+        foreign_extent = data.Callee.is(node.callee, data.Foreign),
+    }
+    Atomic = |node, recurse| -> empty()
+    Fence = |node, recurse| -> empty()
+    LifetimeStart = |node, recurse| -> empty()
+    LifetimeEnd = |node, recurse| -> empty()
+    Moves = |node, recurse| -> data.Effects { ..empty(), moves = { node.target } }
+    Ends = |node, recurse| -> data.Effects { ..empty(), ends = { node.target } }
+    Budget = |node, recurse| -> data.Effects { ..empty(), may_switch = true }
+    Mechanism = |node, recurse| -> data.Effects { ..empty(), may_trap = true }
+end
+return define
+    .empty
+    .of
+    .ending
+end

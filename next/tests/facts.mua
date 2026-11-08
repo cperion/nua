@@ -25,7 +25,7 @@ end
 
 local contents_of = place -> data.Access { .place, path = { data.ContentsStep {} } }
 local held_path = place -> data.BorrowPath { root = place, steps = { data.ContentsStep {} } }
-local kind = |use| -> use { derive = p -> "derive", cached = p -> "cached", fixed = p -> "fixed", ended = e -> "ended " .. e.reason }
+local kind = |use| -> use { derive = p -> "derive", select = p -> "select", cached = p -> "cached", fixed = p -> "fixed", ended = e -> "ended " .. e.reason }
 
 test "rule 1: growth never ends a held borrow; its pointer is derived again":
     local a = activity()
@@ -141,12 +141,14 @@ test "a loop backedge: a refreshed view is live, a stale one is ended":
     a.tracking.ends(body, contents_of h, "replaced", a.origin)
     local view2 = a.tracking.borrow(body, held_path h, false, a.lifetime, a.origin)
     local header = a.tracking.agree { entry, body }.flow
-    local refreshed = a.tracking.join_borrows({ entry, body }, { view.id, view2.id }, header, a.lifetime, a.origin)
+    local refreshed = a.tracking.join_borrows({ entry, body }, { view.id, view2.id }, header, a.lifetime, a.origin, data.Held { path = held_path h })
     assert(kind(a.tracking.use(header, refreshed.id)) == "derive")
-    assert(#refreshed.origins == 2)
+    assert(#refreshed.origins == 1, "origins are a union, not an iteration history")
     local stale_header = a.tracking.agree { entry, body }.flow
-    local stale = a.tracking.join_borrows({ entry, body }, { view.id, view.id }, stale_header, a.lifetime, a.origin)
+    local stale = a.tracking.join_borrows({ entry, body }, { view.id, view.id }, stale_header, a.lifetime, a.origin, data.Held { path = held_path h })
     assert(kind(a.tracking.use(stale_header, stale.id)) == "ended replaced")
+    local ok, problem = pcall(a.tracking.join_borrows, { entry, facts.empty() }, { view.id, view.id }, facts.empty(), a.lifetime, a.origin)
+    assert(not ok and tostring(problem):find("unknown on its edge", 1, true), "missing edge facts must not become a live borrow")
 end
 
 test "distinct places overlap only where the activity says they may alias":
@@ -173,4 +175,35 @@ test "ending a buffer's contents leaves a borrow of its header live":
     assert(kind(a.tracking.use(flow, view.id)) == "ended cleared")
     a.tracking.ends(flow, data.Access { place = buffer, path = {} }, "moved", a.origin)
     assert(kind(a.tracking.use(flow, header.id)) == "ended moved", "moving the owner ends it")
+end
+
+test "a selected borrow distinguishes the origins of stored and held leaves":
+    local a = activity()
+    local first, second = a.place(), a.place()
+    local flow = facts.empty()
+    local held = a.tracking.borrow(flow, held_path first, false, a.lifetime, a.origin)
+    local other = a.tracking.borrow(flow, held_path second, false, a.lifetime, a.origin)
+    local stored = a.tracking.store(flow, other.id, a.pointer(), a.origin)
+    local form = data.Selected {
+        selector = data.Parameter { definition = a.supply.fresh(identity.DefinitionId), index = 1, type = types.U64 },
+        alternatives = {
+            data.BorrowAlternative { form = held.form, origins = held.origins },
+            data.BorrowAlternative { form = stored.form, origins = stored.origins },
+        },
+    }
+    local joined = a.tracking.join_borrows({ flow, flow }, { held.id, stored.id }, flow, a.lifetime, a.origin, form)
+    a.tracking.cache(flow, joined.id, a.pointer())
+    a.tracking.moves(flow, contents_of first, a.origin)
+    assert(kind(a.tracking.use(flow, joined.id)) == "select", "only a held leaf moved; rederive it")
+    a.tracking.moves(flow, contents_of second, a.origin)
+    assert(kind(a.tracking.use(flow, joined.id)) == "ended grew", "the stored leaf moved")
+end
+
+test "joining origins without an explicit result form cannot choose the first path":
+    local a = activity()
+    local flow = facts.empty()
+    local first = a.tracking.borrow(flow, held_path(a.place()), false, a.lifetime, a.origin)
+    local second = a.tracking.borrow(flow, held_path(a.place()), false, a.lifetime, a.origin)
+    local ok, problem = pcall(a.tracking.join_borrows, { flow, flow }, { first.id, second.id }, flow, a.lifetime, a.origin)
+    assert(not ok and tostring(problem):find("explicit selected or transported form", 1, true))
 end

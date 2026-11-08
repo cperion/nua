@@ -59,7 +59,6 @@ local generating = do(filename, start_line)
     -- the end of the innermost scope: its cells, for the evaluator to release their owners
     local scope_end = do()
         local names = orders[#orders]
-        if #names == 0 then return "" end
         return (" __E.scope_end(__path, { %s });"):format(table.concat(names, ", "))
     end
     local lookup = do(name)
@@ -286,6 +285,7 @@ local generating = do(filename, start_line)
             local step = node.step and (", __E.host_number(__path, %s)"):format(expression node.step) or ""
             emit(("for %s = %s, %s%s do "):format(node.var, low, high, step))
             push()
+            emit " __E.scope_begin(__path);"
             declare(node.var, "host")
             statements node.body
             emit(scope_end())
@@ -298,6 +298,7 @@ local generating = do(filename, start_line)
             for index, name in ipairs node.names do names[index] = type name == "table" and name.name or name end
             emit(("for %s in %s do "):format(table.concat(names, ", "), list(node.exprs, host_or_value)))
             push()
+            emit " __E.scope_begin(__path);"
             for _, name in ipairs names do declare(name, "host") end
             statements node.body
             emit(scope_end())
@@ -331,7 +332,7 @@ local generating = do(filename, start_line)
             return
         end
         if kind == "do" then
-            emit "do "
+            emit "do __E.scope_begin(__path);"
             push()
             statements node.body
             emit(scope_end())
@@ -357,6 +358,7 @@ local generating = do(filename, start_line)
         local saved = out
         out = {}
         push()
+        emit " __E.scope_begin(__path);"
         if variable then declare(variable, "cell") end
         statements nodes
         emit(scope_end())

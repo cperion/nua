@@ -1,0 +1,472 @@
+local compile = require "nua.compile"
+local native = require "tests.support.native"
+local data = require "nua.compiler.data"
+local types = require "nua.types"
+local graph = require "nua.compiler.graph"
+local verify = require "nua.compiler.verify_lifetimes"
+
+local refuses = do(source, text)
+    local ok, problem = pcall(compile.compile, source, "boundary_refused.nua")
+    assert(not ok and tostring(problem):find(text, 1, true), tostring(problem))
+end
+local has = do(problems, text)
+    for _, problem in ipairs problems do if problem.message:find(text, 1, true) then return true end end
+    return false
+end
+
+test "native returned views re-root in the caller and preserve their captured range":
+    local library = native("boundary_returned", [[
+local range = do(xs: Ref (Grow U32), first: U64, count: U64): Slice U32
+    return xs:view(first, count)
+end
+local boundary_range = do(first: U64, count: U64, n: U32): U32
+    local xs = (Grow U32) { 11, 13, 17, 19 }
+    local view = call range (Ref xs) first count
+    for i: U32 = 1, n do xs:push i end
+    return view[0] * 100 + U32(#view)
+end
+export boundary_range
+local Token = struct { text: Slice U32 }
+local unwrap = do(token: Token): Slice U32 = token.text
+local boundary_component = do(): U32
+    local xs = (Grow U32) { 23, 29 }
+    local token = Token { text = xs:view(1, 1) }
+    local view = call unwrap token
+    for i: U32 = 1, 100 do xs:push i end
+    return view[0] + U32(#view)
+end
+export boundary_component
+]])
+    assert(library.boundary_range(1, 2, 1000) == 1302)
+    assert(library.boundary_range(3, 1, 1000) == 1901)
+    assert(library.boundary_component() == 30)
+end
+
+test "borrowed parameters and record references forward through native calls":
+    local library = native("boundary_forwarded_borrows", [[
+local Holder = struct { ref: Ref U32 }
+local identity = do(view: Slice U32): Slice U32 = view
+local forward = do(view: Slice U32): Slice U32
+    return call identity view
+end
+local reference = do(holder: Holder): Ref U32 = holder.ref
+local forward_reference = do(holder: Holder): Ref U32
+    return call reference holder
+end
+local boundary_forward_view = do(): U32
+    local xs = (Grow U32) { 2, 7, 19 }
+    local view = call forward (xs:view(1, 2))
+    xs:push 23
+    xs:push 29
+    return view[0] + view[1]
+end
+local boundary_forward_reference = do(): U32
+    local value = U32 6
+    local holder = Holder { ref = Ref value }
+    local ref = call forward_reference holder
+    ref = 17
+    return value
+end
+export boundary_forward_view
+export boundary_forward_reference
+]])
+    assert(library.boundary_forward_view() == 26)
+    assert(library.boundary_forward_reference() == 17)
+end
+
+test "stored header effects follow captured references, not their overwritten slots":
+    local prefix = [[
+local Holder = struct { ref: Ref (Grow U32) }
+local change = do(a: Ref (Grow Holder), b: Ref (Grow Holder), replacement: Ref (Grow U32)): Unit
+    local first = a[0].ref
+    b:set 0 (Holder { ref = replacement })
+    local second = a[0].ref
+    %s:clear
+end
+]]
+    local body = [[
+local boundary_captured_header = do(): U32
+    local xs = (Grow U32) { 7 }
+    local ys = (Grow U32) { 11 }
+    local xv = xs:all()
+    local yv = ys:all()
+    local tokens = (Grow Holder) { Holder { ref = Ref xs } }
+    call change (Ref tokens) (Ref tokens) (Ref ys)
+    return %s
+end
+export boundary_captured_header
+]]
+    local library = native("boundary_captured_headers", prefix:format("first") .. body:format("yv[0] + U32(#xs)"))
+    assert(library.boundary_captured_header() == 11)
+    refuses(prefix:format("first") .. body:format("xv[0]"), "cleared")
+    refuses(prefix:format("second") .. body:format("yv[0]"), "cleared")
+end
+
+test "owner payload provenance moves without observing unused contents":
+    local source = [[
+local boundary_moved_payload = do(): U32
+    local xs = (Grow U32) { 7 }
+    local tokens = (Grow (Slice U32)) { xs:all() }
+    xs:clear
+    local moved = tokens
+    %s
+end
+export boundary_moved_payload
+]]
+    local library = native("boundary_unused_payload", source:format("return 13"))
+    assert(library.boundary_moved_payload() == 13)
+    refuses(source:format("return moved[0][0]"), "cleared")
+end
+
+test "addressed locals remain coherent across branches and loop agreement":
+    local library = native("boundary_resident_locals", [[
+local Holder = struct { ref: Ref U32 }
+local wrap = do(value: Ref U32): Holder = Holder { ref = value }
+local read = do(holder: Holder): U32 = holder.ref
+local boundary_resident_branch = do(choose: Bool): U32
+    local value = U32 6
+    if choose then
+        local holder = call wrap (Ref value)
+        value = call read holder
+    end
+    value = value + 5
+    local holder = call wrap (Ref value)
+    value = value + 2
+    return call read holder
+end
+local boundary_resident_loop = do(n: U32): U32
+    local value = U32 1
+    local sum = U32 0
+    for i: U32 = 1, n do
+        local holder = call wrap (Ref value)
+        value = value + 1
+        sum = sum + (call read holder)
+    end
+    return sum * 100 + value
+end
+export boundary_resident_branch
+export boundary_resident_loop
+]])
+    assert(library.boundary_resident_branch(false) == 13)
+    assert(library.boundary_resident_branch(true) == 13)
+    for n = 0, 20 do assert(library.boundary_resident_loop(n) == (n * (n + 3) / 2) * 100 + n + 1) end
+end
+
+local ordered = [[
+local keep = do(dst: Ref (Grow (Slice U32)), src: Ref (Grow U32)): Unit
+    src:clear
+    src:push 7
+    dst:push (src:all())
+    %s
+end
+local boundary_ordered = do(): U32
+    local src = (Grow U32) { 1 }
+    local dst = (Grow (Slice U32)) {}
+    call keep (Ref dst) (Ref src)
+    local view = dst[0]
+    return view[0]
+end
+export boundary_ordered
+]]
+
+test "equal native effects at different sites retain their order around a store":
+    refuses(ordered:format("src:clear"), "after it ended (cleared)")
+    local library = native("boundary_ordered", ordered:format(""))
+    assert(library.boundary_ordered() == 7)
+end
+
+test "native contracts are revision-bound projections, with real per-site effects":
+    local compiled = compile.compile(ordered:format(""), "boundary_contract.nua")
+    local total = 0
+    for id, definition in pairs compiled.program.definitions do
+        local contract = assert(compiled.analysis.contracts[id])
+        assert(check(data.BoundaryContract, contract) and contract.definition == id)
+        assert(contract.revision == compiled.program.revision)
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do assert(contract.effects[instruction.site.id]) end
+        end
+        total += 1
+    end
+    assert(total >= 2)
+    assert(has(verify.lifetimes(compiled.program, data.Analysis { ..compiled.analysis, contracts = {} }), "no boundary contract"))
+end
+
+test "memory-only provenance cannot masquerade as a pointer or executable path":
+    local typing = require "nua.compiler.verify"
+    for _, component in ipairs { data.PayloadComponent {}, data.AnyElementComponent {} } do
+        local type, problem = typing.component_type(types.buffer(types.U32), component)
+        assert(type == nil and problem:find("not an executable projection", 1, true))
+    end
+    local compiled = compile.compile(ordered:format(""), "pointerless_refused.nua")
+    local definitions = {}
+    for id, facts in pairs compiled.analysis.definitions do
+        local borrows = {}
+        for borrow, info in pairs facts.borrows do
+            borrows[borrow] = data.BorrowForm.is(info.form, data.Stored) and data.BorrowInfo { ..info, form = data.Stored {} } or info
+        end
+        definitions[id] = data.DefinitionFacts { ..facts, .borrows }
+    end
+    assert(has(verify.lifetimes(compiled.program, data.Analysis { ..compiled.analysis, .definitions }), "cannot be a materialized reference"))
+end
+
+test "independent lifetime replay sees a callee invalidation after its store":
+    local compiled = compile.compile(ordered:format(""), "boundary_corrupted.nua")
+    local changes = {}
+    for _, definition in pairs compiled.program.definitions do
+        local source
+        for id, place in pairs definition.places do
+            if data.PlaceRoot.is(place.root, data.ParameterRoot) and place.root.parameter == 2 and #place.path == 0 then source = id end
+        end
+        if source then
+            for _, block in ipairs definition.blocks do
+                for _, instruction in ipairs block.instructions do
+                    if data.Instruction.is(instruction, data.Moves) then
+                        local place = definition.places[instruction.target.place]
+                        if place and data.PlaceRoot.is(place.root, data.ParameterRoot) and place.root.parameter == 1 then
+                            changes[instruction.site.id] = data.Access { place = source, path = { data.ContentsStep {} } }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    assert(next(changes))
+    local alter = data.Instruction.pass "invalidate after native store" with ..graph.Unchanged
+        Moves = |node, recurse| -> changes[node.site.id] and { data.Ends { site = node.site, target = changes[node.site.id], reason = "cleared" } } or { node }
+    end
+    local program = graph.rewrite(alter, compiled.program)
+    assert(has(verify.lifetimes(program, data.Analysis { ..compiled.analysis, revision = program.revision }), "after it ended (cleared)"))
+end
+
+test "resident component facts replace container-wide holds and allow strong overwrites":
+    local library = native("boundary_components", [[
+local Pair = struct { first: Slice U32, second: Slice U32 }
+local resident_fresh = do(): U32
+    local a = (Grow U32) { 3 }
+    local b = (Grow U32) { 5 }
+    local values = (Grow (Slice U32)) {}
+    values:push (a:all())
+    a:clear
+    values:set(0, b:all())
+    local view = values[0]
+    return view[0]
+end
+export resident_fresh
+local resident_records = do(): U32
+    local a = (Grow U32) { 11 }
+    local b = (Grow U32) { 13 }
+    local values = (Grow Pair) {}
+    values:push (Pair { first = a:all(), second = b:all() })
+    local pair = values[0]
+    return pair.first[0] * 100 + pair.second[0]
+end
+export resident_records
+]])
+    assert(library.resident_fresh() == 5 and library.resident_records() == 1113)
+    local compiled = compile.compile(ordered:format(""), "resident_components.nua")
+    local found = false
+    for _, facts in pairs compiled.analysis.definitions do
+        for _, site in pairs facts.sites do
+            assert(site.after.holds == nil)
+            for _, contents in pairs site.after.contents do
+                if data.Contents.is(contents, data.Resident) then
+                    for _, component in pairs contents.info.components do
+                        if data.ComponentInfo.is(component, data.Borrowed) then
+                            local form = facts.borrows[component.borrow].form
+                            assert(data.BorrowForm.is(form, data.Stored) and form.pointer == nil)
+                            found = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    assert(found)
+end
+
+test "nested calls preserve stores, invalidation order and normal-exit facts":
+    refuses([[
+local keep = do(dst: Ref (Grow (Slice U32)), src: Ref (Grow U32)): Unit
+    src:clear
+    src:push 7
+    dst:push (src:all())
+    src:clear
+end
+local wrapper = do(dst: Ref (Grow (Slice U32)), src: Ref (Grow U32)): Unit
+    call keep dst src
+end
+local broken = do(): U32
+    local src = (Grow U32) { 1 }
+    local dst = (Grow (Slice U32)) {}
+    call wrapper (Ref dst) (Ref src)
+    local view = dst[0]
+    return view[0]
+end
+export broken
+]], "after it ended (cleared)")
+    local library = native("boundary_normal_exit", [[
+local maybe = do(xs: Ref (Grow U32), stop: Bool): Unit
+    if stop then
+        xs:clear
+        trap "stop"
+    end
+end
+local wrapper = do(xs: Ref (Grow U32), stop: Bool): Unit
+    call maybe xs stop
+end
+local normal_observed = do(stop: Bool): U32
+    local xs = (Grow U32) { 31 }
+    local view = xs:all()
+    call wrapper (Ref xs) stop
+    return view[0]
+end
+export normal_observed
+]])
+    assert(library.normal_observed(false) == 31)
+end
+
+test "borrowed components loaded by a compiled word substitute their actual owners":
+    local library = native("boundary_memory_inputs", [[
+local take = do(tokens: Ref (Grow (Slice U32))): Slice U32
+    local value = tokens[0]
+    tokens:clear
+    return value
+end
+local memory_input = do(): U32
+    local src = (Grow U32) { 37, 41 }
+    local tokens = (Grow (Slice U32)) {}
+    tokens:push (src:view(1, 1))
+    local view = call take (Ref tokens)
+    for i: U32 = 1, 100 do src:push i end
+    return view[0] + U32(#view) + U32(tokens.length)
+end
+export memory_input
+local Pair = struct { first: Slice U32, second: Slice U32 }
+local unaffected = do(): U32
+    local a = (Grow U32) { 11 }
+    local b = (Grow U32) { 13 }
+    local values = (Grow Pair) {}
+    values:push (Pair { first = a:all(), second = b:all() })
+    a:clear
+    local pair = values[0]
+    return pair.second[0]
+end
+export unaffected
+]])
+    assert(library.memory_input() == 42 and library.unaffected() == 13)
+    refuses([[
+local read = do(tokens: Ref (Grow (Slice U32))): U32
+    local view = tokens[0]
+    return view[0]
+end
+local broken = do(): U32
+    local src = (Grow U32) { 3 }
+    local tokens = (Grow (Slice U32)) {}
+    tokens:push (src:all())
+    src:clear
+    return call read (Ref tokens)
+end
+export broken
+]], "after it ended (cleared)")
+end
+
+test "alias substitution reaches internal joined borrows, not only formal views":
+    refuses([[
+local selected = do(a: Ref (Grow U32), b: Ref (Grow U32), flag: Bool): Slice U32
+    local view = a:all()
+    if flag then view = a:view(1, 1) end
+    b:clear
+    return view
+end
+local broken = do(flag: Bool): U32
+    local xs = (Grow U32) { 3, 5 }
+    local view = call selected (Ref xs) (Ref xs) flag
+    return view[0]
+end
+export broken
+]], "after it ended (cleared)")
+end
+
+test "returned references and nested views recover caller path coordinates":
+    local library = native("boundary_returned_paths", [[
+local element = do(xs: Ref (Grow U32), at: U64): Ref U32
+    return xs:element at
+end
+local ref_result = do(at: U64): U32
+    local xs = (Grow U32) { 43, 47 }
+    local value = call element (Ref xs) at
+    for i: U32 = 1, 100 do xs:push i end
+    value = value + 10
+    return value
+end
+export ref_result
+local head = do(xs: Ref (Grow U32)): Slice U32 = xs:view(0, 1)
+local nested_result = do(at: U64): U32
+    local rows = (Grow (Grow U32)) {}
+    rows:push ((Grow U32) { 53 })
+    rows:push ((Grow U32) { 59 })
+    local row = rows[at]
+    local view = call head row
+    for i: U32 = 1, 100 do
+        rows:push ((Grow U32) { i })
+        rows[at]:push i
+    end
+    return view[0]
+end
+export nested_result
+]])
+    assert(library.ref_result(0) == 53 and library.ref_result(1) == 57)
+    assert(library.nested_result(0) == 53 and library.nested_result(1) == 59)
+end
+
+test "nonreturning recursive groups retain their ordered prefixes":
+    local compiled = compile.compile([[
+local function spin(xs: Ref (Grow U32)): U32
+    xs:clear
+    local next_value = call spin xs
+    return next_value + 1
+end
+export spin
+]], "boundary_nonreturning.nua")
+    local contract = compiled.analysis.contracts[compiled.program.exports[1].definition]
+    assert(next(contract.normal_exits) == nil)
+    local ended = false
+    for _, effects in pairs contract.effects do if #effects.ends > 0 then ended = true end end
+    assert(ended)
+    refuses([[
+local function spin(xs: Ref (Grow U32), view: Slice U32): Unit
+    xs:clear
+    call spin xs view
+end
+local broken = do(): U32
+    local xs = (Grow U32) { 1 }
+    call spin (Ref xs) (xs:all())
+    return 0
+end
+export broken
+]], "storage it also receives a view of")
+end
+
+test "mutual native dependencies close invalidation contracts without a retry cap":
+    refuses([[
+local second
+local function first(xs: Ref (Grow U32), n: U32): Unit
+    if n == 0 then return end
+    call second xs (n - 1)
+end
+second = do(xs: Ref (Grow U32), n: U32): Unit
+    if n == 0 then
+        xs:clear
+        return
+    end
+    call first xs (n - 1)
+end
+local broken = do(n: U32): U32
+    local xs = (Grow U32) { 7 }
+    local view = xs:all()
+    call first (Ref xs) n
+    return view[0]
+end
+export broken
+]], "after it ended (cleared)")
+end

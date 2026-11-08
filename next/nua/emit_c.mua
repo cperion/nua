@@ -24,7 +24,7 @@ local record_name = do(record)
     local found = record_names[record]
     if found then return found end
     record_count += 1
-    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or record.name:gsub("[^%w_]", "_")
+    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or NativeType.is(record, types.ViewType) and "View" or record.name:gsub("[^%w_]", "_")
     found = ("%s_%d"):format(base_name, record_count)
     record_names[record] = found
     return found
@@ -38,7 +38,7 @@ local CSpelling = define
     UnitType = |node, recurse| -> "void"
     PointerType = |node, recurse| -> recurse node.target .. " *"
     ReferenceType = |node, recurse| -> recurse node.target .. " *"
-    ViewType = unsupported
+    ViewType = |node, recurse| -> record_name node
     FixedArrayType = unsupported
     RecordType = |node, recurse| -> record_name node
     SumType = unsupported
@@ -47,9 +47,12 @@ local CSpelling = define
 end
 local c_type = NativeType.pass "spell a native type in C" with ..CSpelling end
 
--- the fields of a record, or of a buffer's header
+-- the fields of a record, of a buffer's header, or of a view
 local fields_of = do(native_type)
     if NativeType.is(native_type, types.RecordType) then return native_type.fields end
+    if NativeType.is(native_type, types.ViewType) then
+        return { { name = "data", type = types.pointer native_type.element }, { name = "length", type = types.U64 } }
+    end
     local fields = {
         { name = "data", type = types.pointer native_type.element },
         { name = "length", type = types.U64 },
@@ -58,13 +61,14 @@ local fields_of = do(native_type)
     if native_type.pinned then fields[4] = { name = "limit", type = types.U64 } end
     return fields
 end
-local is_record_like = native_type -> NativeType.is(native_type, types.RecordType) or NativeType.is(native_type, types.BufferType)
+local is_record_like = native_type -> NativeType.is(native_type, types.RecordType) or NativeType.is(native_type, types.BufferType) or NativeType.is(native_type, types.ViewType)
 
 -- the C declarations of the records a program uses, each after the records it holds
 local record_declarations = do(program)
     local done, order = {}, {}
     local visit
     visit = do(native_type)
+        if NativeType.is(native_type, types.PointerType) or NativeType.is(native_type, types.ReferenceType) then return visit(native_type.target) end
         if not is_record_like native_type or done[native_type] then return end
         done[native_type] = true
         for _, field in ipairs(fields_of native_type) do visit(field.type) end
@@ -89,7 +93,8 @@ local narrow = type -> rules.is_integer type and type.bits < 32
 local wide_of = type -> type.signed and "int32_t" or "uint32_t"
 
 -- a constant as a C expression of its exact type
-local constant_text = do(constant)
+local constant_text
+constant_text = do(constant)
     local type = constant.type
     local constant_bits = constant.bits
     if data.NativeConstant.is(constant_bits, data.BooleanBit) then return constant_bits.value and "true" or "false" end
@@ -103,7 +108,14 @@ local constant_text = do(constant)
         return type.bits == 32 and text .. "f" or text
     end
     if data.NativeConstant.is(constant_bits, data.UnitBits) then return "0" end
-    if rules.is_pointer type then
+    if data.NativeConstant.is(constant_bits, data.AggregateBits) then
+        local parts = {}
+        for index, field in ipairs(fields_of type) do
+            parts[index] = constant_text(data.Constant { type = field.type, bits = constant_bits.parts[index] })
+        end
+        return ("((%s){ %s })"):format(c_type type, table.concat(parts, ", "))
+    end
+    if rules.is_pointer type or NativeType.is(type, types.ReferenceType) then
         if constant_bits.bits ~= 0ULL then fail "a pointer constant other than null has no C spelling" end
         return ("((%s)0)"):format(c_type type)
     end
@@ -170,9 +182,23 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         end
     end
     local operand
+    -- a local that needs memory (its address crosses a call) is a C variable of its own
+    local homes = {}
+    local home_count = 0
+    local local_home = do(place)
+        local found = homes[place.id]
+        if found then return found end
+        home_count += 1
+        found = "home" .. home_count
+        homes[place.id] = found
+        declarations[#declarations + 1] = ("    %s %s;"):format(c_type place.type, found)
+        return found
+    end
     -- the C lvalue of a place: a raw place is its pointer dereferenced
     place_text = do(place)
-        if data.PlaceRoot.is(place.root, data.RawRoot) then return "*" .. operand place.root.pointer end
+        if data.PlaceRoot.is(place.root, data.RawRoot) or data.PlaceRoot.is(place.root, data.IndirectRoot) then return "*" .. operand place.root.pointer end
+        if data.PlaceRoot.is(place.root, data.ParameterRoot) then return "(*p" .. place.root.parameter .. ")" end
+        if data.PlaceRoot.is(place.root, data.LocalRoot) then return local_home place end
         fail("a place rooted in " .. tostring(getmetatable(place.root)) .. " has no C spelling yet")
     end
     local Naming = define
@@ -193,7 +219,8 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             if opcode == "pointer_difference" then return target .. ("(int64_t)(%s - %s);"):format(operand a, operand b) end
             if opcode == "reinterpret" then
                 local from, to = a.type, node.type
-                if rules.is_pointer from and rules.is_pointer to then return target .. ("(%s)%s;"):format(c_type to, operand a) end
+                local pointer_like = t -> rules.is_pointer t or NativeType.is(t, types.ReferenceType)
+                if pointer_like from and pointer_like to then return target .. ("(%s)%s;"):format(c_type to, operand a) end
                 if rules.is_pointer from then return target .. ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
                 if rules.is_pointer to then return target .. ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
                 return target .. ("nua_reinterpret_%s_%s(%s);"):format(c_type from, c_type to, operand a)
@@ -240,7 +267,7 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             return ("%s = %s;"):format(value_name(node.result, place.type), place_text place)
         end
         Store = |node, recurse| -> ("%s = %s;"):format(place_text(definition.places[node.place]), operand node.value)
-        Address = |node, recurse| -> fail "address has no C spelling yet"
+        Address = |node, recurse| -> ("%s = &%s;"):format(value_name(node.result, types.pointer(definition.places[node.place].type)), place_text(definition.places[node.place]))
         Check = |node, recurse| -> fail "check has no C spelling yet"
         Invoke = do(node, recurse)
             if not data.Callee.is(node.callee, data.DirectNua) then fail "an indirect or foreign call has no C spelling yet" end

@@ -78,7 +78,9 @@ local Component = family "component of a native value"
 local FieldComponent = struct { name: String }
 local ElementComponent = struct { index: Operand }
 local AlternativeComponent = struct { name: String }
-Component { FieldComponent, ElementComponent, AlternativeComponent }
+local PayloadComponent = struct {}
+local AnyElementComponent = struct {}
+Component { FieldComponent, ElementComponent, AlternativeComponent, PayloadComponent, AnyElementComponent }
 local ComponentPath = list_of(Component)
 
 local Bits = struct { type: NativeType, operand: Operand }
@@ -152,6 +154,8 @@ return define
     .Component
     .FieldComponent
     .ElementComponent
+    .PayloadComponent
+    .AnyElementComponent
     .AlternativeComponent
     .ComponentPath
     .Bits

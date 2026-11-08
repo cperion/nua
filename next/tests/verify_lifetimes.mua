@@ -15,13 +15,21 @@ local reports = do(problems, expected)
 end
 local passes = |problems| -> assert(#problems == 0, messages problems)
 
+local checking = do(program, definitions)
+    local published = {}
+    for id, facts in pairs definitions do
+        published[id] = data.DefinitionFacts { values = facts.values or {}, borrows = facts.borrows or {}, entries = {}, edges = {}, joins = {}, sites = {}, terminators = {} }
+    end
+    return verify_lifetimes.lifetimes(program, data.Analysis { revision = program.revision, definitions = published, contracts = {} })
+end
+
 local text_type = types.buffer(types.U8)
 
 -- one definition's published facts: which values carry which borrows
 local published = do(p)
     local values, borrows = {}, {}
     local carry = do(operand, borrow)
-        values[data.operand_key operand] = data.ValueInfo { type = operand.type, components = { data.Borrowed { .borrow } }, proofs = {} }
+        values[data.operand_key operand] = data.ValueInfo { type = operand.type, components = { [{}] = data.Borrowed { .borrow } }, proofs = {} }
     end
     local borrow = do(place, form)
         local id = p.fresh identity.BorrowId
@@ -57,14 +65,14 @@ local straight = do(effect, stored)
         local buffer = p.place(writer, text_type)
         local view, length = p.value(), p.value()
         local view_operand = p.result(view, view_type)
-        local form = stored and data.Stored { pointer = p.constant(types.U64, 0) } or nil
+        local form = stored and data.Stored { pointer = view_operand } or nil
         facts.carry(view_operand, facts.borrow(buffer.id, form))
         writer.append(entry, data.Mechanism { site = p.site(), result = view, binding = "make_view", arguments = {} })
         if effect then writer.append(entry, effect(p, buffer)) end
         writer.append(entry, data.Extract { site = p.site(), result = length, type = types.U64, aggregate = view_operand, path = { data.FieldComponent { name = "length" } } })
         writer.terminate(entry, data.Return { origin = p.origin, value = p.result(length, types.U64) })
     end)
-    return verify_lifetimes.lifetimes(p.program(), { [definition.id] = facts })
+    return checking(p.program(), { [definition.id] = facts })
 end
 
 local grows = |p, buffer| -> data.Moves { site = p.site(), target = contents(buffer.id) }
@@ -111,7 +119,7 @@ test "a join: a view ended on one arm ends in the block argument":
             writer.append(join, data.Extract { site = p.site(), result = length, type = types.U64, aggregate = joined, path = { data.FieldComponent { name = "length" } } })
             writer.terminate(join, data.Return { origin = p.origin, value = p.result(length, types.U64) })
         end)
-        return verify_lifetimes.lifetimes(p.program(), { [definition.id] = facts })
+        return checking(p.program(), { [definition.id] = facts })
     end
     reports(build(false), "used after it ended (removed)")
     passes(build(true))
@@ -134,7 +142,7 @@ test "owners are transferred at most once on every path":
             if transfers.after then writer.append(join, data.Store { site = p.site(), place = first.id, value = header }) end
             writer.terminate(join, data.Return { origin = p.origin })
         end)
-        return verify_lifetimes.lifetimes(p.program(), { [definition.id] = {} })
+        return checking(p.program(), { [definition.id] = {} })
     end
     passes(build { left = true, right = true })
     passes(build { left = true })
@@ -161,8 +169,29 @@ test "a loop: an outer owner moved in the body is moved twice; a body-local one 
             writer.terminate(body, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge body, when_false = p.edge done })
             writer.terminate(done, data.Return { origin = p.origin })
         end)
-        return verify_lifetimes.lifetimes(p.program(), { [definition.id] = {} })
+        return checking(p.program(), { [definition.id] = {} })
     end
     reports(build(false), "transferred twice")
     passes(build(true))
+end
+
+-- The same header may be passed on either branch, but not twice on a single edge.
+test "owner transfers on alternative edges are checked separately":
+    local build = do(duplicate)
+        local p = programs()
+        local definition = p.definition("edge_owners", { types.Bool }, text_type, do(writer, parameters)
+            local entry = writer.block "entry"
+            local target = writer.block("target", duplicate and { text_type, text_type } or { text_type })
+            local source = p.place(writer, text_type)
+            local value = p.value()
+            local owner = p.result(value, text_type)
+            writer.append(entry, data.Load { site = p.site(), result = value, place = source.id })
+            local arguments = duplicate and { owner, owner } or { owner }
+            writer.terminate(entry, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge(target, arguments), when_false = p.edge(target, arguments) })
+            writer.terminate(target, data.Return { origin = p.origin, value = writer.parameter(target, 1) })
+        end)
+        return checking(p.program(), { [definition.id] = {} })
+    end
+    passes(build(false))
+    reports(build(true), "transferred twice")
 end

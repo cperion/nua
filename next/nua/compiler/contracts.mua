@@ -37,7 +37,10 @@ local Taken = struct { edge: EdgeId }
 local Known = struct { claim: CheckClaim }
 Proof { Checked, Taken, Known }
 
-local FlowFacts = struct { contents: map_of(PlaceId, Contents), borrows: map_of(BorrowId, BorrowState), live_lifetimes: set_of(LifetimeId) }
+local FlowFacts = struct {
+    contents: map_of(PlaceId, Contents), borrows: map_of(BorrowId, BorrowState),
+    live_lifetimes: set_of(LifetimeId)
+}
 local EdgeFacts = struct { edge: EdgeId, flow: FlowFacts, arguments: list_of(ValueInfo) }
 local JoinRelation = struct { block: BlockId, incoming: list_of(EdgeFacts) }
 

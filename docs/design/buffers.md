@@ -89,10 +89,17 @@ path. After such an operation it derives the pointer again from the current head
 load per moved step). Aliases cannot defeat this: two `Ref`s to an owner reach the same
 header.
 
+A control join preserves which held path was selected, including paths through differently
+nested owners. The compiler carries a finite path choice with an SSA selector and path
+coordinates, not a fixed payload pointer. Growth rederives the selected path; joins do not
+silently change held borrows into stored ones. The selected-path representation and loop
+agreement are specified in [compiler activities §2.4](compiler-activities.md#24-borrows-and-owner-linearity).
+
 A **stored** borrow is a native pointer (or pointer and length) whose value has left the
 compiler's view:
 
-- it was written into data (a field of an aggregate in memory, an element, a global);
+- it was written into data (a field of a record, an element, a global), wherever the
+  compiler keeps that data;
 - it crossed into a word compiled on its own (a `call`, recursion, an export) as an
   argument;
 - it was passed to foreign code.
@@ -248,17 +255,24 @@ owners, syntax §20).
 
 ### 3.3 Compiler facts
 
+A stored borrow resident in memory need not yet have an SSA pointer. `Stored(None)` is its
+provenance, not a null runtime value. A load binds that provenance and its current state to
+the observed pointer. Payload/wildcard component paths describe unknown buffer elements;
+see the [memory-provenance amendment](compiler-activities.md#34-fact-products-not-a-second-program).
+
 These replace holdings, endpoints, custody, loans, loan subjects, epochs and storage
 guarantees. They are published as nominal records in `nua/compiler/data.mua`
 ([compiler activities §2](compiler-activities.md#2-the-values-that-evaluation-works-with)).
 
 ```text
 Access       { place: PlaceId, path: AccessPath }
-BorrowPath   { root: PlaceId, steps: AccessPath, range: Option Range }
+BorrowPath   { root: PlaceId, steps: AccessPath, indices: List Operand, range: Option Range }
 Range        { first: Operand, count: Operand }
 BorrowInfo   { id: BorrowId, form: BorrowForm, origins: List Access, acquired: OriginId }
 BorrowForm   = Held(path: BorrowPath)
-             | Stored(pointer: Operand)
+             | Stored(pointer: Option Operand)
+             | Selected(selector: Operand, alternatives: List BorrowAlternative)
+BorrowAlternative { form: BorrowForm, origins: List Access }
 BorrowState  = Live(pointer: Option Operand) | Ended(at: OriginId, reason: EndReason)
 EndReason    = Grew | Shrank | Removed | Cleared | Replaced | Moved | Released
 Contents     = Uninitialized | Tracked(value: NativeValue)

@@ -11,6 +11,7 @@
 
 local identity = require "nua.identity"
 local data = require "nua.compiler.data"
+local paths = require "nua.compiler.borrow_paths"
 
 local AccessStep, Contents, BorrowState, BorrowForm = data.AccessStep, data.Contents, data.BorrowState, data.BorrowForm
 local Live, Ended = data.Live, data.Ended
@@ -56,6 +57,7 @@ end
 
 local BorrowUse = oneof {
     derive: data.BorrowPath,     -- a held borrow with no cached pointer: derive it from the headers
+    select: data.Selected,       -- an SSA-selected, flat set of held/stored paths
     cached: data.Operand,        -- a held borrow whose pointer is still valid on this path
     fixed: data.Operand,         -- a stored borrow's pointer
     ended: Ended,                -- the borrow ended; the activity reports where and why
@@ -199,8 +201,12 @@ local tracking = do(capabilities)
         local state = flow.borrows[borrow]
         if state == nil then fail(identity.describe borrow .. " is not known on this path") end
         if BorrowState.is(state, Ended) then return BorrowUse.ended state end
-        if BorrowForm.is(info.form, data.Stored) then return BorrowUse.fixed info.form.pointer end
+        if BorrowForm.is(info.form, data.Stored) then
+            if info.form.pointer == nil then fail("resident provenance must be loaded before use") end
+            return BorrowUse.fixed info.form.pointer
+        end
         if state.pointer then return BorrowUse.cached state.pointer end
+        if BorrowForm.is(info.form, data.Selected) then return BorrowUse.select info.form end
         return BorrowUse.derive info.form.path
     end
 
@@ -227,7 +233,13 @@ local tracking = do(capabilities)
             if BorrowState.is(state, Live) then
                 local info = info_of id
                 if touches(info, access) then
-                    if BorrowForm.is(info.form, data.Stored) then
+                    local stored = BorrowForm.is(info.form, data.Stored)
+                    if BorrowForm.is(info.form, data.Selected) then
+                        for _, alternative in ipairs info.form.alternatives do
+                            if BorrowForm.is(alternative.form, data.Stored) and touches(alternative, access) then stored = true end
+                        end
+                    end
+                    if stored then
                         flow.borrows[id] = Ended { .at, reason = "grew" }
                     elseif state.pointer then
                         flow.borrows[id] = Live {}
@@ -280,6 +292,18 @@ local tracking = do(capabilities)
             end
         end
         table.sort(differing, |a, b| -> a.serial < b.serial)
+        -- Memory facts may exist on just one incoming arm. Their borrowed components
+        -- remain facts on that arm; the evaluator joins resident components separately.
+        local held_anywhere = {}
+        for _, flow in ipairs incoming do
+            for _, contents in pairs flow.contents do
+                if Contents.is(contents, data.Resident) then
+                    for _, component in pairs contents.info.components do
+                        if data.ComponentInfo.is(component, data.Borrowed) then held_anywhere[component.borrow] = true end
+                    end
+                end
+            end
+        end
         local borrow_ids = {}
         for _, flow in ipairs incoming do
             for id in pairs flow.borrows do borrow_ids[id] = true end
@@ -288,16 +312,20 @@ local tracking = do(capabilities)
             local result = nil
             for _, flow in ipairs incoming do
                 local state = flow.borrows[id]
-                if state == nil then
+                if state == nil and held_anywhere[id] then
+                    -- a stored borrow a container holds on another path: it is held after the
+                    -- join, in the state it has where it exists
+                elseif state == nil then
                     -- a borrow made on one path only does not exist after the join
                     result = false
                     break
                 end
-                if BorrowState.is(state, Ended) then
+                if state == nil then
+                    -- nothing to contribute from a path where it does not exist
+                elseif BorrowState.is(state, Ended) then
                     result = state
                     break
-                end
-                if result == nil then
+                elseif result == nil then
                     result = state
                 elseif BorrowState.is(result, Live) and result.pointer ~= state.pointer then
                     result = Live {}
@@ -317,18 +345,19 @@ local tracking = do(capabilities)
 
     -- the borrow a block argument carries after a join: the union of the incoming borrows'
     -- origins, ended if any incoming borrow ended there
-    local join_borrows = do(incoming_flows, incoming_borrows, joined_flow, lifetime, acquired)
+    local join_borrows = do(incoming_flows, incoming_borrows, joined_flow, lifetime, acquired, form)
         local origins, mutable, state = {}, true, Live {}
         for position, id in ipairs incoming_borrows do
             local info = info_of id
-            for _, origin in ipairs info.origins do origins[#origins + 1] = origin end
+            origins = paths.union(origins, info.origins)
             mutable = mutable and info.mutable
             local incoming_state = incoming_flows[position].borrows[id]
             if incoming_state == nil then fail("join_borrows: " .. identity.describe id .. " is unknown on its edge") end
             if BorrowState.is(incoming_state, Ended) and BorrowState.is(state, Live) then state = incoming_state end
         end
         local first = info_of(incoming_borrows[1])
-        local info = data.BorrowInfo { ..first, id = supply.fresh identity.BorrowId, .origins, .mutable, .lifetime, .acquired }
+        if form == nil then fail("join_borrows needs an explicit selected or transported form") end
+        local info = data.BorrowInfo { ..first, id = supply.fresh identity.BorrowId, .form, .origins, .mutable, .lifetime, .acquired }
         registry[info.id] = info
         joined_flow.borrows[info.id] = state
         return info

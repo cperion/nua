@@ -16,6 +16,8 @@ local words = do(T)
     if made[T] then return made[T] end
     local size = size_of T
     local B = Buffer T
+    -- elements that own storage are reached by reference, and released with their buffer
+    local owning = owns T
 
     local bytes_of = do(count: U64): U64 = count * size
 
@@ -37,49 +39,83 @@ local words = do(T)
         moves self
     end
 
+    -- growth moves, whether or not this push happens to need new storage: the rule a reader
+    -- relies on does not depend on what the compiler knows about the capacity (buffers §2.3)
     local push = do(self: Ref B, value: T): Unit
         reserve(self, self.length + 1)
-        self.data[self.length] = value
+        local destination = element_of(self, self.length)
+        destination = value
         self.length = self.length + 1
+        moves self
     end
 
     local get = do(self: Ref B, index: U64): T
+        if owning then trap "an element that owns storage is reached by reference, not copied" end
         if index >= self.length then trap "index out of range" end
-        return self.data[index]
+        return element_of(self, index)
+    end
+
+    local element = do(self: Ref B, index: U64): Ref T
+        if index >= self.length then trap "index out of range" end
+        return element_of(self, index)
+    end
+
+    -- release the elements from `first` up to the length (only for elements that own storage)
+    local release_from = do(self: Ref B, first: U64): Unit
+        if owning then
+            local index = first
+            while index < self.length do
+                drop(element_of(self, index))
+                index = index + 1
+            end
+        end
     end
 
     local set = do(self: Ref B, index: U64, value: T): Unit
         if index >= self.length then trap "index out of range" end
-        self.data[index] = value
+        if owning then drop(element_of(self, index)) end
+        local destination = element_of(self, index)
+        destination = value
     end
 
     local pop = do(self: Ref B): T
         if self.length == 0 then trap "pop of an empty buffer" end
         self.length = self.length - 1
         ends(self, "shrank")
-        return self.data[self.length]
+        return element_of(self, self.length)
     end
 
     local truncate = do(self: Ref B, length: U64): Unit
         if length > self.length then trap "truncate past the length" end
+        release_from(self, length)
         self.length = length
         ends(self, "shrank")
     end
 
     local clear = do(self: Ref B): Unit
+        release_from(self, 0)
         self.length = 0
         ends(self, "cleared")
     end
 
     local release = do(self: Ref B): Unit
+        release_from(self, 0)
         if self.capacity > 0 then allocator.release(Ptr(U8)(self.data), bytes_of self.capacity) end
     end
 
     local length = do(self: Ref B): U64 = self.length
 
+    -- views: held borrows of the contents (buffers §2.3)
+    local view = do(self: Ref B, first: U64, count: U64): Slice T
+        if first > self.length or count > self.length - first then trap "view past the length" end
+        return view_of(self, first, count)
+    end
+    local all = do(self: Ref B): Slice T = view_of(self, 0, self.length)
+
     made[T] = {
         reserve = reserve, push = push, get = get, set = set, pop = pop,
         truncate = truncate, clear = clear, release = release, length = length,
+        view = view, all = all, element = element,
     }
     return made[T]
 end

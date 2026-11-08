@@ -24,7 +24,7 @@ local fail = do(message) error("graph: " .. message, 3) end
 local GraphFragment = struct {
     attempt: Optional(identity.AttemptId), entry: Optional(BlockId), order: Table, blocks: Table,
     places: Table, lifetimes: Table, values: Table, borrows: Table, exits: Table, requests: Table,
-    state: String
+    entries: Table, sites: Table, terminal_flows: Table, state: String
 }
 
 local empty_fragment = attempt -> GraphFragment with
@@ -37,12 +37,15 @@ local empty_fragment = attempt -> GraphFragment with
     borrows = {}
     exits = {}
     requests = {}
+    entries = {}
+    sites = {}
+    terminal_flows = {}
     state = "open"
 end
 
 -- the writer over one fragment; every verb checks that the fragment is still open and that a
 -- block belongs to it
-local writer_for = do(fragment, supply)
+local writer_for = do(fragment, supply, parent)
     local open = do(verb)
         if fragment.state ~= "open" then fail(("%s on a writer whose fragment was %s"):format(verb, fragment.state)) end
     end
@@ -82,6 +85,9 @@ local writer_for = do(fragment, supply)
             if fragment.places[place.id] then fail("declare: " .. identity.describe(place.id) .. " is declared twice") end
             fragment.places[place.id] = place
         end
+        has_place = id -> fragment.places[id] ~= nil or (parent ~= nil and parent.has_place(id))
+        -- Read inherited facts without adopting or mutating the parent's construction.
+        information = operand -> fragment.values[data.operand_key operand] or (parent and parent.information(operand))
         lifetime = do(lifetime)
             open "lifetime"
             fragment.lifetimes[lifetime.id] = lifetime
@@ -111,6 +117,24 @@ local writer_for = do(fragment, supply)
             open "borrow"
             fragment.borrows[info.id] = info
         end
+        -- Fact snapshots belong to the same tentative construction as their graph nodes.
+        enter = do(block, flow)
+            open "enter"
+            owned_block(block, "enter")
+            if not check(data.FlowFacts, flow) then fail("enter: expected FlowFacts") end
+            fragment.entries[block] = flow
+        end
+        observe = do(site, information)
+            open "observe"
+            if not check(InstructionId, site) or not check(data.SiteFacts, information) then fail("observe: expected an instruction identity and SiteFacts") end
+            fragment.sites[site] = information
+        end
+        terminal_flow = do(block, flow)
+            open "terminal_flow"
+            owned_block(block, "terminal_flow")
+            if not check(data.FlowFacts, flow) then fail("terminal_flow: expected FlowFacts") end
+            fragment.terminal_flows[block] = flow
+        end
         exit = do(site)
             open "exit"
             fragment.exits[#fragment.exits + 1] = site
@@ -135,6 +159,9 @@ local writer_for = do(fragment, supply)
             for id, info in pairs child.borrows do fragment.borrows[id] = info end
             for _, site in ipairs child.exits do fragment.exits[#fragment.exits + 1] = site end
             for definition in pairs child.requests do fragment.requests[definition] = true end
+            for block, flow in pairs child.entries do fragment.entries[block] = flow end
+            for site, information in pairs child.sites do fragment.sites[site] = information end
+            for block, flow in pairs child.terminal_flows do fragment.terminal_flows[block] = flow end
             return child.entry
         end
     end
@@ -143,9 +170,9 @@ end
 
 -- run `body` with a writer over a new fragment; it answers "adopt" or "discard"
 local BuildResult = oneof { built: GraphFragment, discarded: Unit }
-local building = do(attempt, supply, body)
+local building = do(attempt, supply, body, parent)
     local fragment = empty_fragment attempt
-    local writer = writer_for(fragment, supply)
+    local writer = writer_for(fragment, supply, parent)
     local completed, decision = pcall(body, writer)
     if not completed then
         fragment.state = "discarded"

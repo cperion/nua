@@ -1,0 +1,187 @@
+local compile = require "nua.compile"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local verify = require "nua.compiler.verify_lifetimes"
+local native = require "tests.support.native"
+
+local messages = do(problems)
+    local lines = {}
+    for _, problem in ipairs problems do lines[#lines + 1] = problem.message end
+    return table.concat(lines, "\n")
+end
+local passes = problems -> assert(#problems == 0, messages problems)
+local reports = do(problems, text)
+    assert(messages(problems):find(text, 1, true), messages problems)
+end
+
+local source = [[
+local observed = do(n: U32): U32
+    local xs = (Grow U32) { 7, 11 }
+    local head = xs:all()
+    for i: U32 = 1, n do
+        xs:push i
+    end
+    return head[0] + head[1]
+end
+export observed
+]]
+
+-- Forge an invalid graph with the same sites, while keeping the evaluator's original
+-- (successful) flow snapshots. The verifier must replay instructions, not trust those states.
+local replace_moves = do(program)
+    local definitions = {}
+    for id, definition in pairs program.definitions do
+        local blocks = {}
+        for index, block in ipairs definition.blocks do
+            local instructions = {}
+            for position, instruction in ipairs block.instructions do
+                instructions[position] = data.Instruction.is(instruction, data.Moves)
+                    and data.Ends { site = instruction.site, target = instruction.target, reason = "cleared" }
+                    or instruction
+            end
+            blocks[index] = data.Block { ..block, .instructions }
+        end
+        definitions[id] = data.Definition { ..definition, .blocks }
+    end
+    return data.Program { ..program, .definitions }
+end
+
+test "real Nua publishes revision-bound, construction-owned lifetime facts":
+    local compiled = compile.compile(source, "published.nua")
+    assert(check(data.Analysis, compiled.analysis))
+    local borrows, uses, sites, edges = 0, 0, 0, 0
+    for id, definition in pairs compiled.program.definitions do
+        local facts = assert(compiled.analysis.definitions[id])
+        for borrow, info in pairs facts.borrows do
+            borrows += 1
+            for _, origin in ipairs info.origins do assert(definition.places[origin.place]) end
+        end
+        for _, place in pairs definition.places do
+            if data.PlaceRoot.is(place.root, data.IndirectRoot) then
+                uses += 1
+                assert(facts.borrows[place.root.borrow])
+            end
+        end
+        for _, block in ipairs definition.blocks do
+            assert(facts.entries[block.id], "every block has entry facts")
+            for _, instruction in ipairs block.instructions do
+                sites += 1
+                assert(facts.sites[instruction.site.id], "every instruction has site facts")
+            end
+            for _, edge in ipairs(graph.edges_of block.terminator) do
+                edges += 1
+                assert(facts.edges[edge.id])
+                assert(facts.joins[edge.target])
+            end
+        end
+    end
+    assert(borrows > 0 and uses > 0 and sites > 0 and edges > 0)
+    passes(verify.lifetimes(compiled.program, compiled.analysis))
+    reports(verify.lifetimes(replace_moves(compiled.program), compiled.analysis), "used after it ended (cleared)")
+    -- Verifying a forged graph did not mutate the original product.
+    passes(verify.lifetimes(compiled.program, compiled.analysis))
+end
+
+test "a held borrow survives growth in native execution":
+    local library = native("published_held", source)
+    assert(library.observed(0) == 18)
+    assert(library.observed(10000) == 18)
+end
+
+test "the verifier distinguishes stored and held borrows in real program facts":
+    local compiled = compile.compile(source, "stored_facts.nua")
+    local definitions = {}
+    local changed = false
+    for id, facts in pairs compiled.analysis.definitions do
+        local borrows = {}
+        for borrow, info in pairs facts.borrows do borrows[borrow] = info end
+        for _, place in pairs compiled.program.definitions[id].places do
+            if data.PlaceRoot.is(place.root, data.IndirectRoot) then
+                local info = borrows[place.root.borrow]
+                borrows[info.id] = data.BorrowInfo { ..info, form = data.Stored { pointer = place.root.pointer } }
+                changed = true
+            end
+        end
+        definitions[id] = data.DefinitionFacts { ..facts, .borrows }
+    end
+    assert(changed)
+    reports(verify.lifetimes(compiled.program, data.Analysis { ..compiled.analysis, .definitions }), "used after it ended (grew)")
+end
+
+test "a stale held view on a real loop backedge is refused independently":
+    local ok, problem = pcall(compile.compile, [[
+local stale = do(n: U32): U32
+    local xs = (Grow U32) { 1 }
+    local old = xs:all()
+    local answer: U32 = 0
+    for i: U32 = 1, n do
+        answer = old[0]
+        xs:clear
+        xs:push i
+    end
+    return answer
+end
+export stale
+]], "stale_backedge.nua")
+    assert(not ok, "the stale backedge must be rejected")
+    assert(tostring(problem):find("lifetimes: a borrow is used after it ended (cleared)", 1, true), tostring problem)
+end
+
+test "a fresh loop-local view is acquired on each iteration, not before the loop":
+    local library = native("published_fresh", [[
+local fresh = do(n: U32): U32
+    local xs = (Grow U32) { 1 }
+    local answer: U32 = 0
+    for i: U32 = 1, n do
+        local current = xs:all()
+        answer = answer + current[0]
+        xs:clear
+        xs:push i
+    end
+    return answer
+end
+export fresh
+]])
+    assert(library.fresh(0) == 0)
+    assert(library.fresh(4) == 1 + 1 + 2 + 3)
+end
+
+test "scalar observations do not retain the borrow used to read them":
+    local library = native("published_observation", [[
+local observed_once = do(): U32
+    local xs = (Grow U32) { 23 }
+    local head = xs:all()
+    local value = head[0]
+    xs:clear
+    return value
+end
+export observed_once
+]])
+    assert(library.observed_once() == 23)
+end
+
+test "an absent or stale analysis is not a successful lifetime check":
+    local compiled = compile.compile(source, "missing_facts.nua")
+    reports(verify.lifetimes(compiled.program, {}), "missing or malformed Analysis")
+    reports(verify.lifetimes(compiled.program, data.Analysis { ..compiled.analysis, definitions = {} }), "no published lifetime facts")
+    reports(verify.lifetimes(data.Program { ..compiled.program, revision = compiled.program.revision + 1 }, compiled.analysis), "revision does not match")
+    local definitions = {}
+    for id, facts in pairs compiled.analysis.definitions do definitions[id] = data.DefinitionFacts { ..facts, borrows = {} } end
+    reports(verify.lifetimes(compiled.program, data.Analysis { ..compiled.analysis, .definitions }), "no published origin facts")
+end
+
+test "symbolic formal origins do not reject a valid disjoint native call":
+    local library = native("published_disjoint", [[
+local grow_beside = do(xs: Ref (Grow U32), values: Slice U32): U32
+    xs:push 99
+    return values[0]
+end
+local disjoint = do(): U32
+    local xs = (Grow U32) { 1 }
+    local other = (Grow U32) { 41 }
+    return call grow_beside (Ref xs) (other:all())
+end
+export disjoint
+]])
+    assert(library.disjoint() == 41)
+end

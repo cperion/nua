@@ -265,6 +265,7 @@ local header_fields = { data = 1, length = 2, capacity = 3, limit = 4 }
 -- the type of one component of a native value, or nil and why not
 local component_type = do(type, component)
     local Component = data.Component
+    if Component.is(component, data.PayloadComponent) or Component.is(component, data.AnyElementComponent) then return nil, "a payload/wildcard component is provenance, not an executable projection" end
     if Component.is(component, data.FieldComponent) then
         if NativeType.is(type, types.RecordType) then
             for _, field in ipairs type.fields do
@@ -297,6 +298,11 @@ local verify_types = do(program, capabilities)
         local place_type = do(place, origin)
             local found = definition.places[place]
             if found == nil then report(definition, identity.describe(place) .. " is not a place of the definition", origin) end
+            if found then
+                for _, component in ipairs found.path do
+                    if data.Component.is(component, data.PayloadComponent) or data.Component.is(component, data.AnyElementComponent) then report(definition, "a resident provenance place needs a derived address before access", origin) end
+                end
+            end
             return found and found.type
         end
         local expect = do(operand, type, what, origin)

@@ -79,7 +79,7 @@ local check_types = do(opcode, result, arguments)
     end
     if opcode == "reinterpret" then
         local target = { pointer_bits = 64 }
-        local scalar = type -> is_numeric type or is_pointer type
+        local scalar = type -> is_numeric type or is_pointer type or NativeType.is(type, types.ReferenceType)
         if not scalar first or not scalar result or types.layout(first, target).size ~= types.layout(result, target).size then
             return ("cannot reinterpret %s as %s"):format(described first, described result)
         end

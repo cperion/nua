@@ -173,3 +173,37 @@ test "a fragment is adopted once, and its writer stops":
     end)
     refuses(|| -> child_writer.block("again", {}), "was adopted")
 end
+
+test "fact snapshots are adopted and discarded with their construction":
+    local facts = require "nua.compiler.facts"
+    local effects = require "nua.compiler.effects"
+    local supply = identity.supply()
+    local origin = supply.fresh identity.OriginId
+    local site = data.Site { id = supply.fresh identity.InstructionId, .origin }
+    local child_writer, parent_writer, child_block
+    local child = graph.building(nil, supply, do(writer)
+        child_writer = writer
+        child_block = writer.block "child"
+        writer.enter(child_block, facts.empty())
+        writer.append(child_block, data.Fence { .site, order = "sequential" })
+        writer.observe(site.id, data.SiteFacts { before = facts.empty(), after = facts.empty(), effects = effects.empty() })
+        writer.terminal_flow(child_block, facts.empty())
+        writer.terminate(child_block, data.Return { .origin })
+        return "adopt"
+    end) { built = f -> f, discarded = || -> error "discarded" }
+    local parent = graph.building(nil, supply, do(writer)
+        parent_writer = writer
+        writer.adopt child
+        return "discard"
+    end)
+    assert(parent { built = f -> false, discarded = || -> true })
+    refuses(|| -> child_writer.enter(child_block, facts.empty()), "was adopted")
+    refuses(|| -> parent_writer.terminal_flow(child_block, facts.empty()), "was discarded")
+    local independent = graph.building(nil, supply, do(writer)
+        local entry = writer.block "independent"
+        writer.enter(entry, facts.empty())
+        writer.terminate(entry, data.Return { .origin })
+        return "adopt"
+    end) { built = f -> f, discarded = || -> error "discarded" }
+    assert(independent.entries[child_block] == nil and independent.sites[site.id] == nil)
+end

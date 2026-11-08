@@ -1,0 +1,317 @@
+-- Component/place provenance. Payload and wildcard paths are facts, not addresses. All
+-- resident borrows have Stored(None); only a load can bind them to an SSA observation.
+local data = require "nua.compiler.data"
+local types = require "nua.types"
+local identity = require "nua.identity"
+local paths = require "nua.compiler.borrow_paths"
+local rules = require "nua.compiler.rules"
+
+local component_key = do(path)
+    local parts = {}
+    for _, step in ipairs path do
+        if data.Component.is(step, data.FieldComponent) then parts[#parts + 1] = "f:" .. string.format("%q", step.name)
+        elseif data.Component.is(step, data.AlternativeComponent) then parts[#parts + 1] = "a:" .. string.format("%q", step.name)
+        elseif data.Component.is(step, data.PayloadComponent) then parts[#parts + 1] = "payload"
+        elseif data.Component.is(step, data.AnyElementComponent) then parts[#parts + 1] = "*"
+        elseif data.Operand.is(step.index, data.Constant) then parts[#parts + 1] = "i:" .. tostring(step.index.bits.bits)
+        else parts[#parts + 1] = "*" end
+    end
+    return table.concat(parts, "/")
+end
+local components = do(access)
+    local result = {}
+    for _, step in ipairs access do
+        if data.AccessStep.is(step, data.FieldStep) then result[#result + 1] = data.FieldComponent { name = step.name }
+        elseif data.AccessStep.is(step, data.AlternativeStep) then result[#result + 1] = data.AlternativeComponent { name = step.name }
+        elseif data.AccessStep.is(step, data.ContentsStep) then result[#result + 1] = data.PayloadComponent {}
+        elseif data.AccessStep.is(step, data.AnyElement) then result[#result + 1] = data.AnyElementComponent {}
+        else result[#result + 1] = data.ElementComponent { index = rules.integer(types.U64, step.index) } end
+    end
+    return result
+end
+local access_path = do(path)
+    local result = {}
+    for _, step in ipairs path do
+        if data.Component.is(step, data.FieldComponent) then result[#result + 1] = data.FieldStep { name = step.name }
+        elseif data.Component.is(step, data.AlternativeComponent) then result[#result + 1] = data.AlternativeStep { name = step.name }
+        elseif data.Component.is(step, data.PayloadComponent) then result[#result + 1] = data.ContentsStep {}
+        elseif data.Component.is(step, data.AnyElementComponent) then result[#result + 1] = data.AnyElement {}
+        elseif data.Operand.is(step.index, data.Constant) then result[#result + 1] = data.KnownElement { index = tonumber(step.index.bits.bits) }
+        else result[#result + 1] = data.AnyElement {} end
+    end
+    return result
+end
+local concat = do(first, second)
+    local result = {}
+    for _, step in ipairs first do result[#result + 1] = step end
+    for _, step in ipairs second do result[#result + 1] = step end
+    return result
+end
+local root_places = setmetatable({}, { __mode = "k" })
+local base_place = do(place, places)
+    if #place.path == 0 then return place.id end
+    local found = root_places[place.root]
+    if found and places[found] then return found end
+    for id, candidate in pairs places do
+        if candidate.root == place.root and #candidate.path == 0 then root_places[place.root] = id; return id end
+    end
+    error("provenance: a component place has no declared root", 0)
+end
+local accesses = do(place, places, borrows)
+    local result = {}
+    local suffix = access_path place.path
+    if data.PlaceRoot.is(place.root, data.IndirectRoot) then
+        for _, origin in ipairs assert(borrows[place.root.borrow]).origins do
+            result[#result + 1] = data.Access { place = origin.place, path = concat(origin.path, suffix) }
+        end
+    elseif not data.PlaceRoot.is(place.root, data.RawRoot) then
+        result[1] = data.Access { place = base_place(place, places), path = suffix }
+    end
+    return result
+end
+local borrowed = do(info)
+    local result = {}
+    for _, component in pairs info.components do
+        if data.ComponentInfo.is(component, data.Borrowed) then result[#result + 1] = component.borrow end
+    end
+    return result
+end
+local is_payload = do(path)
+    for _, component in ipairs path do if data.Component.is(component, data.PayloadComponent) then return true end end
+    return false
+end
+local plain = native_type -> data.ValueInfo { type = native_type, components = types.owns(native_type) and { [{}] = data.Owning {} } or {}, proofs = {} }
+local same_origins = do(a, b)
+    local left, right = paths.union({}, a), paths.union({}, b)
+    if #left ~= #right then return false end
+    for index, origin in ipairs left do
+        if origin.place ~= right[index].place or component_key(components(origin.path)) ~= component_key(components(right[index].path)) then return false end
+    end
+    return true
+end
+local same_info = do(a, af, b, bf, registry)
+    local indexed = {}
+    for path, part in pairs a.components do indexed[component_key path] = part end
+    local count = 0
+    for path, part in pairs b.components do
+        count += 1
+        local previous = indexed[component_key path]
+        if previous == nil or getmetatable(previous) ~= getmetatable(part) then return false end
+        if data.ComponentInfo.is(part, data.Borrowed) then
+            if not same_origins(registry[previous.borrow].origins, registry[part.borrow].origins) then return false end
+            local left, right = af.borrows[previous.borrow], bf.borrows[part.borrow]
+            if left == nil or right == nil or getmetatable(left) ~= getmetatable(right) or left.reason ~= right.reason then return false end
+        end
+    end
+    local other = 0
+    for _ in pairs indexed do other += 1 end
+    return count == other
+end
+local is_memory = place -> place ~= nil and #place.path > 0
+local value_info
+value_info = do(value, lookup)
+    if data.NativeValue.is(value, data.Reference) then return data.ValueInfo { type = value.type, components = { [{}] = data.Borrowed { borrow = value.borrow } }, proofs = {} } end
+    if data.NativeValue.is(value, data.Aggregate) then
+        local components = types.NativeType.is(value.type, types.BufferType) and { [{}] = data.Owning {} } or {}
+        local packed = value.packed and lookup and lookup(value.packed)
+        if packed then for key, part in pairs packed.components do components[key] = part end end
+        for name, part in pairs value.parts do
+            for key in pairs components do if key[1] and data.Component.is(key[1], data.FieldComponent) and key[1].name == name then components[key] = nil end end
+            for key, component in pairs value_info(part, lookup).components do components[concat({ data.FieldComponent { .name } }, key)] = component end
+        end
+        return data.ValueInfo { type = value.type, .components, proofs = {} }
+    end
+    return value.operand and lookup and not data.Operand.is(value.operand, data.Constant) and lookup(value.operand) or plain(value.type)
+end
+
+local working = do(compilation, tracking, overlap)
+    local registry, places, fresh = compilation.borrows, compilation.places, compilation.supply.fresh
+    local interned = {}
+    local intern = do(access, native_type, writer)
+        local path = components access.path
+        local key = access.place.serial .. ":" .. component_key(path)
+        local place = interned[key]
+        if place == nil and #path == 0 then place = assert(places[access.place]); interned[key] = place end
+        if place == nil then
+            local base = assert(places[access.place])
+            place = data.Place { id = fresh(identity.PlaceId), type = native_type, root = base.root, .path, lifetime = base.lifetime, origin = base.origin }
+            interned[key], places[place.id] = place, place
+        end
+        if writer and not writer.has_place(place.id) then writer.declare(place) end
+        return place
+    end
+    local resident_borrow = do(flow, infos, states, acquired)
+        local origins, state, mutable = {}, data.Live {}, true
+        for index, info in ipairs infos do
+            origins = paths.union(origins, info.origins)
+            mutable = mutable and info.mutable
+            if states[index] and data.BorrowState.is(states[index], data.Ended) then state = states[index] end
+        end
+        local info = data.BorrowInfo { ..infos[1], id = fresh(identity.BorrowId), form = data.Stored {}, .origins, .mutable, acquired = acquired or infos[1].acquired }
+        registry[info.id], flow.borrows[info.id] = info, state
+        return info.id
+    end
+    local merge_info = do(rows, destination, acquired)
+        local groups, result = {}, {}
+        for _, row in ipairs rows do
+            for path, part in pairs row.info.components do
+                local key = component_key path
+                local group = groups[key]
+                if group == nil then group = { .path, .part, infos = {}, states = {} }; groups[key] = group end
+                if data.ComponentInfo.is(part, data.Borrowed) then
+                    group.infos[#group.infos + 1] = registry[part.borrow]
+                    group.states[#group.states + 1] = assert(row.flow.borrows[part.borrow], "resident borrow has no state")
+                end
+            end
+        end
+        for _, group in pairs groups do
+            result[group.path] = #group.infos > 0 and data.Borrowed { borrow = resident_borrow(destination, group.infos, group.states, acquired) } or group.part
+        end
+        return data.ValueInfo { type = rows[1].info.type, components = result, proofs = {} }
+    end
+    local capture = do(flow, owner, info)
+        local parts = {}
+        for key, part in pairs info.components do
+            local payload = false
+            for _, step in ipairs key do if data.Component.is(step, data.PayloadComponent) then payload = true end end
+            if not payload then parts[key] = part end
+        end
+        for id, contents in pairs flow.contents do
+            if places[id] and is_memory(places[id]) and data.Contents.is(contents, data.Resident) then
+                for _, access in ipairs accesses(places[id], places, registry) do
+                    if access.place == owner then
+                        local prefix = components(access.path)
+                        for key, part in pairs contents.info.components do parts[concat(prefix, key)] = part end
+                    end
+                end
+            end
+        end
+        return data.ValueInfo { type = info.type, components = parts, proofs = {} }
+    end
+    local payloads = do(info)
+        local groups = {}
+        for key, part in pairs info.components do
+            local type, prefix = info.type, {}
+            for index, step in ipairs key do
+                prefix[#prefix + 1] = step
+                if data.Component.is(step, data.FieldComponent) and types.NativeType.is(type, types.RecordType) then
+                    for _, field in ipairs type.fields do if field.name == step.name then type = field.type; break end end
+                elseif data.Component.is(step, data.PayloadComponent) and types.NativeType.is(type, types.BufferType) and key[index + 1] then
+                    prefix[#prefix + 1] = key[index + 1]
+                    local name = component_key(prefix)
+                    local group = groups[name] or { path = access_path(prefix), info = data.ValueInfo { type = type.element, components = {}, proofs = {} } }
+                    local rest = {}
+                    for position = index + 2, #key do rest[#rest + 1] = key[position] end
+                    group.info.components[rest] = part
+                    groups[name] = group
+                    break
+                end
+            end
+        end
+        return groups
+    end
+    local store = do(path, targets, info, acquired)
+        for _, target in ipairs targets do
+            local place = intern(target, info.type, path.writer)
+            local rows = { { .info, flow = path.flow } }
+            local weak = #targets > 1
+            for _, step in ipairs target.path do if data.AccessStep.is(step, data.AnyElement) then weak = true end end
+            local old = path.flow.contents[place.id]
+            if weak and old and data.Contents.is(old, data.Resident) then rows[#rows + 1] = { info = old.info, flow = path.flow } end
+            path.flow.contents[place.id] = data.Resident { info = merge_info(rows, path.flow, acquired) }
+        end
+    end
+    local read = do(flow, targets, native_type, writer)
+        local rows = {}
+        for _, target in ipairs targets do
+            local exact = interned[target.place.serial .. ":" .. component_key(components(target.path))]
+            local contents = exact and flow.contents[exact.id]
+            local known = true
+            for _, step in ipairs target.path do if data.AccessStep.is(step, data.AnyElement) then known = false end end
+            if known and contents and data.Contents.is(contents, data.Resident) then
+                rows[#rows + 1] = { info = contents.info, .flow }
+            else
+                for id, candidate in pairs flow.contents do
+                    local place = places[id]
+                    if place and (data.Contents.is(candidate, data.Resident) or data.Contents.is(candidate, data.Tracked)) then
+                        local access = accesses(place, places, registry)[1]
+                        if access and access.place == target.place and overlap(access.path, target.path) and #access.path <= #target.path then
+                            local info = data.Contents.is(candidate, data.Resident) and candidate.info or value_info(candidate.value, writer and writer.information)
+                            local suffix = {}
+                            for index = #access.path + 1, #target.path do suffix[#suffix + 1] = target.path[index] end
+                            if #suffix == 0 and info.type == native_type then rows[#rows + 1] = { .info, .flow }
+                            elseif #suffix > 0 then
+                                local prefix, selected = components(suffix), {}
+                                for key, part in pairs info.components do
+                                    local match = #key >= #prefix
+                                    for index, step in ipairs prefix do
+                                        if not key[index] or getmetatable(key[index]) ~= getmetatable(step) or key[index].name ~= step.name then match = false end
+                                    end
+                                    if match then
+                                        local rest = {}
+                                        for index = #prefix + 1, #key do rest[#rest + 1] = key[index] end
+                                        selected[rest] = part
+                                    end
+                                end
+                                if next(selected) then rows[#rows + 1] = { info = data.ValueInfo { type = native_type, components = selected, proofs = {} }, .flow } end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if #rows == 0 then return nil end
+        return merge_info(rows, flow)
+    end
+    local agree = do(flows, destination, lookup)
+        local ids = {}
+        for _, flow in ipairs flows do
+            for id, contents in pairs flow.contents do
+                if places[id] and data.Contents.is(contents, data.Resident) then
+                    local present = true
+                    for _, incoming in ipairs flows do if incoming.contents[id] == nil then present = false end end
+                    if is_memory(places[id]) or present then ids[id] = true end
+                end
+            end
+        end
+        for id in pairs ids do
+            local rows = {}
+            for _, flow in ipairs flows do
+                local contents = flow.contents[id]
+                if contents and data.Contents.is(contents, data.Resident) then rows[#rows + 1] = { info = contents.info, .flow }
+                elseif contents and data.Contents.is(contents, data.Tracked) then rows[#rows + 1] = { info = value_info(contents.value, lookup), .flow } end
+            end
+            destination.contents[id] = data.Resident { info = merge_info(rows, destination) }
+        end
+    end
+    local same = do(left, right)
+        for _, pair in ipairs { { left, right }, { right, left } } do
+            for id, contents in pairs pair[1].contents do
+                if places[id] and data.Contents.is(contents, data.Resident) then
+                    local other = pair[2].contents[id]
+                    if not (other and data.Contents.is(other, data.Resident) and same_info(contents.info, pair[1], other.info, pair[2], registry)) then return false end
+                end
+            end
+        end
+        return true
+    end
+    local seed = do(schema, destination, writer)
+        for id, contents in pairs schema.contents do
+            if places[id] and data.Contents.is(contents, data.Resident) then
+                if writer and not writer.has_place(id) then writer.declare(places[id]) end
+                destination.contents[id] = data.Resident { info = merge_info({ { info = contents.info, flow = schema } }, destination) }
+            end
+        end
+    end
+    local forget = do(flow, target)
+        for id in pairs flow.contents do
+            local place = places[id]
+            if place and is_memory(place) then
+                local access = accesses(place, places, registry)[1]
+                if access and access.place == target.place and #access.path >= #target.path and overlap(access.path, target.path) then flow.contents[id] = nil end
+            end
+        end
+    end
+    return { .intern, .resident_borrow, .merge_info, .capture, .payloads, .store, .read, .agree, .same, .seed, .forget }
+end
+return { key = component_key, .components, .access_path, .concat, .base_place, .accesses, .borrowed, .is_payload, .plain, .same_origins, .same_info, .is_memory, .value_info, .working }
