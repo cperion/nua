@@ -5,19 +5,18 @@ local data = require "nua.compiler.data"
 local types = require "nua.types"
 
 local element = step -> data.AccessStep.is(step, data.KnownElement) or data.AccessStep.is(step, data.AnyElement)
+-- a step's part of a path key; a shape key leaves out element indices
+local StepKeys = define
+    KnownElement = |step, recurse, shape| -> shape and "element" or ("element:" .. step.index)
+    AnyElement = |step, recurse, shape| -> shape and "element" or "element:*"
+    ContentsStep = |step, recurse, shape| -> "contents"
+    FieldStep = |step, recurse, shape| -> "field:" .. step.name
+    AlternativeStep = |step, recurse, shape| -> "alternative:" .. step.name
+end
+local key_of_step = data.AccessStep.pass "key an access step" with ..StepKeys end
 local path_key = do(path, shape)
     local parts = {}
-    for _, step in ipairs path do
-        if element step then
-            parts[#parts + 1] = shape and "element" or (step.index and "element:" .. step.index or "element:*")
-        elseif data.AccessStep.is(step, data.ContentsStep) then
-            parts[#parts + 1] = "contents"
-        elseif data.AccessStep.is(step, data.FieldStep) then
-            parts[#parts + 1] = "field:" .. step.name
-        else
-            parts[#parts + 1] = "alternative:" .. step.name
-        end
-    end
+    for _, step in ipairs path do parts[#parts + 1] = key_of_step(step, shape) end
     return table.concat(parts, "/")
 end
 local origins_key = do(origins, shape)

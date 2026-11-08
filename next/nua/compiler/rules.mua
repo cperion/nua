@@ -23,79 +23,6 @@ local is_boolean = type -> is_kind(type, types.BooleanType)
 local is_pointer = type -> is_kind(type, types.PointerType)
 local is_numeric = type -> is_integer type or is_float type
 
-local unary = { negate = true, bit_not = true, convert = true, reinterpret = true }
-
-------------------------------------------------------------------------------------------------
--- Types: nil when the operands suit the opcode and its result type, else the reason.
-
-local both_same = do(arguments, what)
-    if arguments[1] == arguments[2] then return nil end
-    return what .. " needs two operands of one type"
-end
-
-local check_types = do(opcode, result, arguments)
-    local count = unary[opcode] and 1 or 2
-    if #arguments ~= count then return ("%s takes %d operand%s, got %d"):format(opcode, count, count == 1 and "" or "s", #arguments) end
-    local first = arguments[1]
-    local described = types.describe
-    if opcode == "add" or opcode == "subtract" or opcode == "multiply" or opcode == "divide" then
-        if not is_numeric first then return opcode .. " is not defined for " .. described first end
-        return both_same(arguments, opcode) or (result ~= first and opcode .. " yields its operands' type" or nil)
-    end
-    if opcode == "remainder" then
-        if not is_integer first then return "remainder is not defined for " .. described first end
-        return both_same(arguments, opcode) or (result ~= first and "remainder yields its operands' type" or nil)
-    end
-    if opcode == "negate" then
-        if not is_numeric first then return "negation is not defined for " .. described first end
-        return result ~= first and "negation yields its operand's type" or nil
-    end
-    if opcode == "bit_not" then
-        if not (is_integer first or is_boolean first) then return "bit_not is not defined for " .. described first end
-        return result ~= first and "bit_not yields its operand's type" or nil
-    end
-    if opcode == "bit_and" or opcode == "bit_or" or opcode == "bit_xor" then
-        if not (is_integer first or is_boolean first) then return opcode .. " is not defined for " .. described first end
-        return both_same(arguments, opcode) or (result ~= first and opcode .. " yields its operands' type" or nil)
-    end
-    if opcode == "shift_left" or opcode == "shift_right_signed" or opcode == "shift_right_unsigned" then
-        if not is_integer first then return "a shift is not defined for " .. described first end
-        if not is_integer(arguments[2]) then return "a shift count must be an integer, got " .. described(arguments[2]) end
-        return result ~= first and "a shift yields its left operand's type" or nil
-    end
-    if opcode == "equal" or opcode == "not_equal" then
-        if not (is_numeric first or is_boolean first or is_pointer first) then return "equality is not defined for " .. described first end
-        return both_same(arguments, opcode) or (result ~= types.Bool and "a comparison yields Bool" or nil)
-    end
-    if opcode == "less" or opcode == "less_equal" then
-        if not (is_numeric first or is_pointer first) then return "ordering is not defined for " .. described first end
-        return both_same(arguments, opcode) or (result ~= types.Bool and "a comparison yields Bool" or nil)
-    end
-    if opcode == "convert" then
-        if not is_numeric first or not is_numeric result then
-            return ("cannot convert %s to %s"):format(described first, described result)
-        end
-        return nil
-    end
-    if opcode == "reinterpret" then
-        local target = { pointer_bits = 64 }
-        local scalar = type -> is_numeric type or is_pointer type or NativeType.is(type, types.ReferenceType)
-        if not scalar first or not scalar result or types.layout(first, target).size ~= types.layout(result, target).size then
-            return ("cannot reinterpret %s as %s"):format(described first, described result)
-        end
-        return nil
-    end
-    if opcode == "pointer_offset" then
-        if not is_pointer first or not is_integer(arguments[2]) then return "pointer_offset takes a pointer and an integer" end
-        return result ~= first and "pointer_offset yields its pointer's type" or nil
-    end
-    if opcode == "pointer_difference" then
-        if not is_pointer first then return "pointer_difference takes two pointers" end
-        return both_same(arguments, opcode) or (result ~= types.I64 and "pointer_difference yields I64" or nil)
-    end
-    return "unknown opcode " .. tostring opcode
-end
-
 ------------------------------------------------------------------------------------------------
 -- Integer bits. A constant holds 64 canonical bits; its type says how to read them.
 
@@ -152,89 +79,76 @@ local signed_64 = do(opcode, a, b)
     return integer_constant(product, 64)
 end
 
-local fold_integer = do(opcode, type, arguments)
+-- the operands of an integer fold, read as the type reads them
+local integer_operands = do(type, arguments)
     local width, signed = type.bits, type.signed
     local read = bits -> signed and signed_value(bits, width) or unsigned_value(bits, width)
-    local a = read(arguments[1].bits.bits)
-    if opcode == "negate" then
-        if not signed then return integer_constant(-ffi.cast("uint64_t", a), width) end
-        return width == 64 and (a == signed_limits(64) and invalid "negation overflows I64 (undefined behaviour in C)" or integer_constant(-a, 64))
-            or signed_result(-a, width, "negation")
-    end
-    if opcode == "bit_not" then return integer_constant(bit.bnot(a), width) end
     local right = arguments[2]
-    if opcode == "shift_left" or opcode == "shift_right_signed" or opcode == "shift_right_unsigned" then
-        local count_type = right.type
-        local count = count_type.signed and signed_value(right.bits.bits, count_type.bits) or unsigned_value(right.bits.bits, count_type.bits)
+    return define
+        .type
+        .width
+        .signed
+        a = read(arguments[1].bits.bits)
+        .right
+        b = right and read(right.bits.bits)
+    end
+end
+
+-- add, subtract and multiply of integers: unsigned wraps; signed overflow is undefined
+local arithmetic = do(opcode, combine)
+    return do(operands)
+        local a, b, width = operands.a, operands.b, operands.width
+        if not operands.signed then return integer_constant(combine(ffi.cast("uint64_t", a), ffi.cast("uint64_t", b)), width) end
+        if width == 64 then return signed_64(opcode, a, b) end
+        return signed_result(combine(a, b), width, opcode)
+    end
+end
+-- division and remainder truncate toward zero; a zero divisor and MIN / -1 are undefined
+local division = do(opcode, combine)
+    return do(operands)
+        local a, b, width = operands.a, operands.b, operands.width
+        if b == 0 then return invalid(opcode == "divide" and "division by zero (undefined behaviour in C)" or "remainder by zero (undefined behaviour in C)") end
+        if operands.signed and b == -1LL and a == signed_limits width then
+            return invalid(("%s of the minimum I%d by -1 (undefined behaviour in C)"):format(opcode, width))
+        end
+        return integer_constant(combine(a, b), width)
+    end
+end
+-- a shift by a count outside the width is undefined; so is a signed left shift of a negative
+-- value or one whose result does not fit
+local shift = do(opcode, shifted)
+    return do(operands)
+        local type, width, a, right = operands.type, operands.width, operands.a, operands.right
+        local count = right.type.signed and signed_value(right.bits.bits, right.type.bits) or unsigned_value(right.bits.bits, right.type.bits)
         if count < 0 or count >= width then
             return invalid(("a shift by %s is undefined for %s"):format((tostring(count):gsub("U?LL$", "")), types.describe type))
         end
         local amount = tonumber count
-        if opcode == "shift_left" then
-            -- C: a signed left shift of a negative value, or one whose result does not fit, is undefined
-            if signed then
-                local _, high = signed_limits width
-                if a < 0LL or a > bit.arshift(high, amount) then
-                    return invalid("shift_left overflows " .. types.describe type .. " (undefined behaviour in C)")
-                end
+        if opcode == "shift_left" and operands.signed then
+            local _, high = signed_limits width
+            if a < 0LL or a > bit.arshift(high, amount) then
+                return invalid("shift_left overflows " .. types.describe type .. " (undefined behaviour in C)")
             end
-            return integer_constant(bit.lshift(ffi.cast("uint64_t", a), amount), width)
         end
-        if opcode == "shift_right_signed" then return integer_constant(bit.arshift(signed_value(canonical(a, width), width), amount), width) end
-        return integer_constant(bit.rshift(unsigned_value(canonical(a, width), width), amount), width)
+        return integer_constant(shifted(a, width, amount), width)
     end
-    local b = read(right.bits.bits)
-    if opcode == "equal" then return boolean_constant(a == b) end
-    if opcode == "not_equal" then return boolean_constant(a ~= b) end
-    if opcode == "less" then return boolean_constant(a < b) end
-    if opcode == "less_equal" then return boolean_constant(a <= b) end
-    if opcode == "bit_and" then return integer_constant(bit.band(a, b), width) end
-    if opcode == "bit_or" then return integer_constant(bit.bor(a, b), width) end
-    if opcode == "bit_xor" then return integer_constant(bit.bxor(a, b), width) end
-    if opcode == "divide" or opcode == "remainder" then
-        if b == 0 then return invalid(opcode == "divide" and "division by zero (undefined behaviour in C)" or "remainder by zero (undefined behaviour in C)") end
-        if signed and b == -1LL and a == signed_limits width then
-            return invalid(("%s of the minimum I%d by -1 (undefined behaviour in C)"):format(opcode, width))
-        end
-        return integer_constant(opcode == "divide" and a / b or a % b, width)
+end
+local bitwise = combine -> |operands| -> integer_constant(combine(operands.a, operands.b), operands.width)
+local integer_comparison = compare -> |operands| -> boolean_constant(compare(operands.a, operands.b))
+local negate_integer = do(operands)
+    local a, width = operands.a, operands.width
+    if not operands.signed then return integer_constant(-ffi.cast("uint64_t", a), width) end
+    if width == 64 then
+        if a == signed_limits 64 then return invalid "negation overflows I64 (undefined behaviour in C)" end
+        return integer_constant(-a, 64)
     end
-    -- add, subtract, multiply
-    if not signed then
-        local ua, ub = ffi.cast("uint64_t", a), ffi.cast("uint64_t", b)
-        local value = opcode == "add" and ua + ub or opcode == "subtract" and ua - ub or ua * ub
-        return integer_constant(value, width)
-    end
-    if width == 64 then return signed_64(opcode, a, b) end
-    local value = opcode == "add" and a + b or opcode == "subtract" and a - b or a * b
-    return signed_result(value, width, opcode)
+    return signed_result(-a, width, "negation")
 end
 
-local fold_float = do(opcode, type, arguments)
-    local a = arguments[1].bits.value
-    if opcode == "negate" then return float_constant(-a, type) end
-    local b = arguments[2].bits.value
-    if opcode == "equal" then return boolean_constant(a == b) end
-    if opcode == "not_equal" then return boolean_constant(a ~= b) end
-    if opcode == "less" then return boolean_constant(a < b) end
-    if opcode == "less_equal" then return boolean_constant(a <= b) end
-    if opcode == "add" then return float_constant(a + b, type) end
-    if opcode == "subtract" then return float_constant(a - b, type) end
-    if opcode == "multiply" then return float_constant(a * b, type) end
-    if opcode == "divide" then return float_constant(a / b, type) end
-    return FoldingDecision.not_foldable()
-end
-
-local fold_boolean = do(opcode, arguments)
-    local a = arguments[1].bits.value
-    if opcode == "bit_not" then return boolean_constant(not a) end
-    local b = arguments[2].bits.value
-    if opcode == "equal" then return boolean_constant(a == b) end
-    if opcode == "not_equal" then return boolean_constant(a ~= b) end
-    if opcode == "bit_and" then return boolean_constant(a and b) end
-    if opcode == "bit_or" then return boolean_constant(a or b) end
-    if opcode == "bit_xor" then return boolean_constant(a ~= b) end
-    return FoldingDecision.not_foldable()
-end
+-- folds of floats and Booleans, from their values
+local float_arithmetic = combine -> |type, a, b| -> float_constant(combine(a, b), type)
+local value_comparison = compare -> |type, a, b| -> boolean_constant(compare(a, b))
+local boolean_logic = combine -> |a, b| -> boolean_constant(combine(a, b))
 
 -- conversions follow C: integers wrap to the target width, floats truncate toward zero and
 -- must fit, integers become the nearest float
@@ -263,16 +177,32 @@ local fold_convert = do(result, argument)
     return integer_constant(ffi.cast("uint64_t", truncated), result.bits)
 end
 
+-- A NaN's bits are not determined by the value a FloatBits holds (and LuaJIT may read an
+-- arbitrary NaN pattern as another kind of value), so a reinterpretation from or to a NaN is
+-- not folded: the C operation keeps its exact bits.
+local nan_bits = do(bits, width)
+    local exponent_mask = width == 32 and 0x7f800000ULL or 0x7ff0000000000000ULL
+    local mantissa_mask = width == 32 and 0x007fffffULL or 0x000fffffffffffffULL
+    local pattern = bit.band(ffi.cast("uint64_t", bits), width == 32 and 0xffffffffULL or 0xffffffffffffffffULL)
+    return bit.band(pattern, exponent_mask) == exponent_mask and bit.band(pattern, mantissa_mask) ~= 0ULL
+end
 local fold_reinterpret = do(result, argument)
     local source = argument.type
+    if is_float source and argument.bits.value ~= argument.bits.value then return FoldingDecision.not_foldable() end
+    if is_integer source and is_float result and nan_bits(argument.bits.bits, result.bits) then return FoldingDecision.not_foldable() end
     if is_float source and is_integer result then
-        local cell = ffi.new(source.bits == 32 and "float[1]" or "double[1]", argument.bits.value)
-        local bits = source.bits == 32 and ffi.cast("uint32_t*", cell)[0] or ffi.cast("uint64_t*", cell)[0]
+        local bits
+        if source.bits == 32 then
+            bits = ffi.cast("uint32_t*", ffi.new("float[1]", argument.bits.value))[0]
+        else
+            bits = ffi.cast("uint64_t*", ffi.new("double[1]", argument.bits.value))[0]
+        end
         return integer_constant(ffi.cast("uint64_t", bits), result.bits)
     end
     if is_integer source and is_float result then
         local cell = ffi.new("uint64_t[1]", argument.bits.bits)
-        local value = result.bits == 32 and ffi.cast("float*", cell)[0] or ffi.cast("double*", cell)[0]
+        local value
+        if result.bits == 32 then value = ffi.cast("float*", cell)[0] else value = ffi.cast("double*", cell)[0] end
         return FoldingDecision.folded(data.FloatBits { value = tonumber value })
     end
     if is_integer source and is_integer result then return integer_constant(argument.bits.bits, result.bits) end
@@ -294,6 +224,154 @@ local proven_undefined = do(opcode, arguments)
     return nil
 end
 
+------------------------------------------------------------------------------------------------
+-- The opcodes. Each names its operand count, its type rule (nil when the operands suit it and
+-- its result type, else the reason), and how it folds known operands: `integer` from the
+-- operands as their type reads them, `float` and `boolean` from their values, or `whole` from
+-- the result type and the operand, for the conversions. An opcode without a fold for a type
+-- is not folded there.
+
+local described = types.describe
+local both_same = do(arguments, what)
+    if arguments[1] == arguments[2] then return nil end
+    return what .. " needs two operands of one type"
+end
+local yields_operand = do(opcode, what)
+    return do(result, arguments)
+        return both_same(arguments, opcode) or (result ~= arguments[1] and what or nil)
+    end
+end
+local is_integer_or_boolean = type -> is_integer type or is_boolean type
+-- a type rule: the first operand must be of a kind `admits`, then `then_check` decides
+local operand_rule = do(admits, refusal, then_check)
+    return do(result, arguments)
+        if not admits(arguments[1]) then return refusal .. " is not defined for " .. described(arguments[1]) end
+        return then_check(result, arguments)
+    end
+end
+local arithmetic_entry = do(opcode, combine)
+    return define
+        operands = 2
+        check = operand_rule(is_numeric, opcode, yields_operand(opcode, opcode .. " yields its operands' type"))
+        integer = arithmetic(opcode, combine)
+        float = float_arithmetic combine
+    end
+end
+local bitwise_entry = do(opcode, combine, logic)
+    return define
+        operands = 2
+        check = operand_rule(is_integer_or_boolean, opcode, yields_operand(opcode, opcode .. " yields its operands' type"))
+        integer = bitwise combine
+        boolean = boolean_logic logic
+    end
+end
+local shift_check = do(result, arguments)
+    if not is_integer(arguments[1]) then return "a shift is not defined for " .. described(arguments[1]) end
+    if not is_integer(arguments[2]) then return "a shift count must be an integer, got " .. described(arguments[2]) end
+    return result ~= arguments[1] and "a shift yields its left operand's type" or nil
+end
+local shift_entry = |opcode, shifted| -> { operands = 2, check = shift_check, integer = shift(opcode, shifted) }
+local yields_bool = |opcode| -> |result, arguments| -> both_same(arguments, opcode) or (result ~= types.Bool and "a comparison yields Bool" or nil)
+local equality_entry = do(opcode, compare)
+    return define
+        operands = 2
+        check = operand_rule(type -> is_numeric type or is_boolean type or is_pointer type, "equality", yields_bool opcode)
+        integer = integer_comparison compare
+        float = value_comparison compare
+        boolean = boolean_logic compare
+    end
+end
+local ordering_entry = do(opcode, compare)
+    return define
+        operands = 2
+        check = operand_rule(type -> is_numeric type or is_pointer type, "ordering", yields_bool opcode)
+        integer = integer_comparison compare
+        float = value_comparison compare
+    end
+end
+
+local Opcodes = define
+    add = arithmetic_entry("add", |x, y| -> x + y)
+    subtract = arithmetic_entry("subtract", |x, y| -> x - y)
+    multiply = arithmetic_entry("multiply", |x, y| -> x * y)
+    divide = define
+        operands = 2
+        check = operand_rule(is_numeric, "divide", yields_operand("divide", "divide yields its operands' type"))
+        integer = division("divide", |x, y| -> x / y)
+        float = float_arithmetic(|x, y| -> x / y)
+    end
+    remainder = define
+        operands = 2
+        check = operand_rule(is_integer, "remainder", yields_operand("remainder", "remainder yields its operands' type"))
+        integer = division("remainder", |x, y| -> x % y)
+    end
+    negate = define
+        operands = 1
+        check = operand_rule(is_numeric, "negation", |result, arguments| -> result ~= arguments[1] and "negation yields its operand's type" or nil)
+        integer = negate_integer
+        float = |type, a, b| -> float_constant(-a, type)
+    end
+    bit_not = define
+        operands = 1
+        check = operand_rule(is_integer_or_boolean, "bit_not", |result, arguments| -> result ~= arguments[1] and "bit_not yields its operand's type" or nil)
+        integer = operands -> integer_constant(bit.bnot operands.a, operands.width)
+        boolean = |a, b| -> boolean_constant(not a)
+    end
+    bit_and = bitwise_entry("bit_and", bit.band, |x, y| -> x and y)
+    bit_or = bitwise_entry("bit_or", bit.bor, |x, y| -> x or y)
+    bit_xor = bitwise_entry("bit_xor", bit.bxor, |x, y| -> x ~= y)
+    shift_left = shift_entry("shift_left", |a, width, amount| -> bit.lshift(ffi.cast("uint64_t", a), amount))
+    shift_right_signed = shift_entry("shift_right_signed", |a, width, amount| -> bit.arshift(signed_value(canonical(a, width), width), amount))
+    shift_right_unsigned = shift_entry("shift_right_unsigned", |a, width, amount| -> bit.rshift(unsigned_value(canonical(a, width), width), amount))
+    equal = equality_entry("equal", |x, y| -> x == y)
+    not_equal = equality_entry("not_equal", |x, y| -> x ~= y)
+    less = ordering_entry("less", |x, y| -> x < y)
+    less_equal = ordering_entry("less_equal", |x, y| -> x <= y)
+    convert = define
+        operands = 1
+        check = do(result, arguments)
+            if not is_numeric(arguments[1]) or not is_numeric result then return ("cannot convert %s to %s"):format(described(arguments[1]), described result) end
+            return nil
+        end
+        whole = fold_convert
+    end
+    reinterpret = define
+        operands = 1
+        check = do(result, arguments)
+            local first, target = arguments[1], { pointer_bits = 64 }
+            local scalar = type -> is_numeric type or is_pointer type or NativeType.is(type, types.ReferenceType)
+            if not scalar first or not scalar result or types.layout(first, target).size ~= types.layout(result, target).size then
+                return ("cannot reinterpret %s as %s"):format(described first, described result)
+            end
+            return nil
+        end
+        whole = fold_reinterpret
+    end
+    pointer_offset = define
+        operands = 2
+        check = do(result, arguments)
+            if not is_pointer(arguments[1]) or not is_integer(arguments[2]) then return "pointer_offset takes a pointer and an integer" end
+            return result ~= arguments[1] and "pointer_offset yields its pointer's type" or nil
+        end
+    end
+    pointer_difference = define
+        operands = 2
+        check = do(result, arguments)
+            if not is_pointer(arguments[1]) then return "pointer_difference takes two pointers" end
+            return both_same(arguments, "pointer_difference") or (result ~= types.I64 and "pointer_difference yields I64" or nil)
+        end
+    end
+end
+
+-- Types: nil when the operands suit the opcode and its result type, else the reason.
+local check_types = do(opcode, result, arguments)
+    local entry = Opcodes[opcode]
+    local count = entry and entry.operands or 2
+    if #arguments ~= count then return ("%s takes %d operand%s, got %d"):format(opcode, count, count == 1 and "" or "s", #arguments) end
+    if entry == nil then return "unknown opcode " .. tostring opcode end
+    return entry.check(result, arguments)
+end
+
 -- fold a computation whose operands are all constants; types must already be checked. A
 -- computation with unknown operands is refused when its known ones prove undefined behaviour.
 local fold = do(opcode, result, arguments)
@@ -302,13 +380,14 @@ local fold = do(opcode, result, arguments)
     for _, argument in ipairs arguments do
         if not data.Operand.is(argument, data.Constant) then return FoldingDecision.not_foldable() end
     end
+    local entry = Opcodes[opcode]
+    if entry and entry.whole then return entry.whole(result, arguments[1]) end
     local first = arguments[1].type
-    if opcode == "convert" then return fold_convert(result, arguments[1]) end
-    if opcode == "reinterpret" then return fold_reinterpret(result, arguments[1]) end
-    if opcode == "pointer_offset" or opcode == "pointer_difference" or is_pointer first then return FoldingDecision.not_foldable() end
-    if is_integer first then return fold_integer(opcode, first, arguments) end
-    if is_float first then return fold_float(opcode, first, arguments) end
-    if is_boolean first then return fold_boolean(opcode, arguments) end
+    if entry == nil or is_pointer first then return FoldingDecision.not_foldable() end
+    local value_of = argument -> argument and argument.bits.value
+    if is_integer first and entry.integer then return entry.integer(integer_operands(first, arguments)) end
+    if is_float first and entry.float then return entry.float(first, value_of(arguments[1]), value_of(arguments[2])) end
+    if is_boolean first and entry.boolean then return entry.boolean(value_of(arguments[1]), value_of(arguments[2])) end
     return FoldingDecision.not_foldable()
 end
 

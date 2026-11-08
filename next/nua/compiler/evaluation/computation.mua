@@ -1,0 +1,151 @@
+-- The evaluation vocabulary, part: Operators, folding and short-circuit control.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- computation
+
+    E.host_operations = define
+        add = |a, b| -> a + b
+        subtract = |a, b| -> a - b
+        multiply = |a, b| -> a * b
+        divide = |a, b| -> a / b
+        remainder = |a, b| -> a % b
+        equal = |a, b| -> a == b
+        not_equal = |a, b| -> a ~= b
+        less = |a, b| -> a < b
+        less_equal = |a, b| -> a <= b
+        greater = |a, b| -> a > b
+        greater_equal = |a, b| -> a >= b
+        concatenate = |a, b| -> a .. b
+        negate = a -> -a
+    end
+    E.host_operations["not"] = a -> not a
+
+    E.operate = do(path, operator, left, right)
+        if path.dead then return nil end
+        if is_native left then left = E.deref(path, left) end
+        if is_native right then right = E.deref(path, right) end
+        local unary = right == nil and (operator == "negate" or operator == "not" or operator == "bit_not")
+        if not is_native left and (unary or not is_native right) then
+            local host = E.host_operations[operator]
+            if host == nil then fail(path, ("the operator %s needs a native operand"):format(operator)) end
+            return host(left, right)
+        end
+        if unary then
+            local opcode = operator == "not" and "bit_not" or operator
+            if operator == "not" and left.type ~= types.Bool then fail(path, "'not' needs a Bool, got " .. types.describe left.type) end
+            return E.compute(path, opcode, left.type, { left })
+        end
+        -- pointer arithmetic: a pointer and a count of elements, or the distance of two pointers
+        if is_native left and rules.is_pointer left.type then
+            if is_native right and rules.is_pointer right.type then
+                if operator == "subtract" then return E.compute(path, "pointer_difference", types.I64, { left, right }) end
+            elseif operator == "add" or operator == "subtract" then
+                local count = is_native right and right or E.from_host(path, types.I64, right, "the pointer offset")
+                if operator == "subtract" then count = E.compute(path, "negate", count.type, { count }) end
+                return E.compute(path, "pointer_offset", left.type, { left, count })
+            end
+        end
+        -- a shift's count keeps its own type; any other host operand takes its partner's type
+        local shift = operator == "shift_left" or operator == "shift_right"
+        local type = is_native left and left.type or right.type
+        if shift then
+            if not is_native left then fail(path, "a shift needs a native left operand") end
+            if not is_native right then right = E.from_host(path, types.U32, right, "the shift count") end
+        else
+            left = E.from_host(path, type, left, "the left operand")
+            right = E.from_host(path, type, right, "the right operand")
+        end
+        if operator == "greater" then return E.compute(path, "less", types.Bool, { right, left }) end
+        if operator == "greater_equal" then return E.compute(path, "less_equal", types.Bool, { right, left }) end
+        if operator == "shift_right" then operator = type.signed and "shift_right_signed" or "shift_right_unsigned" end
+        if operator == "concatenate" then fail(path, "'..' joins host strings; native text has its own words") end
+        local comparison = operator == "equal" or operator == "not_equal" or operator == "less" or operator == "less_equal"
+        return E.compute(path, operator, comparison and types.Bool or type, { left, right })
+    end
+
+    -- a native computation: folded when its operands are known, else residual
+    E.compute = do(path, opcode, type, operands_values)
+        local argument_types, operands = {}, {}
+        for index, value in ipairs operands_values do
+            argument_types[index] = value.type
+            operands[index] = value.operand
+        end
+        local reason = rules.check_types(opcode, type, argument_types)
+        if reason then fail(path, reason) end
+        local decision = rules.fold(opcode, type, operands)
+        local result = decision with
+            folded = constant_bits -> E.known(data.Constant { .type, bits = constant_bits })
+            not_foldable = || -> E.emit_compute(path, opcode, type, operands)
+            invalid = reason_text -> fail(path, reason_text)
+        end
+
+        return result
+    end
+
+    -- `a and b`, `a or b`: control, not eager operations
+    E.both = do(path, left, right)
+        local operand, value = E.truth(path, left)
+        if operand == nil then
+            if not value then return left end
+            return right path
+        end
+        return E.choose(path, left, right, || -> E.known(rules.boolean false))
+    end
+    E.either = do(path, left, right)
+        local operand, value = E.truth(path, left)
+        if operand == nil then
+            if value then return left end
+            return right path
+        end
+        return E.choose(path, left, || -> E.known(rules.boolean true), right)
+    end
+
+    -- `c ? a : b`: only the selected arm runs when `c` is known
+    E.choose = do(path, condition, when_true, when_false)
+        local operand, value = E.truth(path, condition)
+        if operand == nil then
+            if value then return when_true path end
+            return when_false path
+        end
+        -- the arms meet at one native type: a host value takes the type of the native one
+        local value_type = nil
+        local typed = do(run)
+            return do(arm)
+                local result = run arm
+                if arm.dead then return nil end
+                if not is_native result then
+                    if value_type == nil then fail(arm, "a dynamic choice needs a native value in its first arm to type the other") end
+                    result = E.from_host(arm, value_type, result, "an arm of the choice")
+                end
+                value_type = value_type or result.type
+                if result.type ~= value_type then fail(arm, "the arms of a choice yield different types") end
+                return result
+            end
+        end
+        return E.residual_branch(path, operand, typed when_true, typed when_false, true)
+    end
+
+end

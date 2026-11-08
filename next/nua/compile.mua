@@ -7,6 +7,7 @@
 --   compile(source, filename) -> { program, analysis, exports }
 --   compile_c(source, filename) -> C text, prototypes, program
 
+local specifications = require "nua.compiler.specifications"
 local mua = require "mua"
 local identity = require "nua.identity"
 local types = require "nua.types"
@@ -48,15 +49,18 @@ local prelude = define
     size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
 end
 
-local compiling = do(source, filename)
+-- the compilation: the data every activity of one compilation shares (compiler activities
+-- §1.1): its identity supply, places, borrows, exports and the origins of source positions
+local new_compilation = do()
     local supply = identity.supply()
     local origins, origin_ids = {}, {}
-    local compilation = define
+    return define
         .supply
         places = {}
         place_scope = {}
         borrows = {}
         exports = {}
+        .origins
         origin = do(origin_source, line)
             local key = tostring origin_source .. ":" .. tostring line
             local found = origin_ids[key]
@@ -67,18 +71,14 @@ local compiling = do(source, filename)
             return found
         end
     end
-    local E = evaluate.evaluating compilation
-    local registry = definitions_module.defining compilation
-    compilation.request = registry.request
+end
 
+-- the host environment Nua sources run in: the prelude, the runtime the front end's output
+-- calls (`__nua`), `import` of the Nua library, and the primitives. Answers the environment
+-- and the loader of a source text.
+local hosting_environment = do(compilation, filename)
     local runtime = define
         word = hosting.word
-        trap = setmetatable({}, { __tostring = || -> "trap" })
-        moves = setmetatable({}, { __tostring = || -> "moves" })
-        ends = setmetatable({}, { __tostring = || -> "ends" })
-        view_of = setmetatable({}, { __tostring = || -> "view_of" })
-        element_of = setmetatable({}, { __tostring = || -> "element_of" })
-        drop = setmetatable({}, { __tostring = || -> "drop" })
         record = do(name, fields, line)
             for _, field in ipairs fields do
                 if not check(types.NativeType, field.type) then
@@ -116,60 +116,84 @@ local compiling = do(source, filename)
         end
         return imported[name].value
     end
-    -- the words of buffers of each element type, from the Nua library
-    compilation.buffer_words = element -> environment.import("buffer").words(element)
-    compilation.trap, compilation.moves, compilation.ends = runtime.trap, runtime.moves, runtime.ends
-    environment.trap, environment.moves, environment.ends = runtime.trap, runtime.moves, runtime.ends
-    compilation.view_of, environment.view_of = runtime.view_of, runtime.view_of
-    compilation.element_of, environment.element_of = runtime.element_of, runtime.element_of
-    compilation.drop, environment.drop = runtime.drop, runtime.drop
+    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "drop" } do environment[name] = hosting.primitive name end
     environment.owns = types.owns
-    load_nua(source, filename)
+    return environment, load_nua
+end
 
-    -- each export closed into a definition: its known supply stays known, the native
-    -- requirements still unsupplied are its parameters
-    local exports = {}
-    for _, export in ipairs compilation.exports do
-        local word, supplied = hosting.supplied_of export.value
-        local specification = {}
-        for index, requirement in ipairs word.requirements do
-            local argument = supplied[index]
-            if index <= #supplied then
-                if requirement.type == nil then
-                    specification[index] = { kind = "host", value = argument }
-                else
-                    local path = { source = filename, line = export.line }
-                    specification[index] = { kind = "native", value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name)) }
-                end
+-- an export closed into a specification: its known supply stays known, the native
+-- requirements still unsupplied are its parameters
+local export_specification = do(E, export, filename)
+    local word, supplied = hosting.supplied_of export.value
+    local specification = {}
+    for index, requirement in ipairs word.requirements do
+        local argument = supplied[index]
+        if index <= #supplied then
+            if requirement.type == nil then
+                specification[index] = specifications.KnownHost { value = argument }
             else
-                if requirement.type == nil then
-                    error(("%s:%d: export %s: the parameter '%s' needs a native type"):format(filename, export.line, export.c_name, requirement.name), 0)
-                end
-                specification[index] = { kind = "dynamic", type = requirement.type }
+                local path = { source = filename, line = export.line }
+                specification[index] = specifications.KnownNative { value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name)) }
             end
+        else
+            if requirement.type == nil then
+                error(("%s:%d: export %s: the parameter '%s' needs a native type"):format(filename, export.line, export.c_name, requirement.name), 0)
+            end
+            specification[index] = specifications.Dynamic { type = requirement.type }
         end
-        local id = registry.define_export(word, specification, filename, export.line)
-        exports[#exports + 1] = data.Export { name = export.c_name, definition = id }
     end
-    -- only definitions reachable from the exports are kept (compiler activities §6.3): one
-    -- requested by a construction that was later discarded is not part of the program
-    local built = registry.definitions()
+    return word, specification
+end
+
+-- only definitions reachable from the exports are kept (compiler activities §6.3): one
+-- requested by a construction that was later discarded is not part of the program
+local reachable_definitions = do(built, exports)
     local definitions, pending = {}, {}
     for _, export in ipairs exports do pending[#pending + 1] = export.definition end
     while #pending > 0 do
         local id = table.remove pending
         if definitions[id] == nil then
-            local definition = built[id]
-            definitions[id] = definition
-            for _, block in ipairs definition.blocks do
-                for _, instruction in ipairs block.instructions do
-                    if data.Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then
-                        pending[#pending + 1] = instruction.callee.definition
-                    end
-                end
-            end
+            definitions[id] = built[id]
+            for called in pairs(graph.called_definitions built[id]) do pending[#pending + 1] = called end
         end
     end
+    return definitions
+end
+
+-- the verifiers over the finished program and its facts; any problem refuses the compilation
+local verified = do(program, analysis, filename)
+    local problems = verify.all program
+    for _, problem in ipairs(verify_lifetimes.lifetimes(program, analysis)) do problems[#problems + 1] = problem end
+    if #problems == 0 then return end
+    local lines = {}
+    for _, problem in ipairs problems do lines[#lines + 1] = ("%s: %s"):format(problem.verifier, problem.message) end
+    error(filename .. ": the compiled program does not verify:\n" .. table.concat(lines, "\n"), 0)
+end
+
+-- a source compiled: run it in the host environment, close its exports into definitions, keep
+-- what they reach, publish the facts, and verify
+local compiling = do(source, filename)
+    local compilation = new_compilation()
+    -- the evaluation and the definitions cooperate: each receives the other's vocabulary,
+    -- wired here explicitly (compiler activities §1.1)
+    local definitions_capability, library_capability = {}, {}
+    local E = evaluate.evaluating(compilation, { definitions = definitions_capability, library = library_capability })
+    local registry = definitions_module.defining(compilation, E)
+    definitions_capability.request = registry.request
+    definitions_capability.contract_of = registry.contract_of
+    definitions_capability.bundle_of = registry.bundle_of
+    local environment, load_nua = hosting_environment(compilation, filename)
+    -- the words of buffers of each element type, from the Nua library
+    library_capability.buffer_words = element -> environment.import("buffer").words(element)
+    load_nua(source, filename)
+
+    local exports = {}
+    for _, export in ipairs compilation.exports do
+        local word, specification = export_specification(E, export, filename)
+        local id = registry.define_export(word, specification, filename, export.line)
+        exports[#exports + 1] = data.Export { name = export.c_name, definition = id }
+    end
+    local definitions = reachable_definitions(registry.definitions(), exports)
     local program = data.Program with
         revision = 0
         .definitions
@@ -177,20 +201,16 @@ local compiling = do(source, filename)
         globals = {}
         .exports
         lifetimes = {}
-        .origins
+        origins = compilation.origins
     end
-    local published = {}
-    for id in pairs definitions do published[id] = assert(registry.facts()[id]) end
-    local contracts, completed_contracts = {}, registry.contracts()
-    for id in pairs definitions do contracts[id] = assert(completed_contracts[id]) end
+    local published, contracts = {}, {}
+    local all_facts, all_contracts = registry.facts(), registry.contracts()
+    for id in pairs definitions do
+        published[id] = assert(all_facts[id])
+        contracts[id] = assert(all_contracts[id])
+    end
     local analysis = data.Analysis { revision = program.revision, definitions = published, .contracts }
-    local problems = verify.all program
-    for _, problem in ipairs(verify_lifetimes.lifetimes(program, analysis)) do problems[#problems + 1] = problem end
-    if #problems > 0 then
-        local lines = {}
-        for _, problem in ipairs problems do lines[#lines + 1] = ("%s: %s"):format(problem.verifier, problem.message) end
-        error(filename .. ": the compiled program does not verify:\n" .. table.concat(lines, "\n"), 0)
-    end
+    verified(program, analysis, filename)
     return define
         .program
         .analysis

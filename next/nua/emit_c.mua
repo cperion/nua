@@ -47,21 +47,33 @@ local CSpelling = define
 end
 local c_type = NativeType.pass "spell a native type in C" with ..CSpelling end
 
--- the fields of a record, of a buffer's header, or of a view
-local fields_of = do(native_type)
-    if NativeType.is(native_type, types.RecordType) then return native_type.fields end
-    if NativeType.is(native_type, types.ViewType) then
-        return { { name = "data", type = types.pointer native_type.element }, { name = "length", type = types.U64 } }
+-- the fields of a type C spells as a struct: a record's, a buffer's header's, a view's; every
+-- other type has none
+local no_fields = |node, recurse| -> nil
+local Fields = define
+    IntegerType = no_fields
+    FloatType = no_fields
+    BooleanType = no_fields
+    UnitType = no_fields
+    PointerType = no_fields
+    ReferenceType = no_fields
+    ViewType = |node, recurse| -> { { name = "data", type = types.pointer node.element }, { name = "length", type = types.U64 } }
+    FixedArrayType = no_fields
+    RecordType = |node, recurse| -> node.fields
+    SumType = no_fields
+    BufferType = do(node, recurse)
+        local fields = {
+            { name = "data", type = types.pointer node.element },
+            { name = "length", type = types.U64 },
+            { name = "capacity", type = types.U64 },
+        }
+        if node.pinned then fields[4] = { name = "limit", type = types.U64 } end
+        return fields
     end
-    local fields = {
-        { name = "data", type = types.pointer native_type.element },
-        { name = "length", type = types.U64 },
-        { name = "capacity", type = types.U64 },
-    }
-    if native_type.pinned then fields[4] = { name = "limit", type = types.U64 } end
-    return fields
+    FunctionType = no_fields
 end
-local is_record_like = native_type -> NativeType.is(native_type, types.RecordType) or NativeType.is(native_type, types.BufferType) or NativeType.is(native_type, types.ViewType)
+local fields_of = NativeType.pass "the fields of a type C spells as a struct" with ..Fields end
+local is_record_like = native_type -> fields_of native_type ~= nil
 
 -- the C declarations of the records a program uses, each after the records it holds
 local record_declarations = do(program)
@@ -92,34 +104,14 @@ end
 local narrow = type -> rules.is_integer type and type.bits < 32
 local wide_of = type -> type.signed and "int32_t" or "uint32_t"
 
--- a constant as a C expression of its exact type
-local constant_text
-constant_text = do(constant)
+-- a constant as a C expression of its exact type: a pass over the kinds of its bits
+local is_pointer_like = native_type -> rules.is_pointer native_type or NativeType.is(native_type, types.ReferenceType)
+local integer_text = do(constant)
     local type = constant.type
-    local constant_bits = constant.bits
-    if data.NativeConstant.is(constant_bits, data.BooleanBit) then return constant_bits.value and "true" or "false" end
-    if data.NativeConstant.is(constant_bits, data.FloatBits) then
-        local value = constant_bits.value
-        if value ~= value then return type.bits == 32 and "NAN" or "(double)NAN" end
-        if value == math.huge then return type.bits == 32 and "INFINITY" or "(double)INFINITY" end
-        if value == -math.huge then return type.bits == 32 and "(-INFINITY)" or "(-(double)INFINITY)" end
-        local text = ("%.17g"):format(value)
-        if not text:find("[%.eEn]") then text = text .. ".0" end
-        return type.bits == 32 and text .. "f" or text
-    end
-    if data.NativeConstant.is(constant_bits, data.UnitBits) then return "0" end
-    if data.NativeConstant.is(constant_bits, data.AggregateBits) then
-        local parts = {}
-        for index, field in ipairs(fields_of type) do
-            parts[index] = constant_text(data.Constant { type = field.type, bits = constant_bits.parts[index] })
-        end
-        return ("((%s){ %s })"):format(c_type type, table.concat(parts, ", "))
-    end
-    if rules.is_pointer type or NativeType.is(type, types.ReferenceType) then
-        if constant_bits.bits ~= 0ULL then fail "a pointer constant other than null has no C spelling" end
+    if is_pointer_like type then
+        if constant.bits.bits ~= 0ULL then fail "a pointer constant other than null has no C spelling" end
         return ("((%s)0)"):format(c_type type)
     end
-    if not data.NativeConstant.is(constant_bits, data.IntegerBits) then fail("a constant of " .. types.describe type .. " has no C spelling yet") end
     local value = rules.integer_value constant
     local digits = tostring(value):gsub("U?LL$", "")
     if not type.signed then
@@ -136,6 +128,38 @@ constant_text = do(constant)
     if type.bits == 32 then return value < 0 and "(" .. digits .. ")" or digits end
     return ("(%s)%s"):format(c_type type, digits)
 end
+local float_text = do(constant)
+    local value, single = constant.bits.value, constant.type.bits == 32
+    if value ~= value then return single and "NAN" or "(double)NAN" end
+    if value == math.huge then return single and "INFINITY" or "(double)INFINITY" end
+    if value == -math.huge then return single and "(-INFINITY)" or "(-(double)INFINITY)" end
+    local text = ("%.17g"):format(value)
+    if not text:find("[%.eEn]") then text = text .. ".0" end
+    return single and text .. "f" or text
+end
+local unspelled_constant = do(bits, recurse, constant)
+    if is_pointer_like constant.type then fail "a pointer constant other than null has no C spelling" end
+    fail("a constant of " .. types.describe constant.type .. " has no C spelling yet")
+end
+local constant_text
+local Constants = define
+    IntegerBits = |bits, recurse, constant| -> integer_text constant
+    FloatBits = |bits, recurse, constant| -> float_text constant
+    BooleanBit = |bits, recurse, constant| -> bits.value and "true" or "false"
+    UnitBits = |bits, recurse, constant| -> "0"
+    AggregateBits = do(bits, recurse, constant)
+        local parts = {}
+        for index, field in ipairs(fields_of constant.type) do
+            parts[index] = constant_text(data.Constant { type = field.type, bits = bits.parts[index] })
+        end
+        return ("((%s){ %s })"):format(c_type constant.type, table.concat(parts, ", "))
+    end
+    StaticBytes = unspelled_constant
+    SymbolAddress = unspelled_constant
+    DefinitionAddress = unspelled_constant
+end
+local constant_bits_text = data.NativeConstant.pass "spell a constant in C" with ..Constants end
+constant_text = constant -> constant_bits_text(constant.bits, constant)
 
 local binary_symbols = define
     add = "+"
@@ -155,8 +179,8 @@ local binary_symbols = define
     less_equal = "<="
 end
 
--- one definition's C function
-local place_text
+-- one definition's C function (a stateful vocabulary, writing compilers §4.6): the names of
+-- its values, blocks and local homes, and the declarations they need, belong to it
 local emit_definition = do(definition, c_name, program, names_of_definitions)
     local names = {}
     local declarations = {}
@@ -170,8 +194,9 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         if type ~= types.Unit then declarations[#declarations + 1] = ("    %s %s;"):format(c_type type, found) end
         return found
     end
-    local labels, parameters_of = {}, {}
+    local labels, parameters_of, blocks_by_id = {}, {}, {}
     for _, block in ipairs definition.blocks do
+        blocks_by_id[block.id] = block
         block_count += 1
         labels[block.id] = "block" .. block_count
         parameters_of[block.id] = {}
@@ -194,13 +219,19 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         declarations[#declarations + 1] = ("    %s %s;"):format(c_type place.type, found)
         return found
     end
-    -- the C lvalue of a place: a raw place is its pointer dereferenced
-    place_text = do(place)
-        if data.PlaceRoot.is(place.root, data.RawRoot) or data.PlaceRoot.is(place.root, data.IndirectRoot) then return "*" .. operand place.root.pointer end
-        if data.PlaceRoot.is(place.root, data.ParameterRoot) then return "(*p" .. place.root.parameter .. ")" end
-        if data.PlaceRoot.is(place.root, data.LocalRoot) then return local_home place end
-        fail("a place rooted in " .. tostring(getmetatable(place.root)) .. " has no C spelling yet")
+    -- the C lvalue of a place: a raw or indirect place is its pointer dereferenced
+    local through_pointer = |root, recurse, place| -> "*" .. operand root.pointer
+    local unspelled_root = |root, recurse, place| -> fail("a place rooted in " .. tostring(getmetatable root) .. " has no C spelling yet")
+    local Lvalues = define
+        LocalRoot = |root, recurse, place| -> local_home place
+        GlobalRoot = unspelled_root
+        ParameterRoot = |root, recurse, place| -> "(*p" .. root.parameter .. ")"
+        IndirectRoot = through_pointer
+        ForeignRoot = unspelled_root
+        RawRoot = through_pointer
     end
+    local root_lvalue = data.PlaceRoot.pass "spell a place in C" with ..Lvalues end
+    local place_text = place -> root_lvalue(place.root, place)
     local Naming = define
         Constant = |node, recurse| -> constant_text node
         Parameter = |node, recurse| -> "p" .. node.index
@@ -209,44 +240,48 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
     end
     operand = Operand.pass "spell an operand in C" with ..Naming end
 
+    -- the right-hand side of each opcode, from the instruction and its operands; any other
+    -- opcode is a binary operation
+    local binary = do(node, a, b)
+        local opcode = node.opcode
+        local symbol = binary_symbols[opcode]
+        if symbol == nil then fail("the opcode " .. opcode .. " has no C spelling yet") end
+        if node.type == types.Bool and (opcode == "bit_and" or opcode == "bit_or" or opcode == "bit_xor") then
+            return ("%s %s %s;"):format(operand a, opcode == "bit_xor" and "!=" or symbol, operand b)
+        end
+        if narrow node.type and node.type == a.type then
+            local wide = wide_of node.type
+            return ("(%s)((%s)%s %s (%s)%s);"):format(c_type node.type, wide, operand a, symbol, wide, operand b)
+        end
+        return ("%s %s %s;"):format(operand a, symbol, operand b)
+    end
+    local Opcodes = define
+        convert = |node, a, b| -> ("(%s)%s;"):format(c_type node.type, operand a)
+        pointer_offset = |node, a, b| -> ("%s + %s;"):format(operand a, operand b)
+        pointer_difference = |node, a, b| -> ("(int64_t)(%s - %s);"):format(operand a, operand b)
+        reinterpret = do(node, a, b)
+            local from, to = a.type, node.type
+            if is_pointer_like from and is_pointer_like to then return ("(%s)%s;"):format(c_type to, operand a) end
+            if rules.is_pointer from or rules.is_pointer to then return ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
+            return ("nua_reinterpret_%s_%s(%s);"):format(c_type from, c_type to, operand a)
+        end
+        negate = do(node, a, b)
+            if rules.is_float node.type then return "-" .. operand a .. ";" end
+            if narrow node.type then return ("(%s)(-(%s)%s);"):format(c_type node.type, wide_of node.type, operand a) end
+            if not node.type.signed then return ("(%s)0 - %s;"):format(c_type node.type, operand a) end
+            return "-" .. operand a .. ";"
+        end
+        bit_not = do(node, a, b)
+            if node.type == types.Bool then return "!" .. operand a .. ";" end
+            if narrow node.type then return ("(%s)~(%s)%s;"):format(c_type node.type, wide_of node.type, operand a) end
+            return "~" .. operand a .. ";"
+        end
+    end
+
     local Statements = define
         Compute = do(node, recurse)
-            local target = value_name(node.result, node.type) .. " = "
-            local a, b = node.arguments[1], node.arguments[2]
-            local opcode = node.opcode
-            if opcode == "convert" then return target .. ("(%s)%s;"):format(c_type node.type, operand a) end
-            if opcode == "pointer_offset" then return target .. ("%s + %s;"):format(operand a, operand b) end
-            if opcode == "pointer_difference" then return target .. ("(int64_t)(%s - %s);"):format(operand a, operand b) end
-            if opcode == "reinterpret" then
-                local from, to = a.type, node.type
-                local pointer_like = t -> rules.is_pointer t or NativeType.is(t, types.ReferenceType)
-                if pointer_like from and pointer_like to then return target .. ("(%s)%s;"):format(c_type to, operand a) end
-                if rules.is_pointer from then return target .. ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
-                if rules.is_pointer to then return target .. ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
-                return target .. ("nua_reinterpret_%s_%s(%s);"):format(c_type from, c_type to, operand a)
-            end
-            if opcode == "negate" then
-                if rules.is_float node.type then return target .. "-" .. operand a .. ";" end
-                if narrow node.type then return target .. ("(%s)(-(%s)%s);"):format(c_type node.type, wide_of node.type, operand a) end
-                if not node.type.signed then return target .. ("(%s)0 - %s;"):format(c_type node.type, operand a) end
-                return target .. "-" .. operand a .. ";"
-            end
-            if opcode == "bit_not" then
-                if node.type == types.Bool then return target .. "!" .. operand a .. ";" end
-                if narrow node.type then return target .. ("(%s)~(%s)%s;"):format(c_type node.type, wide_of node.type, operand a) end
-                return target .. "~" .. operand a .. ";"
-            end
-            local symbol = binary_symbols[opcode]
-            if symbol == nil then fail("the opcode " .. opcode .. " has no C spelling yet") end
-            if node.type == types.Bool and (opcode == "bit_and" or opcode == "bit_or" or opcode == "bit_xor") then
-                return target .. ("%s %s %s;"):format(operand a, opcode == "bit_xor" and "!=" or symbol, operand b)
-            end
-            local result_type = node.type
-            if narrow result_type and result_type == a.type then
-                local wide = wide_of result_type
-                return target .. ("(%s)((%s)%s %s (%s)%s);"):format(c_type result_type, wide, operand a, symbol, wide, operand b)
-            end
-            return target .. ("%s %s %s;"):format(operand a, symbol, operand b)
+            local spell = Opcodes[node.opcode] or binary
+            return value_name(node.result, node.type) .. " = " .. spell(node, node.arguments[1], node.arguments[2])
         end
         Pack = do(node, recurse)
             if not is_record_like node.type then fail("packing " .. types.describe node.type .. " has no C spelling yet") end
@@ -303,10 +338,7 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         if #edge.arguments == 0 then return "goto " .. labels[edge.target] .. ";" end
         local temporaries, assignments = {}, {}
         local target_parameters = parameters_of[edge.target]
-        local target_block = nil
-        for _, block in ipairs definition.blocks do
-            if block.id == edge.target then target_block = block end
-        end
+        local target_block = blocks_by_id[edge.target]
         for index, argument in ipairs edge.arguments do
             temporaries[index] = ("%s t%d = %s;"):format(c_type(target_block.arguments[index].type), index, operand argument)
             assignments[index] = ("%s = t%d;"):format(target_parameters[index], index)

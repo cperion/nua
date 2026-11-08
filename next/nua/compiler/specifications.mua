@@ -1,0 +1,17 @@
+-- A specification: what a definition is specialized on (compiler activities §6.3). Each
+-- requirement of a word is supplied as a known host value, a known native value (a constant,
+-- part of the definition's key), or dynamically, by a native type (a parameter).
+
+local Supplied = family "supplied requirement"
+local KnownHost = struct { value: Any }
+local KnownNative = struct { value: Table }
+local Dynamic = struct { type: Table }
+Supplied { KnownHost, KnownNative, Dynamic }
+
+return define
+    .Supplied
+    .KnownHost
+    .KnownNative
+    .Dynamic
+    is_dynamic = entry -> Supplied.is(entry, Dynamic)
+end

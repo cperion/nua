@@ -1,0 +1,264 @@
+-- The evaluation vocabulary, part: Application: inline invocation, native calls and their parameters.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local specifications = require "nua.compiler.specifications"
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local paths_of = require "nua.compiler.evaluation.path"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    -- what a callee's contract needs from the caller's evaluation, and nothing more
+    local boundary_context = define
+        supply = compilation.supply
+        borrows = compilation.borrows
+        memory = compilation.memory
+        bundle_of = id -> definitions.bundle_of(id)
+        check_store = |at, targets, info| -> E.check_store(at, targets, info)
+    end
+    --------------------------------------------------------------------------------------------
+    -- application
+
+    -- a native call (compiler activities §6.3): the definition of the specification the
+    -- arguments give, requested from the compilation; known arguments key it, the others are
+    -- passed. `generalized[index]` forces an argument dynamic even when it is known.
+    E.call_definition = do(path, word, arguments, generalized)
+        for index, argument in ipairs arguments do
+            if E.is_reference argument and types.NativeType.is(argument.type, types.ReferenceType) and data.BorrowForm.is(compilation.borrows[argument.borrow].form, data.Selected) then
+                return E.dispatch_reference(path, argument, do(arm, selected)
+                    local supplied = {}
+                    for position, value in ipairs arguments do supplied[position] = value end
+                    supplied[index] = selected
+                    return E.call_definition(arm, word, supplied, generalized)
+                end)
+            end
+        end
+        local specification, passed = {}, {}
+        local references = {}       -- parameter index -> the reference argument
+        for index, requirement in ipairs word.requirements do
+            local argument = arguments[index]
+            if requirement.type == nil then
+                specification[index] = specifications.KnownHost { value = argument }
+            else
+                local value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
+                if E.is_reference value and types.NativeType.is(value.type, types.ReferenceType) then
+                    specification[index] = specifications.Dynamic { type = requirement.type }
+                    passed[#passed + 1] = E.pack_reference(path, value)
+                    references[#passed] = value
+                elseif E.constant_of value and not (generalized and generalized[index]) then
+                    specification[index] = specifications.KnownNative { .value }
+                else
+                    specification[index] = specifications.Dynamic { type = requirement.type }
+                    passed[#passed + 1] = E.materialize(path, value)
+                    if E.is_view value then references[#passed] = value end
+                end
+            end
+        end
+        local definition = definitions.request(word, specification, "nua_boundary", path.source, path.line)
+        local bundle = definitions.contract_of(definition)
+        local argument_info = {}
+        for index, operand in ipairs passed do argument_info[index] = path.writer.information(operand) or provenance.plain(operand.type) end
+        local result = word.result ~= types.Unit and fresh(identity.ValueId) or nil
+        local call_site = site(path)
+        local before = facts.fork(path.flow)
+        append(path, data.Invoke { site = call_site, .result, callee = data.DirectNua { .definition }, arguments = passed, boundary = fresh(identity.BoundaryId) })
+        path.writer.require_definition(definition)
+        local returned = provenance.plain(word.result)
+        if bundle then
+            local called_effects, continuing
+            returned, called_effects, continuing = boundaries.apply(bundle, path, argument_info, boundary_context, fail)
+            remember_borrows(path)
+            path.writer.observe(call_site.id, data.SiteFacts { .before, after = facts.fork(path.flow), effects = called_effects })
+            if not continuing then
+                terminate(path, data.Trap { origin = origin_of(path), message = data.Constant { type = types.Str, bits = data.StaticBytes { bytes = "a nonreturning call returned" } } })
+                path.dead = true
+                return nil
+            end
+        elseif types.borrows(word.result) then
+            -- Bottom interface of an unfinished recursive request; dependents are rebuilt
+            -- before publication when the group's return origins grow.
+            local info = data.BorrowInfo { id = fresh(identity.BorrowId), form = data.Stored {}, origins = {}, mutable = false, lifetime = fresh(identity.LifetimeId), acquired = origin_of(path) }
+            compilation.borrows[info.id], path.flow.borrows[info.id] = info, data.Live {}
+            returned = data.ValueInfo { type = word.result, components = { [{}] = data.Borrowed { borrow = info.id } }, proofs = {} }
+        end
+        if result == nil then return nil end
+        local value = E.restore(path, word.result, data.Result { value = result, type = word.result }, returned)
+        if E.is_view(value) then return E.reroot_view(path, value, references) end
+        if E.is_reference(value) then return E.reroot_reference(path, value, references) end
+        return value
+    end
+
+    -- a view parameter of a compiled word is a stored borrow: its fixed pointer is the parameter
+    E.parameter_view = do(path, definition, index, view_type, operand)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = view_type
+            root = data.ParameterRoot { .definition, parameter = index }
+            path = {}
+            lifetime = fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        compilation.places[place.id] = place
+        path.writer.declare place
+        local info = data.BorrowInfo with
+            id = fresh identity.BorrowId
+            form = data.Stored { pointer = operand }
+            origins = { data.Access { place = place.id, path = { data.ContentsStep {} } } }
+            mutable = view_type.mutable
+            lifetime = place.lifetime
+            acquired = origin_of path
+        end
+        compilation.borrows[info.id] = info
+        path.flow.borrows[info.id] = data.Live {}
+        remember_reference(path, operand, info.id)
+        return data.Reference { type = view_type, borrow = info.id }
+    end
+
+    E.parameter_value = do(path, definition, index, native_type, operand)
+        local place = data.Place { id = fresh(identity.PlaceId), type = native_type, root = data.ParameterRoot { .definition, parameter = index }, path = {}, lifetime = fresh(identity.LifetimeId), origin = origin_of(path) }
+        compilation.places[place.id] = place
+        path.writer.declare(place)
+        local info = E.symbolic_info(path, native_type, data.Access { place = place.id, path = {} })
+        return E.restore(path, native_type, operand, info)
+    end
+    -- a reference parameter of a compiled word reaches a place rooted in that parameter, its
+    -- contents resident in memory: read by Load, written by Store
+    E.parameter_reference = do(path, definition, index, reference_type, operand)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = reference_type.target
+            root = data.ParameterRoot { .definition, parameter = index }
+            path = {}
+            lifetime = fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        compilation.places[place.id] = place
+        path.writer.declare place
+        path.flow.contents[place.id] = data.Resident { info = data.ValueInfo { type = place.type, components = {}, proofs = {} } }
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = place.id, steps = {} }, true, place.lifetime, origin_of path)
+        remember_reference(path, operand, info.id)
+        return data.Reference { type = reference_type, borrow = info.id }
+    end
+
+    -- the invocation of `word` active on this path's chain, if any
+    E.active_invocation = do(path, word)
+        local invocation = path.invocation
+        while invocation do
+            if invocation.word == word then return invocation end
+            invocation = invocation.parent
+        end
+        return nil
+    end
+
+    -- evaluate a saturated application in place (compiler activities §5.2): the callee's body
+    -- runs on the caller's block and facts; its returns join into the caller's continuation.
+    -- A re-entry under dynamic control (syntax §6.2, §6.5) generalizes the known arguments that
+    -- changed since the active invocation and becomes a native call; under known control it
+    -- keeps unfolding.
+    E.invoke = do(path, word, arguments)
+        local active = E.active_invocation(path, word)
+        local dynamic_control = active and (path.depth > active.entry_depth or path.guarded > active.entry_guarded)
+        if dynamic_control then
+            local generalized = {}
+            for index, requirement in ipairs word.requirements do
+                if requirement.type ~= nil then
+                    local now = E.from_host(path, requirement.type, arguments[index], ("the argument '%s' of %s"):format(requirement.name, word.name))
+                    local before = active.argument_values[index]
+                    local same = E.constant_of now and before and E.constant_of before and facts.same_operand(now.operand, before.operand)
+                    generalized[index] = not same
+                end
+            end
+            return E.call_definition(path, word, arguments, generalized)
+        end
+        local bind_arguments = do(invocation, callee)
+            for index, requirement in ipairs word.requirements do
+                local argument = arguments[index]
+                if requirement.type == nil then
+                    invocation.arguments[index] = E.host_cell(callee, requirement.name, argument)
+                else
+                    local value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
+                    invocation.argument_values[index] = value
+                    local place = E.new_place(callee, requirement.name, requirement.type)
+                    callee.flow.contents[place.id] = data.Tracked { .value }
+                    if types.owns(value.type) then E.install_payload(callee, place.id, value) end
+                    invocation.arguments[index] = E.place_cell(place.id, requirement.name)
+                end
+            end
+        end
+        local new_invocation = || -> {
+            id = fresh identity.InvocationId, .word, arguments = {}, argument_values = {}, exits = {}, places = {},
+            lifetime = fresh identity.LifetimeId, parent = path.invocation, entry_depth = path.depth,
+            entry_guarded = path.guarded, loop_mode = false,
+            level = (path.invocation and path.invocation.level or 0) + 1, scopes = {}, scope_count = 0,
+        }
+        local run_body = do(invocation, callee)
+            word.body(E, callee)
+            if not callee.dead then
+                if word.result ~= types.Unit then fail(callee, word.name .. " can reach its end without returning " .. types.describe word.result) end
+                E.return_value(callee, nil)
+            end
+        end
+        if not word.tail_calls then
+            local invocation = new_invocation()
+            local callee = paths_of.callee(path, invocation, path.writer, path.block, path.flow, word)
+            bind_arguments(invocation, callee)
+            run_body(invocation, callee)
+            return E.join(path, invocation.exits, word.result)
+        end
+        -- a word with tail applications is built as a child construction: a tail re-entry under
+        -- dynamic control discards the first attempt, and the second runs the body as a loop over
+        -- the invocation's parameters (syntax §6.2)
+        local attempt = do(invocation)
+            local callee = nil
+            local outcome = graph.building(nil, supply, do(writer)
+                local block = writer.block("call " .. word.name)
+                callee = paths_of.callee(path, invocation, writer, block, facts.fork path.flow, word)
+                enter callee
+                bind_arguments(invocation, callee)
+                if invocation.loop_mode then
+                    E.drive_loop(callee, || -> true, do(round)
+                        invocation.tail_loop = round.loop
+                        run_body(invocation, round)
+                    end, nil)
+                else
+                    run_body(invocation, callee)
+                end
+                return "adopt"
+            end)
+            return outcome { built = f -> f, discarded = || -> nil }, callee.request
+        end
+        local invocation = new_invocation()
+        local fragment, request = attempt invocation
+        -- the request names this invocation: the attempt is discarded and the body runs again
+        -- as a loop over the invocation's parameters
+        if request then
+            assert(request.invocation == invocation, "a reconsideration request reached an invocation it does not name")
+            invocation = new_invocation()
+            invocation.loop_mode = true
+            fragment, request = attempt invocation
+            assert(request == nil, "a loop attempt cannot be reconsidered again")
+        end
+        -- Adopt graph and facts together, even for a straight-line invocation (§4.3).
+        local entry = path.writer.adopt fragment
+        terminate(path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = {} } })
+        return E.join(path, invocation.exits, word.result)
+    end
+
+end

@@ -1,0 +1,39 @@
+-- Binding cells and what references reach: the closed sets the evaluation dispatches on, as
+-- families, so every operation over them is a checked pass (a kind it does not handle fails where
+-- the pass is made, never silently at use).
+--
+-- A cell is what a name of a typed body denotes: a native place, a host binding, a record field or
+-- an element to assign through, or raw storage behind a pointer. A reference reaches a tracked
+-- place (its contents in the flow facts) or a raw place derived from a header.
+
+local shapes = require "nua.shapes"
+local identity = require "nua.identity"
+
+local Cell = family "binding cell"
+local PlaceCell = struct { place: identity.PlaceId, name: String }
+-- a host binding's value may be rebound while control stays known; `depth` is where it was made
+local HostCell = struct { name: String, value: Any, depth: shapes.Natural }
+local FieldCell = struct { base: Cell, name: String }
+local RawCell = struct { place: Table, name: String }
+-- `base` is a cell or a reference to the buffer the element belongs to
+local ElementCell = struct { base: Any, key: Any, name: String }
+Cell { PlaceCell, HostCell, FieldCell, RawCell, ElementCell }
+
+local Reached = family "what a reference reaches"
+local TrackedPlace = struct { place: identity.PlaceId }
+local RawPlace = struct { place: Table }
+Reached { TrackedPlace, RawPlace }
+
+return define
+    .Cell
+    .PlaceCell
+    .HostCell
+    .FieldCell
+    .RawCell
+    .ElementCell
+    .Reached
+    .TrackedPlace
+    .RawPlace
+    is_cell = value -> check(Cell, value)
+    is_raw = reached -> Reached.is(reached, RawPlace)
+end

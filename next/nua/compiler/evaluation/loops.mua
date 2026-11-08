@@ -1,0 +1,356 @@
+-- The evaluation vocabulary, part: Loops: known rounds at compile time, residual headers that generalize disagreeing leaves.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local paths_of = require "nua.compiler.evaluation.path"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- loops
+
+    -- the leaves of carried state: a scalar part of a place, or a whole record where it is only
+    -- packed. A leaf is { place, fields, key }.
+    E.leaf_value = do(value, fields)
+        for _, name in ipairs fields do
+            if not E.is_aggregate value then return nil end
+            value = value.parts[name]
+            if value == nil then return nil end
+        end
+        return value
+    end
+    E.with_leaf = do(value, fields, replacement)
+        if #fields == 0 then return replacement end
+        local parts = {}
+        for name, existing in pairs value.parts do parts[name] = existing end
+        local rest = {}
+        for position = 2, #fields do rest[#rest + 1] = fields[position] end
+        parts[fields[1]] = E.with_leaf(value.parts[fields[1]], rest, replacement)
+        return data.Aggregate { type = value.type, packed = nil, .parts }
+    end
+    E.leaves_of = do(place, value, fields, out)
+        if E.is_aggregate value and next(value.parts) ~= nil then
+            for _, field in ipairs(E.fields_of value.type) do
+                local extended = {}
+                for index, name in ipairs fields do extended[index] = name end
+                extended[#extended + 1] = field.name
+                E.leaves_of(place, value.parts[field.name], extended, out)
+            end
+            return out
+        end
+        out[#out + 1] = { .place, .fields, type = value.type, key = place.serial .. "." .. table.concat(fields, ".") }
+        return out
+    end
+
+    -- one round from `path`'s state, built as a child construction: the condition, the body and
+    -- the latch. Answers the fragment and the round's outcome.
+    E.run_round = do(path, header_types, assumed, condition, body, latch, memory_schema)
+        local round = nil
+        local outcome = graph.building(nil, supply, do(writer)
+            local header = writer.block "loop"
+            local flow = facts.fork path.flow
+            if memory_schema then memory.seed(memory_schema, flow, writer) end
+            local header_path = paths_of.continuing(path, writer, header, flow)
+            for index, leaf in ipairs assumed do
+                local current = flow.contents[leaf.place].value
+                local parameter_value
+                if leaf.schema then
+                    local incoming = E.leaf_value(current, leaf.fields)
+                    parameter_value = E.instantiate_borrow(header_path, leaf.type, leaf.schema, type -> writer.add_parameter(header, type), data.Live {}, compilation.borrows[incoming.borrow].lifetime)
+                else
+                    parameter_value = E.value_of_operand(header_types[index], writer.add_parameter(header, header_types[index]))
+                end
+                flow.contents[leaf.place] = data.Tracked { value = E.with_leaf(current, leaf.fields, parameter_value) }
+            end
+            local work = { breaks = {}, continues = {}, nexts = {}, places_mark = path.invocation and #path.invocation.places or 0 }
+            local round_path = E.child_path(path, writer, header, flow)
+            round_path.loop = work
+            local entry_flow = facts.fork flow
+            local operand, value = E.truth(round_path, condition round_path)
+            local exits_at_false = nil
+            local request = nil
+            if operand ~= nil then
+                local body_entry, body_state = E.build_arm(round_path, "round", do(arm)
+                    body arm
+                    if not arm.dead then E.next_loop arm end
+                end)
+                request = body_state.request
+                local exit_entry, exit_state = E.build_arm(round_path, "leave", arm -> nil)
+                local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
+                terminate(round_path, data.Branch { origin = origin_of round_path, condition = operand, when_true = edge body_entry, when_false = edge exit_entry })
+                exits_at_false = exit_state
+            elseif value then
+                body round_path
+                if not round_path.dead then E.next_loop round_path end
+            else
+                exits_at_false = { block = round_path.block, flow = round_path.flow }
+            end
+            -- the latch runs after the body falls through or continues; its fall is the next round
+            if latch and #work.continues > 0 then
+                local latch_path = E.child_path(round_path, writer, nil, nil)
+                latch_path.loop = work
+                E.join(latch_path, work.continues, nil)
+                work.continues = {}
+                if not latch_path.dead then
+                    latch latch_path
+                    request = request or latch_path.request
+                    if not latch_path.dead then work.nexts[#work.nexts + 1] = { block = latch_path.block, flow = latch_path.flow } end
+                end
+                for _, next_state in ipairs work.continues do work.nexts[#work.nexts + 1] = next_state end
+            else
+                for _, next_state in ipairs work.continues do work.nexts[#work.nexts + 1] = next_state end
+            end
+            local leaving = {}
+            if exits_at_false then leaving[#leaving + 1] = exits_at_false end
+            for _, state in ipairs work.breaks do leaving[#leaving + 1] = state end
+            round = { .header, .writer, nexts = work.nexts, .leaving, .entry_flow, request = request or round_path.request }
+            return "adopt"
+        end, path.writer)
+        return outcome { built = f -> f, discarded = || -> nil }, round
+    end
+
+    -- is a round entirely known: no residual code, and every place it changed still known?
+    E.known_round = do(fragment, round, start_flow)
+        if #fragment.order ~= 1 then return false end
+        local only = fragment.blocks[fragment.order[1]]
+        if #only.instructions > 0 or only.terminator ~= nil then return false end
+        local states = {}
+        for _, state in ipairs round.nexts do states[#states + 1] = state end
+        for _, state in ipairs round.leaving do states[#states + 1] = state end
+        if #states == 0 then return true, nil, false end
+        if #states ~= 1 then return false end
+        for place, contents in pairs states[1].flow.contents do
+            local before = start_flow.contents[place]
+            if not (before and facts.same_contents(before, contents)) then
+                if Contents.is(contents, data.Tracked) and not E.constant_of contents.value then return false end
+            end
+        end
+        return true, states[1], #round.nexts == 1
+    end
+
+    -- the loop driver; `latch` runs after a round falls through or continues (a typed for steps there)
+    -- Rounds at compile time, while each stays entirely known. Answers whether the loop goes
+    -- on residually; otherwise the loop has finished (or the path stopped) here.
+    local known_rounds = do(path, condition, body, latch)
+        local invocation = path.invocation
+        while true do
+            local exits_before = #invocation.exits
+            local fragment, round = E.run_round(path, {}, {}, condition, body, latch)
+            if round.request then
+                path.request, path.dead = round.request, true
+                return false
+            end
+            local accepted, state, continues = E.known_round(fragment, round, path.flow)
+            if not accepted then
+                for position = #invocation.exits, exits_before + 1, -1 do invocation.exits[position] = nil end
+                return true
+            end
+            -- exits a known round registered stand at the loop's own block
+            for position = exits_before + 1, #invocation.exits do invocation.exits[position].block = path.block end
+            -- a known round that returned ends the loop and the path
+            if state == nil then
+                path.dead = true
+                return false
+            end
+            path.flow = state.flow
+            if not continues then return false end
+        end
+    end
+
+    -- The generalization of a residual loop's header (syntax §6.2): the carried leaves that
+    -- disagree on a continuing edge become header parameters, until a round's header holds.
+    -- Its evolving state: the leaves weakened so far, the places generalized whole, the borrow
+    -- schemas of reference leaves, and the memory facts the header assumes.
+    local generalizing = do(path)
+        local places_carried = {}
+        for place, contents in pairs path.flow.contents do
+            if Contents.is(contents, data.Tracked) and (NativeValue.is(contents.value, data.Bits) or E.is_aggregate contents.value or E.is_reference contents.value) then
+                places_carried[#places_carried + 1] = place
+            end
+        end
+        table.sort(places_carried, |a, b| -> a.serial < b.serial)
+        local weakened, whole, schemas = {}, {}, {}
+        local memory_schema = facts.fork(path.flow)
+
+        -- the leaves the header assumes, as the entry state has them (a place generalized whole
+        -- is one leaf), and their types
+        local assumed_leaves = do()
+            local assumed, header_types = {}, {}
+            for _, place in ipairs places_carried do
+                local value = path.flow.contents[place].value
+                local resident = memory_schema.contents[place] and Contents.is(memory_schema.contents[place], data.Resident)
+                local leaves = resident and {} or whole[place] and { { .place, fields = {}, type = value.type, key = place.serial .. "." } } or E.leaves_of(place, value, {}, {})
+                for _, leaf in ipairs leaves do
+                    if weakened[leaf.key] or whole[place] then
+                        leaf.schema = schemas[leaf.key]
+                        assumed[#assumed + 1] = leaf
+                        header_types[#header_types + 1] = leaf.type
+                    end
+                end
+            end
+            return assumed, header_types
+        end
+
+        -- a leaf the continuing edge changes: a reference widens its schema, another value is
+        -- weakened (or its place generalized whole when the edge no longer has it). Answers
+        -- whether the header grew.
+        local widen_leaf = do(place, leaf, before, now)
+            if E.is_reference before and now and E.is_reference now then
+                if schemas[leaf.key] or not facts.same_value(before, now) then
+                    local widened = borrow_paths.schema({ compilation.borrows[before.borrow], compilation.borrows[now.borrow] }, schemas[leaf.key])
+                    if schemas[leaf.key] == nil or not borrow_paths.same_schema(schemas[leaf.key], widened) then
+                        schemas[leaf.key], weakened[leaf.key] = widened, true
+                        return true
+                    end
+                end
+            elseif not weakened[leaf.key] then
+                if now == nil then
+                    whole[place] = true
+                    return true
+                elseif not facts.same_value(before, now) then
+                    weakened[leaf.key] = true
+                    return true
+                end
+            end
+            return false
+        end
+        -- the header after a residual round: memory widened by what continuing edges hold,
+        -- and each carried leaf against its value on each continuing edge. Answers whether it
+        -- grew.
+        local widen = do(round)
+            local header_flow = round.entry_flow
+            local memory_inputs = { memory_schema }
+            for _, state in ipairs round.nexts do memory_inputs[#memory_inputs + 1] = state.flow end
+            local widened_memory = facts.fork(memory_schema)
+            memory.agree(memory_inputs, widened_memory, operand -> round.writer.information(operand) or path.writer.information(operand))
+            local grew = not memory.same(memory_schema, widened_memory)
+            memory_schema = widened_memory
+            for _, next_state in ipairs round.nexts do
+                for _, place in ipairs places_carried do
+                    if not whole[place] and Contents.is(header_flow.contents[place], data.Tracked) then
+                        local header_value = header_flow.contents[place].value
+                        local next_contents = next_state.flow.contents[place]
+                        local next_value = next_contents and next_contents.value
+                        for _, leaf in ipairs(E.leaves_of(place, header_value, {}, {})) do
+                            local before = E.leaf_value(header_value, leaf.fields)
+                            local now = next_value and E.leaf_value(next_value, leaf.fields)
+                            if widen_leaf(place, leaf, before, now) then grew = true end
+                        end
+                    end
+                end
+            end
+            return grew
+        end
+
+        -- the operands an edge into the header passes: each assumed leaf of `flow`, a reference
+        -- leaf by the coordinates of its schema
+        local leaf_operands = do(edge_path, flow, assumed)
+            local operands = {}
+            for _, leaf in ipairs assumed do
+                local value = E.leaf_value(flow.contents[leaf.place].value, leaf.fields)
+                if leaf.schema then
+                    for _, operand in ipairs(E.capture_borrow(edge_path, value, leaf.schema)) do operands[#operands + 1] = operand end
+                else
+                    operands[#operands + 1] = E.materialize(edge_path, value)
+                end
+            end
+            return operands
+        end
+        -- the header holds: adopt the round, enter it from the path, close each continuing
+        -- edge back into it, and continue after the paths that leave
+        local close = do(fragment, round, assumed)
+            local residents = E.resident_places(memory_schema)
+            for _, place in ipairs residents do E.resident_place(path, compilation.places[place]) end
+            local entry = path.writer.adopt fragment
+            local arguments = leaf_operands(path, path.flow, assumed)
+            terminate(path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, .arguments } })
+            for _, next_state in ipairs round.nexts do
+                local next_path = paths_of.continuing(path, nil, next_state.block, next_state.flow)
+                for _, place in ipairs residents do E.resident_place(next_path, compilation.places[place]) end
+                local values = leaf_operands(next_path, next_state.flow, assumed)
+                terminate(next_path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = values } })
+            end
+            E.join(path, round.leaving, nil)
+        end
+
+        return define
+            .assumed_leaves
+            .widen
+            .close
+            memory_schema = || -> memory_schema
+        end
+    end
+
+    -- a loop: known rounds while they stay known, then a residual loop whose header is
+    -- generalized until it holds
+    E.drive_loop = do(path, condition, body, latch)
+        if not known_rounds(path, condition, body, latch) then return end
+        local invocation = path.invocation
+        local header = generalizing path
+        while true do
+            local assumed, header_types = header.assumed_leaves()
+            local exits_before = #invocation.exits
+            local fragment, round = E.run_round(path, header_types, assumed, condition, body, latch, header.memory_schema())
+            if round.request then
+                path.request, path.dead = round.request, true
+                return
+            end
+            if not header.widen round then
+                header.close(fragment, round, assumed)
+                return
+            end
+            for position = #invocation.exits, exits_before + 1, -1 do invocation.exits[position] = nil end
+        end
+    end
+
+    E.loop = |path, condition, body| -> E.drive_loop(path, condition, body, nil)
+
+    -- `for name: T = low, high, step do … end` (syntax §6.3): if low reaches high, loop with the
+    -- variable at low; after the body, leave at the last value, else step
+    E.count = do(path, name, type, low, high, step, body)
+        if not rules.is_integer type then fail(path, "a typed for counts with an integer type, not " .. types.describe type) end
+        local first = E.from_host(path, type, low, "the start of the for")
+        local last = E.from_host(path, type, high, "the limit of the for")
+        local by = step == nil and 1 or E.host_number(path, step)
+        if by == 0 then fail(path, "a for steps by a nonzero amount") end
+        local variable = E.bind(path, name, type, first)
+        local reaches = by > 0 and E.operate(path, "less_equal", first, last) or E.operate(path, "greater_equal", first, last)
+        E.branch(path, reaches, do(inside)
+            E.drive_loop(inside, || -> true, round -> body(round, variable), do(latch)
+                local current = E.get(latch, variable)
+                local at_end
+                if by == 1 or by == -1 then
+                    at_end = E.operate(latch, "equal", current, last)
+                else
+                    -- the remaining distance, in the unsigned type, is less than the step
+                    local unsigned = types[("U%d"):format(type.bits)]
+                    local remaining = by > 0 and E.operate(latch, "subtract", E.compute(latch, "convert", unsigned, { last }), E.compute(latch, "convert", unsigned, { current }))
+                        or E.operate(latch, "subtract", E.compute(latch, "convert", unsigned, { current }), E.compute(latch, "convert", unsigned, { last }))
+                    at_end = E.operate(latch, "less", remaining, math.abs by)
+                end
+                E.branch(latch, at_end, E.break_loop, do(stepping)
+                    E.set(stepping, variable, E.operate(stepping, by > 0 and "add" or "subtract", E.get(stepping, variable), math.abs by))
+                end)
+            end)
+        end, inside -> nil)
+    end
+
+end

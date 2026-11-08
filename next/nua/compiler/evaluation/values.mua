@@ -1,0 +1,87 @@
+-- The evaluation vocabulary, part: Native values met by host values, truth of conditions, residual computation.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- values
+
+    E.constant_of = do(value)
+        if is_native value and NativeValue.is(value, data.Bits) and Operand.is(value.operand, data.Constant) then return value.operand end
+        return nil
+    end
+    E.bits = |type, operand| -> data.Bits { .type, .operand }
+    E.known = constant -> E.bits(constant.type, constant)
+
+    -- a host value met by a native type (syntax §7.2): numbers range-checked, booleans as Bool,
+    -- a table of fields as a record
+    E.from_host = do(path, type, value, what)
+        if types.NativeType.is(type, types.RecordType) and not is_native value and lua_type value == "table" then
+            return E.construct_record(path, type, value)
+        end
+        if is_native value and NativeValue.is(value, data.Reference) and types.NativeType.is(value.type, types.ReferenceType) and not types.NativeType.is(type, types.ReferenceType) then
+            value = E.deref(path, value)
+        end
+        if is_native value then
+            if value.type ~= type then fail(path, ("%s is %s, not %s"):format(what, types.describe value.type, types.describe type)) end
+            return value
+        end
+        if rules.is_integer type then
+            local is_number = lua_type(value) == "number" and value == math.floor value
+            local is_cdata = lua_type(value) == "cdata" and (ffi.istype("int64_t", value) or ffi.istype("uint64_t", value))
+            if not is_number and not is_cdata then fail(path, ("%s expects %s, got %s"):format(what, types.describe type, tostring value)) end
+            local constant = rules.integer(type, is_number and (value < 0 and ffi.cast("int64_t", value) or ffi.cast("uint64_t", value)) or value)
+            local back = rules.integer_value constant
+            local same = is_number and tonumber back == value or back == value
+            if not same then fail(path, ("%s does not fit %s"):format(tostring value, types.describe type)) end
+            return E.known constant
+        end
+        if rules.is_float type then
+            if lua_type(value) ~= "number" then fail(path, ("%s expects %s, got %s"):format(what, types.describe type, tostring value)) end
+            return E.known(rules.float(type, value))
+        end
+        if rules.is_boolean type then
+            if lua_type(value) ~= "boolean" then fail(path, ("%s expects Bool, got %s"):format(what, tostring value)) end
+            return E.known(rules.boolean value)
+        end
+        if type == types.Unit and value == nil then return E.known(data.Constant { type = types.Unit, bits = data.UnitBits {} }) end
+        if rules.is_pointer type and value == 0 then return E.known(data.Constant { .type, bits = data.IntegerBits { bits = 0ULL } }) end
+        fail(path, ("%s expects %s, got %s"):format(what, types.describe type, tostring value))
+    end
+
+    E.truth = do(path, value)
+        if not is_native value then return nil, value ~= nil and value ~= false end
+        if NativeValue.is(value, data.Reference) then value = E.deref(path, value) end
+        if value.type ~= types.Bool then fail(path, "a condition must be Bool, got " .. types.describe value.type) end
+        local constant = E.constant_of value
+        if constant then return nil, constant.bits.value end
+        return value.operand
+    end
+
+    E.emit_compute = do(path, opcode, type, operands)
+        local result = fresh identity.ValueId
+        append(path, data.Compute { site = site path, .result, .type, .opcode, arguments = operands })
+        return E.bits(type, data.Result { value = result, .type })
+    end
+
+end

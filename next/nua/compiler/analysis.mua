@@ -5,12 +5,38 @@ local types = require "nua.types"
 local graph = require "nua.compiler.graph"
 local verify = require "nua.compiler.verify"
 local effects = require "nua.compiler.effects"
+local provenance = require "nua.compiler.provenance"
 
-local plain = native_type -> data.ValueInfo {
-    type = native_type,
-    components = types.owns(native_type) and { [{}] = data.Owning {} } or {},
-    proofs = {},
-}
+local plain = provenance.plain
+
+-- the facts of an instruction's result, inferred from its kind where its operands' facts carry
+-- through: a record pack nests each part's components under its field, an extraction takes
+-- the components under its path. Answers its type and components; nil leaves the result plain
+-- at the instruction's own type.
+local Inferring = define ..graph.Inert
+    Load = do(instruction, recurse, definition, information)
+        return definition.places[instruction.place].type, {}
+    end
+    Address = do(instruction, recurse, definition, information)
+        return types.pointer(definition.places[instruction.place].type), {}
+    end
+    Pack = do(instruction, recurse, definition, information)
+        local native_type, components = instruction.type, {}
+        if not types.NativeType.is(native_type, types.RecordType) then return native_type, components end
+        for index, operand in ipairs instruction.components do
+            for path, part in pairs(information(operand).components) do
+                local nested = { data.FieldComponent { name = native_type.fields[index].name } }
+                for _, step in ipairs path do nested[#nested + 1] = step end
+                components[nested] = part
+            end
+        end
+        return native_type, components
+    end
+    Extract = do(instruction, recurse, definition, information)
+        return instruction.type, provenance.components_under(information(instruction.aggregate), instruction.path)
+    end
+end
+local inferred = data.Instruction.pass "the facts of an instruction's result" with ..Inferring end
 
 local publish = do(definition, fragment)
     local values = {}
@@ -32,34 +58,10 @@ local publish = do(definition, fragment)
         end
         for _, instruction in ipairs block.instructions do
             for _, operand in ipairs(verify.operands_of instruction) do information operand end
-            if instruction.result then
-                local native_type = instruction.type
-                if data.Instruction.is(instruction, data.Load) then native_type = definition.places[instruction.place].type end
-                if data.Instruction.is(instruction, data.Address) then native_type = types.pointer(definition.places[instruction.place].type) end
-                if native_type and values[instruction.result] == nil then
-                    local components = {}
-                    if data.Instruction.is(instruction, data.Pack) and types.NativeType.is(native_type, types.RecordType) then
-                        for index, operand in ipairs instruction.components do
-                            for path, part in pairs(information(operand).components) do
-                                local nested = { data.FieldComponent { name = native_type.fields[index].name } }
-                                for _, step in ipairs path do nested[#nested + 1] = step end
-                                components[nested] = part
-                            end
-                        end
-                    elseif data.Instruction.is(instruction, data.Extract) then
-                        for path, part in pairs(information(instruction.aggregate).components) do
-                            local matches = #path >= #instruction.path
-                            for index, step in ipairs instruction.path do
-                                local actual = path[index]
-                                if actual == nil or getmetatable(actual) ~= getmetatable(step) or actual.name ~= step.name then matches = false end
-                            end
-                            if matches then
-                                local rest = {}
-                                for index = #instruction.path + 1, #path do rest[#rest + 1] = path[index] end
-                                components[rest] = part
-                            end
-                        end
-                    end
+            if instruction.result and values[instruction.result] == nil then
+                local native_type, components = inferred(instruction, definition, information)
+                if native_type == nil then native_type, components = instruction.type, {} end
+                if native_type then
                     values[instruction.result] = next(components) and data.ValueInfo { type = native_type, .components, proofs = {} } or plain(native_type)
                 end
             end

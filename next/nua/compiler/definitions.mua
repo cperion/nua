@@ -11,11 +11,15 @@
 local identity = require "nua.identity"
 local types = require "nua.types"
 local data = require "nua.compiler.data"
+local paths_of = require "nua.compiler.evaluation.path"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
 local analysis = require "nua.compiler.analysis"
 local boundaries = require "nua.compiler.boundaries"
+local specifications = require "nua.compiler.specifications"
+
+local Supplied = specifications.Supplied
 
 -- host values in keys: numbers, strings and booleans by value, anything else by identity
 local host_serials = setmetatable({}, { __mode = "k" })
@@ -32,7 +36,24 @@ local host_key = do(value)
     return "host:" .. serial
 end
 
-local defining = do(compilation)
+-- a known native argument in a key: integers, floats, booleans and unit by value
+local unkeyed = do(bits, recurse, constant)
+    error("definitions: a known argument of " .. types.describe constant.type .. " cannot key a definition yet", 4)
+end
+local constant_key_of_bits = data.NativeConstant.pass "a known constant in a definition's key" with
+    IntegerBits = |bits, recurse, constant| -> tostring bits.bits
+    FloatBits = |bits, recurse, constant| -> ("%.17g"):format(bits.value)
+    BooleanBit = |bits, recurse, constant| -> tostring bits.value
+    UnitBits = |bits, recurse, constant| -> "unit"
+    AggregateBits = unkeyed
+    StaticBytes = unkeyed
+    SymbolAddress = unkeyed
+    DefinitionAddress = unkeyed
+end
+local constant_key = constant -> constant_key_of_bits(constant.bits, constant)
+
+-- `E`: the evaluation vocabulary, whose verbs build each definition
+local defining = do(compilation, E)
     local supply = compilation.supply
     local fresh = supply.fresh
     local entries = {}      -- key -> { id, state }
@@ -58,26 +79,26 @@ local defining = do(compilation)
 
     -- the key of a specification: the word, then each argument known by its value or dynamic by
     -- its type; the ABI and the word's identity keep different boundaries apart
-    local constant_key = do(constant)
-        local constant_bits = constant.bits
-        if data.NativeConstant.is(constant_bits, data.IntegerBits) then return tostring constant_bits.bits end
-        if data.NativeConstant.is(constant_bits, data.FloatBits) then return ("%.17g"):format(constant_bits.value) end
-        if data.NativeConstant.is(constant_bits, data.BooleanBit) then return tostring constant_bits.value end
-        if data.NativeConstant.is(constant_bits, data.UnitBits) then return "unit" end
-        error("definitions: a known argument of " .. types.describe constant.type .. " cannot key a definition yet", 3)
+    local key_part = Supplied.pass "a supplied requirement in a definition's key" with
+        KnownHost = |entry, recurse| -> host_key entry.value
+        KnownNative = |entry, recurse| -> ("known %s %s"):format(types.describe entry.value.type, constant_key entry.value.operand)
+        Dynamic = |entry, recurse| -> "dynamic " .. types.describe entry.type
     end
     local key_of = do(word, specification, abi)
         local parts = { tostring(word_id(word).serial), abi }
-        for index, entry in ipairs specification do
-            if entry.kind == "dynamic" then
-                parts[#parts + 1] = "dynamic " .. types.describe entry.type
-            elseif entry.kind == "native" then
-                parts[#parts + 1] = ("known %s %s"):format(types.describe entry.value.type, constant_key(entry.value.operand))
-            else
-                parts[#parts + 1] = host_key(entry.value)
-            end
-        end
+        for _, entry in ipairs specification do parts[#parts + 1] = key_part entry end
         return table.concat(parts, "|")
+    end
+
+    -- the argument a parameter supplies inside its definition: a reference or a view is a
+    -- borrow of the caller's storage, a value carrying borrows has their facts, any other value
+    -- is the parameter itself
+    local parameter_argument = do(path, id, position, native_type)
+        local operand = data.Parameter { definition = id, index = position, type = native_type }
+        if types.NativeType.is(native_type, types.ReferenceType) then return E.parameter_reference(path, id, position, native_type, operand) end
+        if types.NativeType.is(native_type, types.ViewType) then return E.parameter_view(path, id, position, native_type, operand) end
+        if types.borrows native_type then return E.parameter_value(path, id, position, native_type, operand) end
+        return E.value_of_operand(native_type, operand)
     end
 
     local build = do(id, word, specification, abi, kind, source, line)
@@ -85,36 +106,27 @@ local defining = do(compilation)
         current = id
         jobs[id].dependencies = {}
         local parameter_types = {}
-        for index, entry in ipairs specification do
-            if entry.kind == "dynamic" then parameter_types[#parameter_types + 1] = entry.type end
+        for _, entry in ipairs specification do
+            if specifications.is_dynamic entry then parameter_types[#parameter_types + 1] = entry.type end
         end
         local outcome = graph.building(nil, supply, do(writer)
             local entry = writer.block "entry"
-            local path = { .writer, block = entry, flow = facts.empty(), invocation = nil, loop = nil, depth = 0, .source, .line, dead = false, definition = id }
+            local path = paths_of.entry(writer, entry, facts.empty(), source, line, id)
             local arguments, position = {}, 0
-            for index, entry_specification in ipairs specification do
-                if entry_specification.kind == "dynamic" then
+            for index, entry in ipairs specification do
+                if specifications.is_dynamic entry then
                     position += 1
-                    local operand = data.Parameter { definition = id, index = position, type = entry_specification.type }
-                    if types.NativeType.is(entry_specification.type, types.ReferenceType) then
-                        arguments[index] = compilation.parameter_reference(path, id, position, entry_specification.type, operand)
-                    elseif types.NativeType.is(entry_specification.type, types.ViewType) then
-                        arguments[index] = compilation.parameter_view(path, id, position, entry_specification.type, operand)
-                    elseif types.borrows(entry_specification.type) then
-                        arguments[index] = compilation.parameter_value(path, id, position, entry_specification.type, operand)
-                    else
-                        arguments[index] = compilation.value_of_operand(entry_specification.type, operand)
-                    end
+                    arguments[index] = parameter_argument(path, id, position, entry.type)
                 else
-                    arguments[index] = entry_specification.value
+                    arguments[index] = entry.value
                 end
             end
-            compilation.enter path
-            local value = compilation.invoke(path, word, arguments)
+            E.enter path
+            local value = E.invoke(path, word, arguments)
             if not path.dead then
                 local returned = nil
-                if value ~= nil and word.result ~= types.Unit then returned = compilation.materialize(path, value) end
-                compilation.terminate(path, data.Return { origin = compilation.origin(source, line), value = returned })
+                if value ~= nil and word.result ~= types.Unit then returned = E.materialize(path, value) end
+                E.terminate(path, data.Return { origin = compilation.origin(source, line), value = returned })
             end
             return "adopt"
         end)
@@ -133,19 +145,17 @@ local defining = do(compilation)
         definition_facts[id] = analysis.publish(definitions[id], fragment)
         bundles[id] = { definition = definitions[id], facts = definition_facts[id], contract = boundaries.project(definitions[id], definition_facts[id], 0) }
         jobs[id].fingerprint = boundaries.fingerprint(bundles[id])
-        local used = {}
-        for _, block in ipairs definitions[id].blocks do
-            for _, instruction in ipairs block.instructions do
-                if data.Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then used[instruction.callee.definition] = true end
-            end
+        -- a dependency the finished definition no longer calls is dropped
+        local called = graph.called_definitions(definitions[id])
+        for dependency in pairs jobs[id].dependencies do
+            if not called[dependency] then jobs[id].dependencies[dependency] = nil end
         end
-        for dependency in pairs jobs[id].dependencies do if not used[dependency] then jobs[id].dependencies[dependency] = nil end end
         current = parent
         return id
     end
 
-    compilation.bundle_of = id -> bundles[id]
-    compilation.contract_of = do(id)
+    local bundle_of = id -> bundles[id]
+    local contract_of = do(id)
         if current then jobs[current].dependencies[id] = jobs[id].fingerprint or "pending" end
         return bundles[id]
     end
@@ -189,7 +199,7 @@ local defining = do(compilation)
         local id = fresh identity.DefinitionId
         local owning = types.owns word.result
         for index, entry in ipairs specification do
-            if entry.kind == "dynamic" and types.owns entry.type then owning = true end
+            if specifications.is_dynamic entry and types.owns entry.type then owning = true end
         end
         local key = not owning and key_of(word, specification, "nua_boundary")
         if key and entries[key] == nil then entries[key] = { .id, state = "building" } end
@@ -204,6 +214,8 @@ local defining = do(compilation)
         .request
         .define_export
         .word_id
+        .contract_of
+        .bundle_of
         definitions = || -> definitions
         facts = || -> definition_facts
         contracts = do()

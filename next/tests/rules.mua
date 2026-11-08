@@ -92,3 +92,16 @@ test "F32 rounds after every operation; conversions follow C":
     assert(folded("reinterpret", types.U32, { float(types.F32, 1) }) == 0x3f800000)
     assert(folded("reinterpret", types.F32, { integer(types.U32, 0x40000000) }) == 2)
 end
+
+test "a reinterpretation from or to a NaN is not folded, so C keeps its exact bits":
+    -- a NaN's payload is not held by the value a constant folds to, and LuaJIT may read an
+    -- arbitrary NaN pattern as another kind of value
+    assert(folded("reinterpret", types.F64, { integer(types.U64, -1) }) == "not foldable")
+    assert(folded("reinterpret", types.F64, { integer(types.I64, 0x7ff8000000000001LL) }) == "not foldable")
+    assert(folded("reinterpret", types.F32, { integer(types.U32, 0xffffffff) }) == "not foldable")
+    assert(folded("reinterpret", types.U64, { float(types.F64, 0 / 0) }) == "not foldable")
+    assert(folded("reinterpret", types.U32, { float(types.F32, 0 / 0) }) == "not foldable")
+    -- infinities are not NaNs: their bits are exact
+    assert(folded("reinterpret", types.F32, { integer(types.U32, 0x7f800000) }) == math.huge)
+    assert(folded("reinterpret", types.U32, { float(types.F32, -math.huge) }) == 0xff800000)
+end

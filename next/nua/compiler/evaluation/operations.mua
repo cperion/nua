@@ -1,0 +1,240 @@
+-- The evaluation vocabulary, part: Applying and accessing values: application of words, types,
+-- mechanisms and primitives; fields, elements, loads.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    E.length = do(path, base)
+        if path.dead then return nil end
+        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
+        if E.is_view value then
+            local _, count = E.view_parts(path, value)
+            return count
+        end
+        if E.is_aggregate value and E.is_buffer value.type then return E.part(path, value, "length") end
+        if not is_native value and lua_type value == "table" then return #value end
+        fail(path, "'#' of this value is not available yet")
+    end
+
+    -- the reference a primitive is given: a cell's value, or the reference itself
+    local reference_argument = do(path, value)
+        if E.is_cell value then return E.peek(path, value) end
+        return value
+    end
+
+    -- the primitives the compiler supplies to the Nua library, by name
+    local Primitives = define
+        trap = |path, arguments, boundary| -> E.trap(path, arguments[1])
+        element_of = |path, arguments, boundary| -> E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
+        view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3])
+        -- `drop(r)`: release what a reference reaches; a local it reaches is moved
+        drop = do(path, arguments, boundary)
+            local reference = reference_argument(path, arguments[1])
+            if not E.is_reference reference then fail(path, "drop takes a reference to what it releases") end
+            local reached = E.reach(path, reference)
+            if cells.Reached.is(reached, cells.TrackedPlace) then
+                E.release_place(path, reached.place)
+            else
+                E.release_value(path, E.load(path, reached.place))
+            end
+        end
+    end
+    -- the effect declarations of a library word (buffers §4.1): the storage a reference reaches
+    -- may relocate (`moves`), or its borrows end (`ends`)
+    local declare_effect
+    declare_effect = do(path, kind, arguments, boundary)
+        local reference = reference_argument(path, arguments[1])
+        if not E.is_reference reference then fail(path, "an effect declaration names a reference to the storage it affects") end
+        local info = compilation.borrows[reference.borrow]
+        local form = info.form
+        if data.BorrowForm.is(form, data.Selected) then
+            return E.dispatch_reference(path, reference, |arm, selected| -> declare_effect(arm, kind, { selected, arguments[2] }, boundary))
+        end
+        local target
+        if data.BorrowForm.is(form, data.Stored) then
+            local place = data.Place { id = fresh(identity.PlaceId), type = reference.type.target, root = data.IndirectRoot { pointer = assert(form.pointer), borrow = reference.borrow }, path = {}, lifetime = info.lifetime, origin = origin_of(path) }
+            compilation.places[place.id] = place
+            path.writer.declare(place)
+            target = data.Access { place = place.id, path = { data.ContentsStep {} } }
+        else
+            target = data.Access { place = form.path.root, path = provenance.concat(form.path.steps, { data.ContentsStep {} }) }
+        end
+        if kind == "moves" then
+            append(path, data.Moves { site = site path, .target })
+        else
+            local reason = arguments[2]
+            append(path, data.Ends { site = site path, .target, .reason })
+        end
+    end
+    Primitives.moves = |path, arguments, boundary| -> declare_effect(path, "moves", arguments, boundary)
+    Primitives.ends = |path, arguments, boundary| -> declare_effect(path, "ends", arguments, boundary)
+
+    -- applying a native type: `Grow(T) { … }` builds a buffer, `Record { … }` a record, `U32(x)`
+    -- converts (a pointer's bits are reinterpreted, never converted)
+    E.apply_type = do(path, callee, arguments)
+        if #arguments ~= 1 then fail(path, types.describe callee .. " takes one argument") end
+        -- `Grow(T) { … }`: an empty buffer, then each entry pushed
+        if E.is_buffer callee then
+            local entries = arguments[1]
+            if lua_type entries ~= "table" or is_native entries then fail(path, types.describe callee .. " is built from a table of its elements") end
+            local holder = E.new_place(path, "built", callee)
+            path.flow.contents[holder.id] = data.Tracked { value = E.zero_value callee }
+            local cell = E.place_cell(holder.id, "built")
+            for _, entry in ipairs entries do E.method(path, cell, "push", { entry }, false) end
+            return E.get(path, cell)
+        end
+        if E.is_record callee then return E.construct_record(path, callee, arguments[1]) end
+        local value = arguments[1]
+        if E.is_cell value then value = E.peek(path, value) end
+        value = E.deref(path, value)
+        if not is_native value then return E.from_host(path, callee, value, "the converted value") end
+        if value.type == callee then return value end
+        -- a pointer's bits as another pointer or as an integer: reinterpreted, never converted
+        if rules.is_pointer callee or rules.is_pointer value.type then return E.compute(path, "reinterpret", callee, { value }) end
+        return E.compute(path, "convert", callee, { value })
+    end
+
+    -- applying a platform mechanism: a Mechanism instruction
+    E.apply_mechanism = do(path, callee, arguments)
+        if #arguments ~= #callee.parameters then fail(path, ("%s takes %d arguments"):format(tostring callee, #callee.parameters)) end
+        local operands = {}
+        for index, parameter in ipairs callee.parameters do
+            local value = arguments[index]
+            if E.is_cell value then value = E.peek(path, value) end
+            operands[index] = E.materialize(path, E.from_host(path, parameter, value, ("argument %d of %s"):format(index, tostring callee)))
+        end
+        local result = callee.result ~= types.Unit and fresh identity.ValueId or nil
+        append(path, data.Mechanism { site = site path, .result, binding = callee.name, arguments = operands })
+        if result == nil then return nil end
+        return E.value_of_operand(callee.result, data.Result { value = result, type = callee.result })
+    end
+
+    -- applying a word or an application: supply, then evaluate in place or call natively
+    E.apply_word = do(path, callee, arguments, boundary)
+    local word, supplied = hosting.supplied_of callee
+    if word == nil then
+        if lua_type callee == "function" then return callee(unpack(arguments)) end
+        fail(path, tostring callee .. " is not something to apply")
+    end
+    local application = hosting.supply(hosting.application(word, supplied), arguments)
+    if not hosting.saturated application then
+        if boundary then fail(path, ("call needs a saturated application: %s takes %d arguments"):format(word.name, #word.requirements)) end
+        return application
+    end
+    if boundary then return E.call_definition(path, word, application.supplied, nil) end
+    return E.invoke(path, word, application.supplied)
+    end
+
+    -- application: a reference of a local, a primitive, a native type, a mechanism, or a word
+    E.apply = do(path, callee, arguments, boundary)
+        if path.dead then return nil end
+        if callee == types.reference and E.is_cell(arguments[1]) then return E.reference_to(path, arguments[1]) end
+        if hosting.is_primitive callee then
+            local apply_primitive = Primitives[callee.name]
+            if apply_primitive == nil then fail(path, "the primitive " .. callee.name .. " is unknown") end
+            return apply_primitive(path, arguments, boundary)
+        end
+        if check(types.NativeType, callee) then return E.apply_type(path, callee, arguments) end
+        if platform.is_mechanism callee then return E.apply_mechanism(path, callee, arguments) end
+        return E.apply_word(path, callee, arguments, boundary)
+    end
+
+    E.dot = do(path, base, name)
+        if path.dead then return nil end
+        if E.is_cell base then base = E.peek(path, base) end
+        base = E.deref(path, base)
+        if E.is_view base and name == "length" then
+            local _, count = E.view_parts(path, base)
+            return count
+        end
+        if E.is_aggregate base then return E.part(path, base, name) end
+        if not is_native base and lua_type base == "table" then return base[name] end
+        fail(path, ("'.%s' of %s is not available yet"):format(name, tostring base))
+    end
+    -- the place `p[i]` names when `p` is a raw pointer: storage under the raw contract
+    E.raw_place = do(path, base, key)
+        if E.is_cell base then base = E.peek(path, base) end
+        base = E.deref(path, base)
+        if not (is_native base and rules.is_pointer base.type) then return nil end
+        local index = is_native key and key or E.from_host(path, types.I64, key, "the index")
+        local address = E.compute(path, "pointer_offset", base.type, { base, index })
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = base.type.target
+            root = data.RawRoot { pointer = address.operand }
+            path = {}
+            lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        compilation.places[place.id] = place
+        path.writer.declare place
+        return place
+    end
+    E.load = do(path, place)
+        local result = fresh identity.ValueId
+        append(path, data.Load { site = site path, .result, place = place.id })
+        local operand = data.Result { value = result, type = place.type }
+        local targets = provenance.accesses(place, compilation.places, compilation.borrows)
+        local info = memory.read(path.flow, targets, place.type, path.writer)
+        if types.borrows(place.type) then
+            if info == nil and #targets == 1 and data.PlaceRoot.is(compilation.places[targets[1].place].root, data.ParameterRoot) then
+                info = E.symbolic_info(path, place.type, targets[1])
+            end
+            if info == nil then fail(path, "a borrowed load has no resident component provenance") end
+        end
+        return E.restore(path, place.type, operand, info)
+    end
+
+    E.element = do(path, base, key)
+        if path.dead then return nil end
+        local place = E.raw_place(path, base, key)
+        if place then return E.load(path, place) end
+        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
+        if E.is_view value then return E.view_element(path, value, key) end
+        if E.is_aggregate value and E.is_buffer value.type then
+            if types.owns value.type.element then
+                local receiver = E.is_cell base and E.reference_to(path, base) or base
+                return E.method(path, receiver, "element", { key }, false)
+            end
+            return E.method(path, base, "get", { key }, false)
+        end
+        if E.is_cell base then base = E.peek(path, base) end
+        if not is_native base and lua_type base == "table" then return base[key] end
+        fail(path, "indexing a native value is not available yet")
+    end
+    -- the field `name` of the record a cell (or a field cell) holds, as a cell to assign
+    E.member = do(path, base, name)
+        if not E.is_cell base then fail(path, ("'.%s' is assigned through a local of the body"):format(name)) end
+        return cells.FieldCell { .base, .name }
+    end
+    E.member_at = do(path, base, key)
+        if path.dead then return nil end
+        local place = E.raw_place(path, base, key)
+        if place then return cells.RawCell { .place, name = "an element" } end
+        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or nil
+        if value and E.is_aggregate value and E.is_buffer value.type then return cells.ElementCell { .base, .key, name = "an element" } end
+        fail(path, "assigning an element is not available yet")
+    end
+
+    return E
+end

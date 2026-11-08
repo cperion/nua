@@ -1,0 +1,179 @@
+-- The evaluation vocabulary, part: Records and buffer headers: aggregates of their parts, packed where a whole value must exist.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- records: a record value is an Aggregate of its parts, packed only where a whole value must
+    -- exist (a native call, a return, a record-typed block parameter); a packed value's fields
+    -- are read by Extract
+
+    E.is_aggregate = value -> is_native value and NativeValue.is(value, data.Aggregate)
+    E.is_reference = value -> is_native value and NativeValue.is(value, data.Reference)
+    E.is_view = value -> E.is_reference value and types.NativeType.is(value.type, types.ViewType)
+    E.is_buffer = native_type -> types.NativeType.is(native_type, types.BufferType)
+    -- records, and buffers (whose header is a record of its data, length and capacity)
+    E.is_record = native_type -> types.NativeType.is(native_type, types.RecordType) or E.is_buffer native_type
+    E.header_fields = setmetatable({}, { __mode = "k" })
+    E.fields_of = do(native_type)
+        if not E.is_buffer native_type then return native_type.fields end
+        local found = E.header_fields[native_type]
+        if found == nil then
+            found = {
+                { name = "data", type = types.pointer native_type.element },
+                { name = "length", type = types.U64 },
+                { name = "capacity", type = types.U64 },
+            }
+            if native_type.pinned then found[4] = { name = "limit", type = types.U64 } end
+            E.header_fields[native_type] = found
+        end
+        return found
+    end
+    E.field_of = do(record, name)
+        for _, field in ipairs(E.fields_of record) do
+            if field.name == name then return field end
+        end
+        return nil
+    end
+
+    -- a value of `native_type` held by `operand`: a record's parts are read from it on demand
+    E.value_of_operand = do(native_type, operand)
+        if E.is_record native_type then return data.Aggregate { type = native_type, packed = operand, parts = {} } end
+        return E.bits(native_type, operand)
+    end
+
+    E.part = do(path, value, name)
+        local field = E.field_of(value.type, name)
+        if field == nil then fail(path, ("%s has no field '%s'"):format(types.describe value.type, name)) end
+        local found = value.parts[name]
+        if found then return found end
+        if value.packed == nil then fail(path, ("the field '%s' of %s has no value"):format(name, types.describe value.type)) end
+        local result = fresh identity.ValueId
+        append(path, data.Extract { site = site path, .result, type = field.type, aggregate = value.packed, path = { data.FieldComponent { .name } } })
+        local extracted = data.Result { value = result, type = field.type }
+        local components = {}
+        for component_path, component in pairs E.information(path, value).components do
+            if component_path[1] and data.Component.is(component_path[1], data.FieldComponent) and component_path[1].name == name then
+                local rest = {}
+                for index = 2, #component_path do rest[#rest + 1] = component_path[index] end
+                components[rest] = component
+            end
+        end
+        return E.restore(path, field.type, extracted, data.ValueInfo { type = field.type, .components, proofs = {} })
+    end
+
+    -- every part present: a packed value's fields extracted
+    E.explode = do(path, value)
+        local parts = {}
+        for _, field in ipairs(E.fields_of value.type) do parts[field.name] = E.part(path, value, field.name) end
+        return data.Aggregate { type = value.type, packed = nil, .parts }
+    end
+
+    -- the operand holding a whole value: a record's parts packed (or its packed operand)
+    E.materialize = do(path, value)
+        if is_native value and NativeValue.is(value, data.Reference) and types.NativeType.is(value.type, types.ViewType) then
+            return E.pack_view(path, value)
+        end
+        if E.is_reference value then return E.pack_reference(path, value) end
+        if not E.is_aggregate value then return value.operand end
+        if value.packed and next(value.parts) == nil then return value.packed end
+        local components = {}
+        for index, field in ipairs(E.fields_of value.type) do components[index] = E.materialize(path, E.part(path, value, field.name)) end
+        local result = fresh identity.ValueId
+        append(path, data.Pack { site = site path, .result, type = value.type, .components })
+        local operand = data.Result { value = result, type = value.type }
+        path.writer.remember(operand, E.information(path, value))
+        return operand
+    end
+
+    E.information = do(path, value)
+        if E.is_reference value then return data.ValueInfo { type = value.type, components = { [{}] = data.Borrowed { borrow = value.borrow } }, proofs = {} } end
+        if not E.is_aggregate(value) then
+            return value.operand and not Operand.is(value.operand, data.Constant) and path.writer.information(value.operand) or provenance.plain(value.type)
+        end
+        local components = E.is_buffer(value.type) and { [{}] = data.Owning {} } or {}
+        if value.packed then
+            local packed = path.writer.information(value.packed)
+            if packed then for key, member in pairs packed.components do components[key] = member end end
+        end
+        for name, member in pairs value.parts do
+            for key in pairs components do if key[1] and key[1].name == name then components[key] = nil end end
+            for key, component in pairs E.information(path, member).components do
+                components[provenance.concat({ data.FieldComponent { .name } }, key)] = component
+            end
+        end
+        return data.ValueInfo { type = value.type, .components, proofs = {} }
+    end
+    E.restore = do(path, native_type, operand, info)
+        info = info or provenance.plain(native_type)
+        path.writer.remember(operand, info)
+        if types.NativeType.is(native_type, types.ViewType) or types.NativeType.is(native_type, types.ReferenceType) then
+            local source = nil
+            for key, component in pairs info.components do
+                if #key == 0 and data.ComponentInfo.is(component, data.Borrowed) then source = component.borrow end
+            end
+            if source == nil then fail(path, "a borrowed observation has no component provenance") end
+            local previous = assert(compilation.borrows[source])
+            local observed = data.BorrowInfo { ..previous, id = fresh(identity.BorrowId), form = data.Stored { pointer = operand }, acquired = origin_of(path) }
+            compilation.borrows[observed.id] = observed
+            path.flow.borrows[observed.id] = assert(path.flow.borrows[source])
+            remember_reference(path, operand, observed.id)
+            return data.Reference { type = native_type, borrow = observed.id }
+        end
+        return E.value_of_operand(native_type, operand)
+    end
+
+    E.zero_value = do(native_type)
+        if E.is_record native_type then
+            local parts = {}
+            for _, field in ipairs(E.fields_of native_type) do parts[field.name] = E.zero_value(field.type) end
+            return data.Aggregate { type = native_type, packed = nil, .parts }
+        end
+        if rules.is_pointer native_type then return E.known(data.Constant { type = native_type, bits = data.IntegerBits { bits = 0ULL } }) end
+        if rules.is_integer native_type then return E.known(rules.integer(native_type, 0)) end
+        if rules.is_float native_type then return E.known(rules.float(native_type, 0)) end
+        if rules.is_boolean native_type then return E.known(rules.boolean false) end
+        error(("a %s field has no zero value; give it one"):format(types.describe native_type), 0)
+    end
+
+    -- `Record { … }`: named entries, or positional ones in field order; omitted fields zeroed
+    E.construct = do(path, record, entries)
+        if lua_type entries ~= "table" or is_native entries then fail(path, types.describe record .. " is built from a table of its fields") end
+        for key in pairs entries do
+            if lua_type key == "string" and E.field_of(record, key) == nil then fail(path, ("%s has no field '%s'"):format(types.describe record, key)) end
+        end
+        local parts = {}
+        for index, field in ipairs record.fields do
+            local given = entries[field.name]
+            if given == nil then given = entries[index] end
+            if given == nil then
+                parts[field.name] = E.zero_value(field.type)
+            else
+                parts[field.name] = E.stored_borrow(path, E.from_host(path, field.type, given, ("the field '%s' of %s"):format(field.name, types.describe record)))
+            end
+        end
+        return data.Aggregate { type = record, packed = nil, .parts }
+    end
+    E.construct_record = E.construct
+
+end

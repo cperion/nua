@@ -40,13 +40,18 @@ local borrows_of = do(values, operand)
     return list
 end
 
--- the operands an instruction transfers, if they own storage
-local transferred = do(instruction, program)
-    if Instruction.is(instruction, data.Store) then return { instruction.value } end
-    if Instruction.is(instruction, data.Pack) then return instruction.components end
-    if Instruction.is(instruction, data.Invoke) then return instruction.arguments end
-    return {}
+-- the operands an instruction transfers, if they own storage: a store's value, a pack's
+-- components, a call's arguments; every other kind transfers nothing
+local Transferring = define ..graph.Inert
+    Store = |node, recurse, transfer| -> transfer node.value
+    Pack = do(node, recurse, transfer)
+        for _, operand in ipairs node.components do transfer operand end
+    end
+    Invoke = do(node, recurse, transfer)
+        for _, operand in ipairs node.arguments do transfer operand end
+    end
 end
+local each_transferred = Instruction.pass "the operands an instruction transfers" with ..Transferring end
 
 local copy_states = do(states)
     local copy = {}
@@ -59,29 +64,29 @@ local copy_set = do(set)
     return copy
 end
 
-local verify_definition = do(program, definition, published, analysis, report)
+-- The published facts are complete and well formed: every borrow has origin facts and a valid
+-- form, value facts are keyed by component paths, and every borrowed operand has its facts.
+-- Answers whether the definition can be replayed.
+local check_published = do(definition, published, report)
     local values, registry = published.values, published.borrows
     local valid = true
+    local refuse = do(message, origin)
+        valid = false
+        report(definition, message, origin)
+    end
     for _, info in pairs registry do
         local problem = borrow_paths.validate info
-        if problem then
-            valid = false
-            report(definition, problem, info.acquired)
-        end
+        if problem then refuse(problem, info.acquired) end
     end
     local require_borrow = do(id, origin)
-        if registry[id] == nil then
-            valid = false
-            report(definition, "a borrow has no published origin facts", origin)
-        end
+        if registry[id] == nil then refuse("a borrow has no published origin facts", origin) end
     end
     local check_value
     check_value = do(value)
         if data.NativeValue.is(value, data.Reference) then
             local info = registry[value.borrow]
             if info and data.BorrowForm.is(info.form, data.Stored) and info.form.pointer == nil then
-                valid = false
-                report(definition, "resident provenance cannot be a materialized reference", info.acquired)
+                refuse("resident provenance cannot be a materialized reference", info.acquired)
             end
         elseif data.NativeValue.is(value, data.Aggregate) then
             for _, part in pairs value.parts do check_value(part) end
@@ -97,23 +102,22 @@ local verify_definition = do(program, definition, published, analysis, report)
     end
     for _, info in pairs values do
         for key, component in pairs info.components do
-            if not check(data.ComponentPath, key) then
-                valid = false
-                report(definition, "value facts need component-path keys", definition.origin)
-            end
+            if not check(data.ComponentPath, key) then refuse("value facts need component-path keys", definition.origin) end
             if data.ComponentInfo.is(component, data.Borrowed) then require_borrow(component.borrow, definition.origin) end
         end
     end
     for _, flow in pairs published.entries do check_flow flow end
-    for _, site in pairs published.sites do check_flow(site.before); check_flow(site.after) end
+    for _, site in pairs published.sites do
+        check_flow(site.before)
+        check_flow(site.after)
+    end
     for _, edge in pairs published.edges do check_flow(edge.flow) end
     for _, place in pairs definition.places do
         if PlaceRoot.is(place.root, data.IndirectRoot) then require_borrow(place.root.borrow, place.origin) end
     end
     local check_operand = do(operand, origin)
         if not Operand.is(operand, data.Constant) and types.borrows operand.type and #borrows_of(values, operand) == 0 then
-            valid = false
-            report(definition, "a borrowed operand has no published borrow facts", origin)
+            refuse("a borrowed operand has no published borrow facts", origin)
         end
     end
     for _, block in ipairs definition.blocks do
@@ -122,7 +126,21 @@ local verify_definition = do(program, definition, published, analysis, report)
         end
         for _, operand in ipairs(verify.terminator_operands block.terminator) do check_operand(operand, block.terminator.origin) end
     end
-    if not valid then return end
+    return valid
+end
+
+-- The replay of one definition (a stateful vocabulary, compiler guide §4.6). What belongs to
+-- the whole replay is captured: the published facts, the borrow tracking, the places. What
+-- varies per block is the working state, one table passed to every handler (§4.5):
+--   flow       evolving: the borrow states and contents replayed so far
+--   moved      evolving: the owner values transferred so far on this path
+--   previous   evolving: the last snapshot acquisitions were taken from
+--   observed   evolving: borrows whose state a call or load has already set
+--   reporting  inherited: whether this pass reports (only the pass over the fixed point does)
+--   replay     the callee-replay context of this block
+-- Problems accumulate through `report`.
+local replaying = do(program, definition, published, analysis, report)
+    local values, registry = published.values, published.borrows
     local supply = identity.supply()
     local places = definition.places
     -- Formal origins remain symbolic here. Whether two distinct parameters may alias is a
@@ -132,204 +150,244 @@ local verify_definition = do(program, definition, published, analysis, report)
     local tracking = facts_module.tracking { borrows = registry, .supply }
     local blocks_by_id = {}
     for _, block in ipairs definition.blocks do blocks_by_id[block.id] = block end
+    local writer = { has_place = id -> true, declare = place -> nil }
 
-    -- borrow states and owner transfers at a block's entry, joined from its incoming edges
-    local entry_states, entry_moved = {}, {}
-    local start = {}
-    local initial = published.entries[definition.entry]
-    if initial then start = copy_states initial.borrows end
-    entry_states[definition.entry] = start
-    entry_moved[definition.entry] = {}
-
-    local apply = do(block, states, moved, reporting)
-        local flow = data.FlowFacts { contents = {}, borrows = states, live_lifetimes = {} }
-        local previous = published.entries[block.id]
-        if previous then for id, contents in pairs previous.contents do flow.contents[id] = contents end end
-        local observed_results = {}
+    -- the context a native call's contract is replayed in, for one block
+    local replay_context = do()
         local replay_registry, replay_places = {}, {}
         for id, info in pairs registry do replay_registry[id] = info end
-        for _, item in pairs program.definitions do for id, place in pairs item.places do replay_places[id] = place end end
+        for _, item in pairs program.definitions do
+            for id, place in pairs item.places do replay_places[id] = place end
+        end
         local replay = { borrows = replay_registry, places = replay_places, .supply }
         replay.memory = provenance.working(replay, tracking, facts_module.paths_overlap)
         replay.check_store = |path, targets, info| -> nil
         replay.bundle_of = do(id)
-            local target, facts = program.definitions[id], analysis.definitions[id]
-            if not target or not facts then return nil end
-            return { definition = target, .facts, contract = boundaries.project(target, facts, program.revision) }
+            local target, target_facts = program.definitions[id], analysis.definitions[id]
+            if not target or not target_facts then return nil end
+            return { definition = target, facts = target_facts, contract = boundaries.project(target, target_facts, program.revision) }
         end
-        local writer = { has_place = id -> true, declare = place -> nil }
-        local match_components = do(destination, source, source_flow, merge)
-            if not destination or not source then return end
-            local components = {}
-            for key, part in pairs source.components do components[provenance.key(key)] = part end
-            for key, part in pairs destination.components do
-                local from = components[provenance.key(key)]
-                if from and data.ComponentInfo.is(part, data.Borrowed) and data.ComponentInfo.is(from, data.Borrowed) then
-                    local state = source_flow.borrows[from.borrow] or data.Live {}
-                    local previous_state = flow.borrows[part.borrow]
-                    if not merge or not previous_state or not BorrowState.is(previous_state, data.Ended) then flow.borrows[part.borrow] = state end
-                    observed_results[part.borrow] = true
-                end
-            end
-        end
-        -- Snapshots tell us where a borrow is acquired, not whether a later use is legal.
-        -- Replay effects independently. Only a new acquisition resets a loop-local borrow;
-        -- an inherited borrow must keep the state arriving on the actual CFG edges.
-        local acquire = do(snapshot)
-            if snapshot == nil then return end
-            for id, state in pairs snapshot.borrows do
-                if not observed_results[id] and (previous == nil or previous.borrows[id] == nil) then flow.borrows[id] = state end
-            end
-            previous = snapshot
-        end
-        local use_borrow = do(borrow, origin)
-            local state = flow.borrows[borrow]
-            if registry[borrow] == nil then
-                if reporting then report(definition, "a borrow has no published origin facts", origin) end
-            elseif state == nil then
-                if reporting then report(definition, "a borrow is used before it is acquired", origin) end
-            elseif BorrowState.is(state, data.Ended) and reporting then
-                report(definition, ("a borrow is used after it ended (%s)"):format(state.reason), origin)
-            end
-        end
-        local use = do(operand, origin)
-            local info = not Operand.is(operand, data.Constant) and values[data.operand_key(operand)]
-            for key, component in pairs(info and info.components or {}) do
-                if not provenance.is_payload(key) and data.ComponentInfo.is(component, data.Borrowed) then use_borrow(component.borrow, origin) end
-            end
-        end
-        local transfer = do(operand, origin)
-            if Operand.is(operand, data.Constant) or not types.owns(operand.type) then return end
-            local key = data.operand_key operand
-            if moved[key] and reporting then report(definition, "an owner value is transferred twice", origin) end
-            moved[key] = true
-        end
-        -- a block's parameters and an instruction's result are new values each time they are
-        -- defined: a transfer of an earlier round's value does not count against them
-        for index, parameter in ipairs block.arguments do
-            moved[data.operand_key(data.BlockArgument { block = block.id, .index, type = parameter.type })] = nil
-        end
-        for _, instruction in ipairs block.instructions do
-            local origin = instruction.site.origin
-            local site = published.sites[instruction.site.id]
-            if site then acquire(site.before) end
-            if instruction.result then moved[instruction.result] = nil end
-            if instruction.place then
-                local place = places[instruction.place]
-                if place and PlaceRoot.is(place.root, data.IndirectRoot) then use_borrow(place.root.borrow, origin) end
-                if place and place.root.pointer then use(place.root.pointer, origin) end
-            end
-            for _, operand in ipairs(verify.operands_of instruction) do
-                if Instruction.is(instruction, data.Extract) and operand == instruction.aggregate and not Operand.is(operand, data.Constant) then
-                    local info = values[data.operand_key(operand)]
-                    for key, component in pairs(info and info.components or {}) do
-                        local selected = not provenance.is_payload(key)
-                        for position = 1, math.min(#key, #instruction.path) do
-                            local a, b = key[position], instruction.path[position]
-                            if getmetatable(a) ~= getmetatable(b) or a.name ~= b.name then selected = false end
-                        end
-                        if selected and data.ComponentInfo.is(component, data.Borrowed) then use_borrow(component.borrow, origin) end
-                    end
-                else use(operand, origin) end
-            end
-            for _, operand in ipairs(transferred(instruction, program)) do transfer(operand, origin) end
-            if Instruction.is(instruction, data.Moves) or Instruction.is(instruction, data.Ends) then
-                local place = places[instruction.target.place]
-                if place and PlaceRoot.is(place.root, data.IndirectRoot) then use_borrow(place.root.borrow, origin) end
-                for _, base in ipairs provenance.accesses(place, places, registry) do
-                    local target = data.Access { place = base.place, path = provenance.concat(base.path, instruction.target.path) }
-                    if Instruction.is(instruction, data.Moves) then tracking.moves(flow, target, origin)
-                    else tracking.ends(flow, target, instruction.reason, origin) end
-                end
-            end
-            if Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then
-                local target = instruction.callee.definition
-                if analysis.contracts[target] == nil then
-                    if reporting then report(definition, "a native call has no boundary contract", origin) end
-                else
-                    local arguments = {}
-                    for index, operand in ipairs instruction.arguments do
-                        arguments[index] = not Operand.is(operand, data.Constant) and values[data.operand_key(operand)] or provenance.plain(operand.type)
-                    end
-                    local at = { flow = facts_module.fork(flow), .writer }
-                    local returned = boundaries.apply(replay.bundle_of(target), at, arguments, replay, do(path, message)
-                        if reporting then report(definition, message, origin) end
-                    end)
-                    for id in pairs registry do if at.flow.borrows[id] then flow.borrows[id] = at.flow.borrows[id] end end
-                    if instruction.result then match_components(values[instruction.result], returned, at.flow) end
-                    if site then
-                        for id, contents in pairs site.after.contents do
-                            if data.Contents.is(contents, data.Resident) and provenance.is_memory(replay_places[id]) then
-                                local targets = provenance.accesses(replay_places[id], replay_places, replay_registry)
-                                local actual = replay.memory.read(at.flow, targets, contents.info.type)
-                                match_components(contents.info, actual, at.flow)
-                            end
-                        end
-                    end
-                end
-            end
-            if Instruction.is(instruction, data.Store) and site then
-                -- New resident components inherit the captured value's replayed state.
-                local source = not Operand.is(instruction.value, data.Constant) and values[data.operand_key(instruction.value)]
-                if source then
-                    local targets = provenance.accesses(places[instruction.place], places, registry)
-                    local weak = #targets > 1
-                    for _, target in ipairs targets do for _, step in ipairs target.path do if data.AccessStep.is(step, data.AnyElement) then weak = true end end end
-                    for id, contents in pairs site.after.contents do
-                        if contents ~= site.before.contents[id] and data.Contents.is(contents, data.Resident) then
-                            match_components(contents.info, source, flow)
-                            local before = site.before.contents[id]
-                            if weak and before and data.Contents.is(before, data.Resident) then match_components(contents.info, before.info, flow, true) end
-                        end
-                    end
-                end
-            end
-            if Instruction.is(instruction, data.Load) and instruction.result and types.borrows(places[instruction.place].type) then
-                local targets = provenance.accesses(places[instruction.place], places, registry)
-                local actual = replay.memory.read(flow, targets, places[instruction.place].type)
-                match_components(values[instruction.result], actual, flow)
-            end
-            if Instruction.is(instruction, data.LifetimeEnd) then
-                for id, info in pairs registry do
-                    if info.lifetime == instruction.lifetime and flow.borrows[id] then
-                        flow.borrows[id] = data.Ended { at = origin, reason = "released" }
-                    end
-                end
-            end
-            if site then
-                acquire(site.after)
-                for id, contents in pairs site.after.contents do flow.contents[id] = contents end
-            end
-            if instruction.result then
-                for _, borrow in ipairs(borrows_of(values, data.Result { value = instruction.result, type = types.Unit })) do
-                    if flow.borrows[borrow] == nil then flow.borrows[borrow] = data.Live {} end
-                end
-            end
-        end
-        for id in pairs flow.borrows do if registry[id] == nil then flow.borrows[id] = nil end end
-        local terminator = block.terminator
-        local outgoing = graph.edges_of terminator
-        if outgoing[1] and published.edges[outgoing[1].id] then acquire(published.edges[outgoing[1].id].flow) end
-        -- Edge captures transport references; only an actual observation is a use. In
-        -- particular a stale, subsequently unused local may cross a join without a fault.
-        if Terminator.is(terminator, data.Branch) then use(terminator.condition, terminator.origin) end
-        if Terminator.is(terminator, data.Return) and terminator.value then
-            use(terminator.value, terminator.origin)
-            transfer(terminator.value, terminator.origin)
-        end
-        if Terminator.is(terminator, data.Trap) then use(terminator.message, terminator.origin) end
-        -- Branch edges are alternatives, not two consecutive transfers.
-        local edge_moves = {}
-        local before_edges = moved
-        for _, edge in ipairs outgoing do
-            moved = copy_set before_edges
-            for _, argument in ipairs edge.arguments do transfer(argument, terminator.origin) end
-            edge_moves[edge.id] = moved
-        end
-        return flow.borrows, before_edges, edge_moves
+        return replay
     end
 
-    -- the state a target block's arguments start with, from one incoming edge
+    ------------------------------------------------------------------------------------------
+    -- the operations a handler uses on the working state
+
+    local match_components = do(state, destination, source, source_flow, merge)
+        if not destination or not source then return end
+        provenance.each_borrowed_pair(destination, source, do(part, from)
+            local borrow_state = source_flow.borrows[from.borrow] or data.Live {}
+            local previous_state = state.flow.borrows[part.borrow]
+            if not merge or not previous_state or not BorrowState.is(previous_state, data.Ended) then state.flow.borrows[part.borrow] = borrow_state end
+            state.observed[part.borrow] = true
+        end)
+    end
+    -- Snapshots tell us where a borrow is acquired, not whether a later use is legal.
+    -- Replay effects independently. Only a new acquisition resets a loop-local borrow;
+    -- an inherited borrow must keep the state arriving on the actual CFG edges.
+    local acquire = do(state, snapshot)
+        if snapshot == nil then return end
+        for id, borrow_state in pairs snapshot.borrows do
+            if not state.observed[id] and (state.previous == nil or state.previous.borrows[id] == nil) then state.flow.borrows[id] = borrow_state end
+        end
+        state.previous = snapshot
+    end
+    local use_borrow = do(state, borrow, origin)
+        if not state.reporting then return end
+        local borrow_state = state.flow.borrows[borrow]
+        if registry[borrow] == nil then
+            report(definition, "a borrow has no published origin facts", origin)
+        elseif borrow_state == nil then
+            report(definition, "a borrow is used before it is acquired", origin)
+        elseif BorrowState.is(borrow_state, data.Ended) then
+            report(definition, ("a borrow is used after it ended (%s)"):format(borrow_state.reason), origin)
+        end
+    end
+    local use = do(state, operand, origin)
+        local info = not Operand.is(operand, data.Constant) and values[data.operand_key(operand)]
+        for key, component in pairs(info and info.components or {}) do
+            if not provenance.is_payload(key) and data.ComponentInfo.is(component, data.Borrowed) then use_borrow(state, component.borrow, origin) end
+        end
+    end
+    local transfer = do(state, operand, origin)
+        if Operand.is(operand, data.Constant) or not types.owns(operand.type) then return end
+        local key = data.operand_key operand
+        if state.moved[key] and state.reporting then report(definition, "an owner value is transferred twice", origin) end
+        state.moved[key] = true
+    end
+    -- an extraction uses only the borrows of the component it selects
+    local use_extracted = do(state, instruction, origin)
+        local info = values[data.operand_key(instruction.aggregate)]
+        for key, component in pairs(info and info.components or {}) do
+            if provenance.extracted_by(instruction.path, key) and data.ComponentInfo.is(component, data.Borrowed) then use_borrow(state, component.borrow, origin) end
+        end
+    end
+
+    ------------------------------------------------------------------------------------------
+    -- what each kind of instruction does to the working state, beyond the uses and transfers
+    -- every instruction has (compiler guide §4.1: a pass checked against the family)
+
+    local invalidate = do(instruction, recurse, state, site)
+        local origin = instruction.site.origin
+        local place = places[instruction.target.place]
+        if place and PlaceRoot.is(place.root, data.IndirectRoot) then use_borrow(state, place.root.borrow, origin) end
+        for _, base in ipairs provenance.accesses(place, places, registry) do
+            local target = data.Access { place = base.place, path = provenance.concat(base.path, instruction.target.path) }
+            if Instruction.is(instruction, data.Moves) then tracking.moves(state.flow, target, origin)
+            else tracking.ends(state.flow, target, instruction.reason, origin) end
+        end
+    end
+    local Replaying = define ..graph.Inert
+        Moves = invalidate
+        Ends = invalidate
+        -- a native call: its contract replayed against the actual arguments
+        Invoke = do(instruction, recurse, state, site)
+            if not data.Callee.is(instruction.callee, data.DirectNua) then return end
+            local origin = instruction.site.origin
+            local target = instruction.callee.definition
+            if analysis.contracts[target] == nil then
+                if state.reporting then report(definition, "a native call has no boundary contract", origin) end
+                return
+            end
+            local arguments = {}
+            for index, operand in ipairs instruction.arguments do
+                arguments[index] = not Operand.is(operand, data.Constant) and values[data.operand_key(operand)] or provenance.plain(operand.type)
+            end
+            local at = { flow = facts_module.fork(state.flow), .writer }
+            local returned = boundaries.apply(state.replay.bundle_of(target), at, arguments, state.replay, do(path, message)
+                if state.reporting then report(definition, message, origin) end
+            end)
+            for id in pairs registry do
+                if at.flow.borrows[id] then state.flow.borrows[id] = at.flow.borrows[id] end
+            end
+            if instruction.result then match_components(state, values[instruction.result], returned, at.flow) end
+            if site then
+                for id, contents in pairs site.after.contents do
+                    if data.Contents.is(contents, data.Resident) and provenance.is_memory(state.replay.places[id]) then
+                        local targets = provenance.accesses(state.replay.places[id], state.replay.places, state.replay.borrows)
+                        local actual = state.replay.memory.read(at.flow, targets, contents.info.type)
+                        match_components(state, contents.info, actual, at.flow)
+                    end
+                end
+            end
+        end
+        -- new resident components inherit the captured value's replayed state
+        Store = do(instruction, recurse, state, site)
+            if not site then return end
+            local source = not Operand.is(instruction.value, data.Constant) and values[data.operand_key(instruction.value)]
+            if not source then return end
+            local targets = provenance.accesses(places[instruction.place], places, registry)
+            local weak = provenance.weak_store targets
+            for id, contents in pairs site.after.contents do
+                if contents ~= site.before.contents[id] and data.Contents.is(contents, data.Resident) then
+                    match_components(state, contents.info, source, state.flow)
+                    local before = site.before.contents[id]
+                    if weak and before and data.Contents.is(before, data.Resident) then match_components(state, contents.info, before.info, state.flow, true) end
+                end
+            end
+        end
+        -- a borrow loaded from memory takes the state its resident components replayed to
+        Load = do(instruction, recurse, state, site)
+            if not (instruction.result and types.borrows(places[instruction.place].type)) then return end
+            local targets = provenance.accesses(places[instruction.place], places, registry)
+            local actual = state.replay.memory.read(state.flow, targets, places[instruction.place].type)
+            match_components(state, values[instruction.result], actual, state.flow)
+        end
+        LifetimeEnd = do(instruction, recurse, state, site)
+            for id, info in pairs registry do
+                if info.lifetime == instruction.lifetime and state.flow.borrows[id] then
+                    state.flow.borrows[id] = data.Ended { at = instruction.site.origin, reason = "released" }
+                end
+            end
+        end
+    end
+    local replay_effects = Instruction.pass "replay an instruction's effects on borrows" with ..Replaying end
+
+    -- an instruction: acquisitions before it, its uses and transfers, its kind's effects, the
+    -- acquisitions and contents after it
+    local replay_instruction = do(state, instruction)
+        local origin = instruction.site.origin
+        local site = published.sites[instruction.site.id]
+        if site then acquire(state, site.before) end
+        if instruction.result then state.moved[instruction.result] = nil end
+        if instruction.place then
+            local place = places[instruction.place]
+            if place and PlaceRoot.is(place.root, data.IndirectRoot) then use_borrow(state, place.root.borrow, origin) end
+            if place and place.root.pointer then use(state, place.root.pointer, origin) end
+        end
+        for _, operand in ipairs(verify.operands_of instruction) do
+            if Instruction.is(instruction, data.Extract) and operand == instruction.aggregate and not Operand.is(operand, data.Constant) then
+                use_extracted(state, instruction, origin)
+            else
+                use(state, operand, origin)
+            end
+        end
+        each_transferred(instruction, operand -> transfer(state, operand, origin))
+        replay_effects(instruction, state, site)
+        if site then
+            acquire(state, site.after)
+            for id, contents in pairs site.after.contents do state.flow.contents[id] = contents end
+        end
+        if instruction.result then
+            for _, borrow in ipairs(borrows_of(values, data.Result { value = instruction.result, type = types.Unit })) do
+                if state.flow.borrows[borrow] == nil then state.flow.borrows[borrow] = data.Live {} end
+            end
+        end
+    end
+
+    -- the uses a terminator makes; edge captures transport references, they do not use them
+    local Ending = define
+        Jump = |terminator, recurse, state| -> nil
+        Branch = |terminator, recurse, state| -> use(state, terminator.condition, terminator.origin)
+        Return = do(terminator, recurse, state)
+            if terminator.value then
+                use(state, terminator.value, terminator.origin)
+                transfer(state, terminator.value, terminator.origin)
+            end
+        end
+        Trap = |terminator, recurse, state| -> use(state, terminator.message, terminator.origin)
+    end
+    local replay_terminator = Terminator.pass "replay a terminator's uses" with ..Ending end
+
+    -- one block from the states at its entry: answers the borrow states at its end, the owner
+    -- transfers before its edges, and each edge's transfers (branch edges are alternatives,
+    -- not two consecutive transfers)
+    local replay_block = do(block, states, moved, reporting)
+        local state = define
+            flow = data.FlowFacts { contents = {}, borrows = states, live_lifetimes = {} }
+            .moved
+            previous = published.entries[block.id]
+            observed = {}
+            .reporting
+            replay = replay_context()
+        end
+        if state.previous then
+            for id, contents in pairs state.previous.contents do state.flow.contents[id] = contents end
+        end
+        -- a block's parameters are new values each time it is entered
+        for index, parameter in ipairs block.arguments do
+            state.moved[data.operand_key(data.BlockArgument { block = block.id, .index, type = parameter.type })] = nil
+        end
+        for _, instruction in ipairs block.instructions do replay_instruction(state, instruction) end
+        for id in pairs state.flow.borrows do
+            if registry[id] == nil then state.flow.borrows[id] = nil end
+        end
+        local outgoing = graph.edges_of block.terminator
+        if outgoing[1] and published.edges[outgoing[1].id] then acquire(state, published.edges[outgoing[1].id].flow) end
+        replay_terminator(block.terminator, state)
+        local edge_moves = {}
+        local before_edges = state.moved
+        for _, edge in ipairs outgoing do
+            state.moved = copy_set before_edges
+            for _, argument in ipairs edge.arguments do transfer(state, argument, block.terminator.origin) end
+            edge_moves[edge.id] = state.moved
+        end
+        return state.flow.borrows, before_edges, edge_moves
+    end
+
+    -- the states a target block's entry receives along one edge: borrows carried by block
+    -- arguments, and references transported as path coordinates (the edge row's contents and
+    -- the target entry's identify their value flow)
     local carry = do(edge, states)
         local target = blocks_by_id[edge.target]
         local carried = copy_states states
@@ -337,92 +395,92 @@ local verify_definition = do(program, definition, published, analysis, report)
             local parameter = data.BlockArgument { block = edge.target, .index, type = target.arguments[index].type }
             local incoming = borrows_of(values, argument)
             for _, joined in ipairs(borrows_of(values, parameter)) do
-                local state = data.Live {}
+                local borrow_state = data.Live {}
                 for _, borrow in ipairs incoming do
                     local incoming_state = states[borrow]
-                    if incoming_state and BorrowState.is(incoming_state, data.Ended) then state = incoming_state end
+                    if incoming_state and BorrowState.is(incoming_state, data.Ended) then borrow_state = incoming_state end
                 end
-                carried[joined] = state
+                carried[joined] = borrow_state
             end
         end
-        -- Held references are transported as path coordinates, not native pointers. The
-        -- paired contents in the real edge row and target entry identify their value flow.
         local row, entry = published.edges[edge.id], published.entries[edge.target]
-        if row and entry then
-            local transferred_states = {}
-            local relate
-            relate = do(incoming, joined)
-                if data.NativeValue.is(incoming, data.Reference) and data.NativeValue.is(joined, data.Reference) then
-                    local state = states[incoming.borrow]
-                    local previous = transferred_states[joined.borrow]
-                    if state and (previous == nil or BorrowState.is(state, data.Ended)) then transferred_states[joined.borrow] = state end
-                elseif data.NativeValue.is(incoming, data.Aggregate) and data.NativeValue.is(joined, data.Aggregate) then
-                    for name, component in pairs joined.parts do
-                        if incoming.parts[name] then relate(incoming.parts[name], component) end
-                    end
-                end
-            end
-            for place, contents in pairs entry.contents do
-                local source = row.flow.contents[place]
-                if source and data.Contents.is(source, data.Tracked) and data.Contents.is(contents, data.Tracked) then relate(source.value, contents.value) end
-                if source and data.Contents.is(source, data.Resident) and data.Contents.is(contents, data.Resident) then
-                    local components = {}
-                    for key, part in pairs source.info.components do components[provenance.key(key)] = part end
-                    for key, part in pairs contents.info.components do
-                        local from = components[provenance.key(key)]
-                        if from and data.ComponentInfo.is(part, data.Borrowed) and data.ComponentInfo.is(from, data.Borrowed) then
-                            local state = states[from.borrow]
-                            local old = transferred_states[part.borrow]
-                            if state and (not old or BorrowState.is(state, data.Ended)) then transferred_states[part.borrow] = state end
-                        end
-                    end
-                end
-            end
-            for borrow, state in pairs transferred_states do carried[borrow] = state end
+        if not (row and entry) then return carried end
+        local transported = {}
+        local keep = do(joined, borrow_state)
+            local previous = transported[joined]
+            if borrow_state and (previous == nil or BorrowState.is(borrow_state, data.Ended)) then transported[joined] = borrow_state end
         end
+        for place, contents in pairs entry.contents do
+            local source = row.flow.contents[place]
+            if source and data.Contents.is(source, data.Tracked) and data.Contents.is(contents, data.Tracked) then
+                provenance.each_reference_pair(source.value, contents.value, |from, to| -> keep(to, states[from]))
+            end
+            if source and data.Contents.is(source, data.Resident) and data.Contents.is(contents, data.Resident) then
+                provenance.each_borrowed_pair(contents.info, source.info, |part, from| -> keep(part.borrow, states[from.borrow]))
+            end
+        end
+        for borrow, borrow_state in pairs transported do carried[borrow] = borrow_state end
         return carried
     end
 
-    -- iterate to a fixed point. It terminates without a bound: a borrow state only moves from
-    -- live to ended, and the set of transferred values at an entry only grows.
-    local order = {}
-    for _, block in ipairs definition.blocks do order[#order + 1] = block.id end
-    local changed = true
-    while changed do
-        changed = false
-        for _, id in ipairs order do
-            if entry_states[id] then
-                local states, moved, edge_moves = apply(blocks_by_id[id], copy_states(entry_states[id]), copy_set(entry_moved[id]), false)
-                for _, edge in ipairs(graph.edges_of(blocks_by_id[id].terminator)) do
-                    moved = edge_moves[edge.id]
-                    local carried = carry(edge, states)
-                    local known = entry_states[edge.target]
-                    if known == nil then
-                        entry_states[edge.target] = carried
-                        entry_moved[edge.target] = copy_set moved
-                        changed = true
-                    else
-                        for borrow, state in pairs carried do
-                            local previous = known[borrow]
-                            if previous == nil or (BorrowState.is(state, data.Ended) and BorrowState.is(previous, data.Live)) then
-                                known[borrow] = state
-                                changed = true
-                            end
-                        end
-                        for key in pairs moved do
-                            if not entry_moved[edge.target][key] then
-                                entry_moved[edge.target][key] = true
-                                changed = true
-                            end
-                        end
+    -- running until nothing changes (compiler guide §10.6). It terminates without a bound: a
+    -- borrow state only moves from live to ended, and the transfers at an entry only grow.
+    -- Then one reporting pass over the fixed point.
+    local run = do()
+        local entry_states, entry_moved = {}, {}
+        local initial = published.entries[definition.entry]
+        entry_states[definition.entry] = initial and copy_states(initial.borrows) or {}
+        entry_moved[definition.entry] = {}
+        local order = {}
+        for _, block in ipairs definition.blocks do order[#order + 1] = block.id end
+        local merge_into = do(target, carried, moved)
+            local known = entry_states[target]
+            if known == nil then
+                entry_states[target] = carried
+                entry_moved[target] = copy_set moved
+                return true
+            end
+            local changed = false
+            for borrow, borrow_state in pairs carried do
+                local previous = known[borrow]
+                if previous == nil or (BorrowState.is(borrow_state, data.Ended) and BorrowState.is(previous, data.Live)) then
+                    known[borrow] = borrow_state
+                    changed = true
+                end
+            end
+            for key in pairs moved do
+                if not entry_moved[target][key] then
+                    entry_moved[target][key] = true
+                    changed = true
+                end
+            end
+            return changed
+        end
+        local changed = true
+        while changed do
+            changed = false
+            for _, id in ipairs order do
+                if entry_states[id] then
+                    local states, _, edge_moves = replay_block(blocks_by_id[id], copy_states(entry_states[id]), copy_set(entry_moved[id]), false)
+                    for _, edge in ipairs(graph.edges_of(blocks_by_id[id].terminator)) do
+                        if merge_into(edge.target, carry(edge, states), edge_moves[edge.id]) then changed = true end
                     end
                 end
             end
         end
+        for _, id in ipairs order do
+            if entry_states[id] then replay_block(blocks_by_id[id], copy_states(entry_states[id]), copy_set(entry_moved[id]), true) end
+        end
     end
-    -- the reporting pass, over the fixed point
-    for _, id in ipairs order do
-        if entry_states[id] then apply(blocks_by_id[id], copy_states(entry_states[id]), copy_set(entry_moved[id]), true) end
+
+    return define
+        .run
+    end
+end
+
+local verify_definition = do(program, definition, published, analysis, report)
+    if check_published(definition, published, report) then
+        replaying(program, definition, published, analysis, report).run()
     end
 end
 

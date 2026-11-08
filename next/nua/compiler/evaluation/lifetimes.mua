@@ -1,0 +1,88 @@
+-- The evaluation vocabulary, part: The lifetime rule (syntax §9.5): what outlives what, and the
+-- checks of storing and rebinding borrows.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    -- a value written into a container's storage: each view it carries becomes a stored
+    -- borrow the container holds (rule 3: growth ends it)
+    -- does `a` outlive `b`? A place of an enclosing invocation outlives the callee's; within an
+    -- invocation, an enclosing block's outlives a nested one's, and in one block the earlier
+    -- declared outlives the later (releases run newest first)
+    E.outlives = do(a, b)
+        local first, second = compilation.place_scope[a], compilation.place_scope[b]
+        if first == nil or second == nil then return nil end
+        if first.level ~= second.level then return first.level < second.level end
+        for position, scope in ipairs first.scopes do
+            if second.scopes[position] ~= scope then return false end
+        end
+        if #first.scopes < #second.scopes then return true end
+        if #first.scopes > #second.scopes then return false end
+        return first.ordinal < second.ordinal
+    end
+    E.name_of = place -> compilation.place_scope[place] and compilation.place_scope[place].name or "a parameter's storage"
+
+    -- A held local may use a borrow in its owner's own scope (§9.5), but rebinding an
+    -- outer local cannot let a block-local owner escape. Check before loop agreement:
+    -- otherwise an illegal body-local root would acquire a new identity on every attempt.
+    E.check_local_borrow = do(path, holder, value)
+        if E.is_reference value then
+            local destination = compilation.place_scope[holder]
+            for _, origin in ipairs compilation.borrows[value.borrow].origins do
+                local source = compilation.place_scope[origin.place]
+                local same_scope = destination and source and destination.level == source.level and #destination.scopes == #source.scopes
+                if same_scope then
+                    for index, scope in ipairs source.scopes do if destination.scopes[index] ~= scope then same_scope = false end end
+                end
+                if not same_scope and E.outlives(holder, origin.place) then
+                    fail(path, ("a borrow of '%s' cannot be stored in '%s', which outlives it"):format(E.name_of(origin.place), E.name_of holder))
+                end
+            end
+        elseif E.is_aggregate value then
+            for _, member in pairs value.parts do E.check_local_borrow(path, holder, member) end
+        end
+    end
+
+    E.check_store = do(path, targets, info)
+        for _, target in ipairs targets do
+            for _, borrow in ipairs provenance.borrowed(info) do
+                for _, origin in ipairs compilation.borrows[borrow].origins do
+                    local root = compilation.places[target.place].root
+                    local source = compilation.places[origin.place].root
+                    local both_parameters = data.PlaceRoot.is(root, data.ParameterRoot) and data.PlaceRoot.is(source, data.ParameterRoot)
+                    local later = E.outlives(target.place, origin.place)
+                    if not both_parameters and (later or (later == nil and data.PlaceRoot.is(root, data.ParameterRoot))) then
+                        fail(path, ("a borrow of '%s' cannot be stored in '%s', which outlives it"):format(E.name_of(origin.place), E.name_of(target.place)))
+                    end
+                end
+            end
+        end
+    end
+    E.install_payload = do(path, holder, value)
+        for _, group in pairs memory.payloads(E.information(path, value)) do
+            local targets = { data.Access { place = holder, path = group.path } }
+            E.check_store(path, targets, group.info)
+            memory.store(path, targets, group.info, origin_of(path))
+        end
+    end
+end

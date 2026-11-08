@@ -23,13 +23,21 @@ local fail = do(message) error("facts: " .. message, 3) end
 
 local element_step = step -> AccessStep.is(step, data.KnownElement) or AccessStep.is(step, data.AnyElement)
 
+-- two steps of one kind overlap when they name the same field, element or alternative
+local SameKindSteps = define
+    FieldStep = |left, recurse, right| -> left.name == right.name
+    AlternativeStep = |left, recurse, right| -> left.name == right.name
+    KnownElement = |left, recurse, right| -> left.index == right.index
+    AnyElement = |left, recurse, right| -> true
+    ContentsStep = |left, recurse, right| -> true
+end
+local same_kind_steps_overlap = AccessStep.pass "do two steps of one kind overlap" with ..SameKindSteps end
 local steps_overlap = do(left, right)
+    -- an unknown element overlaps every element step
     if AccessStep.is(left, data.AnyElement) then return element_step right end
     if AccessStep.is(right, data.AnyElement) then return element_step left end
     if getmetatable left ~= getmetatable right then return false end
-    if AccessStep.is(left, data.KnownElement) then return left.index == right.index end
-    if AccessStep.is(left, data.FieldStep) or AccessStep.is(left, data.AlternativeStep) then return left.name == right.name end
-    return true
+    return same_kind_steps_overlap(left, right)
 end
 
 local paths_overlap = do(left, right)
@@ -82,76 +90,86 @@ local fork = do(flow)
     return data.FlowFacts { .contents, .borrows, .live_lifetimes }
 end
 
--- two operands denote the same value: one operand, or constants of one type with the same bits
+-- two operands denote the same value: one operand, or constants of one type with the same bits.
+-- Each comparison is a pass over its family for two values of one kind; the cases across kinds
+-- (identity, different kinds) are decided before it.
 local same_constant
+local SameConstants = define
+    IntegerBits = |a, recurse, b| -> a.bits == b.bits
+    FloatBits = |a, recurse, b| -> a.value == b.value
+    BooleanBit = |a, recurse, b| -> a.value == b.value
+    UnitBits = |a, recurse, b| -> true
+    StaticBytes = |a, recurse, b| -> a.bytes == b.bytes
+    SymbolAddress = |a, recurse, b| -> a.name == b.name and a.offset == b.offset
+    DefinitionAddress = |a, recurse, b| -> a.definition == b.definition
+    AggregateBits = do(a, recurse, b)
+        if #a.parts ~= #b.parts then return false end
+        for index, part in ipairs a.parts do
+            if not same_constant(part, b.parts[index]) then return false end
+        end
+        return true
+    end
+end
+local same_kind_constants = data.NativeConstant.pass "are two constants of one kind the same" with ..SameConstants end
 same_constant = do(a, b)
     if a == b then return true end
     if getmetatable a ~= getmetatable b then return false end
-    local NativeConstant = data.NativeConstant
-    if NativeConstant.is(a, data.IntegerBits) then return a.bits == b.bits end
-    if NativeConstant.is(a, data.FloatBits) or NativeConstant.is(a, data.BooleanBit) then return a.value == b.value end
-    if NativeConstant.is(a, data.UnitBits) then return true end
-    if NativeConstant.is(a, data.StaticBytes) then return a.bytes == b.bytes end
-    if NativeConstant.is(a, data.SymbolAddress) then return a.name == b.name and a.offset == b.offset end
-    if NativeConstant.is(a, data.DefinitionAddress) then return a.definition == b.definition end
-    if #a.parts ~= #b.parts then return false end
-    for index, part in ipairs a.parts do
-        if not same_constant(part, b.parts[index]) then return false end
-    end
-    return true
+    return same_kind_constants(a, b)
 end
+
+local SameOperands = define
+    Constant = |a, recurse, b| -> a.type == b.type and same_constant(a.bits, b.bits)
+    Parameter = |a, recurse, b| -> a.definition == b.definition and a.index == b.index
+    BlockArgument = |a, recurse, b| -> a.block == b.block and a.index == b.index
+    Result = |a, recurse, b| -> a.value == b.value
+end
+local same_kind_operands = data.Operand.pass "are two operands of one kind the same" with ..SameOperands end
 local same_operand = do(a, b)
     if a == b then return true end
-    if data.Operand.is(a, data.Constant) and data.Operand.is(b, data.Constant) then
-        return a.type == b.type and same_constant(a.bits, b.bits)
-    end
     if getmetatable a ~= getmetatable b then return false end
-    if data.Operand.is(a, data.Result) then return a.value == b.value end
-    if data.Operand.is(a, data.BlockArgument) then return a.block == b.block and a.index == b.index end
-    return a.definition == b.definition and a.index == b.index
+    return same_kind_operands(a, b)
 end
 
 -- two native values are the same: the same operand, or records whose parts are all the same
 -- (or that are one packed operand)
 local same_value
+local SameValues = define
+    Bits = |a, recurse, b| -> same_operand(a.operand, b.operand)
+    Owned = |a, recurse, b| -> same_operand(a.header, b.header)
+    Reference = |a, recurse, b| -> a.borrow == b.borrow
+    Aggregate = do(a, recurse, b)
+        local a_parts, b_parts = next(a.parts) ~= nil, next(b.parts) ~= nil
+        if not a_parts and not b_parts then return a.packed ~= nil and b.packed ~= nil and same_operand(a.packed, b.packed) end
+        if not a_parts or not b_parts then return false end
+        for name, part in pairs a.parts do
+            if b.parts[name] == nil or not same_value(part, b.parts[name]) then return false end
+        end
+        for name in pairs b.parts do
+            if a.parts[name] == nil then return false end
+        end
+        return true
+    end
+end
+local same_kind_values = data.NativeValue.pass "are two native values of one kind the same" with ..SameValues end
 same_value = do(a, b)
     if a == b then return true end
     if getmetatable a ~= getmetatable b or a.type ~= b.type then return false end
-    if data.NativeValue.is(a, data.Bits) then return same_operand(a.operand, b.operand) end
-    if data.NativeValue.is(a, data.Owned) then return same_operand(a.header, b.header) end
-    if data.NativeValue.is(a, data.Reference) then return a.borrow == b.borrow end
-    local a_parts, b_parts = next(a.parts) ~= nil, next(b.parts) ~= nil
-    if not a_parts and not b_parts then return a.packed ~= nil and b.packed ~= nil and same_operand(a.packed, b.packed) end
-    if not a_parts or not b_parts then return false end
-    for name, part in pairs a.parts do
-        if b.parts[name] == nil or not same_value(part, b.parts[name]) then return false end
-    end
-    for name in pairs b.parts do
-        if a.parts[name] == nil then return false end
-    end
-    return true
+    return same_kind_values(a, b)
 end
 
--- contents agree when they are the same record, or track the same native value or operand
+-- contents agree when they are the same record, or track the same native value; uninitialized
+-- contents agree with each other, moved and resident ones only with themselves
+local SameContents = define
+    Uninitialized = |left, recurse, right| -> true
+    Tracked = |left, recurse, right| -> same_value(left.value, right.value)
+    Resident = |left, recurse, right| -> false
+    Moved = |left, recurse, right| -> false
+end
+local same_kind_contents = Contents.pass "do two contents of one kind agree" with ..SameContents end
 local same_contents = do(left, right)
     if left == right then return true end
     if getmetatable left ~= getmetatable right then return false end
-    if Contents.is(left, data.Tracked) then
-        local a, b = left.value, right.value
-        if a == b then return true end
-        if data.NativeValue.is(a, data.Aggregate) then return same_value(a, b) end
-        if data.NativeValue.is(a, data.Bits) and data.NativeValue.is(b, data.Bits) then
-            return a.type == b.type and same_operand(a.operand, b.operand)
-        end
-        if data.NativeValue.is(a, data.Owned) and data.NativeValue.is(b, data.Owned) then
-            return a.type == b.type and same_operand(a.header, b.header)
-        end
-        if data.NativeValue.is(a, data.Reference) and data.NativeValue.is(b, data.Reference) then
-            return a.type == b.type and a.borrow == b.borrow
-        end
-        return false
-    end
-    return Contents.is(left, data.Uninitialized)
+    return same_kind_contents(left, right)
 end
 
 -- capabilities: `borrows`, the activity's registry of borrow records (a map it owns);
@@ -195,19 +213,31 @@ local tracking = do(capabilities)
         return info
     end
 
+    -- how to obtain a live borrow's pointer, by its form: a held borrow derives it from its
+    -- path (or reuses the one cached since its storage last moved), a stored borrow has it
+    -- fixed, a selected borrow dispatches on its selector
+    local Using = define
+        Held = do(form, recurse, state)
+            if state.pointer then return BorrowUse.cached state.pointer end
+            return BorrowUse.derive form.path
+        end
+        Stored = do(form, recurse, state)
+            if form.pointer == nil then fail("resident provenance must be loaded before use") end
+            return BorrowUse.fixed form.pointer
+        end
+        Selected = do(form, recurse, state)
+            if state.pointer then return BorrowUse.cached state.pointer end
+            return BorrowUse.select form
+        end
+    end
+    local use_form = BorrowForm.pass "how a live borrow's pointer is obtained" with ..Using end
     -- how to obtain a borrow's pointer here, or why it cannot be used
     local use = do(flow, borrow)
         local info = info_of borrow
         local state = flow.borrows[borrow]
         if state == nil then fail(identity.describe borrow .. " is not known on this path") end
         if BorrowState.is(state, Ended) then return BorrowUse.ended state end
-        if BorrowForm.is(info.form, data.Stored) then
-            if info.form.pointer == nil then fail("resident provenance must be loaded before use") end
-            return BorrowUse.fixed info.form.pointer
-        end
-        if state.pointer then return BorrowUse.cached state.pointer end
-        if BorrowForm.is(info.form, data.Selected) then return BorrowUse.select info.form end
-        return BorrowUse.derive info.form.path
+        return use_form(info.form, state)
     end
 
     -- remember the pointer derived for a held borrow, until its storage moves
@@ -227,19 +257,27 @@ local tracking = do(capabilities)
         return stored
     end
 
+    -- whether storage at `access` relocating ends a borrow (rule 3, buffers §2.3): a stored
+    -- borrow's fixed pointer does; a held one is re-derived; a selected one ends if any stored
+    -- alternative is of that storage
+    local Growth = define
+        Held = |form, recurse, access| -> false
+        Stored = |form, recurse, access| -> true
+        Selected = do(form, recurse, access)
+            for _, alternative in ipairs form.alternatives do
+                if BorrowForm.is(alternative.form, data.Stored) and touches(alternative, access) then return true end
+            end
+            return false
+        end
+    end
+    local ended_by_growth = BorrowForm.pass "whether relocating storage ends a borrow" with ..Growth end
     -- storage at `access` may relocate: held borrows forget their pointer; stored ones end
     local moves = do(flow, access, at)
         for id, state in pairs flow.borrows do
             if BorrowState.is(state, Live) then
                 local info = info_of id
                 if touches(info, access) then
-                    local stored = BorrowForm.is(info.form, data.Stored)
-                    if BorrowForm.is(info.form, data.Selected) then
-                        for _, alternative in ipairs info.form.alternatives do
-                            if BorrowForm.is(alternative.form, data.Stored) and touches(alternative, access) then stored = true end
-                        end
-                    end
-                    if stored then
+                    if ended_by_growth(info.form, access) then
                         flow.borrows[id] = Ended { .at, reason = "grew" }
                     elseif state.pointer then
                         flow.borrows[id] = Live {}
@@ -269,14 +307,10 @@ local tracking = do(capabilities)
         return OwnerMove.moved contents.value
     end
 
-    -- the facts after several incoming paths join. Borrow states join: ended on any edge is
-    -- ended; a cached pointer survives only where every edge has the same one. Contents that
-    -- agree are kept; the places whose contents differ are named, for the activity to give
-    -- them block arguments, edge stores or releases. A lifetime is live if live on every edge.
-    local agree = do(incoming)
-        if #incoming == 0 then fail("agree needs at least one incoming path") end
+    -- the contents that agree on every incoming path, and the places whose contents differ
+    -- (or exist on some paths only), in identity order
+    local agree_contents = do(incoming, joined)
         local first = incoming[1]
-        local joined = empty()
         local differing = {}
         for place, contents in pairs first.contents do
             local agreeing = true
@@ -292,8 +326,14 @@ local tracking = do(capabilities)
             end
         end
         table.sort(differing, |a, b| -> a.serial < b.serial)
-        -- Memory facts may exist on just one incoming arm. Their borrowed components
-        -- remain facts on that arm; the evaluator joins resident components separately.
+        return differing
+    end
+    -- the state of each borrow after the join: ended on any path is ended; a cached pointer
+    -- survives only where every path has the same one. A borrow made on one path only does not
+    -- exist after the join, unless memory holds it on another path (memory facts may exist on
+    -- one arm only; the evaluator joins resident components separately): there it is held in
+    -- the state it has where it exists.
+    local agree_borrows = do(incoming, joined)
         local held_anywhere = {}
         for _, flow in ipairs incoming do
             for _, contents in pairs flow.contents do
@@ -312,34 +352,41 @@ local tracking = do(capabilities)
             local result = nil
             for _, flow in ipairs incoming do
                 local state = flow.borrows[id]
-                if state == nil and held_anywhere[id] then
-                    -- a stored borrow a container holds on another path: it is held after the
-                    -- join, in the state it has where it exists
-                elseif state == nil then
-                    -- a borrow made on one path only does not exist after the join
-                    result = false
-                    break
-                end
                 if state == nil then
-                    -- nothing to contribute from a path where it does not exist
+                    if not held_anywhere[id] then
+                        result = false
+                        break
+                    end
                 elseif BorrowState.is(state, Ended) then
                     result = state
                     break
                 elseif result == nil then
                     result = state
-                elseif BorrowState.is(result, Live) and result.pointer ~= state.pointer then
+                elseif result.pointer ~= state.pointer then
                     result = Live {}
                 end
             end
             if result then joined.borrows[id] = result end
         end
-        for lifetime in pairs first.live_lifetimes do
+    end
+    -- a lifetime is live after the join if it is live on every path
+    local agree_lifetimes = do(incoming, joined)
+        for lifetime in pairs incoming[1].live_lifetimes do
             local everywhere = true
             for position = 2, #incoming do
                 if not incoming[position].live_lifetimes[lifetime] then everywhere = false end
             end
             if everywhere then joined.live_lifetimes[lifetime] = true end
         end
+    end
+    -- the facts after several incoming paths join: the activity gives the differing places
+    -- block arguments, edge stores or releases
+    local agree = do(incoming)
+        if #incoming == 0 then fail("agree needs at least one incoming path") end
+        local joined = empty()
+        local differing = agree_contents(incoming, joined)
+        agree_borrows(incoming, joined)
+        agree_lifetimes(incoming, joined)
         return JoinDecision { flow = joined, .differing }
     end
 

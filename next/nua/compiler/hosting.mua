@@ -62,6 +62,13 @@ end
 
 local saturated = application -> #application.supplied == #application.word.requirements
 
+-- a primitive: one of the few operations the compiler supplies to the Nua library (trap, effect
+-- declarations, views, element references, drop), named so evaluation can dispatch on it
+local Primitive = {}
+Primitive.__tostring = primitive -> primitive.name
+local primitive = name -> setmetatable({ .name }, Primitive)
+local is_primitive = value -> getmetatable value == Primitive
+
 return define
     .word
     .is_word
@@ -69,5 +76,7 @@ return define
     .supply
     .supplied_of
     .saturated
+    .primitive
+    .is_primitive
     application = |word_value, arguments| -> supply(setmetatable({ word = word_value, supplied = {} }, Application), arguments)
 end

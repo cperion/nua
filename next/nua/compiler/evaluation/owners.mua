@@ -1,0 +1,107 @@
+-- The evaluation vocabulary, part: Owners: release at scope ends, returns and conditional moves; methods and traps.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- releasing owners (syntax §9.2): a buffer through its library's release word, a record
+    -- through its owning fields; the place is moved, its borrows end
+
+    E.release_value = do(path, value)
+        if E.is_aggregate value and E.is_buffer value.type then
+            local words = library.buffer_words(value.type.element)
+            local holder = E.new_place(path, "released", value.type)
+            path.flow.contents[holder.id] = data.Tracked { .value }
+            E.invoke(path, words.release, { E.reference_to(path, E.place_cell(holder.id, "released")) })
+            path.flow.contents[holder.id] = data.Moved { at = origin_of path }
+            return
+        end
+        if E.is_aggregate value and types.owns value.type then
+            for _, field in ipairs(E.fields_of value.type) do
+                if types.owns field.type then E.release_value(path, E.part(path, value, field.name)) end
+            end
+        end
+    end
+    E.release_place = do(path, place)
+        local contents = path.flow.contents[place]
+        if not contents or not (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)) then return end
+        local value = Contents.is(contents, data.Resident) and E.load(path, compilation.places[place]) or contents.value
+        path.flow.contents[place] = data.Moved { at = origin_of path }
+        append(path, data.Ends { site = site path, target = data.Access { .place, path = {} }, reason = "released" })
+        E.release_value(path, value)
+    end
+    -- release the live owners among `places`, from index `first`, newest first
+    E.release_live = do(path, places, first)
+        for position = #places, first, -1 do
+            local place = places[position]
+            if types.owns(compilation.places[place].type) then E.release_place(path, place) end
+        end
+    end
+
+    -- the end of a block: its owners that are still live are released, newest first
+    -- blocks open and close scopes: a place's scope chain decides what it outlives (§9.5)
+    E.scope_begin = do(path)
+        local invocation = path.invocation
+        if invocation == nil then return end
+        invocation.scopes = invocation.scopes or {}
+        invocation.scope_count = (invocation.scope_count or 0) + 1
+        invocation.scopes[#invocation.scopes + 1] = invocation.scope_count
+    end
+    E.scope_end = do(path, declared)
+        local invocation = path.invocation
+        if invocation and invocation.scopes and #invocation.scopes > 0 then invocation.scopes[#invocation.scopes] = nil end
+        if path.dead then return end
+        for position = #declared, 1, -1 do
+            local cell = declared[position]
+            if cells.Cell.is(cell, cells.PlaceCell) and types.owns(compilation.places[cell.place].type) then E.release_place(path, cell.place) end
+        end
+    end
+
+    -- `trap "why"`: the path ends here, at run time, with the message
+    E.trap = do(path, message)
+        local constant = data.Constant { type = types.Str, bits = data.StaticBytes { bytes = tostring message } }
+        terminate(path, data.Trap { origin = origin_of path, message = constant })
+        path.dead = true
+        return nil
+    end
+
+    -- `value:name(arguments)`: a method of the value's type, given a reference to the value
+    E.method = do(path, base, name, arguments, boundary)
+        if path.dead then return nil end
+        local receiver_value = E.is_cell base and E.peek(path, base) or base
+        if E.is_reference receiver_value and data.BorrowForm.is(compilation.borrows[receiver_value.borrow].form, data.Selected) then
+            return E.dispatch_reference(path, receiver_value, |arm, selected| -> E.method(arm, selected, name, arguments, boundary))
+        end
+        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
+        if not (E.is_aggregate value and E.is_buffer value.type) then fail(path, ("':%s' of %s is not available yet"):format(name, is_native value and types.describe value.type or tostring value)) end
+        local words = library.buffer_words(value.type.element)
+        local word = words[name]
+        if word == nil then fail(path, ("%s has no method '%s'"):format(types.describe value.type, name)) end
+        local receiver = E.is_cell base and E.reference_to(path, base) or base
+        if not E.is_reference receiver then fail(path, ("':%s' needs a local holding the %s"):format(name, types.describe value.type)) end
+        local supplied = { receiver }
+        for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
+        return E.apply(path, word, supplied, boundary)
+    end
+
+end

@@ -1,0 +1,86 @@
+-- The path (compiler activities §4): the handle every evaluation verb receives. It holds where code
+-- goes (the writer and its current block), what is known there (the flow facts), the invocation
+-- and innermost loop it belongs to, how deep in dynamic control it is, and the source line. A join
+-- replaces its block and facts; a branch arm or loop round has a path of its own. A path stopped by
+-- a reconsideration request carries it, so no error is used as control. The fields are
+-- closed: a path is made only by the constructors below.
+
+local shapes = require "nua.shapes"
+local identity = require "nua.identity"
+
+local Path = struct {
+    writer: Table, block: Optional(identity.BlockId), flow: Optional(Table),
+    invocation: Optional(Table), loop: Optional(Table),
+    depth: shapes.Natural, guarded: shapes.Natural,
+    source: Optional(String), line: Optional(Number), dead: Boolean,
+    definition: Optional(identity.DefinitionId),
+    -- a reconsideration request this path stopped for (compiler activities §4.1): the drivers
+    -- between here and its target propagate it; only the target consumes it
+    request: Optional(Table),
+}
+
+-- the entry of a definition: no invocation yet, at depth 0
+local entry = |writer, block, flow, source, line, definition| -> Path with
+    .writer
+    .block
+    .flow
+    depth = 0
+    guarded = 0
+    .source
+    .line
+    dead = false
+    .definition
+end
+
+-- a branch arm or a loop round: one level deeper in dynamic control
+local child = |path, writer, block, flow| -> Path with
+    .writer
+    .block
+    .flow
+    invocation = path.invocation
+    loop = path.loop
+    depth = path.depth + 1
+    guarded = path.guarded
+    source = path.source
+    line = path.line
+    dead = false
+    definition = path.definition
+end
+
+-- the same control context continuing in another block (an incoming edge of a join, a round's
+-- header or continuing edge)
+local continuing = |path, writer, block, flow| -> Path with
+    writer = writer or path.writer
+    .block
+    .flow
+    invocation = path.invocation
+    loop = path.loop
+    depth = path.depth
+    guarded = path.guarded
+    source = path.source
+    line = path.line
+    dead = false
+    definition = path.definition
+end
+
+-- the body of an inline invocation: the caller's depth, the callee's source, no loop
+local callee = |path, invocation, writer, block, flow, word| -> Path with
+    .writer
+    .block
+    .flow
+    .invocation
+    depth = path.depth
+    guarded = path.guarded
+    source = word.source
+    line = word.line
+    dead = false
+    definition = path.definition
+end
+
+return define
+    .Path
+    .entry
+    .child
+    .continuing
+    .callee
+end

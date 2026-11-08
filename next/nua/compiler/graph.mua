@@ -215,6 +215,16 @@ local definitions_in_order = do(program)
     return list
 end
 
+-- the definitions a definition calls directly, as a set
+local called_definitions = do(definition)
+    local called = {}
+    for _, block in ipairs definition.blocks do
+        for _, instruction in ipairs block.instructions do
+            if Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then called[instruction.callee.definition] = true end
+        end
+    end
+    return called
+end
 local edges_of = do(terminator)
     if Terminator.is(terminator, data.Jump) then return { terminator.edge } end
     if Terminator.is(terminator, data.Branch) then return { terminator.when_true, terminator.when_false } end
@@ -275,10 +285,48 @@ local rewrite = do(pass, program, state)
     return data.Program { ..program, revision = program.revision + 1, .definitions }
 end
 
--- the identity rewrite every rewrite extends by spread: each kind stands for itself
+-- The two bases a pass over instructions extends by spread (writing compilers §10.2), each
+-- naming every kind, so a new kind fails, by name, every pass until its base learns it:
+-- the identity rewrite, where each kind stands for itself, and the inert walk, where each kind
+-- contributes nothing.
 local itself = node -> { node }
-local Unchanged = {}
-for _, kind in ipairs Instruction.kinds do Unchanged[kind] = itself end
+local Unchanged = define
+    Compute = itself
+    Pack = itself
+    Extract = itself
+    Load = itself
+    Store = itself
+    Address = itself
+    Check = itself
+    Invoke = itself
+    Atomic = itself
+    Fence = itself
+    LifetimeStart = itself
+    LifetimeEnd = itself
+    Moves = itself
+    Ends = itself
+    Budget = itself
+    Mechanism = itself
+end
+local nothing = do() end
+local Inert = define
+    Compute = nothing
+    Pack = nothing
+    Extract = nothing
+    Load = nothing
+    Store = nothing
+    Address = nothing
+    Check = nothing
+    Invoke = nothing
+    Atomic = nothing
+    Fence = nothing
+    LifetimeStart = nothing
+    LifetimeEnd = nothing
+    Moves = nothing
+    Ends = nothing
+    Budget = nothing
+    Mechanism = nothing
+end
 
 ------------------------------------------------------------------------------------------------
 -- Comparing programs: the same kinds, constants and types, and the same structure of
@@ -473,8 +521,10 @@ return define
     .walk
     .rewrite
     .Unchanged
+    .Inert
     .edges_of
     .definitions_in_order
+    .called_definitions
     same = same_program
     print = print_program
 end

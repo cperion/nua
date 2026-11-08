@@ -1,0 +1,180 @@
+-- The evaluation vocabulary, part: Binding cells: the names of a typed body, their places, and reading and writing them (passes over the cell family).
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local paths_of = require "nua.compiler.evaluation.path"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+
+    E.is_cell = cells.is_cell
+
+    E.place_cell = |place, name| -> cells.PlaceCell { .place, .name }
+    E.host_cell = |path, name, value| -> cells.HostCell { .name, .value, depth = path.depth }
+
+    -- An invocation local, or a completion temporary with its result's explicit lifetime.
+    -- Both are declared on the writer; a temporary needs only a fresh local identity namespace.
+    E.new_place = do(path, name, type, lifetime)
+        local invocation = path.invocation
+        local ordinal = invocation and #invocation.places + 1 or 1
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            .type
+            root = data.LocalRoot { invocation = invocation and invocation.id or fresh(identity.InvocationId), local_index = ordinal }
+            path = {}
+            lifetime = invocation and invocation.lifetime or assert(lifetime, "a completion temporary needs its result lifetime")
+            origin = origin_of path
+        end
+        if invocation then invocation.places[ordinal] = place.id end
+        compilation.places[place.id] = place
+        local chain = {}
+        for position, scope in ipairs(invocation and invocation.scopes or {}) do chain[position] = scope end
+        compilation.place_scope[place.id] = { level = invocation and invocation.level or 0, scopes = chain, .ordinal, .name }
+        path.writer.declare place
+        return place
+    end
+
+    E.bind = do(path, name, annotation, value)
+        if path.dead then return nil end
+        if annotation ~= nil and not check(types.NativeType, annotation) then
+            fail(path, ("the local '%s' is annotated with %s, not a native type"):format(name, tostring annotation))
+        end
+        if annotation == nil and not is_native value then
+            if value == nil then fail(path, ("the local '%s' needs a type or a value"):format(name)) end
+            return E.host_cell(path, name, value)
+        end
+        local type = annotation or value.type
+        local place = E.new_place(path, name, type)
+        if value ~= nil then
+            local converted = E.from_host(path, type, value, "the value of '" .. name .. "'")
+            E.check_local_borrow(path, place.id, converted)
+            path.flow.contents[place.id] = data.Tracked { value = converted }
+            if types.owns(type) then E.install_payload(path, place.id, converted) end
+        else
+            path.flow.contents[place.id] = data.Uninitialized {}
+        end
+        return E.place_cell(place.id, name)
+    end
+
+    E.argument = |path, index| -> path.invocation.arguments[index]
+
+    E.get = do(path, cell)
+        if path.dead then return nil end
+        local value = E.peek(path, cell)
+        -- using an owner as a value moves it (syntax §9.2)
+        if cells.Cell.is(cell, cells.PlaceCell) and types.owns(compilation.places[cell.place].type) then
+            local previous = E.information(path, value)
+            local info = memory.capture(path.flow, cell.place, previous)
+            if next(memory.payloads(info)) or next(memory.payloads(previous)) then
+                local operand = E.materialize(path, value)
+                path.writer.remember(operand, info)
+                value = data.Aggregate { ..value, packed = operand }
+            end
+            if Contents.is(path.flow.contents[cell.place], data.Resident) then path.flow.contents[cell.place] = data.Tracked { .value } end
+            append(path, data.Ends { site = site path, target = data.Access { place = cell.place, path = {} }, reason = "moved" })
+            tracking.move_owner(path.flow, cell.place, origin_of path)
+        end
+        return value
+    end
+
+    -- reading a cell: one handler per kind of binding cell
+    local Peeking = define
+        PlaceCell = do(cell, recurse, path)
+            local contents = path.flow.contents[cell.place]
+            if contents == nil or Contents.is(contents, data.Uninitialized) then fail(path, ("'%s' is read before it is assigned"):format(cell.name)) end
+            if Contents.is(contents, data.Moved) then fail(path, ("'%s' was moved"):format(cell.name)) end
+            if Contents.is(contents, data.Resident) then return E.load(path, compilation.places[cell.place]) end
+            return contents.value
+        end
+        HostCell = |cell, recurse, path| -> cell.value
+        FieldCell = do(cell, recurse, path)
+            local whole = E.deref(path, recurse(cell.base, path))
+            if not E.is_aggregate whole then fail(path, ("'.%s' of a value that is not a record"):format(cell.name)) end
+            return E.part(path, whole, cell.name)
+        end
+        RawCell = |cell, recurse, path| -> E.load(path, cell.place)
+        ElementCell = |cell, recurse, path| -> E.method(path, cell.base, "get", { cell.key }, false)
+    end
+    local peek_cell = cells.Cell.pass "read a binding cell" with ..Peeking end
+    E.peek = do(path, cell)
+        if not E.is_cell cell then return cell end
+        return peek_cell(cell, path)
+    end
+
+    -- writing a cell: one handler per kind of binding cell
+    local Setting = define
+        ElementCell = do(cell, recurse, path, value)
+            E.method(path, cell.base, "set", { cell.key, value }, false)
+        end
+        FieldCell = do(cell, recurse, path, value)
+            local whole = E.deref(path, E.peek(path, cell.base))
+            if not E.is_aggregate whole then fail(path, ("'.%s' of a value that is not a record"):format(cell.name)) end
+            local field = E.field_of(whole.type, cell.name)
+            if field == nil then fail(path, ("%s has no field '%s'"):format(types.describe whole.type, cell.name)) end
+            local exploded = E.explode(path, whole)
+            local parts = {}
+            for name, existing in pairs exploded.parts do parts[name] = existing end
+            parts[cell.name] = E.stored_borrow(path, E.from_host(path, field.type, value, ("the field '%s'"):format(cell.name)))
+            recurse(cell.base, path, data.Aggregate { type = whole.type, packed = nil, .parts })
+        end
+        RawCell = do(cell, recurse, path, value)
+            local stored = E.from_host(path, cell.place.type, value, "the stored value")
+            append(path, data.Store { site = site path, place = cell.place.id, value = E.materialize(path, stored) })
+        end
+        HostCell = do(cell, recurse, path, value)
+            if path.depth > cell.depth and not is_native value and value ~= cell.value then
+                fail(path, ("the host binding '%s' cannot be rebound under dynamic control"):format(cell.name))
+            end
+            if is_native value then fail(path, ("'%s' holds a host value and cannot take a native one"):format(cell.name)) end
+            cell.value = value
+        end
+        PlaceCell = do(cell, recurse, path, value)
+            local type = compilation.places[cell.place].type
+            if types.NativeType.is(type, types.ReferenceType) and (not E.is_reference(value) or value.type ~= type) then
+                return E.write_reference(path, E.peek(path, cell), value, cell.name)
+            end
+            local converted = E.from_host(path, type, value, "the value assigned to '" .. cell.name .. "'")
+            E.check_local_borrow(path, cell.place, converted)
+            -- An addressed place remains resident while its value is live: subsequent writes
+            -- must reach references already stored elsewhere, not just a compiler-side cache.
+            local resident = path.flow.contents[cell.place] and Contents.is(path.flow.contents[cell.place], data.Resident)
+            if types.owns type then E.release_place(path, cell.place) end
+            if resident then
+                append(path, data.Store { site = site(path), place = cell.place, value = E.materialize(path, converted) })
+                if not types.borrows(type) then path.flow.contents[cell.place] = data.Resident { info = E.information(path, converted) } end
+            else path.flow.contents[cell.place] = data.Tracked { value = converted } end
+            if types.owns(type) then E.install_payload(path, cell.place, converted) end
+        end
+    end
+    local set_cell = cells.Cell.pass "write a binding cell" with ..Setting end
+    E.set = do(path, cell, value)
+        if path.dead then return nil end
+        if not E.is_cell cell then fail(path, "this is not something a typed body can assign") end
+        set_cell(cell, path, value)
+    end
+
+    E.host_number = do(path, value)
+        if lua_type value == "number" then return value end
+        local constant = E.constant_of value
+        if constant and rules.is_integer constant.type then return tonumber(rules.integer_value constant) end
+        fail(path, "a generation-time for needs host numbers or known integers; use a typed for with a dynamic bound")
+    end
+end

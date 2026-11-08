@@ -1,0 +1,155 @@
+-- The evaluation vocabulary, part: Borrows crossing a native boundary: provenance at a
+-- definition's entry, and returned borrows re-rooted at the caller.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    E.reached_type = do(origin, steps)
+        local type = compilation.places[origin.place].type
+        local position = 1
+        while position <= #steps do
+            if not E.is_buffer(type) or not data.AccessStep.is(steps[position], data.ContentsStep) or not steps[position + 1] then return nil end
+            type = type.element
+            position += 2
+        end
+        return type
+    end
+    E.incoming_indices = do(origin, steps, arguments)
+        local indices = {}
+        local position = 0
+        for depth, step in ipairs steps do
+            if data.AccessStep.is(step, data.KnownElement) or data.AccessStep.is(step, data.AnyElement) then
+                position += 1
+                if data.AccessStep.is(step, data.KnownElement) then indices[position] = rules.integer(types.U64, step.index)
+                else
+                    for _, argument in pairs arguments do
+                        local form = compilation.borrows[argument.borrow].form
+                        if data.BorrowForm.is(form, data.Held) and form.path.root == origin.place and #form.path.steps >= depth and facts.paths_overlap(form.path.steps, steps) then
+                            indices[position] = form.path.indices and form.path.indices[position]
+                        end
+                    end
+                    if indices[position] == nil then return nil end
+                end
+            end
+        end
+        return indices
+    end
+    E.reroot_reference = do(path, reference, arguments)
+        local info = compilation.borrows[reference.borrow]
+        if #info.origins ~= 1 then return reference end
+        local origin = info.origins[1]
+        if E.reached_type(origin, origin.path) ~= reference.type.target then return reference end
+        local indices = E.incoming_indices(origin, origin.path, arguments)
+        if indices == nil and #origin.path >= 2 and data.AccessStep.is(origin.path[#origin.path], data.AnyElement) then
+            local steps = {}
+            for index = 1, #origin.path - 2 do steps[index] = origin.path[index] end
+            local parent_indices = E.incoming_indices(origin, steps, arguments)
+            if parent_indices then
+                local reached = E.reach_path(path, data.BorrowPath { root = origin.place, .steps, indices = parent_indices }, reference.borrow)
+                local header
+                if cells.is_raw(reached) then header = E.load(path, reached.place)
+                else
+                    local contents = path.flow.contents[reached.place]
+                    header = contents and Contents.is(contents, data.Tracked) and contents.value or E.load(path, compilation.places[reached.place])
+                end
+                if E.is_buffer(header.type) then
+                    local pointer = E.emit_compute(path, "reinterpret", types.pointer(reference.type.target), { info.form.pointer })
+                    local distance = E.compute(path, "pointer_difference", types.I64, { pointer, E.part(path, header, "data") })
+                    local offset = E.compute(path, "convert", types.U64, { distance })
+                    indices = parent_indices
+                    indices[#indices + 1] = offset.operand
+                end
+            end
+        end
+        if indices == nil then return reference end
+        info = data.BorrowInfo { ..info, form = data.Held { path = data.BorrowPath { root = origin.place, steps = origin.path, .indices } }, lifetime = compilation.places[origin.place].lifetime }
+        compilation.borrows[info.id] = info
+        path.writer.borrow(info)
+        return reference
+    end
+    E.reroot_view = do(path, view, arguments)
+        local info = compilation.borrows[view.borrow]
+        if #info.origins ~= 1 then return view end
+        local origin = info.origins[1]
+        if not origin.path[#origin.path] or not data.AccessStep.is(origin.path[#origin.path], data.ContentsStep) then return view end
+        local steps = {}
+        for index = 1, #origin.path - 1 do steps[index] = origin.path[index] end
+        local type = E.reached_type(origin, steps)
+        if not type or not E.is_buffer(type) then return view end
+        local indices = E.incoming_indices(origin, steps, arguments)
+        if indices == nil then return view end
+        local start, count = E.view_parts(path, view)
+        local reached = E.reach_path(path, data.BorrowPath { root = origin.place, .steps, .indices }, view.borrow)
+        local header = cells.is_raw(reached) and E.load(path, reached.place) or nil
+        if header == nil then
+            local contents = path.flow.contents[reached.place]
+            header = contents and Contents.is(contents, data.Tracked) and contents.value or E.load(path, compilation.places[reached.place])
+        end
+        if not E.is_buffer(header.type) then return view end
+        local offset = E.compute(path, "pointer_difference", types.I64, { start, E.part(path, header, "data") })
+        local first = E.compute(path, "convert", types.U64, { offset })
+        local form = data.Held { path = data.BorrowPath { root = origin.place, steps = origin.path, .indices, range = data.Range { first = first.operand, count = count.operand } } }
+        info = data.BorrowInfo { ..info, .form, lifetime = compilation.places[origin.place].lifetime }
+        compilation.borrows[info.id] = info
+        path.writer.borrow(info)
+        return view
+    end
+
+    -- Symbolic provenance of unobserved components at a native entry. Paths through a
+    -- borrowed component are substituted with that component's actual origins at the call.
+    -- Each kind adds its components under `component_path` of `components`: a reference or a
+    -- view is a stored borrow of the storage at `target`, a buffer owns, a record has its
+    -- fields', every other type carries nothing.
+    local symbolic_borrow = do(native_type, recurse, path, target, component_path, components)
+        local suffix = types.NativeType.is(native_type, types.ViewType) and { data.ContentsStep {} } or {}
+        local root = memory.intern(target, native_type, path.writer)
+        local info = data.BorrowInfo { id = fresh(identity.BorrowId), form = data.Stored {}, origins = { data.Access { place = root.id, path = suffix } }, mutable = native_type.mutable == true or types.NativeType.is(native_type, types.ReferenceType), lifetime = root.lifetime, acquired = origin_of(path) }
+        compilation.borrows[info.id], path.flow.borrows[info.id] = info, data.Live {}
+        components[component_path] = data.Borrowed { borrow = info.id }
+    end
+    local nothing_symbolic = |native_type, recurse, path, target, component_path, components| -> nil
+    local add_symbolic = types.NativeType.pass "the symbolic components of a type at a native entry" with
+        IntegerType = nothing_symbolic
+        FloatType = nothing_symbolic
+        BooleanType = nothing_symbolic
+        UnitType = nothing_symbolic
+        PointerType = nothing_symbolic
+        ReferenceType = symbolic_borrow
+        ViewType = symbolic_borrow
+        FixedArrayType = nothing_symbolic
+        RecordType = do(native_type, recurse, path, target, component_path, components)
+            for _, field in ipairs native_type.fields do
+                local field_target = data.Access { place = target.place, path = provenance.concat(target.path, { data.FieldStep { name = field.name } }) }
+                recurse(field.type, path, field_target, provenance.concat(component_path, { data.FieldComponent { name = field.name } }), components)
+            end
+        end
+        SumType = nothing_symbolic
+        BufferType = |native_type, recurse, path, target, component_path, components| -> do components[component_path] = data.Owning {} end
+        FunctionType = nothing_symbolic
+    end
+    E.symbolic_info = do(path, native_type, target, component_path)
+        local components = {}
+        add_symbolic(native_type, path, target, component_path or {}, components)
+        return data.ValueInfo { type = native_type, .components, proofs = {} }
+    end
+end

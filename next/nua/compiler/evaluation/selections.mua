@@ -1,0 +1,113 @@
+-- The evaluation vocabulary, part: Selected borrows (compiler activities §2.4): capturing, instantiating and dispatching a borrow chosen by control.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local paths_of = require "nua.compiler.evaluation.path"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+
+    -- Selected borrows carry a finite schema and SSA coordinates, not payload pointers.
+    E.zero_operand = do(native_type)
+        if types.NativeType.is(native_type, types.ViewType) then
+            return data.Constant { type = native_type, bits = data.AggregateBits { parts = { data.IntegerBits { bits = 0ULL }, data.IntegerBits { bits = 0ULL } } } }
+        end
+        return data.Constant { type = native_type, bits = data.IntegerBits { bits = 0ULL } }
+    end
+    E.capture_borrow = do(path, value, schema)
+        local info = compilation.borrows[value.borrow]
+        local alternatives = borrow_paths.alternatives info
+        local positions, by_key = {}, {}
+        for index, alternative in ipairs schema do positions[borrow_paths.key alternative] = index - 1 end
+        for _, alternative in ipairs alternatives do by_key[borrow_paths.key alternative] = alternative end
+        local mapped = do(index) return E.known(rules.integer(types.U64, assert(positions[borrow_paths.key(alternatives[index])], "borrow schema has not reached agreement"))) end
+        local selected = mapped(1)
+        if data.BorrowForm.is(info.form, data.Selected) then
+            local choose
+            choose = do(at, index)
+                if index == #alternatives then return mapped(index) end
+                return E.choose(at, E.operate(at, "equal", E.bits(types.U64, info.form.selector), index - 1), arm -> mapped(index), arm -> choose(arm, index + 1))
+            end
+            local identity_mapping = true
+            for index in ipairs alternatives do if positions[borrow_paths.key(alternatives[index])] ~= index - 1 then identity_mapping = false end end
+            selected = identity_mapping and E.bits(types.U64, info.form.selector) or choose(path, 1)
+        end
+        local operands = { selected.operand }
+        for _, alternative in ipairs schema do
+            local incoming = by_key[borrow_paths.key alternative]
+            local coordinates = incoming and borrow_paths.coordinates(incoming)
+            for index, exemplar in ipairs(borrow_paths.coordinates alternative) do
+                operands[#operands + 1] = coordinates and coordinates[index] or E.zero_operand(exemplar.type)
+            end
+        end
+        return operands
+    end
+    E.instantiate_borrow = do(path, native_type, schema, take, state, lifetime)
+        local selector = take(types.U64)
+        local alternatives, origins = {}, {}
+        for _, alternative in ipairs schema do
+            local form = borrow_paths.instantiate(alternative, take)
+            alternatives[#alternatives + 1] = data.BorrowAlternative { .form, origins = alternative.origins }
+            origins = borrow_paths.union(origins, alternative.origins)
+        end
+        local form = #alternatives == 1 and alternatives[1].form or data.Selected { .selector, .alternatives }
+        local info = data.BorrowInfo { id = fresh identity.BorrowId, .form, .origins, mutable = native_type.mutable == true or types.NativeType.is(native_type, types.ReferenceType), .lifetime, acquired = origin_of path }
+        compilation.borrows[info.id] = info
+        path.flow.borrows[info.id] = state or data.Live {}
+        path.writer.borrow info
+        for _, alternative in ipairs alternatives do
+            if data.BorrowForm.is(alternative.form, data.Stored) then remember_reference(path, alternative.form.pointer, info.id) end
+        end
+        return data.Reference { type = native_type, borrow = info.id }
+    end
+
+    -- Dispatch a selected reference with ordinary control. Each arm's entry relates the
+    -- selected value to its leaf through one temporary place, for independent lifetime replay.
+    E.dispatch_reference = do(path, reference, run)
+        local info = compilation.borrows[reference.borrow]
+        local state = assert(path.flow.borrows[reference.borrow])
+        if data.BorrowState.is(state, data.Ended) then fail(path, ("a borrow is used after it ended (%s)"):format(state.reason)) end
+        if not data.BorrowForm.is(info.form, data.Selected) then return run(path, reference) end
+        local temporary = E.new_place(path, "selected reference", reference.type, info.lifetime)
+        path.flow.contents[temporary.id] = data.Tracked { value = reference }
+        local leaf = do(arm, index)
+            local alternative = info.form.alternatives[index]
+            local selected = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = alternative.form, origins = alternative.origins }
+            compilation.borrows[selected.id] = selected
+            arm.flow.borrows[selected.id] = arm.flow.borrows[reference.borrow]
+            local value = data.Reference { type = reference.type, borrow = selected.id }
+            arm.flow.contents[temporary.id] = data.Tracked { .value }
+            enter arm
+            local result = run(arm, value)
+            arm.flow.contents[temporary.id] = nil
+            return result or E.known(data.Constant { type = types.Unit, bits = data.UnitBits {} })
+        end
+        local choose
+        choose = do(at, index)
+            local condition = E.operate(at, "equal", E.bits(types.U64, info.form.selector), index - 1)
+            return E.residual_branch(at, condition.operand, arm -> leaf(arm, index), do(arm)
+                if index + 1 == #info.form.alternatives then return leaf(arm, index + 1) end
+                return choose(arm, index + 1)
+            end, true)
+        end
+        return choose(path, 1)
+    end
+end

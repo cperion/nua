@@ -1,0 +1,122 @@
+-- The evaluation vocabulary, part: Statements of control: branches, returns, tail re-entries, break and continue.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- statements of control
+
+    -- A body's outcome is its path's state: live (it fell through), dead with its exits
+    -- registered (returned, broke, continued), or dead carrying a reconsideration request.
+    -- `fall` and `stop` are the forms a hosted body returns through; they carry nothing more.
+    E.fall = path -> nil
+    E.stop = path -> nil
+
+    E.branch = do(path, condition, when_true, when_false)
+        local operand, value = E.truth(path, condition)
+        if operand == nil then
+            if value then when_true path else when_false path end
+            return
+        end
+        E.residual_branch(path, operand, when_true, when_false, nil)
+    end
+
+    E.return_value = do(path, value)
+        if path.dead then return nil end
+        local invocation = path.invocation
+        local result_type = invocation.word.result
+        if result_type == types.Unit then
+            if value ~= nil and not (is_native value and value.type == types.Unit) then fail(path, invocation.word.name .. " yields Unit and returns no value") end
+            value = E.from_host(path, types.Unit, nil, "the result")
+        else
+            if value == nil then fail(path, invocation.word.name .. " must return " .. types.describe result_type) end
+            value = E.from_host(path, result_type, value, "the result of " .. invocation.word.name)
+        end
+        -- a word returns borrows of what it received, never of its own locals (syntax §9.5):
+        -- releasing the word's owners is what ends such a borrow, so a borrow live before the
+        -- releases and ended after them borrowed a local
+        local live_before = E.is_reference value and path.flow.borrows[value.borrow]
+            and data.BorrowState.is(path.flow.borrows[value.borrow], data.Live)
+        E.release_live(path, invocation.places, 1)
+        if live_before then
+            local state = path.flow.borrows[value.borrow]
+            if state and data.BorrowState.is(state, data.Ended) then
+                local origin = compilation.borrows[value.borrow].origins[1]
+                local name = compilation.place_scope[origin.place] and compilation.place_scope[origin.place].name or "a local"
+                fail(path, ("%s returns a borrow of its own local '%s', which ends with it"):format(invocation.word.name, name))
+            end
+        end
+        invocation.exits[#invocation.exits + 1] = { block = path.block, flow = path.flow, .value }
+        path.dead = true
+        return nil
+    end
+
+    -- `return f args`: a tail re-entry of the invocation under dynamic control is the next round
+    -- of its loop; the first one met discards the attempt that found it (syntax §6.2)
+    E.return_tail = do(path, callee, arguments)
+        if path.dead then return nil end
+        local invocation = path.invocation
+        local word, supplied = hosting.supplied_of callee
+        if word ~= nil and word == invocation.word then
+            local application = hosting.supply(hosting.application(word, supplied), arguments)
+            local dynamic_control = path.depth > invocation.entry_depth or path.guarded > invocation.entry_guarded
+            if hosting.saturated application and (dynamic_control or invocation.loop_mode) then
+                -- the attempt that found it is reconsidered as a loop: the request stops this path,
+                -- the drivers in between propagate it, the invocation consumes it
+                if not invocation.loop_mode then
+                    path.request = { .invocation }
+                    path.dead = true
+                    return nil
+                end
+                -- the next arguments, all captured before any parameter is assigned
+                local values = {}
+                for index, requirement in ipairs word.requirements do
+                    local argument = application.supplied[index]
+                    values[index] = requirement.type and E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name)) or argument
+                end
+                for index in ipairs word.requirements do E.set(path, invocation.arguments[index], values[index]) end
+                local work = invocation.tail_loop
+                work.continues[#work.continues + 1] = { block = path.block, flow = path.flow }
+                path.dead = true
+                return nil
+            end
+        end
+        return E.return_value(path, E.apply(path, callee, arguments, false))
+    end
+
+    E.break_loop = do(path)
+        if path.loop == nil then fail(path, "break is not inside a loop") end
+        if path.invocation then E.release_live(path, path.invocation.places, (path.loop.places_mark or 0) + 1) end
+        path.loop.breaks[#path.loop.breaks + 1] = { block = path.block, flow = path.flow }
+        path.dead = true
+        return nil
+    end
+    E.next_loop = do(path)
+        if path.loop == nil then fail(path, "continue is not inside a loop") end
+        if path.invocation then E.release_live(path, path.invocation.places, (path.loop.places_mark or 0) + 1) end
+        path.loop.continues[#path.loop.continues + 1] = { block = path.block, flow = path.flow }
+        path.dead = true
+        return nil
+    end
+
+end

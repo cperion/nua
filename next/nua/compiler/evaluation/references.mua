@@ -1,0 +1,194 @@
+-- The evaluation vocabulary, part: References: Ref of a local, what a reference reaches through current headers, element references, and writing through them.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local paths_of = require "nua.compiler.evaluation.path"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+
+    -- references: `Ref x` is a held borrow of x's place; reading through it reads that place's
+    -- current contents, writing writes them (buffers §2.3)
+    E.reference_to = do(path, cell)
+        if not (cells.Cell.is(cell, cells.PlaceCell)) then fail(path, "Ref takes a local of the body") end
+        local place_type = compilation.places[cell.place].type
+        local contents = path.flow.contents[cell.place]
+        if types.NativeType.is(place_type, types.ReferenceType) and contents and Contents.is(contents, data.Tracked) then return contents.value end
+        local lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = cell.place, steps = {} }, true, lifetime, origin_of path)
+        return data.Reference { type = types.reference place_type, borrow = info.id }
+    end
+    -- where a reference reaches: a tracked place, or (for an element path) a raw place
+    -- derived from the root's current header, element by element
+    E.reach_path = do(path, borrow_path, borrow)
+        if #borrow_path.steps == 0 then return cells.TrackedPlace { place = borrow_path.root } end
+        local contents = path.flow.contents[borrow_path.root]
+        local header
+        if contents and Contents.is(contents, data.Resident) then
+            header = E.load(path, compilation.places[borrow_path.root])
+        elseif contents and Contents.is(contents, data.Tracked) then
+            header = E.deref(path, contents.value)
+        else
+            fail(path, "a reference reaches a place that holds no value")
+        end
+        local element_type = compilation.places[borrow_path.root].type
+        local place = nil
+        local index_position = 0
+        for position = 1, #borrow_path.steps, 2 do
+            if place then header = E.load(path, place) end
+            element_type = header.type.element
+            index_position += 1
+            local data_pointer = E.part(path, header, "data")
+            local index = E.bits(types.U64, borrow_path.indices[index_position])
+            place = data.Place with
+                id = fresh identity.PlaceId
+                type = element_type
+                root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index }).operand, .borrow }
+                path = {}
+                lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+                origin = origin_of path
+            end
+            compilation.places[place.id] = place
+            path.writer.declare place
+        end
+        return cells.RawPlace { .place }
+    end
+    E.reach = do(path, reference)
+        local use = tracking.use(path.flow, reference.borrow)
+        return use with
+            derive = p -> E.reach_path(path, p, reference.borrow)
+            cached = pointer -> E.reach_path(path, compilation.borrows[reference.borrow].form.path, reference.borrow)
+            select = selected -> error("a selected reference must be dispatched before reaching its place", 0)
+            fixed = do(pointer)
+                local place = data.Place {
+                    id = fresh identity.PlaceId, type = reference.type.target,
+                    root = data.IndirectRoot { .pointer, borrow = reference.borrow }, path = {},
+                    lifetime = compilation.borrows[reference.borrow].lifetime, origin = origin_of path,
+                }
+                compilation.places[place.id] = place
+                path.writer.declare place
+                return cells.RawPlace { .place }
+            end
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+        end
+    end
+    E.resident_place = do(path, place)
+        local contents = path.flow.contents[place.id]
+        if contents and Contents.is(contents, data.Tracked) then
+            local info = E.information(path, contents.value)
+            append(path, data.Store { site = site(path), place = place.id, value = E.materialize(path, contents.value) })
+            if not types.borrows(place.type) then path.flow.contents[place.id] = data.Resident { .info } end
+        end
+    end
+    E.pack_reference = do(path, reference)
+        if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return E.materialize(path, E.dispatch_reference(path, reference, |arm, leaf| -> E.bits(reference.type, E.pack_reference(arm, leaf))))
+        end
+        local reached = E.reach(path, reference)
+        local pointer
+        if cells.is_raw(reached) then pointer = reached.place.root.pointer
+        else
+            local place = compilation.places[reached.place]
+            E.resident_place(path, place)
+            local result = fresh(identity.ValueId)
+            append(path, data.Address { site = site(path), .result, place = place.id })
+            pointer = data.Result { value = result, type = types.pointer(place.type) }
+        end
+        local operand = E.compute(path, "reinterpret", reference.type, { E.bits(pointer.type, pointer) }).operand
+        local stored = tracking.store(path.flow, reference.borrow, operand, origin_of(path))
+        remember_reference(path, operand, stored.id)
+        return operand
+    end
+    -- the value a reference reaches (a reference to a reference reaches through both)
+    E.deref = do(path, value)
+        if not E.is_reference value or not types.NativeType.is(value.type, types.ReferenceType) then return value end
+        if data.BorrowForm.is(compilation.borrows[value.borrow].form, data.Selected) then
+            return E.dispatch_reference(path, value, E.deref)
+        end
+        local reached = E.reach(path, value)
+        if cells.is_raw(reached) then return E.load(path, reached.place) end
+        local contents = path.flow.contents[reached.place]
+        if contents and Contents.is(contents, data.Resident) then
+            local loaded = E.load(path, compilation.places[reached.place])
+            return loaded
+        end
+        if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
+        return E.deref(path, contents.value)
+    end
+    -- a reference to element `index` of the buffer `reference` reaches (buffers §2.3)
+    E.element_reference = do(path, reference, index)
+        if E.is_reference reference and data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return E.dispatch_reference(path, reference, |arm, selected| -> E.element_reference(arm, selected, index))
+        end
+        local base_path
+        if E.is_reference reference then
+            local info = compilation.borrows[reference.borrow]
+            local use = tracking.use(path.flow, reference.borrow)
+            base_path = use with
+                derive = p -> p
+                select = selected -> error("a selected element reference must be dispatched", 0)
+                cached = pointer -> info.form.path
+                fixed = pointer -> fail(path, "a stored reference is not available yet")
+                ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+            end
+        else
+            fail(path, "an element reference starts from a reference to a buffer")
+        end
+        index = E.from_host(path, types.U64, index, "the index")
+        local steps, indices = {}, {}
+        for position, step in ipairs base_path.steps do steps[position] = step end
+        for position, operand in ipairs(base_path.indices or {}) do indices[position] = operand end
+        local constant = E.constant_of index
+        steps[#steps + 1] = data.ContentsStep {}
+        steps[#steps + 1] = constant and data.KnownElement { index = tonumber(rules.integer_value constant) } or data.AnyElement {}
+        indices[#indices + 1] = index.operand
+        local element_type = reference.type.target.element
+        local base_info = compilation.borrows[reference.borrow]
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, .steps, .indices }, true, base_info.lifetime, origin_of path)
+        local origins = {}
+        for _, origin in ipairs base_info.origins do
+            local extended = {}
+            for position, step in ipairs origin.path do extended[position] = step end
+            extended[#extended + 1] = data.ContentsStep {}
+            extended[#extended + 1] = steps[#steps]
+            origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+        end
+        info = data.BorrowInfo { ..info, .origins }
+        compilation.borrows[info.id] = info
+        return data.Reference { type = types.reference element_type, borrow = info.id }
+    end
+
+    E.write_reference = do(path, reference, value, name)
+        if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return E.dispatch_reference(path, reference, |arm, selected| -> E.write_reference(arm, selected, value, name))
+        end
+        local reached = E.reach(path, reference)
+        local place = cells.is_raw(reached) and reached.place or compilation.places[reached.place]
+        local written = E.from_host(path, place.type, value, "the value written through '" .. name .. "'")
+        local contents = path.flow.contents[place.id]
+        if cells.is_raw(reached) or (contents and Contents.is(contents, data.Resident)) then
+            append(path, data.Store { site = site path, place = place.id, value = E.materialize(path, written) })
+        else
+            path.flow.contents[place.id] = data.Tracked { value = written }
+        end
+    end
+
+end

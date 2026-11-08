@@ -179,8 +179,11 @@ local verify_graph = do(program)
         else
             if #entry.arguments > 0 then report(definition, "the entry block takes parameters; a definition's inputs are its Parameters", definition.origin) end
             local dominates = dominators_of(definition, blocks_by_id)
-            local defined_before = do(operand, block, position, origin)
-                if Operand.is(operand, data.Result) then
+            -- an operand is available where it is used: a result defined before it, a block
+            -- argument of a dominating block, a parameter of this definition; a constant always
+            local defined_before = Operand.pass "is an operand available where it is used" with
+                Constant = |operand, recurse, block, position, origin| -> nil
+                Result = do(operand, recurse, block, position, origin)
                     local found = where_defined[operand.value]
                     if found == nil then
                         report(definition, identity.describe(operand.value) .. " is used but never defined", origin)
@@ -189,7 +192,8 @@ local verify_graph = do(program)
                     elseif not dominates(found.block, block) then
                         report(definition, identity.describe(operand.value) .. " does not dominate its use", origin)
                     end
-                elseif Operand.is(operand, data.BlockArgument) then
+                end
+                BlockArgument = do(operand, recurse, block, position, origin)
                     local owner = blocks_by_id[operand.block]
                     if owner == nil then
                         report(definition, "a block argument of a block outside the definition is used", origin)
@@ -200,7 +204,8 @@ local verify_graph = do(program)
                     elseif owner.arguments[operand.index].type ~= operand.type then
                         report(definition, "a block argument is used at a type other than its parameter's", origin)
                     end
-                elseif Operand.is(operand, data.Parameter) then
+                end
+                Parameter = do(operand, recurse, block, position, origin)
                     if operand.definition ~= definition.id then
                         report(definition, "a parameter of another definition is used", origin)
                     elseif operand.index > #definition.signature.parameters then
@@ -210,26 +215,28 @@ local verify_graph = do(program)
                     end
                 end
             end
+            -- an edge stays in the definition and passes what its target takes
+            local check_edge = do(block, terminator, edge)
+                local target = blocks_by_id[edge.target]
+                if target == nil then
+                    report(definition, "an edge of " .. identity.describe(block.id) .. " leaves the definition", terminator.origin)
+                elseif #edge.arguments ~= #target.arguments then
+                    report(definition, ("an edge into %s passes %d arguments for %d parameters"):format(identity.describe(edge.target), #edge.arguments, #target.arguments), terminator.origin)
+                else
+                    for index, argument in ipairs edge.arguments do
+                        if argument.type ~= target.arguments[index].type then
+                            report(definition, ("argument %d of an edge into %s is %s, not %s"):format(index, identity.describe(edge.target), types.describe(argument.type), types.describe(target.arguments[index].type)), terminator.origin)
+                        end
+                    end
+                end
+            end
             for _, block in ipairs definition.blocks do
                 for position, instruction in ipairs block.instructions do
                     for _, operand in ipairs(operands_of instruction) do defined_before(operand, block.id, position, instruction.site.origin) end
                 end
                 local terminator = block.terminator
                 for _, operand in ipairs(terminator_operands terminator) do defined_before(operand, block.id, nil, terminator.origin) end
-                for _, edge in ipairs(graph.edges_of terminator) do
-                    local target = blocks_by_id[edge.target]
-                    if target == nil then
-                        report(definition, "an edge of " .. identity.describe(block.id) .. " leaves the definition", terminator.origin)
-                    elseif #edge.arguments ~= #target.arguments then
-                        report(definition, ("an edge into %s passes %d arguments for %d parameters"):format(identity.describe(edge.target), #edge.arguments, #target.arguments), terminator.origin)
-                    else
-                        for index, argument in ipairs edge.arguments do
-                            if argument.type ~= target.arguments[index].type then
-                                report(definition, ("argument %d of an edge into %s is %s, not %s"):format(index, identity.describe(edge.target), types.describe(argument.type), types.describe(target.arguments[index].type)), terminator.origin)
-                            end
-                        end
-                    end
-                end
+                for _, edge in ipairs(graph.edges_of terminator) do check_edge(block, terminator, edge) end
             end
         end
     end
@@ -401,6 +408,20 @@ local verify_types = do(program, capabilities)
             end
         end
         local type_of = Instruction.pass "the type an instruction yields" with ..Typing end
+        -- a branch decides on a Bool; a return yields the definition's result type
+        local check_terminator = Terminator.pass "check a terminator's types" with
+            Jump = |node, recurse| -> nil
+            Branch = |node, recurse| -> expect(node.condition, types.Bool, "a branch condition", node.origin)
+            Return = do(node, recurse)
+                local result = definition.signature.result
+                if node.value then
+                    expect(node.value, result, "the returned value", node.origin)
+                elseif result ~= types.Unit then
+                    report(definition, "a return without a value from a definition yielding " .. types.describe(result), node.origin)
+                end
+            end
+            Trap = |node, recurse| -> nil
+        end
         for _, block in ipairs definition.blocks do
             for _, instruction in ipairs block.instructions do
                 local yielded = type_of instruction
@@ -422,15 +443,7 @@ local verify_types = do(program, capabilities)
             end
             local terminator = block.terminator
             for _, operand in ipairs(terminator_operands terminator) do claims(operand, terminator.origin) end
-            if Terminator.is(terminator, data.Branch) then expect(terminator.condition, types.Bool, "a branch condition", terminator.origin) end
-            if Terminator.is(terminator, data.Return) then
-                local result = definition.signature.result
-                if terminator.value then
-                    expect(terminator.value, result, "the returned value", terminator.origin)
-                elseif result ~= types.Unit then
-                    report(definition, "a return without a value from a definition yielding " .. types.describe(result), terminator.origin)
-                end
-            end
+            check_terminator terminator
         end
     end
     return problems

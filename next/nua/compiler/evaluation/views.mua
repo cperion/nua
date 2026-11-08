@@ -1,0 +1,154 @@
+-- The evaluation vocabulary, part: Views: held borrows of a buffer's contents, derived from its
+-- current header; stored views fixed where they are written.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+    --------------------------------------------------------------------------------------------
+    -- views (buffers §2.3): a held borrow of a buffer's contents is a path from the buffer's
+    -- place with a range; each use derives the pointer from the buffer's current header, so
+    -- growth never ends it, and shrinking or clearing does
+
+
+    -- `view_of(self, first, count)`: the primitive a buffer's words make views with
+    E.make_view = do(path, reference, first, count)
+        if not (E.is_reference reference and types.NativeType.is(reference.type, types.ReferenceType)) then fail(path, "view_of takes a reference to a buffer") end
+        if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
+            return E.dispatch_reference(path, reference, |arm, selected| -> E.make_view(arm, selected, first, count))
+        end
+        -- Constructing a held view records its path; it does not derive an address.
+        local state = assert(path.flow.borrows[reference.borrow])
+        if data.BorrowState.is(state, data.Ended) then fail(path, ("a borrow is used after it ended (%s)"):format(state.reason)) end
+        local buffer_type = reference.type.target
+        local base_info = compilation.borrows[reference.borrow]
+        local base = base_info.form
+        if not data.BorrowForm.is(base, data.Held) then fail(path, "a held view through this stored header reference is not available yet") end
+        local steps = {}
+        for index, step in ipairs base.path.steps do steps[index] = step end
+        steps[#steps + 1] = data.ContentsStep {}
+        if not E.is_buffer buffer_type then fail(path, "view_of takes a reference to a buffer") end
+        first = E.from_host(path, types.U64, first, "the first element of the view")
+        count = E.from_host(path, types.U64, count, "the length of the view")
+        local borrow_path = data.BorrowPath { root = base.path.root, .steps, indices = base.path.indices, range = data.Range { first = first.operand, count = count.operand } }
+        local info = tracking.borrow(path.flow, borrow_path, false, base_info.lifetime, origin_of path)
+        local origins = {}
+        for _, origin in ipairs base_info.origins do
+            local extended = {}
+            for position, step in ipairs origin.path do extended[position] = step end
+            extended[#extended + 1] = data.ContentsStep {}
+            origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+        end
+        info = data.BorrowInfo { ..info, .origins }
+        compilation.borrows[info.id] = info
+        return data.Reference { type = types.view(buffer_type.element), borrow = info.id }
+    end
+
+    -- the pointer to a view's first element here, and its count
+    E.view_pair_types = {}
+    E.view_parts = do(path, view)
+        local info = compilation.borrows[view.borrow]
+        if data.BorrowForm.is(info.form, data.Selected) then
+            local pair_type = E.view_pair_types[view.type]
+            if pair_type == nil then
+                pair_type = types.record("view coordinates", { { name = "data", type = types.pointer(view.type.element) }, { name = "length", type = types.U64 } })
+                E.view_pair_types[view.type] = pair_type
+            end
+            local pair = E.dispatch_reference(path, view, do(arm, selected)
+                local start, count = E.view_parts(arm, selected)
+                return data.Aggregate { type = pair_type, parts = { data = start, length = count } }
+            end)
+            return E.part(path, pair, "data"), E.part(path, pair, "length")
+        end
+        local use = tracking.use(path.flow, view.borrow)
+        return use with
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+            fixed = do(packed)
+                local start, count = fresh identity.ValueId, fresh identity.ValueId
+                local pointer_type = types.pointer view.type.element
+                append(path, data.Extract { site = site path, result = start, type = pointer_type, aggregate = packed, path = { data.FieldComponent { name = "data" } } })
+                append(path, data.Extract { site = site path, result = count, type = types.U64, aggregate = packed, path = { data.FieldComponent { name = "length" } } })
+                return E.bits(pointer_type, data.Result { value = start, type = pointer_type }), E.bits(types.U64, data.Result { value = count, type = types.U64 })
+            end
+            select = selected -> error("a selected view must be dispatched", 0)
+            cached = pointer -> fail(path, "a cached view pointer is not available yet")
+            derive = do(borrow_path)
+                local steps = {}
+                for index = 1, #borrow_path.steps - 1 do steps[index] = borrow_path.steps[index] end
+                local reached = E.reach_path(path, data.BorrowPath { root = borrow_path.root, .steps, indices = borrow_path.indices }, view.borrow)
+                local contents = cells.Reached.is(reached, cells.TrackedPlace) and path.flow.contents[reached.place]
+                local header
+                if cells.is_raw(reached) then
+                    header = E.load(path, reached.place)
+                elseif contents and Contents.is(contents, data.Resident) then
+                    header = E.load(path, compilation.places[reached.place])
+                elseif contents and Contents.is(contents, data.Tracked) then
+                    header = E.deref(path, contents.value)
+                else
+                    fail(path, "a view reaches a buffer that holds no value")
+                end
+                local first = E.bits(types.U64, borrow_path.range.first)
+                local data_pointer = E.part(path, header, "data")
+                local start = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, first })
+                return start, E.bits(types.U64, borrow_path.range.count)
+            end
+        end
+    end
+
+    -- A reference/view written into a record is stored: its pointer (and a view's
+    -- count) is fixed there, including when its source was selected or held.
+    E.stored_borrow = do(path, view)
+        if not E.is_reference(view) then return view end
+        local info = compilation.borrows[view.borrow]
+        if data.BorrowForm.is(info.form, data.Stored) then return view end
+        local packed = E.is_view(view) and E.pack_view(path, view) or E.pack_reference(path, view)
+        local stored = tracking.store(path.flow, view.borrow, packed, origin_of path)
+        remember_reference(path, packed, stored.id)
+        return data.Reference { type = view.type, borrow = stored.id }
+    end
+
+    -- a view as a value in memory: its current pointer and count, packed
+    E.pack_view = do(path, view)
+        local start, count = E.view_parts(path, view)
+        local result = fresh identity.ValueId
+        append(path, data.Pack { site = site path, .result, type = view.type, components = { start.operand, count.operand } })
+        local operand = data.Result { value = result, type = view.type }
+        remember_reference(path, operand, view.borrow)
+        return operand
+    end
+
+    E.view_element = do(path, view, index)
+        local start, count = E.view_parts(path, view)
+        index = E.from_host(path, types.U64, index, "the index")
+        E.branch(path, E.operate(path, "greater_equal", index, count), at_end -> E.trap(at_end, "index out of range"), inside -> nil)
+        local place = data.Place with
+            id = fresh identity.PlaceId
+            type = view.type.element
+            root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", start.type, { start, index }).operand, borrow = view.borrow }
+            path = {}
+            lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+            origin = origin_of path
+        end
+        path.writer.declare place
+        return E.load(path, place)
+    end
+end

@@ -54,25 +54,31 @@ marked *built* exist with tests; the others are implementation targets.
 | `nua/identity.mua` *built* | The identity brands of §1.2, `supply`, `describe` | `shapes` |
 | `nua/types.mua` *built* | The native-type family, interned constructors, `describe`, `owns`, `borrows`, `layout` | `shapes` |
 | `nua/compiler/data.mua` *built* | The records of §2–§3, from `values`, `places`, `program`, `contracts`; `operand_key` | `shapes`, `identity`, `types` |
-| `nua/compiler/rules.mua` *built* | `check_types`, `fold`, constant constructors: the native rules of §3.2 | `types`, `data` |
-| `nua/compiler/graph.mua` *built* | `building`, `seal`, `index`, `walk`, `rewrite`, `Unchanged`, `same`, `print` | `data` |
+| `nua/compiler/rules.mua` *built* | `check_types`, `fold`, constant constructors: the native rules of §3.2, one entry per opcode (its operands, type rule and folds) | `types`, `data` |
+| `nua/compiler/graph.mua` *built* | `building`, `seal`, `index`, `walk`, `rewrite`, `same`, `print`, `called_definitions`; the bases `Unchanged` (identity rewrite) and `Inert` (a walk contributing nothing), each naming every instruction kind | `data` |
 | `nua/compiler/facts.mua` *built* | `fork`, `empty`, `tracking` (`borrow`, `use`, `cache`, `store`, `moves`, `ends`, `move_owner`, `agree`, `join_borrows`, `overlap`) | `data` |
 | `nua/compiler/verify.mua` *built* | `shape`, `graph`, `types`, `all` | `data`, `graph`, `rules` |
-| `nua/compiler/verify_lifetimes.mua` *built* | `lifetimes` | `data`, `graph`, `facts`, `verify` |
-| `nua/compiler/evaluate.mua` *built (scalars, records, control, calls)* | `evaluating`: the vocabulary of §5.2, with branches and loops (§6.1, §6.2) | `data`, `graph`, `facts`, `rules`; supplied definition capability and Nua word bindings |
-| `nua/compiler/control.mua` | `branching`, `looping`, `complete_exits` | `data`, `graph`, `facts`; supplied evaluation capability |
-| `nua/compiler/definitions.mua` *built (specialization, recursion, tail loops; contracts not yet)* | `defining`, `request`, `define_export` | `data`, `graph`, `facts`; supplied evaluation capability |
+| `nua/compiler/verify_lifetimes.mua` *built* | `lifetimes` | `data`, `graph`, `facts`, `verify`, `provenance`, `boundaries` |
+| `nua/compiler/provenance.mua` *built* | Component keys and paths, accesses through borrows, value facts and their shared walks (`by_key`, `each_borrowed_pair`, `each_reference_pair`, `extracted_by`, `components_under`, `weak_store`); `working`, the memory facts of one activity | `data`, `types`, `identity`, `borrow_paths`, `rules` |
+| `nua/compiler/boundaries.mua` *built* | `project` (a definition's boundary contract), `fingerprint`, `apply` (a call: each calling context its callee reaches replayed over the callee's graph to a fixed point) | `data`, `graph`, `verify`, `facts`, `effects`, `provenance`, `borrow_paths` |
+| `nua/compiler/evaluate.mua` *built* | `evaluating(compilation, capabilities)`: assembles the one vocabulary of §5.2 from its parts | the parts below; `capabilities` = definitions and library, wired by `compile` |
+| `nua/compiler/evaluation/core.mua` *built* | The construction capabilities every part uses: supply, borrow tracking, memory facts, diagnostics, `append`/`enter`/`terminate` (facts kept with the instructions they emit) | `data`, `facts`, `provenance`, `effects` |
+| `nua/compiler/evaluation/path.mua`, `cells.mua` *built* | `Path` (one record, four constructors: `entry`, `child`, `continuing`, `callee`); the binding-cell and reach families | `shapes`, `identity` |
+| `nua/compiler/evaluation/{values,records,joins,selections,bindings,references,computation,control,loops,application,owners,views,lifetimes,crossings,operations}.mua` *built* | Each a part `do(E, core)` adding its verbs to `E`: host values and truth; records and buffer headers; joins and dynamic branches; selected borrows (§2.4); binding cells and their places (peek and set as passes); references and what they reach; operators; control statements; loops (§6.2); invocation and native calls; owner release; views; the lifetime rule (syntax §9.5); borrows crossing native boundaries; application (a dispatcher over references, primitives, types, mechanisms and words) and access | each other only through `E`; `core` |
+| `nua/compiler/specifications.mua` *built* | The family of supplied requirements a definition is specialized on: `KnownHost`, `KnownNative`, `Dynamic` | Mua |
+| `nua/compiler/definitions.mua` *built (specialization, recursion, tail loops, boundary contracts)* | `defining`, `request`, `define_export` | `data`, `graph`, `facts`, `analysis`, `boundaries`, `specifications`; supplied evaluation capability |
 | `nua/compiler/budgets.mua` | `budgets` | `data`, `graph`; supplied evaluation and the scheduler's budget word |
 | `nua/compiler/optimize.mua` | `fold`, `reach`, `sweep`, `optimize` | `data`, `graph`, `facts`, `rules`, `verify` |
 | `nua/compiler/diagnostics.mua` | `reporting`, `render` | `data`; supplied source text |
-| `nua/compiler/hosting.mua` *built* | `word`, `supply`, applications (§5.1) | `types` |
+| `nua/compiler/hosting.mua` *built* | `word`, `supply`, applications (§5.1), `primitive` (the operations the compiler supplies to the Nua library) | `types` |
 | `nua/compile.mua` *built* | `compile`, `compile_c` | Wires the preceding vocabularies and backend adapters |
 | `nua/front.mua` *built* | The Mua host emitting hosted bodies (§5) | Mua parser/emitter; supplied hosting vocabulary |
 | `nua/emit_c.mua` *built (scalars)*, JIT adapter | `emit prepared target -> BackendProduct` | Ready program, native layouts and mechanism bindings |
 
 `compile` wires the mutually cooperating activities by passing functions; their
 modules do not recursively `require` one another or consult a global current
-compiler. The compilation root owns the scoped use of Lua's module machinery.
+compiler. The `compilation` record holds the compilation's data (supply, places,
+borrows, origins, exports, memory facts), never functions published for others. The compilation root owns the scoped use of Lua's module machinery.
 Native types are `nua/types.mua`'s; there is no second type system.
 
 ### 1.2 Contract notation and representation choices
@@ -580,6 +586,13 @@ CompilationProduct { program: Program, analysis: Analysis,
                      backend: BackendProduct, inspection: Inspection }
 ```
 
+**How the implementation carries body outcomes.** A body's outcome is the state of the path it
+ran on, not a value it returns: live (it fell through), dead with its exits registered on its
+invocation or loop (returned, broke, continued), or dead carrying a reconsideration request. The
+drivers read that state; `fall` and `stop` are the forms a hosted body returns through and carry
+nothing. This is the `BodyResult`/`BranchResult`/`LoopResult` distinction above, held where the
+handle already is rather than duplicated in a returned marker.
+
 `NoContinuation` is not Unit and not an unknown native value. Body completion
 must handle each outcome before returning to its parent. A branch with no normal
 continuation may still have registered returns to its enclosing invocation. That
@@ -602,6 +615,12 @@ Only the target's driver consumes it. Intermediate drivers finish/discard their
 own drafts and restore their bindings, then propagate the same request. It is
 never an operand or a host iterator result. This is compiler control, not a new
 source exception mechanism or an eight-retry failure policy.
+
+**Decided (D03): requests travel on the path, not as errors.** The request stops the path that
+found it (`path.request`); a branch whose arm stopped for one propagates it instead of joining,
+a loop round's request stops the loop, and the invocation it names consumes it (a tail
+re-entry under dynamic control, syntax §6.2: the attempt is discarded and the body runs again
+as a loop). No `pcall` and no Lua error carry compiler control.
 
 ### 4.2 State owned at each boundary
 

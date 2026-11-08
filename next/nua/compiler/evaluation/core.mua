@@ -1,0 +1,114 @@
+-- The core of an evaluation: what every part of the vocabulary uses to construct code: the
+-- identity supply, the borrow tracking and memory facts, diagnostics, and the writer verbs
+-- that keep facts with the instructions they emit. Capabilities from outside the evaluation
+-- (the definitions, the library) are supplied by the compilation root.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+
+return do(compilation, E, capabilities)
+    local supply = compilation.supply
+    local fresh = supply.fresh
+    local tracking = facts.tracking { .supply, borrows = compilation.borrows }
+    local memory = provenance.working(compilation, tracking, facts.paths_overlap)
+    compilation.memory = memory
+
+    local fail = do(path, message)
+        error(("%s:%s: %s"):format(path.source or "?", tostring(path.line or "?"), message), 0)
+    end
+    local site = path -> data.Site { id = fresh identity.InstructionId, origin = compilation.origin(path.source, path.line) }
+    local origin_of = path -> compilation.origin(path.source, path.line)
+
+    local remember_borrows = do(path)
+        for id in pairs path.flow.borrows do path.writer.borrow(compilation.borrows[id]) end
+        for id in pairs path.flow.contents do
+            local place = compilation.places[id]
+            if place and provenance.is_memory(place) and not path.writer.has_place(id) then path.writer.declare(place) end
+        end
+    end
+    local enter = do(path)
+        remember_borrows path
+        path.writer.enter(path.block, facts.fork path.flow)
+    end
+    -- what appending an instruction does to the facts: Moves and Ends change the borrows of the
+    -- storage they name (and clearing storage forgets its resident contents), a store of a
+    -- borrowing or owning value records what the storage now holds; other kinds change nothing
+    local each_access = do(instruction, act)
+        for _, base in ipairs provenance.accesses(compilation.places[instruction.target.place], compilation.places, compilation.borrows) do
+            act(data.Access { place = base.place, path = provenance.concat(base.path, instruction.target.path) })
+        end
+    end
+    local forgets = { cleared = true, released = true, replaced = true, moved = true }
+    local Appending = define ..graph.Inert
+        Moves = do(instruction, recurse, path)
+            each_access(instruction, target -> tracking.moves(path.flow, target, instruction.site.origin))
+        end
+        Ends = do(instruction, recurse, path)
+            each_access(instruction, do(target)
+                tracking.ends(path.flow, target, instruction.reason, instruction.site.origin)
+                if forgets[instruction.reason] then memory.forget(path.flow, target) end
+            end)
+        end
+        Store = do(instruction, recurse, path)
+            if not (types.borrows(instruction.value.type) or types.owns(instruction.value.type)) then return end
+            local place = assert(compilation.places[instruction.place])
+            local targets = provenance.accesses(place, compilation.places, compilation.borrows)
+            local info = Operand.is(instruction.value, data.Constant) and provenance.plain(instruction.value.type) or assert(path.writer.information(instruction.value), "a stored value needs component facts")
+            E.check_store(path, targets, info)
+            memory.store(path, targets, info, instruction.site.origin)
+            remember_borrows(path)
+        end
+    end
+    local apply_to_facts = data.Instruction.pass "what appending an instruction does to the facts" with ..Appending end
+    local append = do(path, instruction)
+        remember_borrows path
+        local before = facts.fork path.flow
+        apply_to_facts(instruction, path)
+        path.writer.append(path.block, instruction)
+        path.writer.observe(instruction.site.id, data.SiteFacts { .before, after = facts.fork path.flow, effects = effects.of instruction })
+    end
+    local terminate = do(path, terminator)
+        remember_borrows path
+        path.writer.terminal_flow(path.block, facts.fork path.flow)
+        path.writer.terminate(path.block, terminator)
+    end
+    local remember_reference = do(path, operand, borrow)
+        path.writer.borrow(compilation.borrows[borrow])
+        path.writer.remember(operand, data.ValueInfo { type = operand.type, components = { [{}] = data.Borrowed { .borrow } }, proofs = {} })
+    end
+
+    E.enter, E.terminate = enter, terminate
+    return define
+        .supply
+        .fresh
+        .tracking
+        .memory
+        .fail
+        .site
+        .origin_of
+        .remember_borrows
+        .enter
+        .append
+        .terminate
+        .remember_reference
+        .compilation
+        definitions = capabilities.definitions
+        library = capabilities.library
+    end
+end

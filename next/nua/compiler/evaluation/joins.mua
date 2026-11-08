@@ -1,0 +1,250 @@
+-- The evaluation vocabulary, part: Joins and dynamic branches: child paths, the join of continuing states (field by field), arms built as child constructions.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local paths_of = require "nua.compiler.evaluation.path"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local hosting = require "nua.compiler.hosting"
+local platform = require "nua.compiler.platform"
+local effects = require "nua.compiler.effects"
+local borrow_paths = require "nua.compiler.borrow_paths"
+local provenance = require "nua.compiler.provenance"
+local boundaries = require "nua.compiler.boundaries"
+local NativeValue, Operand, Contents = data.NativeValue, data.Operand, data.Contents
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local compilation = core.compilation
+
+    E.child_path = do(path, writer, block, flow)
+        local child = paths_of.child(path, writer, block, flow)
+        if block and flow then enter child end
+        return child
+    end
+
+    E.resident_places = do(flow)
+        local places = {}
+        for place, contents in pairs flow.contents do
+            if Contents.is(contents, data.Resident) and not provenance.is_memory(compilation.places[place]) then places[#places + 1] = place end
+        end
+        table.sort(places, |a, b| -> a.serial < b.serial)
+        return places
+    end
+
+    -- One join of several live incoming paths into a new block (a stateful vocabulary, writing
+    -- compilers §4.6). Its state: the incoming flows and the facts they agree on, the target
+    -- block, and per incoming edge its path (to emit what the edge needs in its own block) and
+    -- the arguments it passes. Values merge field by field: an equal leaf keeps its value, a
+    -- differing scalar leaf becomes a block parameter, and a record that is not exploded on
+    -- every edge is packed on each edge into one record parameter.
+    local joining = do(path, live)
+        local flows = {}
+        for index, state in ipairs live do flows[index] = state.flow end
+        local decision = tracking.agree flows
+        memory.agree(flows, decision.flow, path.writer.information)
+        local flow = decision.flow
+        local target = path.writer.block "join"
+        local edge_arguments, edge_paths = {}, {}
+        for index, state in ipairs live do
+            edge_arguments[index] = {}
+            edge_paths[index] = paths_of.continuing(path, nil, state.block, state.flow)
+        end
+        for _, place in ipairs(E.resident_places flow) do
+            for _, edge_path in ipairs edge_paths do E.resident_place(edge_path, compilation.places[place]) end
+        end
+
+        -- a parameter of the target, each incoming edge passing its operand; a borrowing one
+        -- carries the merged facts of what the edges pass
+        local parameter = do(native_type, operands)
+            local argument = path.writer.add_parameter(target, native_type)
+            for index, operand in ipairs operands do edge_arguments[index][#edge_arguments[index] + 1] = operand end
+            if types.borrows native_type then
+                local rows = {}
+                for index, operand in ipairs operands do
+                    local info = not Operand.is(operand, data.Constant) and path.writer.information(operand) or provenance.plain(native_type)
+                    rows[#rows + 1] = { info = info or provenance.plain(native_type), flow = flows[index] }
+                end
+                path.writer.remember(argument, memory.merge_info(rows, flow))
+            end
+            return argument
+        end
+
+        local merge
+        -- references join into one borrow of the schema their paths share: each coordinate
+        -- that differs is a parameter
+        local merge_references = do(native_type, values)
+            local infos, state = {}, data.Live {}
+            for index, value in ipairs values do
+                infos[index] = compilation.borrows[value.borrow]
+                local incoming = assert(flows[index].borrows[value.borrow])
+                if data.BorrowState.is(incoming, data.Ended) then state = incoming end
+            end
+            local schema = borrow_paths.schema infos
+            local captured = {}
+            for index, value in ipairs values do captured[index] = E.capture_borrow(edge_paths[index], value, schema) end
+            local position = 0
+            local destination = { ..path, .flow }
+            local joined = E.instantiate_borrow(destination, native_type, schema, do(type)
+                position += 1
+                local operands = {}
+                for index in ipairs values do operands[index] = captured[index][position] end
+                return parameter(type, operands)
+            end, state, infos[1].lifetime)
+            -- A temporary place relates the incoming references to their joined value in the
+            -- actual edge rows, without assigning borrow facts to numeric coordinates.
+            local temporary = E.new_place(path, "joined reference", native_type, infos[1].lifetime)
+            for index, value in ipairs values do flows[index].contents[temporary.id] = data.Tracked { .value } end
+            flow.contents[temporary.id] = data.Tracked { value = joined }
+            return joined
+        end
+        -- records join field by field while every incoming one is exploded, else as one value
+        local merge_records = do(native_type, values)
+            local exploded = true
+            for _, value in ipairs values do
+                if value.packed and next(value.parts) == nil then exploded = false end
+            end
+            if exploded then
+                local parts = {}
+                for _, field in ipairs(E.fields_of native_type) do
+                    local field_values = {}
+                    for index, value in ipairs values do field_values[index] = E.part(edge_paths[index], value, field.name) end
+                    parts[field.name] = merge(field.type, field_values)
+                end
+                return data.Aggregate { type = native_type, packed = nil, .parts }
+            end
+            local operands = {}
+            for index, value in ipairs values do operands[index] = E.materialize(edge_paths[index], value) end
+            return E.value_of_operand(native_type, parameter(native_type, operands))
+        end
+        -- the incoming values of one thing as one value: itself where they are the same
+        merge = do(native_type, values)
+            local all_same = true
+            for position = 2, #values do
+                if not facts.same_value(values[1], values[position]) then all_same = false end
+            end
+            if all_same then return values[1] end
+            if E.is_reference values[1] then return merge_references(native_type, values) end
+            if E.is_record native_type then return merge_records(native_type, values) end
+            local operands = {}
+            for index, value in ipairs values do operands[index] = value.operand end
+            return E.bits(native_type, parameter(native_type, operands))
+        end
+
+        -- an owner moved on some edges only is released on the others before they join (§9.2)
+        local release_partly_moved = do()
+            for _, place in ipairs decision.differing do
+                local moved_somewhere, moved_at = false, nil
+                for _, incoming in ipairs flows do
+                    local contents = incoming.contents[place]
+                    if contents and Contents.is(contents, data.Moved) then moved_somewhere, moved_at = true, contents.at end
+                end
+                if moved_somewhere and types.owns(compilation.places[place].type) then
+                    for _, edge_path in ipairs edge_paths do
+                        local contents = edge_path.flow.contents[place]
+                        if contents and (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)) then E.release_place(edge_path, place) end
+                    end
+                    flow.contents[place] = data.Moved { at = moved_at }
+                end
+            end
+        end
+        -- a place tracked on every edge with differing values holds their merge
+        local merge_places = do()
+            for _, place in ipairs decision.differing do
+                local values, everywhere = {}, true
+                for index, incoming in ipairs flows do
+                    local contents = incoming.contents[place]
+                    if contents == nil or not Contents.is(contents, data.Tracked) then everywhere = false else values[index] = contents.value end
+                end
+                if everywhere then flow.contents[place] = data.Tracked { value = merge(compilation.places[place].type, values) } end
+            end
+        end
+        -- the edges into the target; the path continues there
+        local finish = do()
+            for index, edge_path in ipairs edge_paths do
+                terminate(edge_path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, .target, arguments = edge_arguments[index] } })
+            end
+            path.block, path.flow, path.dead = target, flow, false
+            enter path
+        end
+
+        return define
+            .merge
+            .release_partly_moved
+            .merge_places
+            .finish
+        end
+    end
+
+    -- join the states that continue into one; each is { block, flow, value }. One live path
+    -- continues as it is; several join in a new block whose parameters are what differs.
+    -- Answers the joined value of `value_type`.
+    E.join = do(path, states, value_type)
+        local live = {}
+        for _, state in ipairs states do live[#live + 1] = state end
+        if #live == 0 then
+            path.dead = true
+            return nil
+        end
+        if #live == 1 then
+            path.block, path.flow, path.dead = live[1].block, live[1].flow, false
+            return live[1].value
+        end
+        local join = joining(path, live)
+        join.release_partly_moved()
+        join.merge_places()
+        local joined_value = nil
+        if value_type then
+            local values = {}
+            for index, state in ipairs live do values[index] = state.value end
+            joined_value = join.merge(value_type, values)
+        end
+        join.finish()
+        return joined_value
+    end
+
+    -- build one arm of a dynamic branch: a child construction from the path's facts
+    E.build_arm = do(path, label, run)
+        local state = nil
+        local outcome = graph.building(nil, supply, do(writer)
+            local block = writer.block(label)
+            local arm = E.child_path(path, writer, block, facts.fork path.flow)
+            local value = run arm
+            state = { block = arm.block, flow = arm.flow, .value, dead = arm.dead, request = arm.request }
+            return "adopt"
+        end, path.writer)
+        local fragment = outcome { built = f -> f, discarded = || -> nil }
+        local entry = path.writer.adopt fragment
+        return entry, state
+    end
+
+    -- a branch on an operand: both arms built and joined; `value_type` when the arms yield values
+    E.residual_branch = do(path, condition, run_true, run_false, wants_value)
+        local true_entry, true_state = E.build_arm(path, "then", run_true)
+        local false_entry, false_state = E.build_arm(path, "else", run_false)
+        -- an arm stopped by a reconsideration request: the branch does not join, it propagates
+        local request = true_state.request or false_state.request
+        if request then
+            path.request, path.dead = request, true
+            return nil
+        end
+        local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
+        terminate(path, data.Branch { origin = origin_of path, .condition, when_true = edge true_entry, when_false = edge false_entry })
+        local states = {}
+        for _, state in ipairs { true_state, false_state } do
+            if not state.dead then states[#states + 1] = state end
+        end
+        local value = E.join(path, states, wants_value and states[1] and states[1].value.type or nil)
+        -- an arm that left (returned, broke) makes what follows depend on the condition
+        if #states == 1 then path.guarded = path.guarded + 1 end
+        return value
+    end
+end
