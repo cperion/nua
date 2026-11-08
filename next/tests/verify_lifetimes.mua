@@ -70,114 +70,99 @@ end
 local grows = |p, buffer| -> data.Moves { site = p.site(), target = contents(buffer.id) }
 local clears = |p, buffer| -> data.Ends { site = p.site(), target = contents(buffer.id), reason = "cleared" }
 
-return define
-    with
-        name = "rule 1: a held view is used after its buffer grew"
-        run = do()
-            passes(straight(grows, false))
-            passes(straight(nil, false))
-        end
-    end
-    with
-        name = "rule 3: a stored view is not used after its buffer grew"
-        run = do()
-            reports(straight(grows, true), "used after it ended (grew)")
-        end
-    end
-    with
-        name = "rule 2: no view is used after its buffer was cleared"
-        run = do()
-            reports(straight(clears, false), "used after it ended (cleared)")
-            reports(straight(clears, true), "used after it ended (cleared)")
-        end
-    end
-    with
-        name = "a join: a view ended on one arm ends in the block argument"
-        run = do()
-            local build = do(refresh)
-                local p = programs()
-                local facts = published p
-                local definition = p.definition("join", { types.Bool }, types.U64, do(writer, parameters)
-                    local entry, left, right = writer.block "entry", writer.block "left", writer.block "right"
-                    local join = writer.block("join", { view_type })
-                    local buffer = p.place(writer, text_type)
-                    local view, fresh_view, length = p.value(), p.value(), p.value()
-                    local view_operand = p.result(view, view_type)
-                    facts.carry(view_operand, facts.borrow buffer.id)
-                    local joined = writer.parameter(join, 1)
-                    facts.carry(joined, facts.borrow buffer.id)
-                    writer.append(entry, data.Mechanism { site = p.site(), result = view, binding = "make_view", arguments = {} })
-                    writer.terminate(entry, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge left, when_false = p.edge right })
-                    writer.terminate(left, data.Jump { origin = p.origin, edge = p.edge(join, { view_operand }) })
-                    writer.append(right, data.Ends { site = p.site(), target = contents(buffer.id), reason = "removed" })
-                    local passed = view_operand
-                    if refresh then
-                        passed = p.result(fresh_view, view_type)
-                        facts.carry(passed, facts.borrow buffer.id)
-                        writer.append(right, data.Mechanism { site = p.site(), result = fresh_view, binding = "make_view", arguments = {} })
-                    end
-                    writer.terminate(right, data.Jump { origin = p.origin, edge = p.edge(join, { passed }) })
-                    writer.append(join, data.Extract { site = p.site(), result = length, type = types.U64, aggregate = joined, path = { data.FieldComponent { name = "length" } } })
-                    writer.terminate(join, data.Return { origin = p.origin, value = p.result(length, types.U64) })
-                end)
-                return verify_lifetimes.lifetimes(p.program(), { [definition.id] = facts })
+test "rule 1: a held view is used after its buffer grew":
+    passes(straight(grows, false))
+    passes(straight(nil, false))
+end
+
+test "rule 3: a stored view is not used after its buffer grew":
+    reports(straight(grows, true), "used after it ended (grew)")
+end
+
+test "rule 2: no view is used after its buffer was cleared":
+    reports(straight(clears, false), "used after it ended (cleared)")
+    reports(straight(clears, true), "used after it ended (cleared)")
+end
+
+test "a join: a view ended on one arm ends in the block argument":
+    local build = do(refresh)
+        local p = programs()
+        local facts = published p
+        local definition = p.definition("join", { types.Bool }, types.U64, do(writer, parameters)
+            local entry, left, right = writer.block "entry", writer.block "left", writer.block "right"
+            local join = writer.block("join", { view_type })
+            local buffer = p.place(writer, text_type)
+            local view, fresh_view, length = p.value(), p.value(), p.value()
+            local view_operand = p.result(view, view_type)
+            facts.carry(view_operand, facts.borrow buffer.id)
+            local joined = writer.parameter(join, 1)
+            facts.carry(joined, facts.borrow buffer.id)
+            writer.append(entry, data.Mechanism { site = p.site(), result = view, binding = "make_view", arguments = {} })
+            writer.terminate(entry, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge left, when_false = p.edge right })
+            writer.terminate(left, data.Jump { origin = p.origin, edge = p.edge(join, { view_operand }) })
+            writer.append(right, data.Ends { site = p.site(), target = contents(buffer.id), reason = "removed" })
+            local passed = view_operand
+            if refresh then
+                passed = p.result(fresh_view, view_type)
+                facts.carry(passed, facts.borrow buffer.id)
+                writer.append(right, data.Mechanism { site = p.site(), result = fresh_view, binding = "make_view", arguments = {} })
             end
-            reports(build(false), "used after it ended (removed)")
-            passes(build(true))
-        end
+            writer.terminate(right, data.Jump { origin = p.origin, edge = p.edge(join, { passed }) })
+            writer.append(join, data.Extract { site = p.site(), result = length, type = types.U64, aggregate = joined, path = { data.FieldComponent { name = "length" } } })
+            writer.terminate(join, data.Return { origin = p.origin, value = p.result(length, types.U64) })
+        end)
+        return verify_lifetimes.lifetimes(p.program(), { [definition.id] = facts })
     end
-    with
-        name = "owners are transferred at most once on every path"
-        run = do()
-            local build = do(transfers)
-                local p = programs()
-                local definition = p.definition("owners", { types.Bool }, types.Unit, do(writer, parameters)
-                    local entry, left, right, join = writer.block "entry", writer.block "left", writer.block "right", writer.block "join"
-                    local first, second = p.place(writer, text_type), p.place(writer, text_type)
-                    local owner = p.value()
-                    local header = p.result(owner, text_type)
-                    writer.append(entry, data.Load { site = p.site(), result = owner, place = first.id })
-                    writer.terminate(entry, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge left, when_false = p.edge right })
-                    if transfers.left then writer.append(left, data.Store { site = p.site(), place = second.id, value = header }) end
-                    if transfers.right then writer.append(right, data.Store { site = p.site(), place = second.id, value = header }) end
-                    writer.terminate(left, data.Jump { origin = p.origin, edge = p.edge join })
-                    writer.terminate(right, data.Jump { origin = p.origin, edge = p.edge join })
-                    if transfers.after then writer.append(join, data.Store { site = p.site(), place = first.id, value = header }) end
-                    writer.terminate(join, data.Return { origin = p.origin })
-                end)
-                return verify_lifetimes.lifetimes(p.program(), { [definition.id] = {} })
+    reports(build(false), "used after it ended (removed)")
+    passes(build(true))
+end
+
+test "owners are transferred at most once on every path":
+    local build = do(transfers)
+        local p = programs()
+        local definition = p.definition("owners", { types.Bool }, types.Unit, do(writer, parameters)
+            local entry, left, right, join = writer.block "entry", writer.block "left", writer.block "right", writer.block "join"
+            local first, second = p.place(writer, text_type), p.place(writer, text_type)
+            local owner = p.value()
+            local header = p.result(owner, text_type)
+            writer.append(entry, data.Load { site = p.site(), result = owner, place = first.id })
+            writer.terminate(entry, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge left, when_false = p.edge right })
+            if transfers.left then writer.append(left, data.Store { site = p.site(), place = second.id, value = header }) end
+            if transfers.right then writer.append(right, data.Store { site = p.site(), place = second.id, value = header }) end
+            writer.terminate(left, data.Jump { origin = p.origin, edge = p.edge join })
+            writer.terminate(right, data.Jump { origin = p.origin, edge = p.edge join })
+            if transfers.after then writer.append(join, data.Store { site = p.site(), place = first.id, value = header }) end
+            writer.terminate(join, data.Return { origin = p.origin })
+        end)
+        return verify_lifetimes.lifetimes(p.program(), { [definition.id] = {} })
+    end
+    passes(build { left = true, right = true })
+    passes(build { left = true })
+    reports(build { left = true, after = true }, "transferred twice")
+    passes(build { after = true })
+end
+
+test "a loop: an outer owner moved in the body is moved twice; a body-local one is not":
+    local build = do(local_to_body)
+        local p = programs()
+        local definition = p.definition("loop", { types.Bool }, types.Unit, do(writer, parameters)
+            local entry, body, done = writer.block "entry", writer.block "body", writer.block "done"
+            local source, target = p.place(writer, text_type), p.place(writer, text_type)
+            local outer = p.value()
+            writer.append(entry, data.Load { site = p.site(), result = outer, place = source.id })
+            writer.terminate(entry, data.Jump { origin = p.origin, edge = p.edge body })
+            local moved = p.result(outer, text_type)
+            if local_to_body then
+                local inner = p.value()
+                writer.append(body, data.Load { site = p.site(), result = inner, place = source.id })
+                moved = p.result(inner, text_type)
             end
-            passes(build { left = true, right = true })
-            passes(build { left = true })
-            reports(build { left = true, after = true }, "transferred twice")
-            passes(build { after = true })
-        end
+            writer.append(body, data.Store { site = p.site(), place = target.id, value = moved })
+            writer.terminate(body, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge body, when_false = p.edge done })
+            writer.terminate(done, data.Return { origin = p.origin })
+        end)
+        return verify_lifetimes.lifetimes(p.program(), { [definition.id] = {} })
     end
-    with
-        name = "a loop: an outer owner moved in the body is moved twice; a body-local one is not"
-        run = do()
-            local build = do(local_to_body)
-                local p = programs()
-                local definition = p.definition("loop", { types.Bool }, types.Unit, do(writer, parameters)
-                    local entry, body, done = writer.block "entry", writer.block "body", writer.block "done"
-                    local source, target = p.place(writer, text_type), p.place(writer, text_type)
-                    local outer = p.value()
-                    writer.append(entry, data.Load { site = p.site(), result = outer, place = source.id })
-                    writer.terminate(entry, data.Jump { origin = p.origin, edge = p.edge body })
-                    local moved = p.result(outer, text_type)
-                    if local_to_body then
-                        local inner = p.value()
-                        writer.append(body, data.Load { site = p.site(), result = inner, place = source.id })
-                        moved = p.result(inner, text_type)
-                    end
-                    writer.append(body, data.Store { site = p.site(), place = target.id, value = moved })
-                    writer.terminate(body, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge body, when_false = p.edge done })
-                    writer.terminate(done, data.Return { origin = p.origin })
-                end)
-                return verify_lifetimes.lifetimes(p.program(), { [definition.id] = {} })
-            end
-            reports(build(false), "transferred twice")
-            passes(build(true))
-        end
-    end
+    reports(build(false), "transferred twice")
+    passes(build(true))
 end

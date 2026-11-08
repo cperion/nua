@@ -3,11 +3,12 @@
 -- in nua/. Mua emits LuaJIT 3.0 syntax verbatim, so it needs upstream LuaJIT, the one
 -- `make deps` installs in .local/bin. From the repository root:
 --
---   make test-next                          every next/tests/*.mua
---   .local/bin/luajit next/test.lua graph   only next/tests/graph.mua
+--   make test-next                                   every next/tests/*.mua
+--   .local/bin/luajit next/test.lua graph            only next/tests/graph.mua
+--   .local/bin/luajit next/test.lua --match borrow   only cases whose name contains "borrow"
 --
--- Each test file returns a list of { name, run } cases; a case passes when `run` returns
--- without an error.
+-- A test file names its cases with Mua's `test "what it shows":` word; Mua's test runner
+-- collects and runs them (mua/test_cli.lua).
 local here = arg[0]:match('^(.*)/[^/]*$') or '.'
 local root = here .. '/..'
 package.path = root .. '/.local/share/lua/5.1/?.lua;' .. root .. '/.local/share/lua/5.1/?/init.lua'
@@ -17,36 +18,23 @@ local mua = require 'mua'
 -- only Mua modules under next/ and Mua itself: a stray require of the old compiler fails
 table.insert(package.loaders, 2, mua.searcher { path = here .. '/?.mua;' .. here .. '/?/init.mua' })
 
-local only = arg[1]
+local only, match = nil, nil
+local i = 1
+while arg[i] do
+    if arg[i] == '--match' then
+        match = arg[i + 1]
+        i = i + 1
+    else
+        only = arg[i]
+    end
+    i = i + 1
+end
+
 local files = {}
 for file in io.popen('ls ' .. here .. '/tests/*.mua 2>/dev/null'):lines() do
     local name = file:match('([^/]*)%.mua$')
-    if not only or name == only then files[#files + 1] = { name = name, path = file } end
+    if not only or name == only then files[#files + 1] = file end
 end
 
-local passed, failed = 0, 0
-for _, file in ipairs(files) do
-    local chunk, problem = mua.loadfile(file.path)
-    if not chunk then
-        failed = failed + 1
-        print(('FAIL %s: does not load: %s'):format(file.name, problem))
-    else
-        local loaded, cases = pcall(chunk)
-        if not loaded then
-            failed = failed + 1
-            print(('FAIL %s: %s'):format(file.name, tostring(cases)))
-        else
-            for _, case in ipairs(cases) do
-                local ok, why = xpcall(case.run, debug.traceback)
-                if ok then
-                    passed = passed + 1
-                else
-                    failed = failed + 1
-                    print(('FAIL %s: %s\n%s'):format(file.name, case.name, why))
-                end
-            end
-        end
-    end
-end
-print(('%d passed, %d failed'):format(passed, failed))
+local _, failed = require('mua.test_cli').run_files(files, { match = match })
 os.exit(failed == 0 and 0 or 1)

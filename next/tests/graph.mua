@@ -64,127 +64,112 @@ local build_max = do(supply)
     end
 end
 
-return define
-    with
-        name = "a built definition is indexed with its predecessors and sites"
-        run = do()
-            local program = build_max(identity.supply())
-            local indexed = graph.index program
-            local definition = graph.definitions_in_order(program)[1]
-            local join = definition.blocks[2]
-            assert(#indexed.predecessors[join.id] == 2)
-            assert(#indexed.predecessors[definition.entry] == 0)
-            local compute = definition.blocks[1].instructions[1]
-            assert(indexed.sites[compute.site.id] == compute)
-            assert(indexed.definitions_of[compute.result] == compute)
+test "a built definition is indexed with its predecessors and sites":
+    local program = build_max(identity.supply())
+    local indexed = graph.index program
+    local definition = graph.definitions_in_order(program)[1]
+    local join = definition.blocks[2]
+    assert(#indexed.predecessors[join.id] == 2)
+    assert(#indexed.predecessors[definition.entry] == 0)
+    local compute = definition.blocks[1].instructions[1]
+    assert(indexed.sites[compute.site.id] == compute)
+    assert(indexed.definitions_of[compute.result] == compute)
+end
+
+test "printing names by role and order, the same for equal programs":
+    local text = graph.print(build_max(identity.supply()))
+    local expected = table.concat({
+        "definition1(%parameter1: U32, %parameter2: U32): U32",
+        "block1:",
+        "    %v1: Bool = %parameter1 < %parameter2",
+        "    branch %v1, block2(), block3()",
+        "block4(U32):",
+        "    return block4.1",
+        "block2:",
+        "    jump block4(%parameter2)",
+        "block3:",
+        "    jump block4(%parameter1)",
+    }, "\n")
+    assert(text == expected, "\n" .. text)
+    assert(graph.print(build_max(identity.supply())) == text)
+end
+
+test "two compilations of one program are the same under a bijection of identities":
+    local first = build_max(identity.supply())
+    local second = build_max(identity.supply())
+    assert(graph.same(first, second))
+    local unchanged = data.Instruction.pass "stand for itself" with ..graph.Unchanged end
+    local rewritten = graph.rewrite(unchanged, first)
+    assert(rewritten.revision == 1 and rewritten ~= first)
+    assert(graph.same(first, rewritten), "the same structure, whatever its revision")
+    assert(graph.print(rewritten) == graph.print(first))
+end
+
+test "a rewrite replaces instructions and owns its output":
+    local program = build_max(identity.supply())
+    local before = graph.definitions_in_order(program)[1].blocks[1].instructions
+    local Flipping = define ..graph.Unchanged
+        Compute = do(node, recurse, work)
+            return { data.Compute { ..node, opcode = "less_equal" } }
         end
     end
-    with
-        name = "printing names by role and order, the same for equal programs"
-        run = do()
-            local text = graph.print(build_max(identity.supply()))
-            local expected = table.concat({
-                "definition1(%parameter1: U32, %parameter2: U32): U32",
-                "block1:",
-                "    %v1: Bool = %parameter1 < %parameter2",
-                "    branch %v1, block2(), block3()",
-                "block4(U32):",
-                "    return block4.1",
-                "block2:",
-                "    jump block4(%parameter2)",
-                "block3:",
-                "    jump block4(%parameter1)",
-            }, "\n")
-            assert(text == expected, "\n" .. text)
-            assert(graph.print(build_max(identity.supply())) == text)
-        end
-    end
-    with
-        name = "two compilations of one program are the same under a bijection of identities"
-        run = do()
-            local first = build_max(identity.supply())
-            local second = build_max(identity.supply())
-            assert(graph.same(first, second))
-            local unchanged = data.Instruction.pass "stand for itself" with ..graph.Unchanged end
-            local rewritten = graph.rewrite(unchanged, first)
-            assert(rewritten.revision == 1 and rewritten ~= first)
-            assert(graph.same(first, rewritten), "the same structure, whatever its revision")
-            assert(graph.print(rewritten) == graph.print(first))
-        end
-    end
-    with
-        name = "a rewrite replaces instructions and owns its output"
-        run = do()
-            local program = build_max(identity.supply())
-            local before = graph.definitions_in_order(program)[1].blocks[1].instructions
-            local Flipping = define ..graph.Unchanged
-                Compute = do(node, recurse, work)
-                    return { data.Compute { ..node, opcode = "less_equal" } }
-                end
-            end
-            local flip = data.Instruction.pass "flip less" with ..Flipping end
-            local rewritten = graph.rewrite(flip, program)
-            local after = graph.definitions_in_order(rewritten)[1].blocks[1].instructions
-            assert(after[1].opcode == "less_equal" and before[1].opcode == "less")
-            assert(not graph.same(program, rewritten))
-        end
-    end
-    with
-        name = "writers refuse misuse"
-        run = do()
-            local supply = identity.supply()
-            local origin = supply.fresh identity.OriginId
-            local site = || -> data.Site { id = supply.fresh identity.InstructionId, .origin }
-            local trap = data.Trap { .origin, message = u32 0 }
-            local kept
-            refuses(|| -> graph.building(nil, supply, do(writer)
-                local block = writer.block("only", {})
-                writer.terminate(block, trap)
-                writer.append(block, data.Fence { site = site(), order = "sequential" })
-            end), "append after the terminator")
-            refuses(|| -> graph.building(nil, supply, do(writer)
-                local block = writer.block("only", {})
-                writer.terminate(block, trap)
-                writer.terminate(block, trap)
-            end), "terminated twice")
-            local other = supply.fresh identity.BlockId
-            refuses(|| -> graph.building(nil, supply, do(writer)
-                writer.terminate(other, trap)
-            end), "not a block of this writer")
-            local discarded = graph.building(nil, supply, do(writer)
-                kept = writer
-                writer.block("unused", {})
-                return "discard"
-            end)
-            assert(discarded { built = f -> false, discarded = || -> true })
-            refuses(|| -> kept.block("late", {}), "was discarded")
-            refuses(|| -> graph.building(nil, supply, writer -> "maybe"), "not \"adopt\"")
-            local open_tail = graph.building(nil, supply, do(writer)
-                writer.block("open", {})
-                return "adopt"
-            end)
-            refuses(|| -> graph.seal(open_tail { built = f -> f, discarded = || -> nil }), "open tail")
-        end
-    end
-    with
-        name = "a fragment is adopted once, and its writer stops"
-        run = do()
-            local supply = identity.supply()
-            local origin = supply.fresh identity.OriginId
-            local child_writer
-            local child = graph.building(nil, supply, do(writer)
-                child_writer = writer
-                local block = writer.block("child", {})
-                writer.terminate(block, data.Trap { .origin, message = u32 1 })
-                return "adopt"
-            end)
-            local fragment = child { built = f -> f, discarded = || -> nil }
-            graph.building(nil, supply, do(parent)
-                parent.adopt fragment
-                refuses(|| -> parent.adopt fragment, "adopted")
-                return "adopt"
-            end)
-            refuses(|| -> child_writer.block("again", {}), "was adopted")
-        end
-    end
+    local flip = data.Instruction.pass "flip less" with ..Flipping end
+    local rewritten = graph.rewrite(flip, program)
+    local after = graph.definitions_in_order(rewritten)[1].blocks[1].instructions
+    assert(after[1].opcode == "less_equal" and before[1].opcode == "less")
+    assert(not graph.same(program, rewritten))
+end
+
+test "writers refuse misuse":
+    local supply = identity.supply()
+    local origin = supply.fresh identity.OriginId
+    local site = || -> data.Site { id = supply.fresh identity.InstructionId, .origin }
+    local trap = data.Trap { .origin, message = u32 0 }
+    local kept
+    refuses(|| -> graph.building(nil, supply, do(writer)
+        local block = writer.block("only", {})
+        writer.terminate(block, trap)
+        writer.append(block, data.Fence { site = site(), order = "sequential" })
+    end), "append after the terminator")
+    refuses(|| -> graph.building(nil, supply, do(writer)
+        local block = writer.block("only", {})
+        writer.terminate(block, trap)
+        writer.terminate(block, trap)
+    end), "terminated twice")
+    local other = supply.fresh identity.BlockId
+    refuses(|| -> graph.building(nil, supply, do(writer)
+        writer.terminate(other, trap)
+    end), "not a block of this writer")
+    local discarded = graph.building(nil, supply, do(writer)
+        kept = writer
+        writer.block("unused", {})
+        return "discard"
+    end)
+    assert(discarded { built = f -> false, discarded = || -> true })
+    refuses(|| -> kept.block("late", {}), "was discarded")
+    refuses(|| -> graph.building(nil, supply, writer -> "maybe"), "not \"adopt\"")
+    local open_tail = graph.building(nil, supply, do(writer)
+        writer.block("open", {})
+        return "adopt"
+    end)
+    refuses(|| -> graph.seal(open_tail { built = f -> f, discarded = || -> nil }), "open tail")
+end
+
+test "a fragment is adopted once, and its writer stops":
+    local supply = identity.supply()
+    local origin = supply.fresh identity.OriginId
+    local child_writer
+    local child = graph.building(nil, supply, do(writer)
+        child_writer = writer
+        local block = writer.block("child", {})
+        writer.terminate(block, data.Trap { .origin, message = u32 1 })
+        return "adopt"
+    end)
+    local fragment = child { built = f -> f, discarded = || -> nil }
+    graph.building(nil, supply, do(parent)
+        parent.adopt fragment
+        refuses(|| -> parent.adopt fragment, "adopted")
+        return "adopt"
+    end)
+    refuses(|| -> child_writer.block("again", {}), "was adopted")
 end

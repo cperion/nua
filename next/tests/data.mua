@@ -57,68 +57,55 @@ local build = do()
     end
 end
 
-return define
-    with
-        name = "a definition is built from checked records"
-        run = do()
-            local made = build()
-            assert(data.Instruction.is(made.built.blocks[1].instructions[1], data.Compute))
-            assert(data.Terminator.is(made.built.blocks[1].terminator, data.Return))
-        end
+test "a definition is built from checked records":
+    local made = build()
+    assert(data.Instruction.is(made.built.blocks[1].instructions[1], data.Compute))
+    assert(data.Terminator.is(made.built.blocks[1].terminator, data.Return))
+end
+
+test "malformed nodes are refused where they are built":
+    local made = build()
+    local fresh = made.supply.fresh
+    local site = data.Site { id = fresh identity.InstructionId, origin = made.origin }
+    refuses(|| -> data.Compute { .site, result = made.y, type = types.U32, opcode = "power", arguments = {} }, "numeric opcode")
+    refuses(|| -> data.Load { .site, result = made.y, place = made.y }, "PlaceId")
+    refuses(|| -> data.Store { .site, place = fresh identity.PlaceId, value = 5 }, "operand")
+    refuses(|| -> data.Pack { .site, result = made.y, type = types.U32, components = { made.x, nil, made.x } }, "list of operand")
+    refuses(|| -> data.Fence { .site, order = "sequential", extra = true })
+    refuses(|| -> data.Block { id = made.entry, arguments = {}, instructions = { made.x }, terminator = data.Trap { origin = made.origin, message = made.x } }, "list of instruction")
+end
+
+test "integer constants are 64 exact bits":
+    local big = data.IntegerBits { bits = ffi.new("uint64_t", -1) }
+    assert(big.bits == 0xffffffffffffffffULL)
+    refuses(|| -> data.IntegerBits { bits = 3 }, "64 bits")
+end
+
+test "operands have one canonical key for fact maps":
+    local made = build()
+    assert(data.operand_key(made.result) == made.y)
+    local again = data.Parameter { definition = made.x.definition, index = 1, type = types.U32 }
+    assert(data.operand_key(again) == data.operand_key(made.x))
+    local second = data.Parameter { definition = made.x.definition, index = 2, type = types.U32 }
+    assert(data.operand_key(second) ~= data.operand_key(made.x))
+    refuses(|| -> data.operand_key(constant(types.U8, 1)), "no facts")
+end
+
+test "borrow facts: a held path or a stored pointer, live or ended":
+    local made = build()
+    local fresh = made.supply.fresh
+    local place = fresh identity.PlaceId
+    local path = data.BorrowPath { root = place, steps = { data.ContentsStep {} } }
+    local held = data.BorrowInfo with
+        id = fresh identity.BorrowId
+        form = data.Held { .path }
+        origins = { data.Access { .place, path = { data.ContentsStep {} } } }
+        mutable = false
+        lifetime = fresh identity.LifetimeId
+        acquired = made.origin
     end
-    with
-        name = "malformed nodes are refused where they are built"
-        run = do()
-            local made = build()
-            local fresh = made.supply.fresh
-            local site = data.Site { id = fresh identity.InstructionId, origin = made.origin }
-            refuses(|| -> data.Compute { .site, result = made.y, type = types.U32, opcode = "power", arguments = {} }, "numeric opcode")
-            refuses(|| -> data.Load { .site, result = made.y, place = made.y }, "PlaceId")
-            refuses(|| -> data.Store { .site, place = fresh identity.PlaceId, value = 5 }, "operand")
-            refuses(|| -> data.Pack { .site, result = made.y, type = types.U32, components = { made.x, nil, made.x } }, "list of operand")
-            refuses(|| -> data.Fence { .site, order = "sequential", extra = true })
-            refuses(|| -> data.Block { id = made.entry, arguments = {}, instructions = { made.x }, terminator = data.Trap { origin = made.origin, message = made.x } }, "list of instruction")
-        end
-    end
-    with
-        name = "integer constants are 64 exact bits"
-        run = do()
-            local big = data.IntegerBits { bits = ffi.new("uint64_t", -1) }
-            assert(big.bits == 0xffffffffffffffffULL)
-            refuses(|| -> data.IntegerBits { bits = 3 }, "64 bits")
-        end
-    end
-    with
-        name = "operands have one canonical key for fact maps"
-        run = do()
-            local made = build()
-            assert(data.operand_key(made.result) == made.y)
-            local again = data.Parameter { definition = made.x.definition, index = 1, type = types.U32 }
-            assert(data.operand_key(again) == data.operand_key(made.x))
-            local second = data.Parameter { definition = made.x.definition, index = 2, type = types.U32 }
-            assert(data.operand_key(second) ~= data.operand_key(made.x))
-            refuses(|| -> data.operand_key(constant(types.U8, 1)), "no facts")
-        end
-    end
-    with
-        name = "borrow facts: a held path or a stored pointer, live or ended"
-        run = do()
-            local made = build()
-            local fresh = made.supply.fresh
-            local place = fresh identity.PlaceId
-            local path = data.BorrowPath { root = place, steps = { data.ContentsStep {} } }
-            local held = data.BorrowInfo with
-                id = fresh identity.BorrowId
-                form = data.Held { .path }
-                origins = { data.Access { .place, path = { data.ContentsStep {} } } }
-                mutable = false
-                lifetime = fresh identity.LifetimeId
-                acquired = made.origin
-            end
-            assert(data.BorrowForm.is(held.form, data.Held) and data.BorrowState.is(data.Live {}, data.Live))
-            local ended = data.Ended { at = made.origin, reason = "grew" }
-            assert(data.BorrowState.is(ended, data.Ended))
-            refuses(|| -> data.Ended { at = made.origin, reason = "compacted" }, "reason a borrow ended")
-        end
-    end
+    assert(data.BorrowForm.is(held.form, data.Held) and data.BorrowState.is(data.Live {}, data.Live))
+    local ended = data.Ended { at = made.origin, reason = "grew" }
+    assert(data.BorrowState.is(ended, data.Ended))
+    refuses(|| -> data.Ended { at = made.origin, reason = "compacted" }, "reason a borrow ended")
 end
