@@ -44,9 +44,10 @@ Five mechanisms carry the language:
    compute immediately; unknown ones become typed commands. The same word does
    both, and the same result either way (§4, §5, §6).
 5. **Goose-style memory analysis assigns native storage.** Lexical ownership,
-   borrowed references, stores and data-stack requirements are checked and
+   borrowed references, stores and storage obligations are checked and
    lowered for the residual program (§9). The executable has no LuaJIT
-   dependency, no garbage collector, no reference counting and no implicit heap.
+   dependency, no garbage collector, no reference counting and no implicit borrow
+   promotion. Its approved region allocator uses heap-like reservation/free machinery.
 
 The central principle:
 
@@ -989,14 +990,20 @@ A `while` with a host condition runs at compile time as long as its rounds are k
 
 ### 6.4 A loop's state is explicit
 
-A loop is sugar for a tail-recursive word, and a word receives its state as parameters. The sugar does the same: **every typed local of the enclosing word that a loop mentions becomes a parameter of the loop.** In `sum_until`, `total` and `i` are its state.
+A loop is sugar for tail recursion: **every typed local of the enclosing word that a loop mentions contributes its contents to the loop's state.** In `sum_until`, `total` and `i` are its state. References and captured names can identify additional participating places, as described below.
 
-- Each round works on its own copies, under the same names.
-- `next` (a round ending, or `continue`) passes the copies to the next round.
-- Leaving the loop (`break`, or the condition failing) stores them back into the word's locals, all at once.
-- A `return` inside the loop leaves the word; nothing needs storing back.
+**Looping does not create a source-visible copy of a carried local.** Direct access and references to that local observe the same current contents, in both known and residual rounds. A write through either is visible through the other at subsequent reads. This is a rule about place identity, not a demand to allocate memory or make known contents dynamic.
 
-So a residual loop's state is exactly its parameters, and no hidden iteration is needed to discover what it carries. In a residual loop a state variable is its own local: nothing else reads it while the loop runs, so the C has one variable, not a copy (`total` in `runtime_sum`).
+- Each round uses the same places for carried enclosing locals, under the same names.
+- `next` (a round ending, or `continue`) supplies the next state values. Edge assignments are simultaneous: capture incoming values before overwriting their inputs (§6.2).
+- Leaving the loop (`break`, or the condition failing) establishes that exit's contents for the following continuation. There is no separate source-level round copy to store back.
+- A `return` inside the loop leaves the enclosing word under the ordinary effect and lifetime rules; it does not undo writes to shared places.
+
+This does not make distinct value copies aliases or change by-value word arguments or task captures. Locals declared inside a round retain their ordinary scope and lifetime. A value bound by an earlier read still denotes the value at that earlier point, not a later read through a reference.
+
+For example, if `state.count` starts at `0` and `alias = Ref state`, then assigning `state.count = 1` makes a subsequent `alias.count` read yield `1`, even in a single known round. The residual loop must obey the same rule.
+
+**Implementation status:** this rule is adopted, but the current evaluator still uses round copies in some known evaluations. The [W02 alias probe](design/compiler-inventory/review.md#w02--an-alias-writes-a-loop-variable) observes `0` in that case instead of the required `1`. This is an outstanding compiler discrepancy, not an alternative language mode.
 
 ```lua
 local Pair = struct { a: U32, b: U32 }
@@ -1062,7 +1069,7 @@ uint32_t panel_extent(uint32_t n) {
 
 Known fields are materialized when storage is needed, for example when the record's address crosses a function boundary (§5.3). Existing reference, ownership, atomic, and string rules still apply; field-wise loop generalization does not bypass them.
 
-A write through a reference taken before the loop, or through a captured local, can change state that the loop's syntax does not name. The outermost affected loop rolls its round back and adopts an initialized, unescaped ordinary local owned by the same native function as loop state. Its unchanged known fields stay known; adoption adds no callback argument and preserves the original place, so direct writes and reference aliases see the same state. If no invariant remains, or the local's address crosses a native boundary, it becomes ordinary memory. Storage is initialized before the affected loop, not on every round. Atomics, owning records and foreign locals retain their existing contracts.
+A write through a reference taken before the loop, or through a captured local, can change state that the loop's syntax does not name. Such state participates in the affected loops without changing its place identity. The current evaluator discovers it by rolling back the outermost affected loop and adopting an initialized, unescaped ordinary local owned by the same native function as loop state. Its unchanged known fields stay known; adoption adds no callback argument. This discovery mechanism does not limit the same-place rule to alias-written or residual state. If no invariant remains, or the local's address crosses a native boundary, it becomes ordinary memory. Storage is initialized before the affected loop, not on every round. Atomics, owning records and foreign locals retain their existing contracts.
 
 ### 6.5 Where unrolling comes from
 
@@ -1177,7 +1184,9 @@ end
 
 ## 9. Owned storage and references
 
-**Memory management happens after residualization**, on the specialized program that remains.
+**Ownership and lifetime facts are established during evaluation; executable allocation and reclamation operate on the residual program.**
+
+**Approved replacement contract:** this section incorporates [affine regions and completion](design/region-completion.md). Dynamic region/block allocation and the uniform owning-transfer contents-loan cutoff are adopted, but not implemented by the current fixed-index compiler. Current implementation details are marked explicitly; they do not limit the replacement's accepted placements.
 
 Native memory has exactly two ownership forms:
 
@@ -1192,17 +1201,17 @@ Scalars, structs without owner fields, references and IDs are fixed-size. They l
 
 ### 9.2 Owners
 
-`Grow T`, `Array T`, `Store T`, `Map(K, V)` (including `Map(Str, V)`) and `Text` are owners: they have storage of their own on a data stack. A struct holding owner fields, any number of them and in any order, is an owner too.
+`Grow T`, `Array T`, `Store T`, `Map(K, V)` (including `Map(Str, V)`) and `Text` are owners: they have storage under affine region custody. A struct holding owner fields, any number of them and in any order, is an owner too.
 
 - **Created in place.** An owner is constructed where it lives: `local xs = Grow(U32) {}`, a field of an owner struct, or the place a word's owner result is built in. Declared without a value, it starts empty: `local s: Store Node`. An owner struct's omitted owner fields start empty and its omitted value fields start zeroed: `Graph {}`, `Graph { name = Chars(32) "roads" }`.
-- **One data stack each.** Creation takes the lowest free data-stack indices of the function: one per stack of the owner, consecutive (an owner holding owners has an arena for each owner position, §9.13). An owner occupies the top of its stack, and no other live owner of the function shares it. A recursion is the exception that keeps the number of stacks fixed: its levels share stack indices, each level's owners above the previous level's (§9.10).
-- **Moved at its last use.** Using a named owner as a value moves it: assigning it, passing it to an owner-typed parameter, returning it, or giving it to a field (`Graph { .nodes, .edges }`). Nothing is copied: its storage stays where it is, and the destination takes over releasing it. A move into an element copies the bytes once into the container's arenas (§9.13). A later use is rejected: `'nodes' was moved into 'g.nodes'`. A move on some paths only is exact: the paths that do not move it release it before they join.
+- **Independent regions.** A standalone holding exclusively owns its region; independently movable owning fields normally have separate regions. Its stable growable storage uses private nonmoving reservations. Nested owners use independently reclaimable blocks in an enclosing region (§9.13). Logical type positions and native interfaces are finite; actual live resources can grow with recursion. No unrelated owner can bury its growth frontier or be clipped by its release. Allocation failure traps; there is no fixed root-bank limit or placement-based rejection of a valid cohort.
+- **Moved at its last use.** Using a named owner as a value moves it: assigning it, passing it to an owner-typed parameter, returning it, or giving it to a field (`Graph { .nodes, .edges }`). Cleanup authority transfers with the value. A standalone handoff normally adopts its region without payload copying; fragment detachment or destination normalization may copy. Every actual owning transfer ends old contents loans, even if copying is elided. A source-header reference does not retarget to the destination. A later owner use is rejected: `'nodes' was moved into 'g.nodes'`. A move on some paths only is exact: the paths that do not move it release it before they join. Joins/backedges transporting the same installed holding, and compiler-only capture/result transport, are not additional source moves.
 - **Moved out through a `Ref` parameter.** A word may move an owner out of a `Ref` argument: in place, the caller's place is moved; compiled on its own (`call`, recursion), its summary says which part of which argument it moves, and the caller's place counts as moved after the call. An exported word may not. Through a `Ref` whose target is not known while compiling (a field, an element, a local chosen at run time), moving out is rejected.
 - **Replaced by assignment.** Assigning a new owner to an owner place ends the old one there: its storage returns, and borrows of it end (`'g' was replaced`).
-- **Copied only by `copy`.** `copy x` builds a duplicate in its destination: owner structs deeply (owner fields copied, value fields as values), a `Store` with the same token (its `Id`s name the same entities in the copy). `copy` of a `Str` builds a `Text`, of a `Slice T` an `Array T`; `copy` of a value is the value.
+- **Duplicated only by `copy`.** `copy x` builds a duplicate in its destination: owner structs deeply (owner fields copied, value fields as values), a `Store` with the same token (its `Id`s name the same entities in the copy). `copy` of a `Str` builds a `Text`, of a `Slice T` an `Array T`; `copy` of a value is the value. Relocating contents across storage positions (§9.13) is not duplication: the source ownership ends.
 - **Passed.** A parameter of an owner type owns its argument: a constructor or call result built in place, a moved owner, or a copy. `Ref T` lends the owner for reading and writing, including growth. Where a `Slice T` or a `Str` is expected, an owner lends its elements read-only with no marker (`total xs`); a `Slice.mut T` takes them for writing, marked at the call: `scale(Ref xs, 2)`.
-- **Returned like a value.** A word returning an owner builds it where the caller keeps it: `local xs = squares 10`. Evaluated in place, its returns move into the caller's place. Compiled on its own, it receives its destination: result stacks reserved by the caller, one for each owner allocation the word may return (§9.10).
-- **Released when its life ends.** At the latest when the residual block that holds it ends; exactly where a move on another path or a replacement ends it. Its stack's top returns to where it began.
+- **Returned like a value.** A word returning an owner transfers storage and cleanup responsibility to the caller: `local xs = squares 10`. Capture the result into a complete exit holding before required source completion, retain it across legal waits, then transfer at the prescribed point. A materialized callee receives a fixed-layout result holding, not a vector of allocation histories; no escaping region depends on its dead frame. A standalone handoff normally avoids payload copying, but shared-fragment extraction and transfer into a container may relocate. Arbitrary owner-returning computations are not guaranteed to construct directly in an element.
+- **Released when its life ends.** At the latest when the residual block that holds it ends; exactly where a move on another path or a replacement ends it. Release follows actual region/block allocation records. Shared backing remains with its explicit enclosing custodian until escaping fragments have detached and it can end; one fragment cannot free a surviving sibling.
 - **Runtime only.** Creating one at compile time is an error. C cannot hand over or take over an owner: an exported word takes `Ref T` or a `Slice`.
 
 ### 9.3 Variable-size values
@@ -1280,13 +1289,16 @@ all (§20.5); a borrow stored in a map value is checked like any stored borrow (
 
 ### 9.7 Invalidation
 
-Data stacks never move (§9.10), so growing invalidates nothing: a `Grow` or a
-`Text` may grow while a borrow of it is live, and the borrow keeps the length it
-was taken with. An owner inside an element is the exception: its bytes may move
-when it grows (§9.13). Only freeing storage invalidates. `clear` ends every borrow of the
-owner's contents taken so far (its views, references to its elements); borrows
-taken afterwards are new. A reference to the owner itself (`Ref g`) survives:
-the owner still exists. The check is made where a
+Standalone stable growth never moves existing contents (§9.10): a `Grow` or a
+`Text` may grow while a borrow of it is live, and the borrow keeps its captured
+length. Shared-position growth may relocate and ends the specified loans (§9.13).
+Actual owning transfers, replacement and prescribed logical compaction also end
+their loans, even when physical bytes happen not to move. `clear` ends every borrow
+of the owner's contents taken so far (views and references to elements); borrows
+taken afterwards are new. A reference to the owner header itself (`Ref g`) survives
+clear/replacement while that header place remains live. Moving an enclosing header
+array can separately invalidate that header-address dependency; metadata never
+repairs an old plain pointer. The check is made where a
 borrow is used, so a borrow that is not used again is no obstacle:
 
 ```lua
@@ -1299,11 +1311,13 @@ xs:clear  -- fine: head is not used again
 Using `head` after the `clear` is rejected
 (`a borrow of 'xs' is used after 'xs' was cleared`).
 
-A function compiled on its own (`call`, recursion) is described by a summary
-derived from its body: which arguments its result borrows from, and which
-arguments it may clear. A call that may clear an owner ends that owner's borrows
-at the call; a call that only reads or appends leaves them valid. A function still
-being built, within a recursive cycle, is assumed to do both.
+A function compiled on its own (`call`, recursion) has a derived contract for
+result origins, storage guarantees and ordered uses/moves/invalidation, including
+nonreturning prefixes. Call-site alias substitution must detect a killed argument
+whose contents are subsequently read through another argument. A readonly call or
+stable append without relevant kills preserves loans. Apply pending logical
+caller-completion cuts before validating a returned borrow; a pre-cut loan is not
+a post-cut loan. Recursive agreement cannot publish unresolved lifetime assumptions.
 
 A store slot is addressed as a place, `s[id]`, whose address is recomputed and whose ID is checked at every use (§10.6). A removed slot is detected by its generation. A borrow of an element (`Ref s[id]`) ends at `s:remove`: the slot is reused, so a borrow used afterwards is rejected while compiling.
 
@@ -1336,7 +1350,9 @@ An ID is a store token, a slot index and a generation. A checked lookup verifies
 
 ### 9.10 Store ownership
 
-A store's slots live on its data stack; its header (stack index, base offset, counters, token) lives in its place. A data stack is address space reserved once and committed as it is touched, so it never moves: growth bumps its top after one comparison against the reservation, and exceeding the reservation traps. The reservation is 64 GiB per stack for a thread and 1 GiB per stack for a task by default (`NUA_THREAD_STACK_BYTES`, `NUA_TASK_STACK_BYTES` when building the runtime); there are no guard pages.
+A standalone store's slots use a private nonmoving reservation under its region. Its current header, including counters/token and region/block information, lives in its source place. Check capacity arithmetic and reservation bounds before publishing growth. Nested stores have shared-position growth/invalidation (§9.13). Relocation preserves slot numbers, generations, occupancy and token; physical address reuse cannot revive an ID.
+
+**Current implementation:** slots still use fixed-index data stacks with stack/base headers. It reserves 64 GiB per thread stack and 1 GiB per task stack by default (`NUA_THREAD_STACK_BYTES`, `NUA_TASK_STACK_BYTES` when building the runtime), checked on growth without guard pages. These are current data-storage settings, not a fixed physical-index requirement or the native execution-stack contract of §20.3.
 
 ### 9.11 Cyclic graphs
 
@@ -1369,17 +1385,25 @@ local names = Map(U64, Text) {}
 local Doc = oneof { empty: Unit, text: Text }
 ```
 
-- **Positions.** Each place in an owner's type where an owner sits is a position, with one data stack. A position under an element (of a container, of an `Array(T, n)`, a map value) is shared by every element there: it is that position's arena. `Grow Text` holds 2 stacks, `Store Player` 3, `Grow(Grow Text)` 3. The number is fixed while compiling, so a type that contains itself through an owner is rejected; a tree goes through `Id`s into a `Store` (§9.11).
-- **Growth.** An owner inside an element grows within its capacity, at its arena's top when it ends there, or by moving its bytes to the top with doubled capacity. A top-level owner never moves.
+- **Positions.** Each owning location in the finite type topology is a logical layout/invalidation position. A position under an element is shared semantically by those elements, but need not be one packed physical stack. `Grow Text` has 2 logical positions, `Store Player` 3, `Grow(Grow Text)` 3; each can have arbitrarily many live blocks subject to resources. A type containing itself through ownership is still rejected; a tree uses `Id`s into a `Store` (§9.11).
+- **Growth.** A nested owner uses its capacity or replaces its own block. Moving a parent element/header array transports its headers while retaining separately owned child blocks; it is not indiscriminate deep copying. Stable standalone growth preserves its private reservation and prefix.
 - **Borrows.** Growing an owner inside an element ends the borrows of its contents (`a text in 'lines' grew, so its bytes may have moved`); when the compiler cannot tell two elements apart (unknown indices), the borrows of the contents of every element at that position. A word compiled on its own says so in its summary (`the call to append, which may grow or clear it`). Borrows of the elements themselves, and of top-level owners, are unaffected.
-- **Moving in and out.** Storing a named owner into an element (`lines:push t`, `lines[i] = t`, `players[id].name = t`) copies its bytes once into the arenas and ends it; a constructor (`lines:push(Text {})`) builds the element where it lands. Moving an owner out of an element is rejected; `copy lines[i]` and `lines:pop()` (a new owner) are the ways out.
-- **Reclaiming.** Removing, popping, truncating, clearing or replacing an element leaves its owners' bytes dead in the arenas. These operations, which already end borrows, compact an arena when its dead bytes reach its live bytes (and 4096), and compaction ends the borrows of the contents at the root's positions. A word that removes owners inside an argument's elements says so in its summary, and its caller compacts. `clear` of the outermost container empties every arena at once.
+- **Moving in and out.** Storing a named owner into an element (`lines:push t`, `lines[i] = t`, `players[id].name = t`) transfers ownership and may copy into the enclosing region; a constructor can build directly there. Call results may likewise relocate. Direct placement/adoption is an optimization, not a universal no-copy or exactly-one-copy guarantee. Building an empty element and filling it through `Ref` avoids a separately built owner transfer, without exempting growth from its rules. Moving out through an unknown element Ref remains rejected; `copy lines[i]` and `lines:pop()` are the ways out. A fragment extracted from genuinely shared backing detaches before its custodian ends.
+- **Reclaiming.** Removal, pop, truncate, clear and replacement retire obsolete exclusive blocks independently, without relocating unrelated live headers. Preserve their specified logical root-position compaction cuts, even if physical compaction moves nothing. A materialized word's summarized abandonment still produces its caller-completion cut; a returned borrow acquired before that cut does not survive it. Explicit compact retains its cuts too. The old dead-byte/4096 packing heuristic is a current implementation mechanism, not the replacement allocator. `clear` ends the removed holdings and their loans; no completed operation leaves an accumulating retirement history.
 - **Elements one at a time.** A container whose elements hold owners offers no `all` or `sub`: a slice would read their headers as values.
-- **`copy`** of a container is deep: every element's owners are built anew in the copy's arenas.
-- **Sums.** A sum whose payload holds owners is an owner. Its alternatives share its stacks, and it keeps where they began. Its payload is matched by reference (`d { text = do(t: Ref Text) ... end, ... }`); a handler taking it by value is rejected. Assigning another variant ends the old payload. A payload given by a named owner is copied into the sum's stacks; one built by a constructor is built there.
-- **Globals.** A global may be an owner (`global(Grow Text, { name = "journal" })`), with only a name. Its stacks are the first of the main thread's, reserved for it; it is set up at its first use, by the thread that uses it first, and a later use by another thread traps. A task may not use one (`a task cannot use the owner global 'journal'`). Trap recovery leaves it.
-- **Maps.** A map may sit inside an element or a map value (`Map(U32, Map(U32, U32))`, `Grow(Map(Str, U32))`): each of its stacks (slots, index, keys) is a position. Its slots and keys grow like any owner inside an element, its index is rebuilt at its arena's top, and an insertion ends the borrows of its entries (`a map in 'outer' grew, so its entries may have moved`).
-- **Not yet.** A sum holding owners as a global is rejected.
+- **`copy`** of a container is deep: every initialized owning element is built anew. External borrowed fields remain borrows; only declared internal representation links are rebased.
+- **Sums.** A sum whose payload holds owners is an owner. Only its active alternative has live owning fields. Its payload is matched by reference (`d { text = do(t: Ref Text) ... end, ... }`); a handler taking it by value is rejected. Replacement prepares a complete new payload before publishing its tag/header and retiring the old active payload. A named payload transfers under §9.2; a constructor can build it directly.
+- **Globals.** A global may be an owner (`global(Grow Text, { name = "journal" })`), with only a name. Its static Home and durable domain own its regions. It is set up at first use by that thread; another thread's later use traps. A task may not use it (`a task cannot use the owner global 'journal'`). Recoverable plain-entry failure preserves a structurally complete old or committed new value, never half-installed storage; earlier source effects are not rolled back. First-use failure leaves an uncommitted initialization claim, which is cleared before recovery completes.
+- **Maps.** A nested map's slots, index and owned keys are logical positions. Shared slot/key growth has the usual invalidation; rebuilding an index need not move entry slots. An insertion ends its prescribed entry loans (`a map in 'outer' grew, so its entries may have moved`).
+- **Current implementation limitation.** A sum holding owners as a global is rejected; the approved typed region protocol covers it, rather than adopting that exclusion.
+
+### 9.14 Checked storage direction
+
+The [approved checked-storage design](design/checked-storage.md) chooses one typed-buffer foundation for Nua containers: initialized contents, checked access, replacement/removal that end affected borrows, and ownership transfers that carry cleanup. Container authors should not need raw pointers, forged headers or manual retirement annotations. Algorithms remain ordinary Nua words; this is a target implementation contract, not an already available `Buffer` type or `reserve` method.
+
+The [approved region/completion protocol](design/region-completion.md) supplies its physical and completion architecture: private preparation, nontrapping/nonsuspending publication, then bounded retirement. Fallible allocation cannot leave a surviving global or outer target half-published. Logical lifetime cuts and raw resource reclamation are distinct.
+
+The stable/shared-position storage guarantee of a reference must survive binding, matching, return joins and function boundaries. It cannot be inferred solely from whether the current representation still names the original element place. The current evaluator has recorded gaps in reference-returning lookup and preservation of that guarantee; the design document separates those discrepancies from the required behavior. Scoped borrowing is a useful activity, not a restriction that replaces ordinary reference-returning words.
 
 ## 10. Activities, opening and spread
 
@@ -1528,7 +1552,7 @@ uint32_t evens(uint32_t n) {
 
 (The loop writes the context through the opened reference, which no syntax of the loop shows, so `counting` becomes plain memory before the loop, §6.4.)
 
-Temporary resizable state (a worklist, a change log) created in an activity takes a data stack and gives it back when the activity ends: activity scope is Goose scope.
+Temporary resizable state (a worklist, a change log) created in an activity owns its region until it ends or transfers that ownership: activity completion is a storage lifetime boundary, not necessarily a physical stack rewind.
 
 ### 10.4 Saturating chains
 
@@ -1633,7 +1657,7 @@ Every use is checked, as a slice checks its index, but uses that nothing separat
 * a call into a function compiled on its own, or into C;
 * the start of a residual loop's round, the end of the loop, and the join after a branch.
 
-Then the next use looks again. The C compiler cannot do this merging itself, because a store to an element may alias the store's header as far as it can tell. The lookup itself is inline: a few loads and compares, with the failure and the growth of the stack set out of line. Looking again is what makes an `Id` safe after a removal: the generation is checked at every use, so a stale `Id` never reaches a recycled slot. This replaces both a borrow checker for §9.7 and the borrow-by-scope activity of earlier versions.
+Then the next use looks again. The C compiler cannot do this merging itself, because a store to an element may alias the store's header as far as it can tell. The current lookup is inline: a few loads and compares, with failure and stack-set growth out of line. The replacement keeps checked lookup but obtains storage through the region protocol (§9). Looking again is what makes an `Id` safe after a removal: the generation is checked at every use, so a stale `Id` never reaches a recycled slot. This replaces both a borrow checker for §9.7 and the borrow-by-scope activity of earlier versions.
 
 ### 10.7 Keyed spread
 
@@ -2133,7 +2157,7 @@ establish the scoped loan around the user callback and perform invalidating work
 
 ## 13. Fixed-length arrays
 
-`Array(T, n)` holds `n` elements of a fixed-size `T`, with `n` known while compiling. It is a value: a typed local, a struct field, a parameter, a pool's slot type. In C it is a struct wrapping `T e[n]`, so it copies and passes by value as structs do. An `Array(T, n)` whose elements hold owners is an owner instead (§9.13): its elements' owners live in its arenas, it is indexed like a container (`a[i]`, `a.length`), moved and copied like any owner.
+`Array(T, n)` holds `n` elements of a fixed-size `T`, with `n` known while compiling. It is a value: a typed local, a struct field, a parameter, a pool's slot type. In C it is a struct wrapping `T e[n]`, so it copies and passes by value as structs do. An `Array(T, n)` whose elements hold owners is an owner instead (§9.13): its elements' owners live in its enclosing regions/blocks, it is indexed like a container (`a[i]`, `a.length`), moved and copied like any owner.
 
 ```lua
 local fixed = do(): U32
@@ -2165,12 +2189,12 @@ uint32_t fixed(void) {
 
 ## 14. Text
 
-Three types, one per role, each fitting the memory model as it is: views never outlive what they view, resizable storage lives on data stacks, and values are copied.
+Three types, one per role: views obey their contents lifetimes, resizable storage has affine region custody, and fixed-size values copy by value.
 
 | Type | Role | Storage | Store in a struct | Send to a task |
 |---|---|---|---|---|
 | `Str` | a view of text | someone else's bytes | no | no |
-| `Text` | text being built | its own data stack (it is `Grow U8`) | as a field created in place | no |
+| `Text` | text being built | owned region/block storage (it is `Grow U8`) | as a field created in place | no |
 | `Chars(n)` | short text as a value | inline: a length and `n` bytes | yes | yes |
 
 ### 14.1 Str
@@ -2258,14 +2282,7 @@ Everything above, on both backends (`examples/strings.nua`, `tests/strings_main.
 
 ### 15.1 Owned mutable storage
 
-`Map(K, V)` owns fixed-size entries in slots that never move (a free list reuses
-removed ones) and a hash index of slot numbers, on two Goose data stacks; only the
-index is rebuilt when the map grows. `Map(Str, V)` also owns copied arbitrary byte
-keys, on a third. Iteration follows slot order. Either is an owner (§9.2):
-created in place with `{}`, moved, returned, copied with `copy`, passed by `Ref`,
-and never captured by another task. A task may own its own map. A struct may hold
-maps among any number of owner fields. Scope exit and trap recovery release its
-owned stacks.
+A standalone `Map(K, V)` owns stable entry slots (a free list reuses removed ones) and a separately rebuilt hash index of slot numbers. `Map(Str, V)` also owns copied arbitrary byte keys. These are logical storage positions under region custody (§9); nested maps have the shared-position rules of §9.13. Iteration follows slot order. Either is an owner: created in place with `{}`, transferred, copied with `copy`, passed by `Ref`, and never captured by another task. A task may own its own map; a struct may hold maps among owning fields. Scope completion/recovery releases resources according to their current custody, preserving globals/outer domains.
 
 Keys of `Map` are integers (including Duration), Bool, Id, Chars, or recursive
 structs and sums of these. General arrays, floating keys, pointers and borrowed
@@ -2279,7 +2296,7 @@ values; Unit remains valid as a sum alternative. `Map(Str, V)` accepts Str and o
 empty keys and embedded NUL bytes.
 
 `Map.borrowing(Str, V)` keeps the caller's `Str` keys instead of copying them into
-an arena, and compares them by contents. Each key is a stored borrow (§9.4): it must
+owned key storage, and compares them by contents. Each key is a stored borrow (§9.4): it must
 not outlive its owner, and the map is rejected once a source is cleared or ends
 (`Map.borrowing(Str, V)` operations check the keys they compare against). Tokens keyed
 by their text in a source buffer need no copies. `put(k, v)` and `m[k] = v` store the
@@ -2393,8 +2410,7 @@ for keys such as `"length"`.
 [SipHash-2-4](../lib/hash.nua) are ordinary Nua words shared by both backends. The
 `__eq` rule of §15.2 is `keys.check_key`, which walks a key type the way the encoding
 does; it runs when a map type is built and again when a key encoding begins.
-Mutable tables use Robin Hood probing, backward-shift deletion, growth at 7/8
-load, and offset-based string arenas with bounded dead-byte compaction. Pending
+**Current representation:** mutable tables use Robin Hood probing, backward-shift deletion, growth at 7/8 load, and offset-based string arenas with bounded dead-byte compaction. The approved replacement keeps Nua map algorithms but uses region/block custody and declared internal representation links (§9); this paragraph's arena layout is not its fixed ABI. Pending
 keys are copied before table movement, and arena aliases are rebased after
 allocation. Hashing incorporates a per-process random seed; entropy failure traps.
 
@@ -2405,6 +2421,8 @@ Mutable maps remain runtime storage even when their arguments are known. Known
 descriptions have no mutable compile-time heap.
 
 ### 15.5 Design rationale
+
+The physical stack/offset-arena descriptions in this rationale record the original/current implementation, superseded for the replacement by §9's approved region protocol. Stable/shared borrow guarantees and the Nua-first algorithms remain contracts; physical packing is not.
 
 A map is an owner like `Store` and `Grow`, so the decisions that shaped it
 were mostly decisions about the Goose model it already had: two data stacks for a
@@ -3063,12 +3081,12 @@ end
 | `channel(T, n)` | a channel of `T` with `n` buffered slots; `n = 0` is unbuffered |
 | `pool(T, n)` | `n` slots of `T` whose ownership moves between tasks (§20.6) |
 
-**The scope's end is a wait.** It completes when the body has finished and every task spawned in the scope has finished. Then the channels and pools retire. A scope does not cancel anything: it waits. A scope that would wait forever is a deadlock, and the scheduler reports it (§20.8).
+**The scope's end is a wait.** It completes when the body has finished and every task spawned in the scope has finished. Then the channels and pools retire. A scope does not cancel anything: it waits. Waiting parties with no possible wake source produce the deadlock diagnostic (§20.8); a task computing forever instead keeps its join pending, while its permitted budget points let other ready tasks run.
 
 **The scope body is the enclosing code, continued.** It runs in sequence with the code around it, so it reads and writes that code's locals freely; `total` above is one. Spawned tasks are not the enclosing code, and the next section says what they can reach.
 
 * *Inside a task*, the body is part of that task. Its waits suspend the task, and so does the scope's end.
-* *In plain code*, such as an exported function called from C, the body runs on the calling thread, and its waits **block** that thread instead of suspending it. The compiler emits the same runtime call in both cases. A blocked thread is not idle: it runs tasks from the scheduler's queue until its own wait completes. So a scope in plain code costs no closure conversion, and with no worker threads at all (deterministic mode, §20.8) everything runs on the blocked thread.
+* *In plain code*, such as an exported function called from C, the body runs on the calling thread, and its waits **block** that thread instead of suspending it. The compiler emits the same runtime call in both cases. With no workers (deterministic mode, §20.8), that blocked thread runs the tasks until its own wait completes. In the approved worker-affine runtime, workers retain their assigned tasks and blocked plain parties wait; the current implementation instead lets blocked plain threads also take queued tasks. Neither representation needs scope-body closure conversion.
 
 Scopes nest. A task may open its own scope. It may also spawn into the scope it belongs to, or make channels and pools in it, because a task carries its scope's handle implicitly. Everything it makes there still ends with that scope.
 
@@ -3091,7 +3109,9 @@ A spawned block may mention:
 
 ### 20.3 What a task compiles to
 
-A task is not a thread. It compiles to a **resumable C function**: a frame struct holding the task's typed locals and its copies, and a step function that runs until the next wait and returns. Two properties of Nua make this both possible and cheap:
+A task is not an OS thread. Its **source waits** compile to a typed frame holding locals/copies and a resumable step function. The [approved replacement](design/region-completion.md#7-native-tasks-without-a-second-evaluator) runs that step on a private nonmoving native stack: budget suspension saves the actual native continuation, including materialized callees, without returning those frames. Source-wait state and budget continuation are distinct. This mechanism is adopted but not yet implemented.
+
+Two properties make source-wait lowering possible:
 
 * **Words are evaluated in place (architecture §5),** so a `send` inside a word inside a callback lands in the task's own body. No `async` marks the words that may wait: there is no call to mark, so there is no function coloring.
 * **Loop state is explicit (§6.4),** so the locals live at each wait are known exactly.
@@ -3105,7 +3125,7 @@ local square = do(inp: Chan U32, out: Chan U64): Unit
 end
 ```
 
-Spawned with `spawn(square, nums, squares)`, it becomes a frame and a step function:
+**Current implementation listing:** spawned with `spawn(square, nums, squares)`, it becomes the following frame and step function. Its `NUA_YIELD` state labels are the old budget representation; the replacement uses native budget context switching, not both representations for the same budget continuation.
 
 ```c
 typedef struct square_frame {
@@ -3168,13 +3188,15 @@ static nua_step square_step(nua_task *nua_task_) {
 
 The copies are named after the word's parameters, `inp` and `out`. Each wait passes its site, the source line, which a deadlock report prints.
 
-Jumping into a loop body is ordinary C99, so the lowering is portable: no stack switching and no assembly.
+The current source-wait/state-label lowering uses ordinary C99. The approved native-budget mechanism additionally requires a conforming platform context switch and guarded/probed nonmoving execution stacks; the complete runtime is no longer claimed to need no stack switching or assembly.
 
 * **A wait owns its operation records** (`nua_op`) in the frame: one, or one per case of a `first_of`. Waiting allocates nothing: the record is linked into a channel's queue or handed to the I/O backend, and whoever completes it writes the result into the record and makes the task runnable.
-* **Each task has its own data stacks** (architecture §7). They are heap buffers addressed by offset, so a suspended task's stores and Grow arrays stay where they are. A worker switches to a task's stack set when it runs the task, and back to its own afterwards. The frame never moves, so references into the task's own locals stay valid across waits.
-* **Loop back-edges count down a budget** and yield when it runs out. The compiler knows every residual loop, because loops are tail calls (§6), so a task that never waits still cannot starve the others. This is cooperative scheduling with the cooperation inserted by the compiler. Only a long call into C goes unchecked.
+* **Each task owns its storage context and nonmoving frame/native stack.** Dispatch installs that context and restores the executor's previous context afterwards. Ordinary workers use lifetime executor affinity; no other worker resumes an active/saved stack. Current code still uses per-task data-stack sets.
+* **Every residual Nua loop and known recursive native-call cycle charges a budget in common prepared IR.** At a permitted safe point, switching to the same executor's scheduler stack lets another task run without waiting for the native word to return. Storage PREPARE/RETIRE service budgets between bounded steps; COMMIT never suspends. Private ownership/place identities do not change merely because another task ran.
+* **Opaque foreign extents remain unchecked.** No budget switch occurs under an opaque C invocation, including its synchronous Nua callbacks; service debt at the next permitted point after it returns. Direct known Nua calls and trusted generated task/runtime entries remain budget-capable. C TLS/locks are not virtualized. Explicit `blocking` jobs remain outside-scheduler work, not an implicit implementation of native budgets.
+* **Acquire before publication, release after switching away.** Spawn acquires/registers frame, context and stack before making the child runnable. Budget suspension allocates nothing. Native-stack exhaustion is a fatal task resource failure. All variable-size retirement finishes with budgets before DONE; final stack/frame release runs from the scheduler stack.
 
-**The one restriction.** A task cannot wait inside a word that is compiled as its own C function: a recursion re-entered in non-tail position (architecture §5). Plain code may, since it blocks rather than suspends. Such a function has a real C stack frame, which cannot be suspended. Tail recursion is a loop and is fine. Non-tail recursion that waits is written with an explicit stack in a Grow. The design leaves room for a later extension that lays such frames on the task's data stack, which amounts to segmented stacks.
+**The source-wait restriction remains.** A task cannot perform a source wait inside a word materialized as its own native function, including non-tail recursion. Plain code may block there. Although the new context mechanism can preserve native frames for budget suspension, this approval does not enable additional source waits. Tail recursion remains a loop; waiting non-tail algorithms use an explicit stack in a Grow.
 
 The scope body that spawned it is plain code, an export. Its waits block, and `nua_self()` names the calling thread as a party the runtime can wake:
 
@@ -3213,7 +3235,7 @@ uint64_t sum_squares(uint32_t n) {
 }
 ```
 
-A spawn allocates a zeroed frame, fills in the copies (the producer block captured `n` and the channel), and starts the task.
+The listing above is the current spawn/frame protocol. The replacement additionally acquires the execution stack/context before publication; source captures and Slot transfers retain their prescribed ordering.
 
 ### 20.4 Operations and `first_of`
 
@@ -3490,7 +3512,7 @@ The `failed` arms the program left empty disappeared; the match is the branch on
 ### 20.8 Deadlocks, determinism, failure
 
 * **Deadlock is detected exactly.** Suppose no task is runnable or running, no plain thread is active in a scope, and no timer or I/O operation is outstanding, yet some task or thread is waiting. Then nothing can ever wake it, because only tasks and scope bodies touch channels and pools. The runtime traps with `deadlock: every task is waiting` and names the wait each party is suspended in. The classic leak, a goroutine blocked forever on a channel nobody closes, becomes this diagnostic at the scope's end.
-* **Deterministic mode.** With `NUA_SCHED_SEED=n`, the runtime starts no workers. The blocked plain thread runs every task, with a seeded choice among runnable tasks and ready cases. A failing concurrent test can be replayed exactly, apart from the timing of real I/O and timers.
+* **Deterministic mode.** With `NUA_SCHED_SEED=n`, the runtime starts no workers. The blocked plain thread runs every task, with seeded runnable-task and ready-case choices. Native budget suspension switches stacks on that same thread, never starts a replacement worker. The approved scheduler uses finite service rounds: seeded choices serve the eligible cohort once; yielded/new/woken tasks join the next round. Replay is for the same program/runtime, seed, initial state and external-event trace, apart from real I/O/timer timing; schedules need not match older runtime versions. Context-switch addresses and OS scheduling are not another lottery for native Nua work.
 * **A trap aborts the process,** as an unrecovered panic does in Go: an out-of-range index, a stale handle, a send on a closed channel, a slot used by a task that does not own it.
 * **Cancellation is closing a channel.** There is no separate mechanism, so no operation grows a third outcome. A deadline bounds a single I/O operation; a task stops when it observes `closed`.
 
@@ -3537,7 +3559,7 @@ Not checked: memory that C code shares behind an extern's back (§17.1), and a b
 
 ### 20.11 What is implemented
 
-All of this section is built: tasks as state machines, the scheduler, channels, `first_of` over receives, sends, takes and timers, `spawn do`, pools and slots, `blocking` blocks on a blocking thread pool, I/O by completion with the `poll`, io_uring and kqueue backends, deadlock detection and deterministic mode.
+The current implementation provides tasks as state machines, the scheduler, channels, `first_of` over receives, sends, takes and timers, `spawn do`, pools and slots, `blocking` blocks on a blocking thread pool, I/O by completion with the `poll`, io_uring and kqueue backends, deadlock detection and deterministic mode. The approved region allocator, native task-stack/context mechanism, common-IR native budgets and service-round/affinity policy are **not implemented**. The historical results below do not validate them.
 
 The harnesses (`examples/channels.nua`, `examples/io.nua`) cover:
 
@@ -3631,7 +3653,7 @@ uint32_t (*pick(uint32_t which))(uint32_t) {
 }
 ```
 
-A function whose address is taken starts its data stacks at index 0, as an export does, so it takes no hidden base parameter.
+A function whose address is taken retains its declared C signature: no variable ownership-history or continuation parameters. The replacement obtains its selected storage/execution context through the runtime. The current fixed-index implementation starts such a function's data stacks at index 0, like an export, without a hidden base parameter.
 
 ## 22. What the language does not have
 
@@ -3640,10 +3662,10 @@ The core language does not provide:
 - Arbitrary Lua-to-C compilation.
 - A second complete typed C virtual machine.
 - Implicit runtime closure allocation.
-- General-purpose heap ownership, reference counting or tracing garbage collection.
+- Source-level general-purpose pointer-owned heap objects, reference counting or tracing garbage collection. The approved affine region allocator itself uses heap-like reservation/free machinery.
 - Automatic heap promotion.
 - References that outlive their owners: a stored borrow is checked by the lifetime rule (§9.5).
-- Arbitrary independently owned objects, or automatic collection of unreachable graph nodes.
+- Arbitrary pointer-owned object graphs or automatic collection of unreachable graph nodes. Independently live affine owners do have independent regions.
 - Unrestricted speculation of compile-time side effects.
 - A runtime object model for generic types, or dynamic method dispatch by default.
 - Shared mutable memory between tasks, and the lock and ownership type disciplines that would police it (tasks communicate over channels and move pool slots, §20).
@@ -3666,10 +3688,10 @@ Not implemented: a sum holding owners as a global (§9.13). Pointer arithmetic b
 11. **Typed places store lazily; storage is written only when something needs it.**
 12. **The C backend receives a specialized residual program, not a translation of the source.**
 13. **Goose memory analysis operates on the surviving native operations.**
-14. **Scopes own ordinary values; stores own recyclable objects; resizable values are created in place and moved only by reference.**
+14. **Scopes own ordinary values; stores own recyclable objects; resizable values are created in place and transferred affinely, with their cleanup and contents-loan cuts.**
 15. **References borrow, IDs identify, and neither owns storage.**
-16. **Data-stack allocation is bounded through lexical scopes and call-graph restrictions.**
-17. **No runtime GC, reference counting or implicit heap ownership exists.**
+16. **Affine region custody determines reclamation; independent live owners have independent storage, subject to runtime resources rather than a fixed physical-index bound.**
+17. **No runtime GC, reference-counted language ownership or implicit borrow promotion exists.**
 18. **Activities are compile-time: a callback never becomes a closure; opening introduces live field places with lexical shadowing.**
 19. **Tasks share no memory: what reaches a task or crosses a channel is a copy or a move, every wait is an operation in the task's own body, and a scope joins every task it started.**
 20. **The resulting executable is independent of LuaJIT.**

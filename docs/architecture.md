@@ -7,6 +7,8 @@ toolchain, and the boundary between what is written in Nua, what stays in Lua an
 what stays in C. [The guide](designing-and-writing-nua.md) owns how to design a
 program with these mechanisms.
 
+**Approved replacement:** [affine regions, completion and native task execution](design/region-completion.md) now supplies the ownership/storage/recovery/scheduling architecture, together with [compiler activities](design/compiler-activities.md). It replaces fixed-index placement and packed arenas with dynamic affine regions, and task-only state-machine budgets with nonmoving native task contexts. It is approved, not implemented. Unless explicitly marked as target design, the implementation descriptions and historical results below still describe the current compiler; they are not compatibility constraints on the replacement.
+
 Section numbers are stable and are cited from the sources as `architecture §N.M`.
 
 The compiler is Lua and the runtime is Nua. That split is not an accident of
@@ -386,7 +388,14 @@ Store  Let(temporary)  SetParameter  Expression  If  Loop(top, end)  Return  Got
 
 Immediate sum matching is owned by an application, not by an ambient next-frame flag. A callback registry maps its Lua closure to its descriptor; native words and callbacks receive explicit invocation options. Known-tag returns retain separate landing sites, with payload expressions captured before return-path stores. Each tag joins producer state once; differing payloads get a typed slot, while equal known payloads remain static. A separate inferred frame joins handler results. Its path blocks are spliced into residual IR only after join-time stores have been inserted. Unknown sums and materialized calls use ordinary matching. The resulting IR contains only the existing stores, labels and jumps.
 
-Reference-written loop state is likewise invocation-local. A loop retry can adopt an initialized local from the same native function without adding a source-level body parameter. Existing syntactic slots and reference aliases reuse the same owner. Per-field agreement retains invariants; address escape replays the outermost affected loop with storage initialized before it. For derived locals, a lazily bound scalar input can be snapshotted once at its original binding point instead of materializing each derived expression separately. Unbound reads retain the ordinary version checks.
+The adopted loop contract ([syntax §6.4](syntax.md#64-a-loops-state-is-explicit))
+keeps a carried native local's identity across known and residual rounds: direct
+access and references observe the same current contents. Existing round copies
+can still violate this for read-only aliases in known evaluation; the discrepancy
+and approval are recorded in [W02](design/compiler-inventory/review.md#w02--an-alias-writes-a-loop-variable).
+The implementation described below has not yet been changed to satisfy that case.
+
+Reference-written loop state is likewise invocation-local. In the current evaluator, a loop retry can adopt an initialized local from the same native function without adding a source-level body parameter. Existing syntactic slots and reference aliases reuse the same owner. Per-field agreement retains invariants; address escape replays the outermost affected loop with storage initialized before it. For derived locals, a lazily bound scalar input can be snapshotted once at its original binding point instead of materializing each derived expression separately. Unbound reads retain the ordinary version checks.
 
 Internal widening forgets a changing sum tag as well as its payload; keeping a payload-free tag known would make retries fail to progress. Local lifetime checks use an opaque frame identity rather than retaining the completed frame and its snapshots. Rollback releases abandoned locals and this builder's statement graphs while preserving statement indices and independently materialized functions. Discarded trace positions contribute zero to size profiles.
 
@@ -404,6 +413,12 @@ The backend applies presentation-only rewrites that cannot change behaviour:
 - a temporary used once by the very next statement is written in place, under the conditions of §4.
 
 ## 7. Data-stack assignment
+
+**Approved replacement:** [affine regions](design/region-completion.md) replace fixed-index assignment as correctness machinery. Standalone holdings have independent regions/nonmoving growth reservations; nested owners have individually reclaimable blocks. Logical positions and native interfaces remain finite, but physical resource counts follow actual live ownership. No root-bank limit, early target scan or interprocedural placement fixed point is required. A genuinely shared allocation has one explicit custodian; escaping fragments detach before it ends.
+
+[Checked storage](design/checked-storage.md) remains the safe Nua library foundation. Actual owning transfers permit relocation and end old contents loans even when copying is elided; SSA transport of the same installed holding is not another move. Capture complete values in source order, prepare private storage, publish through bounded nontrapping/nonsuspending COMMIT, then retire obsolete allocations. Complete exit holdings survive legal activity waits; current domain/Home custody, not dead frame pointers or reconstructed suffix marks, determines cleanup and trap recovery. Preserve logical caller-side compaction cuts rather than adopting eager compaction.
+
+These algorithms specialize/residualize as ordinary Nua over the same IR used by both backends. Their implementation and independent validation remain work, but the allocator/completion mechanism is now selected. The rest of this section describes the **current implementation**, not a requirement to retain its ordinal/rebuild machinery.
 
 The compiler assigns the lowest available relative data-stack index; an index is released when the block that owns it ends.
 
@@ -440,7 +455,7 @@ An owner reached through a reference keeps its stack identity in its header, so 
 
 Knownness is semantic information used during residualization; memory facts are verified for the residual program. They are separate responsibilities.
 
-Specialization keys contain code identity, native types and known arguments — never absolute data-stack positions, because `gs_sp` is a relative base.
+Specialization keys contain code identity, native types and known arguments, including the stable/shared-position guarantee of reference arguments — never absolute data-stack positions, because `gs_sp` is a relative base. That guarantee must survive reference materialization and return joins; the current representation loses it in the focused case recorded in [checked storage §5](design/checked-storage.md#5-executable-witnesses-and-actual-results).
 
 Borrow provenance is staged information, not a pointer-field ABI extension.
 Tokens name what a borrow depends on: an activity (`view_of`, a `Map(Str, V)` key during
@@ -449,9 +464,11 @@ has a whole token, taken by a `Ref` to it and by views of fixed arrays, which en
 with its word or block, and a contents token, taken by views of a `Grow` or `Text`
 and by references to their elements, which also ends at `clear`. A `Ref` keeps the
 tokens it was taken with. A reference stored as data is a pointer; reading it back
-yields a `deref` place carrying the stored tokens, and a loop round's copy of a
-variable answers to the variable (a reference to it that becomes data makes the loop
-adopt the variable). When a join materializes differing references, it takes their
+yields a `deref` place carrying the stored tokens. In the current implementation,
+a loop round's copy answers to the original variable for borrow provenance (a
+reference to it that becomes data makes the loop adopt the variable). That token
+association alone does not satisfy the same-current-contents rule in §6 above.
+When a join materializes differing references, it takes their
 targets' addresses; places that became memory during the join store their pending
 values on every path.
 Bindings, sum payloads, dynamic conversion, return joins and loop results retain
@@ -759,6 +776,10 @@ The gccjit backend does not keep a second copy of any of them. `nua.cjit` contai
 Everything above, with libgccjit 13 or later on 64-bit targets. Compiling a module takes a few hundred milliseconds at `-O2` (most of it gcc; `opt` lowers it). Code quality is gcc's: with the same gcc version the two backends produce the same code. (On the machine these tests ran on, libgccjit is GCC 14 and `cc` is GCC 13, and a Collatz loop ran in 0.82 s through gccjit against 1.24 s through `cc -O2`.) ThreadSanitizer covers the C backend only, since gccjit's code is not instrumented. The C reader reads the C the compiler writes, not C in general.
 
 ## 12. The runtime
+
+**Approved replacement runtime:** [region/completion architecture](design/region-completion.md#7-native-tasks-without-a-second-evaluator) adds nonmoving task-owned native stacks and a minimal platform context mechanism. Common prepared IR inserts loop/known-recursive-cycle budget effects. Budget suspension saves actual native frames; legal source waits retain the existing typed-frame state machine. Seeded execution switches stacks on the sole blocked plain thread; ordinary workers keep lifetime task affinity. There are no replacement workers or native-resume tickets. Opaque foreign extents defer switching, including their synchronous callbacks; explicit blocking jobs remain outside-scheduler operations.
+
+Nua implements region allocation, typed relocation, phase-aware recovery, bounded storage walks and seeded service rounds. C/assembly provides raw resource and conforming context/ABI mechanisms, not ownership/scheduling policy. PREPARE/RETIRE may yield between bounded steps; COMMIT cannot. Bulk task cleanup finishes before DONE; final frame/stack release is from the scheduler stack. This replaces the C99-only/no-stack-switch implementation claim and costs per-task stack reservations, platform ports and worker-affinity imbalance. The remainder of §12 describes **current code**, not an implementation of this target.
 
 ### 12.1 The runtime in Nua
 
@@ -1465,10 +1486,11 @@ expectations, `nua size`, the three fuzzers and the documentation checks.
 
 | Not implemented | Where the design says so |
 |---|---|
-| A sum holding owners as a global | design memory.md §5.10 |
-| A call result built directly in a new element (`lines:push(read_line f)` copies it once) | design memory.md §5.3 |
+| Dynamic affine regions, phase-correct recovery, nonmoving native task contexts and common-IR budgets | [approved region/completion architecture](design/region-completion.md); not validated by the old allocator/task tests |
+| A sum holding owners as a global | syntax §9.13; covered by the approved typed region protocol, still rejected by current code |
+| A safe typed-buffer foundation replacing unsafe-grade per-container storage hooks; complete storage guarantees through reference results | [checked storage](design/checked-storage.md); cross-position call-result relocation is now permitted, not a missing universal no-copy feature |
 | Releasing every owner at its last use (today: exact for moves and replacement, otherwise at block end) | design memory.md §5.8 |
-| Work stealing; the run queue is one locked queue | syntax §20.8 |
+| Work stealing; the current run queue is one locked queue | The approved reference scheduler deliberately uses executor affinity rather than migration; syntax §20.3 |
 | `s:find` faster than the obvious algorithm | implementation note, not a contract |
 | A fully Nua decimal conversion (libc `snprintf`/`strtod` are called today) | architecture §15.6 |
 
@@ -1522,6 +1544,12 @@ is not an optional skip; `make test-scheduler` requires it too and covers the ru
 policy objects, recursive layouts and the queue/heap/channel/pool models.
 
 ## 18. Source layout
+
+[Mapping the compiler before rewriting it](design/compiler-map.md) records the
+current representations, operations and state boundaries. The subsequent
+[rewrite inventories](design/compiler-inventory/README.md) curate that evidence
+and track review/freeze decisions. Their proposals do not change this document's
+contracts.
 
 | Part | Source |
 |---|---|

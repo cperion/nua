@@ -1,0 +1,687 @@
+-- Completion experiment over the activities probe's ONE program family.
+-- Run: .local/bin/luajit ../mua/mua.lua docs/design/compiler-completion-probe.mua
+-- No production evaluator, backend, native execution or second source tree.
+local supplied = ...
+local mua = require "mua.init"
+local v = supplied or assert(mua.loadfile "docs/design/compiler-activities-probe.mua") "module"
+local types = require "nua.types"
+local front = require "nua.front"
+local words_path = "docs/design/compiler-completion-words.nua"
+
+-- A deliberately thin adapter for the actual hosted storage listing. Unsupported host
+-- operations fail; they never fall through to nua.stage. Each invocation owns its handlers.
+local evaluate_word = do(name) = do(role) = do(known_mark) = do(observed_top)
+    local parameters = name == "restore" and not known_mark and { v.parameter "U64" "mark" } or {}
+    local result_type = name == "capture" and "U64" or "Unit"
+    return v.construct ("storage." .. name) parameters result_type do(evaluation) return do(path) return do(inputs)
+                local current, returned = path, nil
+                local with_path = do(next_path) = do(body)
+                    local saved = current
+                    current = next_path
+                    local ok, problem = pcall body
+                    current = saved
+                    if not ok then error(problem, 0) end
+                end
+                local access = define
+                    top = role -> observed_top or evaluation.stack_top current role
+                    store = role -> value -> evaluation.stack_write current role value
+                    fail = message -> evaluation.trap current message
+                end
+                local stage = {
+                    word = spec -> spec,
+                    dot = do(object, key) = assert(object[key], "unknown storage vocabulary member"),
+                    gt = do(left, right) = evaluation.greater current left right,
+                    dead = do() = current.block == nil,
+                    ret = do(value)
+                        assert(current == path, "probe host adapter needs a nested return contract")
+                        returned = value
+                    end,
+                    if_ = do(condition, yes, no)
+                        evaluation.choose current condition (branch -> with_path branch yes) (branch -> with_path branch (no or do() end))
+                    end,
+                    args = do(..args) = args,
+                    chain = do(f, ..groups)
+                        for _, group in ipairs groups do f = f(unpack(group, 1, group.n)) end
+                        return f
+                    end,
+                }
+                setmetatable(stage,
+                    { __index = do(_, key) error("unimplemented probe host operation: " .. key) end })
+                local chunk = assert(mua.loadfile(words_path, { host = front.host words_path }))
+                setfenv(chunk, { __S = stage, U64 = types.U64, Unit = types.Unit })
+                local word = assert chunk()[name]
+                assert(word.result == types[result_type] and word.params[1][2] == nil and word.params[2][2] == nil)
+                if name == "restore" then
+                    assert(word.params[3][2] == types.U64 and types.U64.bits == 64 and not types.U64.signed)
+                    word.body(access, role, known_mark or inputs[1])
+                else
+                    word.body(access, role)
+                end
+                if not path.block then return end
+                return returned or v.unit()
+            end end end
+end
+
+-- Requirements are obtained from the existing logical graph, not another fixture AST.
+-- This milestone has one receiving boundary: the definition's entry and its scalar exits.
+-- Imported/escaping holdings, explicit mid-region releases and nesting need further contracts.
+local requirements = do(definition)
+    v.verify definition
+    assert(#definition.return_extents == 0, "probe needs an outbound completion contract")
+    for _, parameter in ipairs definition.parameters do
+        assert(parameter.native_type == "Bool", "completion witness expects Boolean control inputs")
+    end
+    local external, begun, sites = {}, {}, {}
+    for _, block in ipairs definition.blocks do
+        for _, node in ipairs block.instructions do
+            if v.Instruction.is(node, v.BeginExtent) then
+                assert(not begun[node.extent], "repeated group site needs a cyclic contract")
+                begun[node.extent] = block.identity
+            elseif v.Instruction.is(node, v.ExternalGrowth) then external[node.role] = true
+            elseif v.Instruction.is(node, v.CompleteBoundary) then sites[#sites + 1] = block.identity
+            elseif v.Instruction.is(node, v.ReleaseExtent) then error "explicit release needs a nested completion contract"
+            elseif v.Instruction.is(node, v.StackWrite) or v.Instruction.is(node, v.StackTop) then
+                error "input is already storage-realized"
+            end
+        end
+    end
+    for _, extent in ipairs definition.extents do assert(begun[extent.identity],
+            "imported extent cannot acquire a fresh mark") end
+    return { boundary = definition.entry, .external, .begun, .sites }
+end
+local reserve = do(definition) = do(needed)
+    local placement, used = {}, v.copy_keys needed.external
+    local serial = 0
+    -- Allocate one conservative role per allocation, NOT per fixture group. Even two
+    -- independent candidates proposed as one group receive distinct physical roles here.
+    for _, allocation in ipairs definition.allocations do
+        local role
+        repeat serial += 1; role = "result-role-" .. serial until not used[role]
+        used[role] = true
+        placement[#placement + 1] = v.Placement with
+            allocation = allocation.identity
+            extent = allocation.extent
+            .role
+            mark = v.Result { identity = "completion.mark." .. serial, native_type = "U64" }
+        end
+    end
+    return placement
+end
+local check_reservation = do(definition) = do(needed) = do(placement)
+    local allocated, roles, marks, expected = {}, {}, {}, {}
+    for _, allocation in ipairs definition.allocations do expected[allocation.identity] = allocation end
+    for _, assignment in ipairs placement do
+        local allocation = assert(expected[assignment.allocation], "unknown allocation assignment")
+        assert(allocation.extent == assignment.extent and needed.begun[assignment.extent] and not allocated[assignment.allocation],
+            "invalid allocation assignment")
+        assert(not roles[assignment.role],
+            "independently live regions need distinct reserved roles")
+        assert(not needed.external[assignment.role],
+            "capture would undo unrelated surviving growth")
+        assert(not marks[assignment.mark.identity], "duplicate capture identity")
+        allocated[assignment.allocation], roles[assignment.role], marks[assignment.mark.identity] = true, true, true
+    end
+    for _, allocation in ipairs definition.allocations do assert(allocated[allocation.identity],
+            "missing allocation assignment") end
+end
+
+-- Instantiate the already-evaluated Nua helper's blocks into the same graph. This is IR
+-- transport, not a source interpreter. Only the helper's tiny closed vocabulary is admitted.
+local realization = do(namespace)
+    namespace = namespace or "completion"
+    local blocks, serial = {}, 0
+    local fresh = do(stem) serial += 1; return namespace .. "." .. stem .. "." .. serial end
+    local publish = do(block) blocks[#blocks + 1] = v.Block block end
+    local block = do(identity) = { .identity, arguments = {}, instructions = {} }
+    local append = do(into) = do(node) into.instructions[#into.instructions + 1] = node end
+    local jump = target -> v.Jump with
+        edge = v.Edge { .target, arguments = {} }
+        at = "completion continuation"
+    end
+    local inline_word = do(into) = do(name) = do(assignment)
+        local fragment = evaluate_word name assignment.role (nil) (nil)
+        assert(#fragment.places == 0 and #fragment.extents == 0 and #fragment.owners == 0)
+        local names, operands = {}, {}
+        for _, original in ipairs fragment.blocks do
+            names[original.identity] = fresh "block"
+            for _, instruction in ipairs original.instructions do
+                local result = v.result_of instruction
+                if result then operands[result.identity] = v.Result with
+                    identity = fresh "value"
+                    native_type = result.native_type
+                end end
+            end
+            assert(#original.arguments == 0, "helper now needs block-argument transport")
+            if name == "capture" and v.Terminator.is(original.terminator, v.Return) then
+                operands[original.terminator.value.identity] = assignment.mark
+            end
+        end
+        for _, parameter in ipairs fragment.parameters do operands[parameter.identity] = assignment.mark end
+        local operand = value -> value.identity and assert(operands[value.identity],
+            "unknown helper operand") or value
+        local edge = value -> v.Edge { target = assert names[value.target], arguments = {} }
+        local unsupported = do(node, recurse) error "storage word introduced an unhandled instruction" end
+        local copying = v.Instruction.pass "instantiate storage word" with
+            Add = unsupported
+            Load = unsupported
+            Store = unsupported
+            Expose = unsupported
+            EndContents = unsupported
+            BeginExtent = unsupported
+            BeginOwned = unsupported
+            TransferOwned = unsupported
+            BorrowOwned = unsupported
+            ObserveBorrow = unsupported
+            EndOwned = unsupported
+            ReleaseExtent = unsupported
+            CompleteBoundary = unsupported
+            ExternalGrowth = unsupported
+            Call = unsupported
+            StackTop = do(node, recurse) = v.StackTop { ..node, result = operand node.result }
+            StackWrite = do(node, recurse) = v.StackWrite { ..node, top = operand node.top }
+            Greater = do(node, recurse) = v.Greater with ..node
+                result = operand node.result
+                left = operand node.left
+                right = operand node.right
+            end
+        end
+        local continuation = block (fresh "continue")
+        local ending = v.Terminator.pass "instantiate storage control" with
+            Jump = do(node, recurse) = v.Jump { ..node, edge = edge node.edge }
+            Branch = do(node, recurse) = v.Branch with ..node
+                condition = operand node.condition
+                when_true = edge node.when_true
+                when_false = edge node.when_false
+            end
+            Return = do(node, recurse) = jump continuation.identity
+            Trap = do(node, recurse) = node
+        end
+        into.terminator = jump names[fragment.entry]
+        publish into
+        for _, original in ipairs fragment.blocks do
+            local written = block names[original.identity]
+            for _, instruction in ipairs original.instructions do append written (copying instruction) end
+            written.terminator = ending original.terminator
+            publish written
+        end
+        return continuation
+    end
+    return define .blocks, .publish, .append, word = inline_word end
+end
+local realize = do(definition) = do(placement)
+    local output = realization()
+    local blocks, publish, inline_word, append = output.blocks, output.publish, output.word, output.append
+    for _, original in ipairs definition.blocks do
+        local written = { ..original, instructions = {} }
+        if original.identity == definition.entry then
+            for _, assignment in ipairs placement do written = inline_word written ("capture") assignment end
+        end
+        for _, instruction in ipairs original.instructions do
+            if v.Instruction.is(instruction, v.CompleteBoundary) then
+                for _, assignment in ipairs placement do written = inline_word written ("restore") assignment end
+            else append written instruction end
+        end
+        written.terminator = original.terminator
+        publish written
+    end
+    return v.verify_graph(v.Definition { ..definition, .blocks, .placement })
+end
+
+-- An independent, bounded storage-event ledger. It does not call the evaluator's ownership
+-- predicates or replay source. This is not another Nua evaluator or a native memory simulator.
+local ledger = do(definition) = do(inputs) = do(prefix)
+    local blocks, values, positions, allocations, custody, assignments, marks, restored, begun, trace = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+    for _, block in ipairs definition.blocks do blocks[block.identity] = block end
+    for _, assignment in ipairs definition.placement do assignments[assignment.allocation] = assignment end
+    for _, parameter in ipairs definition.parameters do
+        assert(type inputs[parameter.identity] == "boolean", "missing concrete control input")
+        values[parameter.identity] = inputs[parameter.identity]
+    end
+    local position = do(role)
+        if not positions[role] then
+            positions[role] = { top = prefix, claimed = prefix > 0, protected = {}, captures = 0 }
+            if prefix > 0 then positions[role].protected[1] = { low = 0,
+                    high = prefix, name = "inherited prefix" } end
+        end
+        return positions[role]
+    end
+    local operand = do(value)
+        if value.identity then
+            assert(values[value.identity] ~= nil, "ledger use before definition")
+            return values[value.identity]
+        end
+        if v.Operand.is(value, v.UnitConstant) then return "unit" end
+        if v.Operand.is(value, v.WideConstant) then
+            local number = tonumber value.value
+            assert(number < 9007199254740992, "wide constant outside bounded ledger arithmetic")
+            return number
+        end
+        return value.value
+    end
+    local held = do(value)
+        local allocation = operand value
+        assert(allocations[allocation] and allocations[allocation].live and custody[allocation] == value.identity,
+            "ledger owner has no custody")
+        return allocation
+    end
+    local record = do(text) trace[#trace + 1] = text end
+    local unsupported = do(node, recurse) error "ledger vocabulary does not cover this instruction" end
+    local execute = v.Instruction.pass "check physical storage events" {
+        Add = unsupported,
+        Load = unsupported,
+        Store = unsupported,
+        Expose = unsupported,
+        EndContents = unsupported,
+        ReleaseExtent = unsupported,
+        CompleteBoundary = unsupported,
+        Call = unsupported,
+        BeginExtent = do(node, recurse)
+            assert(not begun[node.extent], "ledger group began twice")
+            begun[node.extent] = true
+        end,
+        BeginOwned = do(node, recurse)
+            local allocation = node.allocation.identity
+            local assignment = assert assignments[allocation]
+            local storage = position assignment.role
+            assert(marks[assignment.role] ~= nil, "allocation before boundary capture")
+            assert(begun[node.allocation.extent] and not allocations[allocation],
+                "invalid allocation event")
+            allocations[allocation] = { role = assignment.role,
+                low = storage.top, high = storage.top + 4,
+                live = true, initial = operand node.initial }
+            values[node.result.identity], custody[allocation] = allocation, node.result.identity
+            storage.top, storage.claimed = storage.top + 4, true
+            record("allocate " .. allocation .. " on " .. assignment.role .. " -> " .. storage.top)
+        end,
+        TransferOwned = do(node, recurse)
+            local allocation = held node.source
+            values[node.result.identity], custody[allocation] = allocation, node.result.identity
+        end,
+        BorrowOwned = do(node, recurse) values[node.result.identity] = { allocation = held node.owner } end,
+        ObserveBorrow = do(node, recurse)
+            local allocation = assert allocations[(operand node.reference).allocation]
+            assert(allocation.live and position(allocation.role).top >= allocation.high,
+                "ledger observes ended/reclaimed contents")
+        end,
+        EndOwned = do(node, recurse)
+            local allocation = held node.owner
+            allocations[allocation].live, custody[allocation] = false, nil
+            record("end " .. allocation .. " (bytes retained)")
+        end,
+        ExternalGrowth = do(node, recurse)
+            local storage = position node.role
+            storage.protected[#storage.protected + 1] = { low = storage.top,
+                high = storage.top + node.amount, name = "unrelated live growth" }
+            storage.top, storage.claimed = storage.top + node.amount, true
+            record("external " .. node.role .. " -> " .. storage.top)
+        end,
+        StackTop = do(node, recurse)
+            local storage = position node.role
+            values[node.result.identity] = storage.top
+            for _, assignment in ipairs definition.placement do
+                if node.result == assignment.mark then
+                    assert(node.role == assignment.role and marks[node.role] == nil,
+                        "incorrect/repeated capture")
+                    marks[node.role], storage.captures = storage.top, storage.captures + 1
+                    record("capture " .. node.role .. " = " .. storage.top .. " claimed=" .. tostring storage.claimed)
+                end
+            end
+        end,
+        Greater = do(node, recurse) values[node.result.identity] = operand node.left > operand node.right end,
+        StackWrite = do(node, recurse)
+            local storage, top = position node.role, operand node.top
+            assert(top <= storage.top and top >= 0, "ledger reset outside stack")
+            assert(top == marks[node.role], "restore does not use boundary mark")
+            assert(not restored[node.role], "completion performed twice")
+            for _, interval in ipairs storage.protected do
+                assert(top >= interval.high, "restore clips " .. interval.name)
+            end
+            for _, interval in pairs allocations do
+                assert(not interval.live or interval.role ~= node.role or top >= interval.high,
+                    "restore clips live holding")
+            end
+            restored[node.role], storage.top = true, top
+            record("restore " .. node.role .. " = " .. top .. " claimed=" .. tostring storage.claimed)
+        end
+    }
+    local current = blocks[definition.entry]
+    while true do
+        for _, node in ipairs current.instructions do execute node end
+        local ending = current.terminator
+        if v.Terminator.is(ending, v.Return) or v.Terminator.is(ending, v.Trap) then
+            for _, interval in pairs allocations do assert(not interval.live,
+                    "live holding exits ledger") end
+            for _, assignment in ipairs definition.placement do
+                local storage = position assignment.role
+                assert(storage.captures == 1, "boundary capture missing")
+                if next begun then assert(restored[assignment.role], "completion missing at exit") end
+                assert(storage.top == marks[assignment.role], "result bytes not reclaimed")
+            end
+            return { .trace, .positions, .allocations, .restored,
+                exit = v.Terminator.is(ending, v.Return) and "return" or "trap",
+                value = v.Terminator.is(ending, v.Return) and operand ending.value or ending.message }
+        end
+        local edge
+        if v.Terminator.is(ending, v.Jump) then edge = ending.edge
+        else
+            local flag = operand ending.condition
+            assert(type flag == "boolean", "non-Boolean ledger condition")
+            edge = flag and ending.when_true or ending.when_false
+        end
+        local target, captured = blocks[edge.target], {}
+        for index, value in ipairs edge.arguments do
+            captured[index] = operand value
+            if v.operand_type value == "Owned U32" then held value end
+        end
+        for index, argument in ipairs target.arguments do
+            values[argument.identity] = captured[index]
+            if argument.native_type == "Owned U32" then custody[captured[index]] = argument.identity end
+        end
+        current = target
+    end
+end
+
+-- Check preservation and structural prerequisites. Semantic verification precedes realization:
+-- it does not know reset-above-top fault edges are infeasible. The independent ledger checks
+-- concrete storage and custody after realization; no published compiler-readiness claim.
+local check_realization = do(original) = do(needed) = do(prepared)
+    check_reservation original needed prepared.placement
+    v.verify_graph prepared
+    local original_nodes, original_ends, captures, writes = {}, {}, {}, {}
+    for _, block in ipairs original.blocks do
+        original_ends[block.terminator] = 0
+        for _, node in ipairs block.instructions do
+            if not v.Instruction.is(node, v.CompleteBoundary) then original_nodes[node] = 0 end
+        end
+    end
+    for _, block in ipairs prepared.blocks do
+        if original_ends[block.terminator] then original_ends[block.terminator] += 1 end
+        for _, node in ipairs block.instructions do
+            assert(not v.Instruction.is(node, v.CompleteBoundary) and not v.Instruction.is(node,
+                    v.ReleaseExtent), "pending physical completion")
+            if original_nodes[node] then original_nodes[node] += 1 end
+            for _, assignment in ipairs prepared.placement do
+                if v.Instruction.is(node, v.StackTop) and node.result == assignment.mark then
+                    assert(node.role == assignment.role, "capture role mismatch")
+                    captures[node.result] = (captures[node.result] or 0) + 1
+                elseif v.Instruction.is(node, v.StackWrite) and node.role == assignment.role then
+                    assert(node.top == assignment.mark, "completion operand changed")
+                    writes[node.role] = (writes[node.role] or 0) + 1
+                end
+            end
+        end
+    end
+    for _, count in pairs original_nodes do assert(count == 1, "source effect lost or duplicated") end
+    for _, count in pairs original_ends do assert(count == 1, "source control lost or duplicated") end
+    for _, assignment in ipairs prepared.placement do
+        assert(captures[assignment.mark] == 1, "capture missing or duplicated")
+        assert(writes[assignment.role] == #needed.sites, "completion site missing or duplicated")
+    end
+end
+local complete = do(definition)
+    local needed = requirements definition
+    local placement = reserve definition needed
+    check_reservation definition needed placement
+    local prepared = realize definition placement
+    check_realization definition needed prepared
+    return prepared, needed
+end
+local accept = do(definition)
+    local before = v.write_definition definition
+    local prepared, needed = complete definition
+    print("\n=== completion requirements: " .. definition.identity .. " ===")
+    print("receiving boundary " .. needed.boundary .. "; " .. #definition.allocations .. " allocations; " .. #needed.sites .. " completion sites")
+    print(v.write_definition prepared)
+    for _, flag in ipairs { false, true } do
+        local result = ledger prepared ({ .flag }) 0
+        print("ledger flag=" .. tostring flag .. ": " .. table.concat(result.trace, "; ") .. "; " .. result.exit)
+    end
+    assert(v.write_definition definition == before, "storage activity changed its input")
+    return prepared
+end
+local exported = define
+    .complete
+    .accept
+    .requirements
+    .reserve
+    .check_reservation
+    .realize
+    .ledger
+    .check_realization
+    .evaluate_word
+    .realization
+end
+if supplied then return exported end
+
+------------------------------------------------------------------------------------------------
+-- Acceptance witnesses. The original branch-local body is reused without moving its groups.
+local accepted, rejected, executions = 0, 0, 0
+local refuse = do(name) = do(fragment) = do(body)
+    local ok, problem = pcall body
+    assert(not ok and tostring(problem):find(fragment, 1, true), name .. ": " .. tostring problem)
+    rejected += 1
+    print("refused " .. name .. ": " .. tostring problem)
+end
+local witness = do(name) = do(body) = do(expected)
+    local invocations = 0
+    local logical = v.construct (name) { v.parameter "Bool" "flag" } "U32" do(evaluation) return do(path) return do(inputs)
+                invocations += 1
+                return body evaluation path inputs
+            end end end
+    print("\n=== logical " .. name .. " ===\n" .. v.write_definition logical)
+    local prepared = accept logical
+    local printed = v.write_definition prepared
+    assert(v.write_definition(complete logical) == printed and invocations == 1,
+        "placement replayed source or changed published output")
+    for _, prefix in ipairs { 0, 16, 64 } do
+        for _, flag in ipairs { false, true } do
+            local checked = ledger prepared ({ .flag }) prefix
+            expected flag prefix checked
+            executions += 1
+        end
+    end
+    accepted += 1
+    return logical, prepared
+end
+local returns_zero = do(flag) = do(prefix) = do(result)
+    assert(result.exit == "return" and result.value == 0)
+end
+local original, prepared = witness "original-branch-local" v.branch_local do(flag) return do(prefix) return do(result)
+            returns_zero flag prefix result
+            local count, claimed = 0, 0
+            for _, allocation in pairs result.allocations do
+                count += 1
+                assert(allocation.initial == (flag and 1 or 2),
+                    "allocation moved to unselected arm")
+            end
+            for _, storage in pairs result.positions do if storage.claimed then claimed += 1 end end
+            assert(count == 1 and claimed == (prefix == 0 and 1 or 2), "unused role was claimed")
+        end end end
+
+local two_live = do(shared_group) return do(evaluation) return do(path) return do(inputs)
+                local first = evaluation.group "first live candidate" path
+                local a = evaluation.owned "a" path first (v.unsigned 1)
+                local second = shared_group and first or evaluation.group "second live candidate" path
+                local b = evaluation.owned "b" path second (v.unsigned 2)
+                local selected = evaluation.declare (path) "selected" "Owned U32"
+                evaluation.choose path inputs[1] do(left)
+                    evaluation.write left selected (evaluation.take left a)
+                    evaluation.drop left b
+                end do(right)
+                    evaluation.write right selected (evaluation.take right b)
+                    evaluation.drop right a
+                end
+                evaluation.observe path (evaluation.borrow path selected)
+                return v.unsigned 0
+            end end end end
+local check_two_live = do(flag) return do(prefix) return do(result)
+            returns_zero flag prefix result
+            local count, roles = 0, {}
+            for _, allocation in pairs result.allocations do count += 1; roles[allocation.role] = true end
+            local role_count = 0
+            for _ in pairs roles do role_count += 1 end
+            assert(count == 2 and role_count == 2)
+        end end end
+witness "two-live-candidates" (two_live false) check_two_live
+local shared_logical, shared_prepared = witness "one-group-two-physical-roles" (two_live true) check_two_live
+assert(#shared_logical.extents == 1 and #shared_prepared.placement == 2)
+
+witness "trap-after-allocation" (do(evaluation) = do(path) = do(inputs)
+        evaluation.choose path inputs[1] do(left)
+            local group = evaluation.group "trapping arm" left
+            evaluation.owned "doomed" left group (v.unsigned 7)
+            evaluation.trap (left) "fixture trap"
+        end do(right)
+            local group = evaluation.group "continuing arm" right
+            evaluation.owned "continuing" right group (v.unsigned 9)
+        end
+        return v.unsigned 0
+    end) do(flag) return do(prefix) return do(result)
+            assert(result.exit == (flag and "trap" or "return"))
+            assert(result.value == (flag and "fixture trap" or 0))
+        end end end
+
+witness "early-scalar-return" (do(evaluation) = do(path) = do(inputs)
+        evaluation.choose path inputs[1] do(left)
+            local group = evaluation.group "early arm" left
+            evaluation.owned "early owner" left group (v.unsigned 1)
+            evaluation.return_scalar left (v.unsigned 1)
+        end do(right)
+            local group = evaluation.group "continuing arm" right
+            evaluation.owned "later owner" right group (v.unsigned 2)
+        end
+        return v.unsigned 0
+    end) do(flag) return do(prefix) return do(result)
+            assert(result.exit == "return" and result.value == (flag and 1 or 0))
+        end end end
+
+local growth, growth_prepared = witness "unrelated-growth" (do(evaluation) = do(path) = do(inputs)
+        local result = v.branch_local evaluation path inputs
+        -- Deliberately collide with the allocator's first candidate role name.
+        evaluation.external_growth (path) "result-role-1" 12
+        return result
+    end) do(flag) return do(prefix) return do(result)
+            returns_zero flag prefix result
+            assert(result.positions["result-role-1"].top == prefix + 12)
+        end end end
+for _, assignment in ipairs growth_prepared.placement do assert(assignment.role ~= "result-role-1") end
+local needed = requirements growth
+local unsafe = reserve growth needed
+unsafe[1] = v.Placement { ..unsafe[1], role = "result-role-1" }
+refuse "unsafe placement (source remains accepted)" "undo unrelated surviving growth" do()
+    check_reservation growth needed unsafe
+end
+-- Deliberately bypass the plan check to challenge the independent oracle as well.
+local unsafe_program = realize growth unsafe
+for _, flag in ipairs { false, true } do
+    refuse ("unsafe reset flag=" .. tostring flag) "restore clips unrelated live growth" do()
+        ledger unsafe_program ({ .flag }) 16
+    end
+end
+
+-- Mutants are invalid plans/output, NOT valid source programs counted as expected rejections.
+local mutate = do(definition) = do(change)
+    local blocks = {}
+    for _, block in ipairs definition.blocks do
+        local instructions = {}
+        for _, node in ipairs block.instructions do
+            for _, replacement in ipairs(change node) do instructions[#instructions + 1] = replacement end
+        end
+        blocks[#blocks + 1] = v.Block { ..block, .instructions }
+    end
+    return v.Definition { ..definition, .blocks }
+end
+local missing = mutate prepared do(node)
+    if v.Instruction.is(node, v.StackWrite) then return {} end
+    return { node }
+end
+refuse "missing completion structure" "completion site missing" do()
+    check_realization original (requirements original) missing
+end
+refuse "missing completion ledger" "completion missing at exit" do() ledger missing ({ flag = true }) 0 end
+local duplicated = mutate prepared do(node)
+    if v.Instruction.is(node, v.StackWrite) then return { node, node } end
+    return { node }
+end
+refuse "duplicate completion" "completion performed twice" do() ledger duplicated ({ flag = true }) 0 end
+local premature = mutate prepared do(node)
+    if v.Instruction.is(node, v.EndOwned) then return {} end
+    return { node }
+end
+refuse "premature completion" "restore clips live holding" do() ledger premature ({ flag = true }) 0 end
+local no_capture = mutate prepared do(node)
+    for _, assignment in ipairs prepared.placement do
+        if v.Instruction.is(node, v.StackTop) and node.result == assignment.mark then return {} end
+    end
+    return { node }
+end
+refuse "missing capture binding" "operand identity is not canonical" do() v.verify_graph no_capture end
+local displaced
+local late_capture = mutate prepared do(node)
+    if v.Instruction.is(node, v.StackTop) and node.result == prepared.placement[1].mark then
+        displaced = node
+        return {}
+    end
+    return { node }
+end
+local late_blocks = {}
+for _, block in ipairs late_capture.blocks do
+    local instructions = v.copy_keys block.instructions
+    if block.identity == original.blocks[2].identity then table.insert(instructions, 1, displaced) end
+    late_blocks[#late_blocks + 1] = v.Block { ..block, .instructions }
+end
+refuse "capture does not dominate" "does not dominate use" do()
+    v.verify_graph(v.Definition { ..late_capture, blocks = late_blocks })
+end
+-- A capture at the join dominates its uses, but is too late to cover either allocation.
+local late_marks = {}
+local after_allocation = mutate prepared do(node)
+    for _, assignment in ipairs prepared.placement do
+        if v.Instruction.is(node, v.StackTop) and node.result == assignment.mark then
+            late_marks[#late_marks + 1] = node
+            return {}
+        end
+    end
+    return { node }
+end
+local after_blocks = {}
+for _, block in ipairs after_allocation.blocks do
+    local instructions = v.copy_keys block.instructions
+    if block.identity == original.blocks[4].identity then
+        for index = #late_marks, 1, -1 do table.insert(instructions, 1, late_marks[index]) end
+    end
+    after_blocks[#after_blocks + 1] = v.Block { ..block, .instructions }
+end
+after_allocation = v.verify_graph(v.Definition { ..after_allocation, blocks = after_blocks })
+refuse "SSA domination is not capture ordering" "allocation before boundary capture" do()
+    ledger after_allocation ({ flag = true }) 0
+end
+refuse "unrealized graph is not completion-ready" "pending physical completion" do()
+    check_realization original (requirements original) (v.Definition with ..original
+        placement = prepared.placement
+    end)
+end
+local bad_operand = mutate prepared do(node)
+    if v.Instruction.is(node, v.StackWrite) then return { v.StackWrite with ..node
+        top = (v.wide 0).operand
+    end } end
+    return { node }
+end
+refuse "wrong completion operand" "completion operand changed" do()
+    check_realization original (requirements original) bad_operand
+end
+local one_role = reserve original (requirements original)
+one_role[2] = v.Placement { ..one_role[2], role = one_role[1].role }
+refuse "unproved shared position" "distinct reserved roles" do()
+    check_reservation original (requirements original) one_role
+end
+
+-- The same actual Nua body folds a known check and residualizes an unknown one.
+local safe_known = evaluate_word "restore" "known-role" (v.wide 0xfffffffffffffffeULL) (v.wide 0xffffffffffffffffULL)
+local bad_known = evaluate_word "restore" "known-role" (v.wide 0xffffffffffffffffULL) (v.wide 0xfffffffffffffffeULL)
+assert(#safe_known.blocks == 1 and v.Terminator.is(safe_known.blocks[1].terminator, v.Return))
+assert(#bad_known.blocks == 1 and v.Terminator.is(bad_known.blocks[1].terminator, v.Trap))
+assert(#bad_known.blocks[1].instructions == 0, "known failing restore wrote a top")
+assert(not package.loaded["nua.stage"], "old evaluator was loaded")
+print(("\nPASS: %d completion witnesses; %d prefix/branch checks; %d expected invalid-plan/output rejections; 2 known Nua checks. No native execution."):format(accepted,
+        executions, rejected))

@@ -1,6 +1,10 @@
-# Nua memory: model and API (design proposal)
+# Nua memory: historical model and API
 
-Status, revision of 2026-11-02:
+**Approved replacement:** [affine regions, completion and native tasks](region-completion.md), together with [checked storage](checked-storage.md), supersedes this revision's fixed physical indices, packed arenas, universal no-copy standalone moves and stack-relative result cleanup. Dynamic independent regions, uniform contents-loan cuts on actual owning transfers, phase-correct publication/recovery and nonmoving native task contexts are now approved. [Syntax](../syntax.md) and [architecture](../architecture.md) record the current contracts and implementation distinction.
+
+The numbered sections below preserve the older design and decisions as historical evidence, including their then-open/implemented labels. They are not competing target contracts. The safe typed-buffer foundation and Nua-first algorithms remain; unsafe-grade per-container hooks are not the chosen library-author interface. Historical task-borrow proposals are not newly enabled by the region approval.
+
+Historical status, revision of 2026-11-02:
 
 - **Implemented:** milestone 1 (data stacks never move) and milestone 2 (one borrow
   system rooted in owners). [syntax.md](../syntax.md) §9, §12 and §14 and
@@ -152,9 +156,12 @@ local h = Graph { name = Chars(32) "roads" }
 
 ### 5.3 Returning
 
-An owner is returned like a value (*decided*). The callee builds it directly in the
-caller's destination: a local, a field, an element being pushed, a payload, or an
-argument.
+An owner is returned like a value (*decided*): ordinary returns transfer its storage
+and cleanup without copying contents. A materialized callee receives caller-reserved
+result storage; the selected header may name one of several allocation candidates.
+Transferring that result into a container's storage may relocate contents, even
+when supplied directly to `push`. Universal direct construction of arbitrary call
+results in elements is no longer promised; see [checked storage](checked-storage.md).
 
 ```lua
 local squares = do(n: U32): Grow U64
@@ -164,7 +171,7 @@ local squares = do(n: U32): Grow U64
 end
 
 local xs = squares 10                -- built on xs's stack, never copied
-lines:push(read_line f)              -- built in the new element (§5.9)
+lines:push (read_line f)             -- may relocate into the new element (§5.9)
 ```
 
 ### 5.4 Moving
@@ -183,8 +190,9 @@ local g = Graph { .nodes, .edges }   -- moved: nothing is copied
   local, a field of one, a parameter, a result, §5.9): the storage stays where it is,
   the destination takes over its stack and the duty to release it. A move into or
   out of a shared position (an element) copies the bytes once, since an owner's
-  bytes always live on its position's stack (§5.9, R3); `lines:push(read_line f)`
-  builds in the element and copies nothing.
+  bytes always live on its position's stack (§5.9, R3). An immediately supplied
+  call result may need the same relocation. A fresh element can instead be filled
+  directly through a borrowed writer; automatic result placement is an optimization.
 - **Use after a move is rejected,** with the move site in the diagnostic: `nodes
   moved into g.nodes at line 3`. Last use is liveness, as for invalidation (§6.3).
 - **Using a named owner as a value when it is used again later** is rejected, with
@@ -290,7 +298,9 @@ stack's top, so it never relocates: top-level owners keep today's cost, one
 comparison. A move to a different position copies the bytes once; a move within the
 same kind of one-tenant position hands over the stack (§5.4). Storing an owner into
 an element, `push` of a named owner at its last use, `pop` and `take` are such
-copies; a call result or a constructor is built in the element and copies nothing.
+copies. A constructor builds in the element; an arbitrary call result may need
+cross-position relocation. Direct construction avoids that transfer but does not
+promise that later shared-position growth never moves contents.
 Moving out of an element is rejected (D6); `copy`, `pop` and `take` are the ways out.
 
 **R4. Borrows of a shared position's contents end when they may relocate.** Growing
@@ -611,6 +621,12 @@ activity are removed.
 
 ### 10.1 Library owner types
 
+**Historical/current implementation interface, not the chosen safe foundation.**
+The approved [checked-storage design](checked-storage.md#2-the-safe-surface-and-its-implementation-boundary)
+puts these unsafe-grade hooks below the library-author boundary. Safe container
+algorithms compose initialized storage, checked access and operations that end
+borrows automatically; forgetting a separate `retire` must not make one unsafe.
+
 A container is a **declaration plus ordinary words**. The declaration gives its
 header layout, its stacks (the release fields: one data stack each) and an init and
 copy word; the owner machinery of §5 needs nothing else. Its operations are words
@@ -746,8 +762,10 @@ test-native`).
    `Map.borrowing`; the
    text types; all as Nua over the compiler primitives; compile-time `each` checks
    with no runtime guard; `init_storage` and the compiler storage kinds removed.
-5. **Nested owners.** Done, except a sum holding owners as a global (rejected) and a call
-   result built directly in a new element (copied once). The position model (§5.9): the uniform header and relocation,
+5. **Nested owners.** Historical milestone status: implemented except a sum holding
+   owners as a global (rejected). Cross-position relocation of call results is now
+   permitted, rather than an unimplemented universal direct-construction contract.
+   The position model (§5.9): the uniform header and relocation,
    one stack per position, the owner-aware element store, dead bytes and
    compaction in borrow-ending operations, `compact()`; owner globals (§5.10).
 6. **Capacity.** Reservations per tasks scope and from known bounds.
@@ -756,7 +774,9 @@ test-native`).
 
 ## 14. Open questions
 
-None. The former open questions are decided (§15 D9–D11).
+The former questions of this revision were decided (§15 D9–D11). Current replacement
+obligations, including reference-result guarantees, region cleanup and partial
+moves, are tracked in [checked storage](checked-storage.md#6-next-implementation-obligations).
 
 ## 15. Decisions
 

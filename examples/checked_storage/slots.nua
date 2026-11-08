@@ -1,0 +1,65 @@
+-- Design witness, not a replacement Store or Buffer implementation.
+-- Sparse initialized storage using only safe Nua operations. Indices name reusable
+-- slots, NOT persistent IDs; a Store adds generations and instance identity.
+-- The module constructs types in Lua; every storage algorithm is an ordinary word.
+return function(T)
+    local Cell = oneof { empty: Unit, occupied: T }
+    local Slots = struct { cells: Grow Cell }
+
+    local empty = do(cell: Ref Cell): Bool
+        return cell with
+            empty = do(): Bool return true end
+            occupied = do(value: Ref T): Bool return false end
+        end
+    end
+    local vacancy = do(slots: Ref Slots): U64
+        local i = U64 0
+        while i < slots.cells.length do
+            if empty (Ref slots.cells[i]) then return i end
+            i = i + 1
+        end
+        return i
+    end
+    local add = do(slots: Ref Slots, value: T): U64
+        local i = vacancy slots
+        if i == slots.cells.length then slots.cells:push Cell.empty() end
+        slots.cells[i] = Cell.occupied value
+        return i
+    end
+    -- Scoped access retains the exact payload place and its storage guarantee.
+    local borrow = do(slots: Ref Slots, i: U64, body): Unit
+        slots.cells[i] with
+            empty = do(): Unit
+                trap "checked storage: empty slot"
+            end
+            occupied = do(value: Ref T): Unit
+                body value
+            end
+        end
+    end
+    -- Required ordinary lookup, retained as a blocked witness: the current
+    -- inferred match cannot return Ref. Merely allowing that loses the shared
+    -- position guarantee at the return join (see the approved storage design).
+    local get = do(slots: Ref Slots, i: U64): Ref T
+        return slots.cells[i] with
+            empty = do(): Ref T
+                trap "checked storage: empty slot"
+            end
+            occupied = do(value: Ref T): Ref T return value end
+        end
+    end
+    local replace = do(slots: Ref Slots, i: U64, value: T): Unit
+        slots.cells[i] = Cell.occupied value
+    end
+    local remove = do(slots: Ref Slots, i: U64): Unit
+        slots.cells[i] = Cell.empty()
+    end
+    -- Publish the initialized element before the body. A callback return does
+    -- not undo it; no transactional publication or rollback is promised.
+    local build = do(slots: Ref Slots, initial: T, body): U64
+        local i = add slots initial
+        borrow slots i body
+        return i
+    end
+    return { .Slots, .add, .borrow, .get, .replace, .remove, .build }
+end

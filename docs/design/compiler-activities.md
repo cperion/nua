@@ -1,515 +1,1376 @@
-# One evaluation system: program IR and compiler activities
+# Replacement compiler: data, vocabularies and activities
 
-**Design commitment, not an implementation-completion claim.** After reviewing
-Mua's compiler guide, the user asked to replace further inventories with explicit
-IRs and activities, required symbolic execution and residualization to be **one
-system**, and said “lets expand and commit to that”. This document expands that
-accepted direction. It does not revive the withdrawn scalar-only milestone, add
-language exclusions, or claim the current compiler already has these structures.
+This document **selects the internal architecture to implement**. The field lists,
+closed alternatives, vocabulary entries, ownership boundaries and completion rules
+below are contracts, not placeholders for a later inventory. Implementation may
+change a contract through an explicit design revision, not by hiding extra state
+in a builder or treating an unspecified case as a language restriction.
 
-[Syntax](../syntax.md) owns language/ABI contracts; [architecture](../architecture.md)
-describes the compiler/runtime boundary and current implementation. This is the
-replacement design, not an inventory of current fields and tags. Earlier research
-remains evidence and coverage questions, not a blueprint or an implementation.
+[Syntax](../syntax.md) owns language/ABI semantics. [Region completion](region-completion.md)
+owns the approved allocator, transfer, recovery and native-task architecture.
+[Architecture](../architecture.md) describes the current implementation separately.
+This specification does not claim replacement code or executable acceptance exists.
 
-## 1. Commitments
-
-> Supply what you know. Evaluate in place. Keep what remains. Share with `call`.
-
-1. **Symbolic execution and residualization are one evaluation activity.** The
-   same operation handlers compute with available information, change semantic
-   state, and produce required residual work. There is no preliminary interpreter
-   followed by an independent implementation that emits the program.
-2. **Use Mua's AST, not another source tree.** Retain Nua's Mua host and staged
-   word bodies as the starting substrate. Host values, closures and generators
-   remain available; hosting is not a translation to Lua followed by reparsing.
-3. **Use one Nua program IR.** Checking, collecting, rewriting, placement and
-   storage realization are operations over it. A new pass does not imply a new
-   wire type. A genuinely different representation must earn its existence.
-4. **Choose explicit control-flow blocks, immutable computed values and mutable
-   places.** Definition and block identities are separate from source word and
-   invocation identities. Normal application does not create a native function.
-5. **Keep state with the activity that owns it.** Handlers may capture it or
-   receive it. No universal context, transaction, dependency-repair or state-machine
-   framework is selected by this design.
-6. **Make memory semantics part of evaluation.** Preserve stable/shared-position
-   guarantees, borrow origins, ownership and cleanup obligations before assigning
-   final physical storage. These are not backend discoveries.
-7. **Keep algorithms in Nua.** Storage realization evaluates Nua storage words
-   through the same system. Growth, copying, compaction and cleanup do not become
-   separate Lua/C algorithms or backend-specific semantics.
-8. **Publish only at explicit completion boundaries.** Rewrites own new output;
-   consumers do not mutate a completed producer's construction state. Mutually
-   revising work belongs to an explicitly owned activity over the same program.
-
-The method comes from [Writing compilers in Mua][compiler-guide]: closed families
-and open operations (§§1, 3–4), primary results and effects (§4.2), state ownership
-at boundaries (§4.5), stateful vocabulary factories (§4.6), owned rewrites (§10.1)
-and cooperating passes over one instruction family (§10.6). The guide's roles are
-questions, not a framework (§17). Its bounded optimizer may stop early because
-unfinished optimization leaves correct code; unfinished ownership or placement
-cannot use that excuse to publish an executable program.
-
-## 2. Representations and wire contracts
+## 1. The composition we are building
 
 ```text
-Mua AST / hosted source
-        |
-        | hosting and evaluation use one semantic operation system
-        v
-Nua program IR
-        |
-        | analyses and rewrites; some activities coordinate repeated work
-        v
-Nua program IR satisfying backend-ready invariants
-        |
-        +--------------------+
-        v                    v
-      C text          libgccjit construction
+Mua parser + nua.front
+    hosted Word / Application / Body
+              |
+              v
+    evaluating invocation                 same handlers for known and unknown
+       |       |       |
+    branches  loops  shared definitions
+       \       |       /
+         one Program graph
+              |
+     checking + realizing Nua words       same evaluator, same Program kinds
+              |
+       preparing + verifying
+              |
+       +------+------+
+       C             libgccjit
 ```
 
-An arrow names a transformation and its input/output contract. It does not require
-pure handlers, a different family, or a single traversal. Analysis facts and
-placement assignments are named data products, but are not additional program IRs.
-Feedback inside an activity revises that activity's owned work, not a supposedly
-finished upstream representation. Hosting may invoke evaluation while the host
-program runs; it need not first collect every word into a closed whole-program IR.
+There is no Nua source AST beside Mua's AST, no separate source interpreter,
+no ownership program beside the program graph, and no evaluator fallback.
+An ordinary saturated application enters an invocation; only a requested native
+boundary enters the definition registry. Container and scheduler algorithms are
+Nua words. Compiler Lua/Mua constructs types, evaluates operations and proves
+contracts; C/assembly supplies platform mechanisms.
 
-### 2.1 Semantic objects, not extra pipeline stages
+### 1.1 Modules and their exported vocabularies
 
-| Object | Meaning |
-|---|---|
-| Word | Computation identity, requirements, supplied bindings and hosted body |
-| Application | Supplies arguments; incomplete supply does not run the body |
-| Invocation | One evaluation lifetime with its local bindings, exits and owned work |
-| Staged value | A native value described with available knowledge, or a host value where the language permits one |
-| Place | Stable source-visible identity whose contents may change |
-| Holding | Which lifetime currently owns an allocation and its cleanup |
-| Definition | A materialized native boundary with parameters, code and a derived contract |
+These are the selected replacement module boundaries. Names under `nua/compiler/`
+are implementation targets, not claims that those files already exist.
 
-Native staged values have native types. Scalar contents may be known or name an
-immutable residual result. Records, arrays and sums may have independently known
-components; a single whole-value known/dynamic flag is insufficient. References
-carry target/origin and storage-guarantee information. Owners denote holdings,
-not freely duplicable headers. Host tables and closures need not belong to one
-universal family with native values.
-
-A word body may be an opaque Lua closure. Inspection records its identity, source
-and supplied bindings; it does not pretend arbitrary Lua captures are serializable
-IR. Knownness determines binding time, not a different set of native semantics.
-
-### 2.2 Program shape
-
-```text
-Program
-    definitions, globals, exports
-
-Definition
-    identity, parameters, boundary contract, entry block, blocks
-
-Block
-    identity, arguments, ordered instructions, terminator
-
-Edge
-    target block, supplied arguments
-```
-
-These are conceptual checked shapes, not final constructor signatures. Program
-identities are explicit references; visitors do not recursively traverse arbitrary
-Lua tables. Definitions exist for requested/required native boundaries, including
-exports, shared calls, recursion and task execution—not for every applied word.
-
-An instruction result is defined once. Block arguments merge values from incoming
-edges. Mutable-place contents remain an evolving semantic fact, with explicit
-loads/stores when runtime storage is necessary. This does not force every local
-into memory or make known contents dynamic.
-
-Ownership is not inferred from copying a value ID. An aggregate containing owners
-is not freely duplicable merely because its computed header has an immutable
-name. Transfers and the corresponding edge/lifetime obligations remain explicit.
-
-### 2.3 Constituent families
-
-Several closed families can describe one program representation:
-
-| Family | Shapes and obligations |
-|---|---|
-| Operands | Typed constant, definition parameter, block argument, instruction result |
-| Places | Local, field, checked element, reference-target access, explicit foreign-memory access |
-| Instructions | Computation; load/store; address exposure; invocation; checks; ownership/storage transitions; required atomic/task mechanisms |
-| Terminators | Jump, conditional branch, return, trap, suspension with a continuation |
-
-These are kind groups to specify while building the first example, not an unchecked
-`Operation { anything }` payload. Operator sets, operand/result types, effects,
-identity edges and source provenance need checked contracts. Every pass covers its
-family explicitly, including identity/no-contribution handlers where appropriate.
-There is no default handler that quietly accepts unknown kinds.
-
-Arithmetic, conversion and comparison use target-native validity and width rules.
-Loads, calls, atomics, checks and suspension are execution sites, not expressions
-that may be moved merely because a visitor calls them pure. Expressions may be
-inlined by a later rewrite only when effects, validity, observation and dominance
-permit it. Evaluating operands is ordered; a multiple assignment does not silently
-choose the traversal order of effectful handlers.
-
-### 2.4 Storage and reference facts
-
-The program names logical allocations and semantic ownership operations:
-
-```text
-begin owned storage
-transfer a holding
-end a holding
-access initialized contents
-```
-
-Logical ending is not necessarily an immediate physical rewind. Reclamation may
-be retained by a larger result region or shared arena. A move transfers cleanup
-responsibility as well as the selected header. A reference records possible origins,
-lifetime dependencies and stable/shared-position guarantees; none may disappear
-when its native pointer is materialized, stored, selected or returned.
-
-Facts may be carried by checked descriptors/maps keyed by program identities; they
-need not be repeated in every node. They must belong to the representation or an
-explicit boundary contract, rather than to accidentally reachable builder objects.
-A lifetime bound alone does not prove exact target or allocation identity.
-
-Memory choices already made for this redesign remain inputs:
-
-- stack-backed ownership, no general heap, GC or reference counting;
-- stable standalone storage and potentially relocating shared-position arenas;
-- one safe initialized typed-buffer foundation, composed by Nua containers;
-- no requirement that container authors use raw pointers or manual retirement;
-- ordinary moves/returns transfer storage without copying contents;
-- crossing storage positions, including insertion of a call result, may relocate
-  contents; automatic direct construction is an optimization, not correctness;
-- construction activities initialize/publish an element and then lend it; callback
-  return does not imply rollback or atomic publication;
-- aliases remain allowed; no new exclusive-borrow system is introduced.
-
-Slots reused later do not revive earlier borrows. A view whose pointer/length were
-captured still requires live contents. Independently moving owner fields must not
-allow one field's cleanup to reclaim storage another still needs. These rules apply
-to loops, recursion, sums, globals, tasks and foreign boundaries; implementation
-order does not turn an intended feature into a forbidden program.
-
-### 2.5 Readiness, not another IR per pass
-
-| Condition | What it promises |
-|---|---|
-| Private construction | Its activity owns open blocks, pending definitions, path facts and reconsideration; this is not executable output |
-| Semantically complete program | Native types, uses, control and boundary contracts are established; source-level ownership/borrow obligations are satisfied; outstanding physical storage constraints are explicit |
-| Backend-ready program | All reachable definitions and targets are closed; physical storage operands are resolved; required transfers, captures and cleanup are executable; storage-ordering proofs hold; no unresolved logical operation remains |
-
-The latter two are checked conditions over the same program family, not two copies
-of all its types. An unsatisfied physical constraint prevents backend readiness;
-semantic completeness alone is not acceptance of an executable layout. A rewrite
-that invalidates a condition must say so and re-establish it before publication.
-
-## 3. One symbolic-execution and residualization activity
-
-The conceptual handler contract is:
-
-```text
-handle(native operation, evaluation state)
-    returns: a staged result, where the operation has one
-    changes: semantic facts and activity-owned residual output
-```
-
-All binding times use these handlers. There is no “unknown operand” fallback to a
-second compiler, no preliminary execution to discover results followed by another
-execution to emit them, and no second implementation for Nua storage helpers.
-Necessary reconsideration replaces owned facts and residual output together.
-
-| Operation | Integrated behavior |
-|---|---|
-| Arithmetic | Compute when available operands and native validity permit; otherwise emit the required computation and return its symbolic result |
-| Read | Return valid tracked contents or produce an ordered observation; its result is an immutable value, not a recipe that later reads changed contents |
-| Write | Update place contents and ownership/borrow facts; establish runtime storage where required, preserving lazy stores |
-| Conditional | Select one known arm; otherwise evaluate both under separate path facts, emit control flow and reconcile live predecessors |
-| Loop | Execute accepted known rounds; establish a reusable residual header and edges when necessary, using the same operation handlers |
-| Ordinary application | Bind supply without execution until saturation; then evaluate in the caller's circumstances without a native boundary by default |
-| Explicit `call` | In a residual context, request a shared specialization using supplied knowledge; in host compile-time evaluation, retain the specified in-place behavior |
-| Ownership/storage | Check lifetime and storage guarantees as the operation happens and produce its required runtime work; owner creation remains runtime storage |
-| Trap | End the current native path; do not fabricate a return value or a caller continuation |
-
-**Known result is not the same as no residual work.** A mutation, check, call or
-atomic operation may have a known or unused result and still require an execution
-site. Sharing a definition is not permission to skip repeated invocations or their
-effects. General known-result memoization is not part of this starting design.
-
-An earlier read of a tracked place keeps the value observed then. Address exposure
-can require a store before the exposing operation and loss of private knowledge;
-it does not retroactively change the earlier value. Direct access and references
-to a carried local observe that same place in known and residual loop rounds.
-Earlier scalar observations, distinct copies, by-value arguments and task captures
-retain their different meanings.
-
-### 3.1 State by role
-
-| Role | In evaluation | Boundary treatment |
+| Module | Exports | May depend on |
 |---|---|---|
-| Inherited | Lexical bindings, available supplies, enclosing identities | Extend bindings for nested work; do not overwrite the parent's bindings |
-| Accumulated | Diagnostics and contributions to owned definition/region requirements | Share only within the owner whose completion includes those contributions |
-| Evolving | Contents knowledge, holdings, loan validity and current flow | Fork for residual paths; reconcile at their actual continuation |
-| Produced | Values/blocks and provisional definition work | Own locally; adopt together on success; discard together on rejection |
-| Capabilities | Fresh identities, module resolution, explicitly supplied host facilities | Share intentionally; a capability is not a bag of all compiler state |
+| `nua/compiler/data.mua` | Checked wire shapes below; identity/list/map checkers | Mua contracts; `nua.types` |
+| `nua/compiler/graph.mua` | `building`, `rewrite`, `walk`, `index`, `same`, `print` | `data` |
+| `nua/compiler/facts.mua` | `fork`, `agree`, `substitute`, `observe`, `invalidate`, `transfer`, `rebind`, `check_edge` | `data`; graph indices |
+| `nua/compiler/evaluate.mua` | `evaluating`, `apply`, `invoke` | `data`, `graph`, `facts`; supplied definition/storage capabilities |
+| `nua/compiler/control.mua` | `branching`, `looping`, `complete_exits` | `data`, `graph`, `facts`; supplied evaluation capability |
+| `nua/compiler/definitions.mua` | `defining`, `request`, `agree_group` | `data`, `graph`, `facts`; supplied evaluation capability |
+| `nua/compiler/realize.mua` | `realizing`, `storage`, `tasks`, `budgets` | `data`, `graph`; supplied evaluation and Nua word bindings |
+| `nua/compiler/verify.mua` | `shape`, `graph`, `types`, `lifetimes`, `task_access`, `publication`, `ready` | `data`, `graph`, `facts` |
+| `nua/compiler/optimize.mua` | `fold`, `reach`, `sweep`, `optimize` | `data`, `graph`, `facts`, `verify` |
+| `nua/compiler/diagnostics.mua` | `reporting`, `render` | `data`; supplied source text |
+| `nua/compiler/compile.mua` | `compiling`, `prepare` | Wires the preceding vocabularies and backend adapters |
+| `nua/front.lua` | Existing Mua host, changed to the hosted-body contract in §5 | Mua AST/emitter; supplied hosting vocabulary |
+| C/JIT adapters | `emit prepared target -> BackendProduct` | Ready program, native layouts and mechanism bindings |
 
-Capture what belongs to the activity; pass what changes within it. A factory makes
-fresh handlers/state for independent work. Spreading handlers copies closures, not
-their captures. Nested rewrites receive their own output, never replace a caller's
-output field. Native construction discard does not undo arbitrary Lua effects or
-complete host resources; those resources retain explicit completion owners.
+`compile` wires the mutually cooperating activities by passing functions; their
+modules do not recursively `require` one another or consult a global current
+compiler. `nua.loader` still owns the scoped use of Lua's module machinery.
+Native type construction remains in `nua.types`; this is not another type system.
 
-## 4. Activity contracts
+### 1.2 Contract notation and representation choices
 
-The following activities are responsibilities, not a prescribed module per row.
-Their state machines describe owned work, not a universal outcome/driver framework.
-A source-contract violation produces a diagnostic and abandons the affected
-construction; it is not successful completion with a dummy value. Actual host
-errors/resources follow their explicit completion rules. These common obligations
-do not require every activity to use one generic outcome type.
+The following listings are **interface notation**, not executable Mua listings.
+`List T` is a dense ordered list; `Map K V` has only checked K/V entries; `Set T`
+is a checked set; `Option T = absent | present(T)`. Missing and known `false`/`nil`
+are different. Function arrows give curried application order. A final `Body`
+argument is the trailing callback of an activity.
 
-### 4.1 Compile a program
+- Program nodes, identity brands and facts crossing activity boundaries are
+  nominal checked records. Closed node alternatives are `family` kinds.
+- Operation vocabularies and private working state are structural `define` tables.
+  No nominal `Context`, universal `Activity`, or generic transaction framework.
+- Outcome protocols with different payloads are `oneof`s. Each activity below
+  names its own outcome; errors are not an extra success variant.
+- Published records/lists/maps are read-only by ownership convention, enforced by
+  tests and construction APIs. Mua `struct` alone does not make them immutable.
+- IDs are separate nominal brands with `{ compilation: CompilationId, serial: U64 }`.
+  The brands are `WordId`, `EnvironmentId`, `DefinitionId`, `BlockId`, `EdgeId`,
+  `InstructionId`, `ValueId`, `PlaceId`, `HoldingId`, `LoanId`, `LifetimeId`,
+  `InvocationId`, `AttemptId`, `LoopId`, `BoundaryId`, `GlobalId`, `TaskId`,
+  `OriginId`, `HostId`. `CompilationId` is a fresh opaque identity. IDs are not
+  source locations, payload addresses or allocation-site numbers.
 
-**Input:** source/module entries and requested output. **Result:** inspected program
-representations, diagnostics and requested backend products. **Owns:** module-loading
-lifetime, definition registry, diagnostic accumulation and identity capabilities.
+## 2. The values that evaluation works with
 
-It hosts Mua source and connects evaluation, preparation and emission. Existing
-stable host/type identities may be shared deliberately; invocation facts and new
-program modules cannot leak into another compilation. It returns completed output
-or a diagnostic and completes its actual host resources. It does not inject a
-universal compilation context into every operation handler.
-
-### 4.2 Evaluate an invocation
-
-**Input:** word, saturated supply, lexical bindings and current path circumstances.
-**Primary result:** staged result or terminating/control outcome. **Effects:** native
-mutation facts, lifetime transitions, residual output and definition requests.
-**Owns:** local bindings, observations, local lifetimes and tentative output.
-
-```text
-evaluating → returned
-evaluating → terminated
-evaluating → requires reconsideration → evaluating owned work again
-```
-
-Partial supply precedes invocation; it does not enter this machine. Nested ordinary
-application uses the caller's path facts, not a cloned native allocation world.
-Returning supplies its actual continuation; terminating does not. Body return,
-parent adoption and publication are different boundaries. An accepted child is
-still tentative under its parent; rejection drops its contributions as well.
-Accepted prefixes/siblings are not discarded merely because later work changes.
-
-### 4.3 Construct a control region
-
-**Input:** entry facts, participating places and target continuations. **Result:**
-blocks and facts for each surviving continuation. **Owns:** predecessor results,
-header assumptions, continuing/exiting sites, edge transfers and cleanup.
-
-Branch construction forks facts and joins live predecessors; no live predecessor
-may be treated as initialized merely because another is. Reference joins preserve
-origins and guarantees, not just pointer bits. A loop's core transitions are:
+### 2.1 Source, words and supply
 
 ```text
-establish header → evaluate body → check continuing edges
-                                     ├─ holds → complete
-                                     └─ weakens → reconsider owned body
+Span             { source: String, line: Positive, column: Option Positive }
+Origin           { span: Span, expanded_from: Option OriginId,
+                   introduced_by: Option WordId }
+Diagnostic       { rule: String, primary: OriginId, message: String,
+                   related: List RelatedLocation }
+RelatedLocation  { origin: OriginId, message: String }
+
+Requirement      { name: String, native_type: Option NativeType, opened: Bool }
+Word             { id: WordId, name: String, requirements: List Requirement,
+                   rest: Option String, result_type: NativeType,
+                   environment: EnvironmentId, body: HostedBody, origin: OriginId }
+Application      { word: WordId, supplied: List Argument }
+Argument         = HostArgument { identity: HostId, value: Any }
+                 | NativeArgument { value: NativeValue }
+                 | WordArgument { application: Application }
+                 | PackArgument { arguments: List Argument }
+Environment      { id: EnvironmentId, parent: Option EnvironmentId,
+                   bindings: Map String Binding }
+Binding          = HostBinding { identity: HostId, value: Any }
+                 | ValueBinding { value: NativeValue }
+                 | PlaceBinding { place: PlaceId }
+                 | WordBinding { application: Application }
+                 | PackBinding { arguments: List Argument }
 ```
 
-Discovering a participant is not by itself proof that a header assumption failed.
-A write restored before a continuing edge may preserve the assumption. Exit-only
-changes establish exit facts, not automatically weaker next-round facts. Inner
-exits are not outer back edges. Edge inputs are captured before assignment or
-invalidating cleanup, preserving simultaneous updates and ownership transfers.
-This is nested evaluation, not a second interpreter or a second loop IR.
+A requirement without `native_type` requires host/known supply. A native
+requirement converts/checks its supplied argument against that native type. `rest`
+collects an ordered argument pack under the existing source rules. Requirements
+and native result types are evaluated when the word is constructed, not on every
+invocation. `Application` is immutable supply, not a partially executed body.
 
-### 4.4 Construct a shared definition
+`NativeType` is a `nua.types` descriptor. `Any` occurs only in explicitly host-owned
+bindings; those bindings cannot be inserted into the native graph. Opaque Lua
+closures remain Lua closures. Their identities and origins can be inspected;
+the compiler does not serialize their arbitrary upvalues.
 
-**Input:** word and specialization inputs, including relevant reference/storage
-guarantees. **Result:** definition and boundary-relative contract. **Owns:** fresh
-parameter-relative evaluation, return origins, recursive dependencies, move and
-borrow effects. It invokes the same evaluation handlers as ordinary application.
+### 2.2 Native values and observations
 
 ```text
-requested → building → awaiting recursive agreement → complete
+NativeValue = Bits       { type: NativeType, operand: Operand }
+            | Aggregate  { type: NativeType, packed: Option Operand,
+                           parts: Map ComponentPath NativeValue }
+            | Reference  { type: NativeType, representation: Option Operand,
+                           access: ReferenceInfo }
+            | Owned      { type: NativeType, header: Operand, holding: HoldingId,
+                           endpoint: Endpoint }
+
+ComponentPath = List Component
+Component     = Field(name: String) | Element(index: Operand) | Alternative(name: String)
+
+Operand = Constant       { type: NativeType, bits: NativeConstant }
+        | Parameter      { definition: DefinitionId, index: Positive, type: NativeType }
+        | BlockArgument  { block: BlockId, index: Positive, type: NativeType }
+        | Result         { value: ValueId, type: NativeType }
 ```
 
-Recursive calls may refer to a definition being built. Callback return alone does
-not close a recursive group's assumptions. If a newly discovered move or borrow
-effect changes dependent evaluation, the owning construction coordinates that
-reconsideration before publishing. This is semantic feedback, not stack numbering.
-A call site belongs to its caller's output; retaining a definition does not retain
-discarded caller operands. Definition contracts cannot contain caller-local places.
+`NativeConstant` has the closed forms `IntegerBits(bytes)`, `FloatBits(bytes)`,
+`BooleanBit(value)`, `UnitBits`, `AggregateBits(parts)`, `StaticBytes(bytes)`,
+`SymbolAddress(name, offset)` and `DefinitionAddress(definition)`. Bytes use a
+canonical byte order; the associated native type checks width, layout and legal
+interpretation. This is not “any Lua number”. `Bits` excludes safe references and
+owning types: their facts cannot be omitted by selecting a convenient constructor.
 
-Residual `call` still specializes known supply and requests shared residual work,
-even where its result is known. Specialization keys do not use absolute stack
-indices or arbitrary lifetime-token identities. No new retry transport is selected
-here: the current targeted transport has no demonstrated need for replacement.
+A reference to an exact tracked place may have no materialized representation yet.
+Reification produces its pointer or pointer/length representation only when needed;
+constructing `Ref` does not by itself force a pending scalar store. An indirect
+reference must have its captured native representation. An `Owned` use must match
+both its holding and current endpoint; an old host wrapper cannot consume that
+holding again after it has transferred elsewhere.
 
-### 4.5 Analyze and realize storage
+An aggregate can have known parts and a residual packed representation. Every
+missing part must be recoverable from `packed`; otherwise construction fails.
+Owning/borrowed components retain their facts when packed. Extracting a header
+operand does not manufacture a second holding. Dynamic sum alternatives are
+accessed only under their active-tag proof. Fixed arrays use element paths;
+container payload lengths are runtime data, not a compiler list of every element.
 
-**Input/output:** the same program IR family. **Result:** a rewritten program with
-executable storage work and established readiness. **Owns:** working program output,
-allocation/order constraints, result-region requirements, assignments and pending
-Nua realizations. Analyses produce explicit facts; they do not mutate an earlier
-producer's private builder or require another copy of the program vocabulary.
+A read returns an observation now. Later place mutation cannot turn its `operand`
+into a recipe that rereads the place. Borrowed observations still require live loans.
+
+### 2.3 Places, contents and access
 
 ```text
-collect requirements → assign storage → realize operations → verify
-          ^                                  |
-          └──── new requirements in owned work ┘
+Place            { id: PlaceId, type: NativeType, root: PlaceRoot,
+                   path: ComponentPath, lifetime: LifetimeId, origin: OriginId }
+PlaceRoot        = LocalRoot(invocation: InvocationId, local: Positive)
+                 | GlobalRoot(global: GlobalId)
+                 | ParameterRoot(definition: DefinitionId, parameter: Positive)
+                 | IndirectRoot(pointer: Operand, access: ReferenceInfo)
+                 | ForeignRoot(pointer: Operand, contract: ForeignAccess)
+
+Contents         = Uninitialized
+                 | Tracked(value: NativeValue)
+                 | Resident(info: ValueInfo)
+                 | Moved(at: OriginId)
+
+StorageGuarantee = Stable | SharedPosition
+ReferenceInfo    { targets: TargetRelation, loans: List LoanId,
+                   guarantee: StorageGuarantee, mutable: Bool }
+TargetRelation   = Exact(place: PlaceId)
+                 | Selected(join: BlockId, component: ComponentPath)
+                 | Relative(parameter: Positive, path: AccessPath)
+                 | BoundedUnknown(lifetime: LifetimeId, path: AccessPath)
+AccessPath       = List AccessStep
+AccessStep       = FieldStep(name: String) | KnownElement(index: U64)
+                 | AnyElement | AlternativeStep(name: String)
+ForeignAccess    { lifetime: LifetimeId, type: NativeType, mutable: Bool,
+                   retains: Bool, effects: ForeignEffects }
 ```
 
-This is one activity when those operations can affect each other. Its driver
-coordinates their handlers over the same work. It is not a sequence of supposedly
-finished checking/placement/lowering IRs with hidden backward requests.
+Here `BoundedUnknown` means **lifetime-bounded**, not a bound on the number of
+possible targets. It represents late-selected runtime targets without scanning
+their collection or allocating one compiler root per element. Unknown-index
+aliasing remains conservative. It does not weaken a proved stable guarantee.
+The existing prohibition on owning moves through unknown Ref targets remains.
 
-A logical allocation may occur once per accepted known round, or repeatedly at one
-residual loop site. Source location or the nth allocation in two attempts is not
-proof of identity. Rejected construction contributes no placement evidence unless
-a separately justified contract explicitly retains it.
+Local/global place IDs persist across content replacement. Field-place identities
+are interned by root and path. `LocalRoot.invocation` is an identity namespace,
+not a pointer to a retained `InvocationWork` record. An indirect access uses its captured pointer and
+access facts; it never silently substitutes the destination of a prior source move.
+An element place additionally needs the dominating bounds/active-tag checks recorded
+in `ValueInfo.proofs` (§3). Unsafe raw pointers use their existing unsafe contract.
 
-Nua storage words run through the same evaluator with the available type, mode and
-layout inputs. Their generated definitions/allocations, if any, belong to this
-activity's work and must be included in its completion. Their realization must
-preserve the original operation's semantic contract: it cannot revive loans,
-weaken source guarantees, reorder effects or replay arbitrary user computation.
-A numeric placement change alone does not restart source evaluation.
+### 2.4 Holdings, loans and loop epochs
 
-Completion requires resolved operands, valid growth ordering, adequate result
-regions, correctly placed pre-call captures, and cleanup that cannot reclaim live
-storage. A larger reclamation extent travels with the appropriate ownership;
-partial moves may not prematurely release it. The activity cannot stop at an
-iteration cap and emit unresolved work. The convergence argument and exact region
-realization are implementation obligations, not already proved by this diagram.
+```text
+Holding          { id: HoldingId, type: NativeType, endpoint: Endpoint,
+                   header: Operand, guarantee: StorageGuarantee,
+                   custody: Custody, lifetime: LifetimeId }
+Endpoint         = InPlace(place: PlaceId) | InCapture(value: ValueId)
+                 | InResult(boundary: BoundaryId) | InOperation(instruction: InstructionId)
+Custody          = WholeRegion | Fragment(custodian: HoldingId, path: AccessPath)
+                 | BorrowedCustody(parameter: Positive, path: AccessPath)
 
-### 4.6 Rewrite a program
+Loan             { id: LoanId, lender: LifetimeId, subject: LoanSubject,
+                   acquired: OriginId }
+LoanSubject      = Header(place: PlaceId)
+                 | ContentsOf(place: PlaceId, position: AccessPath, epoch: Epoch)
+                 | ForeignContents(contract: ForeignAccess)
+Epoch            = EntryEpoch(place: PlaceId)
+                 | CutEpoch(site: InstructionId, place: PlaceId)
+                 | HeaderEpoch(block: BlockId, place: PlaceId)
+LoanState        = Live | Ended(at: OriginId)
+```
 
-**Input/output:** the same family. **Primary handler result:** replacement nodes or
-blocks. **Effects:** the rewrite's specified facts/output only. **Owns:** new output
-and its analysis state; nested rewrites have independent output lifetimes.
+These are compiler facts; runtime ownership uses the region/header ABI in
+[region completion](region-completion.md#2-actual-resources-and-exclusive-custody).
+There are no runtime per-borrow objects and no concrete epoch history vector.
+`BorrowedCustody` gives a native callee access to an existing owner through Ref;
+it does not give that callee authority to release its caller's whole region.
 
-Identity, collection and rewriting handlers compose as in the Mua guide. Input
-nodes may be shared with output only while they remain unmodified; a rewrite does
-not alter an earlier inspected result through shared mutable attachments. One
-rewrite can enable another; a driver may repeat them on this representation.
-Structural/semantic change, not merely instruction count, determines convergence.
-Optional optimization may stop with a valid less-optimized result. A change to
-calls, control, ownership or lifetimes invalidates the affected placement facts;
-backend readiness must then be re-established. No obsolete plan remains attached
-as if it still proved the new program.
+An epoch is relative to one execution of its block, not globally identified by
+its instruction address. On a loop edge, first compare a loan's epoch with that
+edge's current owner epoch. Only a matching current relation is renamed to the
+header's `HeaderEpoch`. An old loan does not become current merely because its
+syntax or address repeats. A refreshed loan passes this substitution; a stale one
+fails. Backedge transport itself creates neither a cut nor a source move.
 
-### 4.7 Emit a backend
+Whole regions transfer their actual current custody. A fragment can escape only
+through detachment before its custodian ends. Equal/empty header bits do not prove
+which holding was selected. Partial moves change only the selected component's
+endpoint and leave sibling authority intact.
 
-**Input:** a backend-ready program. **Result:** C text or libgccjit construction.
-**Owns:** backend names, declarations, labels, output and backend resources.
+## 3. The one program graph
 
-It translates already established execution. It does not infer ownership, choose
-container algorithms, repair cleanup or implement another borrow system. Both
-backends consume the same prepared view. Backend readiness is verified, not assumed
-because a previous helper returned successfully.
+### 3.1 Containers and control
 
-### 4.8 Inspect and verify
+```text
+Program          { revision: U64, definitions: Map DefinitionId Definition,
+                   words: Map WordId WordInfo,
+                   globals: Map GlobalId Global, exports: List Export,
+                   lifetimes: Map LifetimeId Lifetime, origins: Map OriginId Origin }
+WordInfo         { id: WordId, name: String, requirements: List Requirement,
+                   result_type: NativeType, origin: OriginId }
+Definition       { id: DefinitionId, word: WordId, kind: DefinitionKind,
+                   wait_mode: WaitMode,
+                   signature: Signature, entry: BlockId, blocks: List Block,
+                   places: Map PlaceId Place, origin: OriginId }
+DefinitionKind   = NativeWord | TaskStep | BlockingEntry | StorageHelper
+WaitMode         = PlainBlocking | TaskSuspending | NoSourceWait
+Signature        { parameters: List NativeType, result: NativeType,
+                   abi: NativeABI, variadic: Bool }
+NativeABI        = NuaBoundary | CBoundary | TaskEntry
+Global           { id: GlobalId, name: String, type: NativeType,
+                   initializer: GlobalInitializer, policy: GlobalPolicy,
+                   lifetime: LifetimeId, origin: OriginId }
+GlobalPolicy     = PlainGlobal | ThreadLocalGlobal | AtomicGlobal
+                 | UncheckedSharedGlobal | ThreadAffineOwner
+GlobalInitializer = StaticValue(value: NativeConstant) | FirstUse(definition: DefinitionId)
+Export           { name: String, definition: DefinitionId }
+Block            { id: BlockId, arguments: List BlockArgument,
+                   instructions: List Instruction, terminator: Terminator }
+Edge             { id: EdgeId, target: BlockId, arguments: List Operand }
+Site             { id: InstructionId, origin: OriginId }
 
-Printers, invariant checkers, collectors and decision explanations are ordinary
-operations over the families. A printer is implemented with the first kinds, not
-added after the compiler becomes opaque. Inspect the activity's state separately
-from its produced program; do not serialize a retained compiler heap as IR.
+Terminator = Jump       { origin: OriginId, edge: Edge }
+           | Branch     { origin: OriginId, condition: Operand,
+                          when_true: Edge, when_false: Edge }
+           | Return     { origin: OriginId, value: Operand }
+           | Trap       { origin: OriginId, message: Operand }
+           | SourceWait { origin: OriginId, operation: Operand, resume: Edge }
+```
 
-Verification checks constructor shapes plus graph/type/dominance/lifetime and
-readiness obligations as applicable. Repeating and nesting activities must not
-change an earlier independent result. Identity references and deliberate sharing
-need explicit comparison rules; unrestricted recursive table equality is not an
-allocation or provenance proof.
+`WordInfo` retains source identity without retaining a hosted body or its builder.
+A block has one terminator; its edge arguments are simultaneous. `Return` is an
+actual native return after completion, not an inline body return. `SourceWait`
+marks the existing source-wait operation, not budget suspension. Before emission,
+`PlainBlocking` waits become ordinary Nua blocking-wait calls; `TaskSuspending`
+waits become step-function control and typed frame access in this same graph.
+`NoSourceWait` rejects a source wait. `SourceWait` may not remain in a ready program.
+Root plain entries select PlainBlocking; task steps select TaskSuspending. Ordinary
+inline invocations inherit their caller's mode. Shared/materialized native bodies
+and blocking-job bodies retain NoSourceWait; budget capability does not relax it.
 
-## 5. Worked traces that fix the interfaces
+The Nua boundary ABI passes each owning result through one caller-provided complete
+result holding of its fixed native layout. Non-owning results use their native
+result convention. An aggregate's independently owning fields remain distinct
+holdings in that fixed layout. C-boundary signatures retain their restrictions on
+owners; task entry has the trusted runtime ABI, not a signature-based guess.
 
-### 5.1 Same word, different knowledge, same handlers
+### 3.2 Instruction family: complete top-level membership
+
+Every row below includes the mandatory `site: Site` field. These are the complete
+top-level instruction kinds; there is no `Other`, C template, or untyped payload.
+
+| Kind | Remaining fields | Evaluation/effect contract |
+|---|---|---|
+| `Compute` | `result: ValueId, type: NativeType, opcode: NumericOpcode, arguments: List Operand` | Native typed computation; validity classified by opcode/type |
+| `Pack` | `result: ValueId, type: NativeType, components: List Operand` | Representation assembly; transports existing facts, never duplicates custody |
+| `Extract` | `result: ValueId, type: NativeType, aggregate: Operand, path: ComponentPath` | Projection under required tag/index proofs; no new owning move |
+| `Load` | `result: ValueId, place: PlaceId` | Ordered observation; result facts taken at this site |
+| `Store` | `place: PlaceId, value: Operand` | Non-owning assignment only; preserves reference facts when materialized |
+| `Address` | `result: ValueId, place: PlaceId` | Expose this place; establish pending contents before exposure |
+| `Check` | `condition: Operand, message: Operand, claim: CheckClaim` | Fallthrough establishes claim; failure traps at this site |
+| `Invoke` | `result: Option ValueId, callee: Callee, arguments: List Operand, boundary: BoundaryId` | Complete ordered argument captures, callee effects and caller completion |
+| `Atomic` | `result: Option ValueId, opcode: AtomicOpcode, address: Operand, arguments: List Operand, order: MemoryOrder, failure_order: Option MemoryOrder` | Atomic read/write/RMW with native legality checks |
+| `Fence` | `order: MemoryOrder` | Atomic ordering; not a pure unused computation |
+| `Storage` | `result: Option ValueId, request: StorageRequest` | Logical resource/custody operation, realized by Nua words |
+| `LifetimeStart` | `lifetime: LifetimeId` | Begin the declared logical lifetime |
+| `LifetimeEnd` | `lifetime: LifetimeId` | End its loans after required source completion and ownership cleanup |
+| `Borrow` | `loan: LoanId` | Record acquisition at this graph site; does not force address materialization |
+| `LoanCut` | `target: PlaceId, position: AccessPath, reason: CutReason` | Explicit semantic invalidation; no runtime per-loan bookkeeping |
+| `StartTask` | `result: ValueId, task: TaskId, captures: List Operand` | Typed capture and child publication protocol, realized by Nua words |
+| `Budget` | `reason: BudgetReason` | Permitted native scheduling point; ordered control/memory effect |
+| `Mechanism` | `result: Option ValueId, binding: String, arguments: List Operand` | A declared platform mechanism, never an opaque Nua algorithm |
+
+```text
+NumericOpcode = Add | Subtract | Multiply | Divide | Remainder | Negate
+              | BitAnd | BitOr | BitXor | BitNot | ShiftLeft
+              | ShiftRightSigned | ShiftRightUnsigned
+              | Equal | NotEqual | Less | LessEqual
+              | Convert | Reinterpret | PointerOffset | PointerDifference
+AtomicOpcode  = Read | Write | Exchange | CompareExchange
+              | FetchAdd | FetchSubtract | FetchAnd | FetchOr | FetchXor
+MemoryOrder   = Relaxed | Consume | Acquire | Release | AcquireRelease | Sequential
+BudgetReason  = LoopEdge | RecursiveEdge | StorageStep
+CutReason     = OwningTransfer | SharedGrowth | TruncateContents
+              | RootCompletion | NativeCompletion | ExplicitCompact
+CheckClaim    = Bounds(place: PlaceId, index: Operand, length: Operand)
+              | ActiveAlternative(value: Operand, name: String)
+              | Condition(value: Operand)
+Callee        = DirectNua(definition: DefinitionId)
+              | IndirectNua(pointer: Operand, signature: Signature, provenance: NuaEntry)
+              | Foreign(pointer: Operand, signature: Signature, contract: ForeignEffects)
+NuaEntry      = DefinitionEntry(definition: DefinitionId)
+              | TaskStepEntry(task: TaskId)
+              | RuntimeEntry(name: String)
+```
+
+Greater comparisons reverse already captured operands into `Less`/`LessEqual`;
+this does not reverse source evaluation. Short circuit and selection are control,
+not eager numeric opcodes. Type/arity/result rules belong in a closed opcode
+vocabulary shared by evaluation, verification and emission. Adding an opcode
+requires those rules, not merely a new string accepted by `Compute`.
+
+`Mechanism.binding` must resolve in the target's checked mechanism vocabulary.
+Each entry has `{ signature, effects, c_symbol, jit_symbol }`. The required storage/
+context entries are `reserve`, `commit_pages`, `release`, `move_bytes`,
+`context_initialize`, `context_switch`, `context_finish`, `recover_jump` and
+`fatal_trap`. OS threading, TLS and I/O use separately declared platform bindings.
+Unknown bindings fail construction. `context_switch` is explicitly switching,
+not an opaque foreign call that would fence its own switch. Reserve returns
+status/provenance; allocation policy and all resource-list algorithms stay Nua.
+
+### 3.3 Storage requests and their realization bindings
+
+```text
+StorageRequest = CreateOwner { type: NativeType, destination: PlaceId }
+               | TransferOwner { source: HoldingId, destination: Endpoint,
+                                 kind: TransferKind }
+               | CopyOwner { source: PlaceId, destination: Endpoint }
+               | EndOwner { holding: HoldingId }
+               | ReserveStorage { owner: PlaceId, position: AccessPath, capacity: Operand }
+               | InitializeElement { owner: PlaceId, index: Operand, value: Operand }
+               | EndElements { owner: PlaceId, first: Operand, limit: Operand }
+               | CompactStorage { owner: PlaceId, position: AccessPath }
+TransferKind   = SourceTransfer | Transport
+```
+
+These are general typed-storage capabilities, not Map/Text/Store-specific
+instructions. `InitializeElement` is a trusted initialized-buffer transition,
+not a public uninitialized-slot API. Public append/pop/replace/truncate algorithms
+are Nua words composing checked operations; compiler code does not choose their
+capacity policy, walk payloads or rebuild map indices.
+
+| Request | Nua binding selected by realization |
+|---|---|
+| `CreateOwner` | `regions.create type` |
+| `TransferOwner` | `regions.transfer type kind` |
+| `CopyOwner` | `regions.copy type` |
+| `EndOwner` | `regions.end_value type` |
+| `ReserveStorage` | `buffers.reserve type position guarantee` |
+| `InitializeElement` | `buffers.initialize type` |
+| `EndElements` | `buffers.end_range type` |
+| `CompactStorage` | `regions.compact type position` |
+
+These bindings live in the replacement Nua runtime/storage vocabulary. Their type
+arguments specialize finite structural visitors; their native arguments carry
+captured headers, addresses, indices, capacities and durable operation/context
+records. Realization replaces `Storage` with their evaluated graph and retains the
+associated source `LoanCut` exactly once. Private helper copies do not add another
+cut. Adoption avoiding a payload copy does not erase that event. `Storage` may not
+remain in backend-ready code. `Transport` changes the receiving endpoint of the
+same installed holding without a source cut. It must preserve existing valid
+loans; required fragment detachment occurs at the actual source transfer, not as
+an unexpected relocation during later compiler transport.
+
+### 3.4 Fact products, not a second program
+
+```text
+ValueInfo       { type: NativeType, components: Map ComponentPath ComponentInfo,
+                  proofs: Set Proof }
+ComponentInfo   = Plain | Borrowed(info: ReferenceInfo) | Owning(holding: HoldingId)
+                | Callable(entry: Option NuaEntry)
+Proof           = Checked(site: InstructionId) | Taken(edge: EdgeId)
+                | Known(claim: CheckClaim)
+FlowFacts       { contents: Map PlaceId Contents, holdings: Map HoldingId Holding,
+                  loans: Map LoanId LoanState,
+                  epochs: Map PlaceId (Map AccessPath Epoch),
+                  live_lifetimes: Set LifetimeId }
+EdgeFacts       { edge: EdgeId, flow: FlowFacts, arguments: List ValueInfo }
+JoinRelation    { block: BlockId, incoming: List EdgeFacts }
+SiteFacts       { before: FlowFacts, after: FlowFacts, effects: Effects }
+DefinitionFacts { values: Map Operand ValueInfo, loans: Map LoanId Loan,
+                  entries: Map BlockId FlowFacts, edges: Map EdgeId EdgeFacts,
+                  joins: Map BlockId JoinRelation, sites: Map InstructionId SiteFacts,
+                  terminators: Map BlockId Effects }
+Analysis        { revision: U64, definitions: Map DefinitionId DefinitionFacts,
+                  contracts: Map DefinitionId BoundaryContract,
+                  tasks: Map TaskId TaskPlan, realizations: Map RealizationSite Realization }
+```
+
+`Map Operand` uses canonical operand identity, not a deep Lua-table key comparison.
+Facts are tied to `Program.revision`. A rewrite returns a new revision and the
+analyses it has actually rebuilt; it cannot reuse a certificate for changed code.
+
+Each `JoinRelation` row is keyed by the actual incoming edge. The row contains
+owner, reference and current-contents facts together. Selection consults that row,
+not independent unions of possible owners and borrows. Nested relations refer to
+other joins by ID; the driver does not enumerate every whole-program path.
+Loops have finite header-relative facts, not a row for every runtime iteration.
+
+`Analysis` has no executable control of its own. Ordered checking follows the
+actual blocks, instructions and edges of `Program`. It does not execute an
+ownership-only copy of that program.
+
+### 3.5 Effects and native boundary contracts
+
+```text
+Effects          { reads: List Access, writes: List Access, exposes: List Access,
+                   consumes: List Access, cuts: List Access,
+                   may_trap: Bool, may_wait: Bool, may_switch: Bool,
+                   foreign_extent: Bool, nonreturning: Bool }
+Access           { target: TargetRelation, path: AccessPath }
+ForeignEffects   { reads: List Access, writes: List Access, retains: List Access,
+                   may_reenter: Bool, noreturn: Bool }
+InterfaceOrigin  = Incoming(parameter: Positive, path: AccessPath)
+                 | GlobalOrigin(global: GlobalId, path: AccessPath)
+                 | FreshResult(path: ComponentPath)
+                 | SelectedResult(join: BlockId, component: ComponentPath)
+InterfaceLoan    = HeaderLoan | InputContents(position: AccessPath)
+                 | AcquiredContents(position: AccessPath, site: InstructionId)
+InterfacePart    = PlainPart
+                 | BorrowPart(origin: InterfaceOrigin, loan: InterfaceLoan,
+                              guarantee: StorageGuarantee)
+                 | OwnerPart(origin: InterfaceOrigin, guarantee: StorageGuarantee)
+InterfaceInfo    { type: NativeType, parts: Map ComponentPath InterfacePart }
+AliasRequirement { left: Access, right: Access, at: InstructionId }
+BoundaryContract { definition: DefinitionId, inputs: List InterfaceInfo,
+                   returns: Map BlockId InterfaceInfo,
+                   effects: Map InstructionId Effects,
+                   terminators: Map BlockId Effects,
+                   requires_disjoint: List AliasRequirement,
+                   completion_cuts: List Access,
+                   normal_exits: Set BlockId, revision: U64 }
+```
+
+`Effects` describes **one execution site**. The boundary contract retains the
+instruction/terminator maps and the definition's actual CFG, including nonreturning
+prefixes and source waits. A trap/wait terminator is not lost because it has no
+instruction result. It is not an unordered final may-read/may-kill summary. A call substitutes parameter
+accesses with actual argument relations, then checks ordered use/kill constraints
+on that graph. Required separation of an invalidator and a subsequent old-view
+observation is represented by `requires_disjoint`; it is not inferred from final
+return facts. Return rows preserve which actual exit supplies each result origin;
+`SelectedResult` refers to that definition's correlated join rows after projection.
+`completion_cuts` are applied at caller completion before returned-loan validation.
+An `AcquiredContents` site is the actual `Borrow` instruction, not a fictional
+post-call acquisition. A header loan is distinct from a contents loan.
+
+Contract projection replaces local IDs by incoming/global/result paths. A remaining
+callee-local place, loan or holding in the outward interface is a verification
+error. Actual header custody crosses the native boundary; compile-time origin
+alternatives do not become a runtime cleanup-history vector.
+
+## 4. Private state and completion outcomes
+
+These structural records are private to the named activity. They are not fields
+on published program nodes. Their fields are listed so ownership is testable.
+
+```text
+CompilationWork { id: CompilationId, sources: Map String String,
+                  origins: Map OriginId Origin, words: Map WordId Word,
+                  environments: Map EnvironmentId Environment,
+                  globals: Map GlobalId Global, exports: List Export,
+                  lifetimes: Map LifetimeId Lifetime,
+                  definitions: DefinitionRegistry, diagnostics: List Diagnostic,
+                  next_identity: U64, target: Target,
+                  loader_scope: LoaderScope, bridge: HostBridge }
+Draft           { attempt: AttemptId, parent: Option AttemptId,
+                  definition: Option DefinitionId, blocks: Map BlockId BlockDraft,
+                  places: Map PlaceId Place, values: Map Operand ValueInfo,
+                  lifetimes: Map LifetimeId Lifetime,
+                  loans: Map LoanId Loan, exits: List ExitSite,
+                  requests: Set DefinitionId, state: DraftState }
+DraftState      = Open | Adopted | Discarded
+BlockDraft      { id: BlockId, arguments: List BlockArgument,
+                  instructions: List Instruction, terminator: Option Terminator }
+Path            { attempt: AttemptId, block: Option BlockId,
+                  environment: EnvironmentId, lifetime: LifetimeId, facts: FlowFacts }
+InvocationWork  { id: InvocationId, word: WordId, draft: Draft,
+                  entry: Path, locals: List PlaceId, exits: List ExitSite,
+                  result_type: NativeType, mode: EvaluationMode, wait_mode: WaitMode }
+EvaluationMode  = HostOnly | Residual
+ExitSite        { kind: ExitKind, path: Path, capture: Capture, origin: OriginId }
+ExitKind        = InvocationReturn(target: InvocationId)
+                | LoopBreak(target: LoopId) | LoopNext(target: LoopId)
+Capture         { value: NativeValue, ready_after: Set LifetimeId,
+                  transfer: Option PendingTransfer }
+PendingTransfer { source: HoldingId, destination: Endpoint }
+CapturePurpose  = Observation | ArgumentCapture | ReturnCapture | Transport
+Lifetime        { id: LifetimeId, parent: Option LifetimeId,
+                  kind: LifetimeKind, completion: List CompletionAction }
+LifetimeKind    = GlobalLife | InvocationLife | LexicalLife | TaskScopeLife | ForeignViewLife
+CompletionAction = EndLocal(place: PlaceId) | JoinScope(operation: Operand)
+                 | FinishForeign(operation: Operand) | ApplyNativeCuts(boundary: BoundaryId)
+```
+
+`LoaderScope` is the restoration handle owned by `nua.loader.with_context`:
+`{ loaded, public_loaded, loaders, path, preload, cpath }`, holding the saved Lua
+registry/package values. It is not another module cache. The compilation driver
+restores it on success and failure; it does not promise concurrent compilation.
+
+A `Capture` contains the value already observed, never a callback that rereads
+it. Owning captures retain complete header/custody information. `ready_after`
+records existing legal protectors that must complete before destructive transfer;
+it does not introduce new task-borrow permissions. Source capture, activity
+completion and the final owning transfer are three distinct operations.
+`Observation`/`Transport` add no owning move. An owning argument is transferred
+into its complete argument holding before the next argument is evaluated.
+`ReturnCapture` records a pending transfer when existing legal protectors defer it;
+the complete captured value, not a future reread, survives that interval.
+
+### 4.1 Outcomes returned by the drivers
+
+```text
+BodyResult       = FellThrough(path: Path) | Returned(exit: ExitSite) | Terminated
+CallbackResult   = CallbackValue(path: Path, value: Argument)
+                 | CallbackVoid(path: Path) | CallbackTerminated
+InvocationResult = ReturnedValue(path: Path, value: NativeValue) | NoContinuation
+BranchResult     = Joined(path: Path) | NoContinuation
+LoopResult       = Exited(path: Path) | NoContinuation
+HeaderAgreement  = Holds | Weaken(changes: List HeaderChange)
+HeaderChange     = ForgetContents(place: PlaceId)
+                 | Materialize(place: PlaceId)
+                 | WidenTargets(place: PlaceId, targets: TargetRelation)
+                 | WidenGuarantee(place: PlaceId, guarantee: StorageGuarantee)
+DefinitionResult = Complete(definition: Definition, contract: BoundaryContract)
+                 | Awaiting(group: Set DefinitionId)
+CompileResult    = Compiled(product: CompilationProduct)
+                | Refused(problems: List Diagnostic)
+CompilationProduct { program: Program, analysis: Analysis,
+                     backend: BackendProduct, inspection: Inspection }
+```
+
+`NoContinuation` is not Unit and not an unknown native value. Body completion
+must handle each outcome before returning to its parent. A branch with no normal
+continuation may still have registered returns to its enclosing invocation. That
+invocation completes its recorded return sites before deciding whether *it* has
+`NoContinuation`. `return_value` registers an exit once; `Returned` carries the
+same exit, not a second contribution. Source diagnostics and genuine Lua errors leave through the responsible protected activity; neither is
+reported as successful `FellThrough`.
+
+Nonlocal reconsideration retains the existing targeted-request approach, with an
+explicit internal payload:
+
+```text
+ConstructionRequest { target: AttemptId, reason: Reconsideration }
+Reconsideration = GeneralizeHeader(loop: LoopId, changes: List HeaderChange)
+                | MaterializeCall(invocation: InvocationId)
+                | ReviseContract(definition: DefinitionId)
+```
+
+Only the target's driver consumes it. Intermediate drivers finish/discard their
+own drafts and restore their bindings, then propagate the same request. It is
+never an operand or a host iterator result. This is compiler control, not a new
+source exception mechanism or an eight-retry failure policy.
+
+### 4.2 State owned at each boundary
+
+| Activity | Creates and owns | Receives/borrows | Completion |
+|---|---|---|---|
+| `compiling` | `CompilationWork`, loading scope, diagnostic list | Source entries, target, backend | Return product or refusals; restore loader/bridge; product owns retained JIT resources |
+| `building` | `Draft`, fresh block buffers | Identity supplier, parent destination | Adopt once or discard once; reject later writes; definition completion seals blocks |
+| `evaluating` | `InvocationWork`, local lifetimes, evaluation vocabulary | Entry `Path`, word, supply, definition requests | Complete exits and local holdings; return value/path or no continuation |
+| `branching` | Two child drafts and predecessor facts | Captured condition and entry facts | Adopt both valid residual arms; reconcile only continuing edges |
+| `looping` | `LoopWork` (§6), round draft, header agreement | Entry path, carried places, hosted condition/body | Keep accepted known prefix; revise only rejected round/body; finish exits |
+| `defining` | Definition drafts and recursive agreement group | Word/specialization request | Publish group only after contracts close; discard caller-local contributions |
+| `realizing` | Working graph, queue of logical sites, realization records | Completed semantic graph, Nua bindings | Resolve all reachable logical storage/task sites and verify protocols |
+| `rewriting` | New output, evolving analysis state | Read-only input and explicit shared capabilities | Return replacement graph/facts; never mutate inspected input |
+| `emitting` | Names, declarations, backend handles | Verified ready program and target | Return backend product; close nonretained resources |
+
+`facts.fork` copies the four `FlowFacts` maps and the live-lifetime set; their entries
+are immutable records. A later write replaces an entry rather than changing a
+shared holding/loan record. Name environments extend by fallback. These are two different operations.
+
+### 4.3 Graph building vocabulary
+
+```text
+building parent identities -> (GraphWriter -> BuildDecision) -> BuildResult
+BuildDecision = Adopt | Discard
+BuildResult   = Built(fragment: GraphFragment) | Discarded
+GraphWriter = {
+    block        : String -> List NativeType -> BlockId,
+    parameter    : BlockId -> Positive -> BlockArgument,
+    declare      : Place -> Unit,
+    lifetime     : Lifetime -> Unit,
+    append       : BlockId -> Instruction -> Unit,
+    terminate    : BlockId -> Terminator -> Unit,
+    remember     : Operand -> ValueInfo -> Unit,
+    loan         : Loan -> Unit,
+    exit         : ExitSite -> Unit,
+    require      : DefinitionId -> Unit
+}
+GraphFragment { entry: Option BlockId, blocks: Map BlockId BlockDraft,
+                places: Map PlaceId Place,
+                lifetimes: Map LifetimeId Lifetime,
+                values: Map Operand ValueInfo, loans: Map LoanId Loan,
+                exits: List ExitSite, requests: Set DefinitionId }
+```
+
+A fragment is a **private construction product**, not a completed Program. Its
+exit tails may still be open. Adoption transfers those block buffers and creates
+parent-owned Path handles; only that parent writer can continue them. Definition
+completion constructs immutable `Block` records after all tails are terminated.
+
+Each child invocation/control construction writes fresh blocks. Adoption links its
+entry and continuation with edges; a cleanup rewrite merges redundant blocks.
+It does not append into a buffer captured by its parent. A wholly known HostOnly
+invocation has no native blocks. `append` after a terminator, wrong-attempt handles,
+undeclared operand facts and a second adoption/discard are construction errors.
+
+Adoption transfers the fragment to the parent draft and makes its old writer
+unusable. It is still tentative under that parent. On parent failure, all adopted
+children's graph/fact/request contributions disappear with the parent. Globally
+fresh identity serials need not be rolled back; their unused gaps carry no meaning.
+
+### 4.4 Fact and graph operations
+
+```text
+Facts = {
+    fork        : FlowFacts -> FlowFacts,
+    agree       : List EdgeFacts -> BlockId -> JoinDecision,
+    substitute  : InterfaceInfo -> List NativeValue -> ValueInfo,
+    observe     : FlowFacts -> NativeValue -> OriginId -> Unit,
+    invalidate  : FlowFacts -> Access -> CutReason -> Site -> Unit,
+    transfer    : FlowFacts -> HoldingId -> Endpoint -> Site -> Holding,
+    rebind      : FlowFacts -> HoldingId -> Endpoint -> Holding,
+    check_edge  : EdgeFacts -> FlowFacts -> EdgeFacts
+}
+Graph = {
+    building    : Option AttemptId -> IdentitySupply -> (GraphWriter -> BuildDecision)
+                  -> BuildResult,
+    index       : Program -> GraphIndex,
+    walk        : VisitPass -> Program -> Unit,
+    rewrite     : RewritePass -> Program -> Program,
+    same        : Program -> Program -> Bool,
+    print       : Program -> String
+}
+IdentitySupply  { fresh: String -> BrandedIdentity }
+GraphIndex      { definitions: Map DefinitionId Definition,
+                  blocks: Map BlockId Block, sites: Map InstructionId Instruction,
+                  predecessors: Map BlockId (List EdgeId), edges: Map EdgeId Edge,
+                  definitions_of: Map Operand (Option InstructionId) }
+```
+
+`IdentitySupply.fresh` accepts only the ID brand names in §1.2. `VisitPass` and
+`RewritePass` are checked family passes; rewriting each definition owns fresh block
+output. Constants and formal/block parameters have no defining instruction, hence
+`definitions_of` uses `Option`; their own kind records establish their definition.
+
+`observe` checks current loans and owner endpoints; it does not mark mere pointer
+transport as dereferencing contents. `invalidate` changes matching current epochs
+and loan states under the target relation. `transfer` moves one authority, updates
+source/destination facts and records the required source cut. `rebind` implements
+compiler transport with no new cut or duplicated authority. `check_edge` verifies
+and normalizes incoming facts, including the loop epoch substitution. `agree` and
+`substitute` return data; their enclosing activity performs any required stores or
+cleanup. None of these functions allocates native storage during compilation.
+
+`Graph.same` compares kinds, native constant bits and ID-consistent graph structure,
+with an explicit bijection for fresh local IDs. It preserves global/word/type
+identity and sharing; it is not arbitrary recursive table equality. `Graph.print`
+uses stable role-based names from traversal order, not Lua addresses.
+
+## 5. The hosted-body and evaluation vocabulary
+
+### 5.1 The bridge from Mua
+
+```text
+HostedBody : Evaluation -> Path -> List Argument -> BodyResult
+HostedCallbackBody : Evaluation -> Path -> List Argument -> CallbackResult
+ConditionBody : Evaluation -> Path -> List Argument -> ConditionResult
+ConditionResult = Tested(path: Path, condition: NativeValue) | ConditionTerminated
+HostCallback is an ordinary Lua callable wrapping HostedCallbackBody and its environment.
+Hosting = {
+    word       : Word -> Application,
+    supply     : Application -> List Argument -> Application,
+    apply      : Path -> Application -> InvocationResult,
+    callback   : EnvironmentId -> HostedCallbackBody -> HostCallback,
+    export     : String -> Application -> Unit
+}
+```
+
+Mua's parser hands `nua.front` the actual typed/opened nodes. The host emits a Lua
+closure with this body contract, preserving lexical captures. The closure calls
+the evaluation vocabulary; it is not translated back into a second syntax tree.
+The frontend sequences callee/receiver and operand evaluation in separate ordered
+steps. It captures each supplied argument under its receiving requirement before
+evaluating the next; partial applications retain that captured supply. Installing
+an already captured argument at invocation entry uses transport, not another source
+move. Known branch selection invokes only the selected delayed body.
+
+`Hosting.supply` never runs the body. `Hosting.apply` requires saturation, then
+enters `evaluating`; source partial application uses `supply`. Native and host
+callbacks retain their existing source return conventions through the adapter.
+The adapter unwraps ordinary successful native values for existing Lua hooks; it
+must propagate termination/reconsideration, never hand those outcomes to a hook
+as if they were source values.
+
+For Lua metamethods/hooks that need an ambient entry, the **compilation-owned**
+`HostBridge` is the only bridge to it:
+
+```text
+BridgeSignal = Reconsider(request: ConstructionRequest)
+             | NativeTerminated(target: AttemptId)
+HostBridge { bindings: List BridgeBinding, pending: Option BridgeSignal,
+             live: Bool }
+BridgeBinding { attempt: AttemptId, evaluation: Evaluation, path: Path,
+                invocation: InvocationId }
+bridge.enter binding body -> body's ordinary result
+bridge.current() -> BridgeBinding
+bridge.raise signal -> does not return
+```
+
+`enter` pushes, runs protected work, pops on every exit, then returns or propagates.
+A NativeTerminated signal stops the owning path/arm, not unrelated branch
+construction. It is needed only when an ordinary Lua hook cannot return the
+explicit NoContinuation outcome. Genuine Lua errors are never relabeled as signals.
+Generated body operations pass their `Path` explicitly; semantic modules never
+consult a process-global `current`. A staged host wrapper retains its compilation's
+bridge, not a private draft output buffer. A closed bridge or stale attempt fails
+before any staging operation. The existing Lua loading/generator contract is
+retained; request propagation through supported hook/protected/generator boundaries
+is an acceptance test, not permission to ban them. Opening a vocabulary does not
+perform this push/pop or resource cleanup implicitly.
+
+### 5.2 Evaluation: exact entries
+
+`evaluating` creates these verbs once for one invocation. They capture the invocation's
+writer, identity supplier, diagnostics, native rules and explicit definition/storage
+capabilities. The current path is an argument, not a field swapped in those modules.
+
+```text
+evaluating : Word -> List Argument -> Path -> EvaluationServices -> InvocationResult
+EvaluationServices {
+    writer: GraphWriter,
+    identities: IdentitySupply,
+    report: Diagnostic -> Unit,
+    get_word: WordId -> Word,
+    get_environment: EnvironmentId -> Environment,
+    add_environment: Environment -> EnvironmentId,
+    native_rules: NativeRules,
+    request_definition: AttemptId -> Application -> List ValueInfo
+                        -> NativeABI -> WaitMode -> DefinitionId,
+    branching: Path -> NativeValue -> HostedBody -> HostedBody -> BranchResult,
+    looping: Path -> List PlaceId -> ConditionBody -> HostedBody -> LoopResult,
+    mode: EvaluationMode,
+    wait_mode: WaitMode
+}
+NativeRules {
+    result_type: NumericOpcode -> List NativeType -> NativeType,
+    fold: NumericOpcode -> List NativeType -> List NativeConstant -> FoldingDecision,
+    effects: NumericOpcode -> List NativeType -> Effects
+}
+FoldingDecision = Folded(value: NativeConstant) | NotFoldable | Invalid(reason: String)
+Evaluation = {
+    literal       : NativeType -> NativeConstant -> NativeValue,
+    lookup        : Path -> String -> Argument,
+    bind          : Path -> String -> Binding -> Path,
+    declare       : Path -> String -> NativeType -> Option NativeValue -> PlaceId,
+    read          : Path -> PlaceId -> NativeValue,
+    write         : Path -> PlaceId -> NativeValue -> Unit,
+    compute       : Path -> NumericOpcode -> List NativeValue -> NativeValue,
+    field         : Path -> PlaceId -> String -> PlaceId,
+    element       : Path -> PlaceId -> NativeValue -> PlaceId,
+    address       : Path -> PlaceId -> NativeValue,
+    borrow        : Path -> PlaceId -> AccessPath -> NativeValue,
+    capture       : Path -> CapturePurpose -> NativeValue -> Capture,
+    transfer      : Path -> HoldingId -> Endpoint -> NativeValue,
+    transport     : Path -> HoldingId -> Endpoint -> NativeValue,
+    copy          : Path -> PlaceId -> Endpoint -> NativeValue,
+    end_value     : Path -> HoldingId -> Unit,
+    storage       : Path -> StorageRequest -> Option NativeValue,
+    apply         : Path -> Application -> List Argument -> InvocationResult,
+    call          : Path -> Application -> List Argument -> InvocationResult,
+    foreign       : Path -> Callee -> List NativeValue -> InvocationResult,
+    branch        : Path -> NativeValue -> HostedBody -> HostedBody -> BranchResult,
+    loop          : Path -> List PlaceId -> ConditionBody -> HostedBody -> LoopResult,
+    return_value  : Path -> InvocationId -> NativeValue -> BodyResult,
+    return_argument : Path -> Argument -> CallbackResult,
+    break_loop    : Path -> LoopId -> BodyResult,
+    next_loop     : Path -> LoopId -> BodyResult,
+    trap          : Path -> NativeValue -> BodyResult,
+    atomic        : Path -> AtomicOpcode -> NativeValue -> List NativeValue
+                   -> MemoryOrder -> Option MemoryOrder -> Option NativeValue,
+    fence         : Path -> MemoryOrder -> Unit,
+    start_task    : Path -> TaskPlan -> List NativeValue -> NativeValue,
+    wait          : Path -> NativeValue -> Path,
+    mechanism     : Path -> String -> List NativeValue -> Option NativeValue
+}
+```
+
+All handlers validate path ownership/liveness first. `read` of a named owner in
+value context captures its current holding for the prescribed move; borrowing
+contexts use `borrow`/`address`, never a header-copy escape. `write` dispatches an
+owning assignment to `transfer`; it cannot emit a raw owner-typed `Store`.
+
+| Verb | Known case | Residual case | Facts changed |
+|---|---|---|---|
+| `compute` | Native rule computes exact result if valid | Emit `Compute`; return `Bits(Result)` | None beyond result/proof registration |
+| `read` | Return valid tracked observation | Emit `Load` and register its complete `ValueInfo` | Observation/owner capture as appropriate |
+| `write` | Replace tracked contents; keep pending store lazy | Emit required store at observation/exposure boundary | Contents and reference/holding facts |
+| `address` | Preserve the exact source place | Flush pending contents before `Address` | Exposure and loss of invalid private knowledge |
+| `branch` | Execute selected body | Build isolated arms and a join | Edge-correlated flow facts |
+| `transfer` | Still requires runtime owner storage | Emit `Storage(TransferOwner)` and its logical cut | Source moved, destination custody, old loans ended |
+| `call` | HostOnly follows in-place source rule | Request definition; emit `Invoke` even for a known result with effects | Ordered substituted boundary effects |
+| `trap` | Source/host diagnostic when native execution is unavailable | Terminate path with `Trap` | No continuation; no dummy result |
+
+The handler's returned value is not its whole effect. A known result cannot erase
+an invocation, allocation, check, atomic operation or completion that must execute.
+A helper word uses these same handlers; there is no second evaluator for storage.
+`Evaluation.apply` receives saturated supply; the frontend uses `Hosting.supply`
+until then. Untyped callbacks can return host values, words and packs through
+`CallbackResult`; they are not forced into a native result type. A typed body's
+fallthrough is Unit only when its declared result permits Unit. `wait` terminates
+the current block with `SourceWait` and returns its resume path; it does not end
+the logical invocation. The Nua operation word reads its completed result from
+the operation record on that path.
+
+## 6. Control and native-definition construction
+
+### 6.1 Branches: the actual join algorithm
+
+```text
+branching entry condition -> when_true -> when_false -> BranchResult
+facts.agree predecessors -> destination -> JoinDecision
+JoinDecision { arguments: List NativeType, incoming: List EdgeFacts,
+               flow: FlowFacts, stores: List EdgeStore }
+EdgeStore { edge: EdgeId, place: PlaceId, value: Operand }
+```
+
+1. Capture the condition before entering either arm. Known Bool chooses one body.
+2. For a residual condition, make two writers and `facts.fork entry.facts` twice.
+   Both share identity/type capabilities, not mutable contents maps or output.
+3. Collect normal continuation paths separately from return/break/next/trap exits.
+   Only the normal paths participate in this join; a terminated arm contributes no
+   invented initialization or value.
+4. For each live place, keep equal tracked native contents. For unequal values
+   of one native type, create a block argument and supply its edge-specific value.
+   A place exposed to memory gets its required edge stores before the jump.
+5. For owner/reference components, create one `JoinRelation` with whole incoming
+   rows. Rebind each block argument to its row's actual holding and loans. Do not
+   merge their metadata independently. Apply required conditional-move cleanup
+   on the nonmoving edge before that edge enters the join.
+6. Establish missing-initialization/moved facts conservatively: another edge's
+   initialized/live state is not permission to read. Check future observations
+   against every feasible incoming row.
+7. Adopt arm fragments, terminate their live tails with the constructed edges,
+   and return the joined `Path`. No live predecessor returns `NoContinuation`.
+
+`facts.agree` decides from captured facts; it does not emit stores or evaluate
+source. `branching` owns establishment of that decision, including edge stores,
+loan effects and cleanup, and rejects the whole construction if establishment fails.
+
+### 6.2 Loops: entry, header, body, continuing edges, exits
+
+```text
+LoopWork { id: LoopId, attempt: AttemptId, entry: Path,
+           carried: List PlaceId, header: BlockId,
+           assumptions: FlowFacts, accepted_prefix: List GraphFragment,
+           body: Option Draft, continuing: List ExitSite, exits: List ExitSite }
+looping entry carried condition body -> LoopResult
+check_header assumptions continuing -> HeaderAgreement
+```
+
+The driver is this sequence, not a generic retry framework:
+
+1. Start with the actual carried places and entry observations. Known rounds run
+   in the same evaluator. Keep a round only when it satisfies the source known-round
+   rule; preserve already accepted rounds when a later round generalizes.
+2. Allocate one residual header with block arguments for dynamic carried contents.
+   Local IDs remain the original source places; aliases never point to round copies.
+3. Evaluate the condition and body in a child draft under the header assumptions.
+   Gather `LoopNext(this loop)` separately from breaks, returns and inner-loop edges.
+4. Check every continuing edge. Equal restored contents can preserve an assumption;
+   merely discovering a write/participant does not force a retry. Normalize current
+   owner/loan relations using the epoch substitution in §2.4.
+5. On `Weaken`, discard that child draft and its contributions, update only the
+   named assumptions, and reconstruct that body. Known scalar agreement weakens to
+   a typed dynamic value on disagreement; it does not accumulate all encountered
+   constants. Reference information weakens by the existing conservative alias and
+   stable/shared rules, never by a physical root-count limit.
+6. On `Holds`, establish simultaneous edge captures/stores, add the required budget
+   point on each residual cycling edge, and seal the backedges. Complete exiting
+   paths at their own continuations. Exit-only changes do not alter the next header.
+
+The analysis domain contains native types, finite source/parameter component paths,
+known-or-dynamic contents, stable/shared guarantees, initialization/move states,
+and current/ended loan relations. Unknown array indices use `AnyElement`; runtime
+cohort sizes are not enumerated. Each header weakening removes an assumption rather
+than allocating a new concrete epoch. Known host unfolding can still fail to
+terminate; that does not justify a placement-based rejection of a residual program.
+
+### 6.3 Definition requests, captures and recursive agreement
+
+```text
+DefinitionKey   { word: WordId, supply: List SpecializationInput,
+                  captures: List CaptureRequirement, abi: NativeABI, wait_mode: WaitMode }
+SpecializationInput = KnownNative(type: NativeType, bits: NativeConstant)
+                    | DynamicNative(info: InterfaceInfo)
+                    | KnownHost(identity: HostId)
+                    | KnownWord(application: Application)
+CaptureRequirement { environment: EnvironmentId, name: String,
+                     type: NativeType, mode: CaptureMode }
+CaptureMode     = ByValue | ByPlace
+DefinitionEntry { id: DefinitionId, key: DefinitionKey, state: DefinitionState,
+                  clients: Set AttemptId, dependencies: Set DefinitionId,
+                  host_dependencies: List HostDependency, reusable: Bool }
+DefinitionState = Requested | Building(attempt: AttemptId)
+                | AwaitingAgreement
+                | Complete(definition: Definition, contract: BoundaryContract)
+DefinitionRegistry { entries: Map DefinitionId DefinitionEntry,
+                     keys: Map DefinitionKey (List DefinitionId), worklist: List DefinitionId }
+HostDependency  = BindingRead(environment: EnvironmentId, name: String, value: Argument)
+                | RawTableRead(table: HostId, key: Argument, value: Argument)
+
+request requester application argument_info abi wait_mode -> DefinitionId
+require_capture definition binding mode -> Parameter
+agree_group definitions -> List DefinitionResult
+```
+
+The key contains no caller-local place, absolute allocation index or concrete loan
+identity. `InterfaceInfo` carries the native reference/storage guarantees. A
+capture of a native value becomes a value parameter; a capture of a native place
+becomes a Ref parameter to that same place. Capture order is stable first discovery
+order after explicit parameters. Calls fill those parameters from their own path,
+never from a cached caller operand. C function-pointer materialization retains its
+existing closure restrictions; hidden captures do not change a declared C signature.
+
+A completed specialization is reusable only while its observed host dependencies
+still match. Validation uses compiler bindings/raw table reads, not user getters or
+callbacks. Encountering an opaque host observation that cannot be validated sets
+`reusable = false`: that completed definition is not reused for a later request.
+Active recursive references still resolve to the group's provisional definition
+under the stage-safe-body contract. This is a deliberately conservative definition
+cache policy, not result memoization or a second evaluator. It does not mutate or
+rematerialize an already-created native function value. Host effects are never
+rerun just to test a cache key.
+
+The definition driver:
+
+1. Register the requested identity before evaluating its body. Recursive calls
+   reference that identity, not a depth-specific definition.
+2. Evaluate with fresh formal native parameters, parameter-relative holdings/loans
+   and the same evaluation vocabulary. Discover captures and dependencies in owned
+   draft state. No outward contract is published yet.
+3. Build the reachable call graph and its strongly connected components. Insert
+   `RecursiveEdge` budgets after argument capture on intra-cycle calls before
+   final effect agreement. For each group, project return origins and site effects
+   to interface paths; propagate requirements across call edges until agreement.
+   Pending native definitions conservatively retain possible switching effects.
+   Nonreturning prefixes remain reachable even when the group has no normal return.
+4. If new capture, move or invalidation facts invalidate a dependent construction,
+   target that unfinished owner's attempt. Rebuild its owned output and facts
+   together. A completed scalar prefix/sibling is not discarded without dependency.
+5. Publish the group only when interfaces, call arities, lifetime constraints and
+   ordered alias requirements agree. There is no “sixteen retries, reject valid
+   placement” completion path. No finite-placement analysis participates here.
+6. Remove failed clients' requests; collect only definitions reachable from accepted
+   exports/tasks. Retained definitions contain formals, not rejected caller operands.
+
+### 6.4 Completion ordering at a return
+
+`return_value` captures first and records `ExitSite`; `complete_exits` performs:
+
+```text
+capture observed value
+    -> run remaining source activity completion in lexical order
+    -> wait for separately legal protectors / joins
+    -> transfer complete result to the receiver
+    -> end remaining local holdings
+    -> apply pending caller-side native cuts at caller completion
+    -> validate returned borrows
+    -> continue caller, or emit native Return
+```
+
+For a native boundary, callee-side transfer/local completion precede its `Return`;
+the pending cuts and returned-borrow validation are caller-side operations. The
+sequence above is across both sides of that boundary, not code placed after a
+terminator in the callee. Inline completion has no native ABI return.
+
+The receiver exists before a native callee's frame disappears. Complete holdings
+survive legal waits. A frozen source cannot move early; a legal capture cannot be
+delayed past a mutation that would change its value. The caller-side cut remains
+at caller completion even if physical retirement earlier moved no payload.
+
+## 7. Realization, task planning and backend readiness
+
+### 7.1 Realization work and protocol checks
+
+```text
+RealizationSite = AtInstruction(instruction: InstructionId) | AtTerminator(block: BlockId)
+RealizationWork { input_revision: U64, writer: GraphWriter,
+                  pending: List RealizationSite, completed: Map RealizationSite Realization,
+                  definitions: Set DefinitionId }
+Realization     { source: RealizationSite, origin: OriginId, word: WordId,
+                  entry: BlockId, exits: Set BlockId,
+                  generated: Set InstructionId, protocol: Option StorageProtocol }
+StorageProtocol { prepare: Set BlockId, ready: Set EdgeId,
+                  commit: Set BlockId, retire: Set BlockId,
+                  operation_record: Operand, current_custody: List Operand }
+
+realizing program analysis bindings -> (Program, Analysis)
+```
+
+The worklist starts with reachable `Storage`, `StartTask` and `SourceWait` sites.
+For each site, use the already captured operands to evaluate its selected Nua word
+or generate its typed step/frame control. Adopt the resulting blocks and definition
+requests into the same program. Enqueue newly introduced logical sites. Type schema
+recursion visits owning fields/active sums/initialized ranges; runtime lengths
+remain native loops. Raw metadata allocation does not invoke ordinary owner
+construction recursively. This is the selected bootstrap boundary.
+
+`StorageProtocol` names real blocks/edges, not a Boolean “trusted” label. Verification
+checks all reachable commit instructions and transitive call effects: no allocation,
+fallible arithmetic/check, user callback, foreign reentry, wait, budget or runtime-
+length loop. Prepared resources are registered before another fallible action;
+retirement entries cannot cover one allocation twice. Recovery state/cursors are
+in durable native records, not Lua builders or abandoned native frames. Raw-kernel
+correctness additionally requires independent runtime ledgers/failure injection;
+a graph certificate alone is not a proof of an allocator algorithm.
+
+A realized helper's logical effects remain in its checked call/site contract and
+explicit `LoanCut`s. Pure SSA/header transport is not assigned another transfer cut.
+The `Realization` source ID is historical provenance; all executable targets in
+its generated set resolve in the current graph. Rewriting that region invalidates
+its protocol record and requires rechecking it.
+
+### 7.2 Task data and the two continuation kinds
+
+```text
+TaskPlan        { id: TaskId, entry: DefinitionId, frame_type: NativeType,
+                  captures: List TaskCapture, waits: Map BlockId WaitState,
+                  native_stack_bytes: U64, origin: OriginId }
+TaskCapture     { field: String, type: NativeType, source: Operand, info: ValueInfo }
+WaitState       { number: U32, operation_field: String, resume: BlockId,
+                  live_fields: List String }
+TaskResume      = Start | SourceResume(state: U32) | BudgetResume
+```
+
+These are compiler plans for the approved runtime records. Runtime task state
+includes the typed frame, native stack/context, storage context, executor affinity,
+run state and resume kind specified in [region completion §7](region-completion.md#7-native-tasks-without-a-second-evaluator).
+
+- `StartTask` captures values in order, constructs/registers frame/control/context/
+  stack resources, then publishes the child through ordinary Nua scheduler words.
+- In TaskSuspending mode, `SourceWait` assigns a `WaitState`, stores live values
+  in the typed frame and returns the waiting step status. Source-resume completion/Slot adoption occurs
+  once. PlainBlocking mode instead calls the Nua plain-wait driver, with the approved
+  worker/no-worker execution policy. NoSourceWait bodies are rejected at the source
+  operation; they are not silently converted to either form.
+- `Budget` calls the trusted Nua budget entry. It saves the actual native continuation
+  on the nonmoving task stack; it does not store a source state number or replay
+  arguments. Nua scheduler policy handles service rounds, seed draws and affinity.
+- Every residual Nua cycle has budget coverage. Known recursive native-call SCC
+  edges charge after argument capture and before callee entry. Storage walks use
+  completed bounded steps; COMMIT has none. Opaque foreign extents defer service.
+- Variable-size cleanup finishes on the task stack before DONE. Only fixed release
+  after permanent switch-out runs on the scheduler stack. No second step may run
+  while a budget continuation remains claimed.
+
+Both C and JIT preserve these distinctions. The context platform port, guard/probe
+rules and fatal task trap policy are not replaceable by an OS-thread fallback.
+
+### 7.3 Preparation order and invalidation
+
+```text
+prepare program analysis -> Prepared
+Prepared { program: Program, analysis: Analysis, certificate: ReadyCertificate }
+ReadyCertificate { revision: U64, definitions: Set DefinitionId }
+```
+
+The selected driver order is:
+
+1. Close reachable native-definition groups and verify semantic graph/contracts.
+2. Realize storage, task construction and source waits; include helper definitions
+   in closure and contract checking.
+3. Run optional folding, reachability and dead pure-result elimination on this graph.
+4. Add/verify budget coverage for the resulting loop and native-call cycles, then
+   recompute affected graph/alias/effect/lifetime facts, including switching effects.
+   Verify storage publication regions. A newly discovered semantic effect that
+   invalidates construction targets its owning attempt; it is not ignored because
+   an optimizer already ran.
+5. Verify backend readiness and produce `ReadyCertificate` for exactly this revision.
+
+The optional optimizer has eight rounds, stopping earlier on graph-aware equality.
+Every round must preserve a valid program. Mandatory agreement/realization has no
+“publish at cap” path. A structural change after step 5 invalidates the certificate.
+No backend accepts a bare `Program` without a matching certificate.
+
+`task_access` propagates parameter/global/callback origins across the reachable
+call graph, including blocking entries and known Nua function pointers passed to
+opaque code. `Global.policy` implements the existing atomic/TLS/unchecked-shared
+exceptions and owner-global task prohibition. A native context switch does not
+make an ordinary global write safe. Foreign hidden state retains its explicit
+foreign contract; the checker does not claim to inspect arbitrary C.
+
+| Verifier | Checks |
+|---|---|
+| `shape` | Nominal kinds, exact fields, dense lists, registered native types/opcodes/bindings |
+| `graph` | Unique identities, complete targets, one terminator, edge arity, SSA dominance |
+| `types` | Operand/result/native ABI rules; initialized/tag/index proofs; no raw owner Store |
+| `lifetimes` | Use/kill order, explicit lifetime starts/ends, correlated joins, unique custody, current loan relations, complete exits |
+| `task_access` | Reachable task/blocking/callback accesses; global policy, pointer origins and sendability |
+| `publication` | PREPARE/READY/COMMIT/RETIRE regions, transitive effects, recovery records, budget exclusion |
+| `ready` | All preceding checks; no Storage/StartTask/SourceWait; closed helper graph; budget coverage; target mechanisms available |
+
+`LifetimeStart`, `LifetimeEnd`, `Borrow` and `LoanCut` remain checked zero-machine-code
+events, not unresolved physical work. A materialized reference still needs its
+separate address/packed operand. `Budget` and `Mechanism` are executable effects. Backend adapters cannot
+classify these kinds together as ignorable bookkeeping.
+
+### 7.4 Pass vocabulary membership
+
+All family handlers have `(node, recurse, ...)`. These are the selected operations:
+
+| Pass | Primary result | State/effects |
+|---|---|---|
+| `print` | String | Identity naming map; no mutation of program |
+| `operands` | List Operand | None; exact uses of every instruction kind |
+| `effects` | Effects | Native opcode/binding/contract tables |
+| `verify_instruction` | Unit | Accumulate diagnostics under current graph/facts |
+| `fold` | List Instruction | Evolving native-value facts; own replacement output |
+| `reach` | Reachability map | Worklist over actual CFG, not a forward-label flag |
+| `sweep` | List Instruction | Liveness and effect/validity facts; own output |
+| `realize_instruction` | GraphFragment | Realization-owned pending sites and definitions |
+| `emit_c` | Unit | C emitter's declarations, labels and text buffer |
+| `emit_jit` | Unit | JIT emitter's handle maps and resource owner |
+
+`fold`/`sweep` spread an enumerated identity vocabulary. Their default **preserves**
+a known kind; no pass accepts an unknown kind. Checkers/effect classifiers and
+emitters list every kind deliberately. A stateful variant is made by invoking its
+factory again, not by copying handlers that still capture the first output.
+
+### 7.5 Compilation root and backend products
+
+```text
+SourceEntry      { filename: String, source: String }
+ByteOrder        = LittleEndian | BigEndian
+NativeLayout     { size: U64, alignment: U64, fields: List LayoutField }
+LayoutField      { path: ComponentPath, type: NativeType, offset: U64 }
+MechanismBinding { signature: Signature, effects: Effects,
+                   c_symbol: String, jit_symbol: String }
+StackContract    { alignment: U64, page_bytes: U64, red_zone_bytes: U64,
+                   frame_probes: Bool, context_port: String }
+Target           { name: String, pointer_bits: U32, byte_order: ByteOrder,
+                   layout: NativeType -> NativeLayout,
+                   mechanisms: Map String MechanismBinding,
+                   stack: StackContract }
+BackendRequest   = CText | ObjectFile(path: String) | Executable
+BackendProduct   = WrittenC(text: String, map: List SourceMapEntry)
+                 | WrittenObject(path: String, map: List SourceMapEntry)
+                 | LoadedCode(exports: Map String NativeFunction, release: Function)
+NativeFunction   { signature: Signature, address: HostNativeAddress }
+SourceMapEntry   { definition: DefinitionId, generated: String, origin: OriginId }
+Inspection       { programs: List Program, analyses: List Analysis,
+                   decisions: List Explanation }
+Explanation      { operation: String, origin: OriginId, detail: String }
+
+compiling entries target backend_request -> CompileResult
+emit prepared target backend_request -> BackendProduct
+reporting sources -> Reporting
+Reporting = {
+    report : Diagnostic -> Unit,
+    finish : Unit -> List Diagnostic
+}
+```
+
+`HostNativeAddress` is the backend's host FFI address value, not a source operand.
+`LoadedCode.release` owns the retained JIT result/code resources; returning from
+emission cannot free them. File/compiler/probe resources that are not retained
+finish in the emission activity on success or failure. C output and JIT handle
+construction consume the same prepared graph. C operand evaluation is sequenced
+by statements, never delegated to unspecified C argument evaluation order.
+
+The root creates identity, reporting, bridge and definition-registry instances,
+installs the Nua source loader, and binds `Hosting` to `evaluating`. It supplies
+`request` to evaluation and the evaluation function back to definition/control/
+realization activities. Hosting collects the actual export requests. The root
+closes those requests, calls `prepare`, calls the selected backend adapter, restores
+its loading/bridge scopes, and returns `CompilationProduct`. It does not publish
+partial output when a child construction was refused.
+
+Reporting keeps source-order independent diagnostics and their related locations.
+It never executes an unselected body or supplies a dummy native value to continue
+an invalid construction. Host error decoration preserves the original cause;
+internal graph failures, source refusals and native runtime traps are distinct.
+
+## 8. Worked construction using these contracts
+
+### 8.1 Supply and one evaluator
 
 ```lua
 local affine = do(scale: U32, bias: U32, x: U32): U32 = scale * x + bias
 local transform = affine 4 3
 ```
 
-| Supply/context | Evaluation and residual result |
+| Source action | Selected interface and result |
 |---|---|
-| Bind `affine 4 3` | Partial word; body has not executed |
-| `transform 5` | Native arithmetic yields known 23; no residual arithmetic is needed |
-| `transform x`, runtime `x` | Same arithmetic handlers produce multiply/add results with constants 4 and 3; no call boundary is introduced |
-| `call transform x`, residual context | A shared definition specializes scale/bias; its runtime parameter is `x`; caller produces an invocation |
-| Known arithmetic after an effect | Arithmetic may disappear; the required effect does not disappear with it |
+| `affine 4 3` | `Hosting.supply` returns `Application`; no invocation/body/output |
+| `transform 5` | `evaluating` uses `compute Multiply` and `compute Add`; exact known U32 23 |
+| `transform x` with runtime x | Same verbs emit two `Compute` instructions; no native call |
+| `call transform x` | `request` creates/reuses a scale=4,bias=3 definition; caller emits `Invoke` |
 
-A known-component record follows the same rule field by field. This is not
-whole-word knownness or a separate dynamic implementation.
+### 8.2 Owners, observations and current contents
 
-### 5.2 A place and its earlier observation
-
-A place `p` contains value `v0`. Reading it binds `before = v0`. A later write gives
-`p` contents `v1`; direct and aliased access now observe `v1`, while `before` still
-means `v0`. If a runtime read was needed, its result ID fixes that observation.
-If an address becomes exposed, establish the required contents at the exposure
-site. Neither a late store nor storage placement may turn `before` into a read of
-`v1`. If the bound value was a view, preserving its bits does not waive loan validity.
-
-### 5.3 Two owners, a result and a container
-
-This is a semantic sketch, not final IR constructor syntax:
+The first source situation selects an ordering of two independent owners A/B.
+A header alias must not retarget when A moves; an earlier scalar observation must
+not change. The following loop then exercises replacement through a persistent H.
+The schema below omits only native type spelling, not the choice/custody edges. It is an architectural trace, not a test-run report.
 
 ```text
-begin A
-begin B
-... evaluate ordinary Nua work that grows both ...
-branch flag
-    true:  capture/transfer A to result; end B; return result
-    false: capture/transfer B to result; end A; return result
+entry facts:
+    A -> Tracked(Owned(type=T, header=%a, holding=ha, endpoint=InPlace(A)))
+    B -> Tracked(Owned(type=T, header=%b, holding=hb, endpoint=InPlace(B)))
+    ha.endpoint = InPlace(A); hb.endpoint = InPlace(B)
+    epochs[A] = EntryEpoch(A); epochs[B] = EntryEpoch(B)
+
+body:
+    %before = Load A.count
+    %alias  = Address A
+    Branch %choice -> choose_a(), choose_b()
+
+choose_a:
+    capture actual A; transfer ha -> InCapture(%left_a)
+    capture actual B; transfer hb -> InCapture(%right_a)
+    Jump join(%left_a, %right_a)
+
+choose_b:
+    capture actual B; transfer hb -> InCapture(%left_b)
+    capture actual A; transfer ha -> InCapture(%right_b)
+    Jump join(%left_b, %right_b)
+
+join(%left, %right):
+    JoinRelation rows are:
+      choose_a edge: left owns ha; right owns hb
+      choose_b edge: left owns hb; right owns ha
+    ... use/end left; observe right ...
 ```
 
-A and B coexist and need distinct growing storage. Known control selects one
-return path, not permission to omit earlier effects. Inline returns transfer into
-the invocation's continuation. Shared evaluation produces a definition with both
-possible origins; it does not start another semantic engine.
+The alias to A still names A, not whichever joined result owns ha. The count
+observation still means `%before`, not a fresh read through `%alias`. Actual owner
+moves end their old contents loans on their edges. The selected result transports
+its actual region handle; no header comparison reconstructs the branch. An empty
+owner has the same custody requirements as a nonempty one.
 
-Storage realization assigns compatible positions and reclamation work from these
-facts. A caller may then relocate the selected contents into its container's
-storage. Alternatively, an initialized element can be lent to the same ordinary
-Nua writer and filled there. Neither form changes the shared-position borrow rule.
+For replacement of a separate live H in a loop, these interfaces produce:
 
-Recursive forwarding keeps the returned holding alive through intermediate levels.
-Recursive combination may retain consumed bytes below a later result until the
-outer region is reclaimed. A mixed argument/fresh result must transfer the correct
-cleanup on either edge. Those cases challenge the same representation and activity,
-not separate recursive, container or cleanup engines.
+```text
+header(%current_header, %refreshed_view):
+    H.epoch = HeaderEpoch(header, H)
+    view.loan.subject = ContentsOf(H, position, HeaderEpoch(header, H))
+    ... observe view ...
+    Storage TransferOwner(source=next_holding, destination=InPlace(H), kind=SourceTransfer)
+    LoanCut(H, position, OwningTransfer)
+    H.epoch = CutEpoch(transfer_site, H)
+    view2 = borrow(H, position)       -- new loan of that current epoch
+    Budget LoopEdge
+    Jump header(H.header, view2)
+```
 
-## 6. What is committed, and what still needs implementation proof
+The backedge verifies `view2` against its current H before renaming both to the
+header relation. Supplying the earlier view instead fails: its HeaderEpoch is not
+the backedge's CutEpoch. Reusing that printed site on another runtime iteration
+never revives the earlier loan.
 
-The design decisions in §§1–4 are the direction to implement. Exact constructor
-names, handler signatures beyond their result/effect contracts, scheduling details
-and file splits are not frozen by this document. In particular:
+Realization replaces the `Storage` site with `regions.transfer T SourceTransfer` through
+`Evaluation`. Its result has recorded prepare/commit/retire blocks; current custody
+is published before old exclusive blocks retire. The existing `LoanCut` is linked
+to that source transition, not duplicated for helper copies. C/JIT receive the same
+verified blocks. Plain recovery uses the operation/domain records; task traps stay
+fatal. No completed replacement retains obsolete blocks merely because a later
+owner happened to allocate after them.
 
-- The reference contract must be worked through known targets, joins, materialized
-  pointers, aggregate fields and native boundaries. A potentially shared target
-  cannot become stable because its original place representation was lost.
-- Loop and recursive completion need a precise agreement/reconsideration driver;
-  no assumption that a different retry transport is necessary has been adopted.
-- Storage realization needs a concrete finite dependency/convergence argument and
-  an ownership-safe treatment of mixed origins and independently moved fields.
-- Task capture, suspension, foreign access and safe library storage must participate
-  in the same contracts, even when their implementation follows incrementally.
+## 9. Acceptance and implementation boundary
 
-The next artifact is a small end-to-end construction using the first checked
-shapes, handlers and activity states—not another exhaustive inventory or a port
-of the current tag tables. Walk the traces above through staged values, program
-output, ownership facts and storage completion. Print every intermediate result.
-Then add the recursive, reference-result and partial-move cases before calling the
-boundaries complete. Temporary implementation gaps are not language exclusions;
-there is no hidden fallback to the old evaluator in a replacement path.
+The first replacement milestone must connect actual Mua hosting, these evaluation
+interfaces, owner/reference/partial-move facts, control agreement, Nua storage
+realization and one backend product. A scalar-only evaluator or a family declaration
+library is not that milestone. Task/platform implementation follows the same selected
+interfaces; it is not grounds to weaken the architectural contract meanwhile.
 
-This design commit adds no compiler implementation and claims no new executable
-acceptance results. Its checks are documentation/contract consistency. Later
-focused tests must distinguish staged success, correct rejection, verified IR and
-native behavior; two backends sharing erroneous IR are not independent semantic
-oracles. Compile-heavy validation remains off unless separately requested.
+The concrete acceptance set is:
 
-[compiler-guide]: https://github.com/cperion/mua/blob/f74545c99f429da4bfe169d32012e6f62e6bf367/docs/writing-compilers.md
+1. Load every family/pass with contracts enabled; reject missing handlers, unknown
+   fields, sparse node lists and malformed graph/owner/loan facts.
+2. Host real Nua source for partial/known/mixed supply, earlier observations, branch
+   correlation, partial moves, current-header replacement and refreshed/stale loops.
+3. Repeat and nest factories; reject stale writers; accept child then reject parent;
+   verify independent prior output and surviving prefix/sibling state are unchanged.
+4. Exercise definition capture, argument/fresh results, recursive forwarding and
+   combination, ordered aliased kill/use, and nonreturning call prefixes.
+5. Independently account for raw acquisition, current custody, preparation failure,
+   publication, obsolete retirement, shared-fragment escape and surviving globals.
+6. Verify task source/budget resume separation, single executing continuation,
+   foreign fencing, long storage work, cleanup-before-DONE and seeded service rounds.
+7. Compare known results, unoptimized/optimized prepared execution and C/JIT against
+   independent expected values/effect/resource traces. Agreement between shared
+   handlers/backends alone is not an independent oracle.
+
+Positive partners must accompany refusals: refreshed versus stale loan; stable
+independent growth versus genuinely shared invalidation; valid large/late target
+cohorts versus an actual lifetime violation. An optimizer limit may reduce
+optimization, not accepted source coverage or correctness.
+
+The historical [activities](compiler-activities-experiment.md),
+[completion](compiler-completion-experiment.md), [native-boundary](compiler-boundary-experiment.md),
+[join](compiler-join-experiment.md) and [regional](compiler-region-experiment.md)
+experiments remain unchanged evidence. Their fixed positions/ports and counts do
+not implement or validate this region architecture. Their raw failures remain
+preserved. This document replaces the earlier deferred constructor/API descriptions;
+it does not rewrite their reports or claim their probes implement these schemas.
+
+The method is Mua's [compiler guide](https://github.com/cperion/mua/blob/b93e36fa75c9d23cc1e68c70bdb5834e8c17b476/docs/writing-compilers.md):
+name the data, list the operations, give each activity its state and completion.
+The concrete Nua contracts above are this design's choices, not the toy compiler's.
+
+**No replacement implementation, dependency change or native test run accompanies
+this specification.** The design now names its data and operations; implementation
+and independent acceptance still have to establish that those contracts hold.
