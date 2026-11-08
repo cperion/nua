@@ -1,0 +1,190 @@
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+
+local refuses = do(test, expected)
+    local done, problem = pcall test
+    assert(not done, "expected a refusal")
+    if expected then assert(tostring(problem):find(expected, 1, true), tostring problem) end
+end
+
+local u32 = value -> data.Constant { type = types.U32, bits = data.IntegerBits { bits = ffi.new("uint64_t", value) } }
+
+-- a definition of max(x, y): entry branches; each arm jumps to a join with its value
+local build_max = do(supply)
+    local fresh = supply.fresh
+    local origin = fresh identity.OriginId
+    local definition = fresh identity.DefinitionId
+    local x = data.Parameter { .definition, index = 1, type = types.U32 }
+    local y = data.Parameter { .definition, index = 2, type = types.U32 }
+    local site = || -> data.Site { id = fresh identity.InstructionId, .origin }
+    local edge = |target, arguments| -> data.Edge { id = fresh identity.EdgeId, .target, .arguments }
+    local outcome = graph.building(nil, supply, do(writer)
+        local entry = writer.block("entry", {})
+        local join = writer.block("join", { types.U32 })
+        local less = fresh identity.ValueId
+        writer.append(entry, data.Compute { site = site(), result = less, type = types.Bool, opcode = "less", arguments = { x, y } })
+        -- the arms are a child construction, adopted into this one
+        local arms = graph.building(nil, supply, do(child)
+            local take_y = child.block("take y", {})
+            local take_x = child.block("take x", {})
+            child.terminate(take_y, data.Jump { .origin, edge = edge(join, { y }) })
+            child.terminate(take_x, data.Jump { .origin, edge = edge(join, { x }) })
+            return "adopt"
+        end)
+        local fragment = arms { built = f -> f, discarded = || -> error "the arms were discarded" }
+        writer.adopt fragment
+        local take_y, take_x = fragment.order[1], fragment.order[2]
+        writer.terminate(entry, data.Branch { .origin, condition = data.Result { value = less, type = types.Bool }, when_true = edge(take_y, {}), when_false = edge(take_x, {}) })
+        writer.terminate(join, data.Return { .origin, value = writer.parameter(join, 1) })
+        return "adopt"
+    end)
+    local fragment = outcome { built = f -> f, discarded = || -> error "discarded" }
+    local blocks = graph.seal fragment
+    local built = data.Definition with
+        id = definition
+        word = fresh identity.WordId
+        kind = "native_word"
+        signature = data.Signature { parameters = { types.U32, types.U32 }, result = types.U32, abi = "nua_boundary", variadic = false }
+        entry = blocks[1].id
+        .blocks
+        places = {}
+        .origin
+    end
+    return data.Program with
+        revision = 0
+        definitions = { [definition] = built }
+        words = {}
+        globals = {}
+        exports = { data.Export { name = "max", .definition } }
+        lifetimes = {}
+        origins = {}
+    end
+end
+
+return define
+    with
+        name = "a built definition is indexed with its predecessors and sites"
+        run = do()
+            local program = build_max(identity.supply())
+            local indexed = graph.index program
+            local definition = graph.definitions_in_order(program)[1]
+            local join = definition.blocks[2]
+            assert(#indexed.predecessors[join.id] == 2)
+            assert(#indexed.predecessors[definition.entry] == 0)
+            local compute = definition.blocks[1].instructions[1]
+            assert(indexed.sites[compute.site.id] == compute)
+            assert(indexed.definitions_of[compute.result] == compute)
+        end
+    end
+    with
+        name = "printing names by role and order, the same for equal programs"
+        run = do()
+            local text = graph.print(build_max(identity.supply()))
+            local expected = table.concat({
+                "definition1(%parameter1: U32, %parameter2: U32): U32",
+                "block1:",
+                "    %v1: Bool = %parameter1 < %parameter2",
+                "    branch %v1, block2(), block3()",
+                "block4(U32):",
+                "    return block4.1",
+                "block2:",
+                "    jump block4(%parameter2)",
+                "block3:",
+                "    jump block4(%parameter1)",
+            }, "\n")
+            assert(text == expected, "\n" .. text)
+            assert(graph.print(build_max(identity.supply())) == text)
+        end
+    end
+    with
+        name = "two compilations of one program are the same under a bijection of identities"
+        run = do()
+            local first = build_max(identity.supply())
+            local second = build_max(identity.supply())
+            assert(graph.same(first, second))
+            local unchanged = data.Instruction.pass "stand for itself" with ..graph.Unchanged end
+            local rewritten = graph.rewrite(unchanged, first)
+            assert(rewritten.revision == 1 and rewritten ~= first)
+            assert(graph.same(first, rewritten), "the same structure, whatever its revision")
+            assert(graph.print(rewritten) == graph.print(first))
+        end
+    end
+    with
+        name = "a rewrite replaces instructions and owns its output"
+        run = do()
+            local program = build_max(identity.supply())
+            local before = graph.definitions_in_order(program)[1].blocks[1].instructions
+            local Flipping = define ..graph.Unchanged
+                Compute = do(node, recurse, work)
+                    return { data.Compute { ..node, opcode = "less_equal" } }
+                end
+            end
+            local flip = data.Instruction.pass "flip less" with ..Flipping end
+            local rewritten = graph.rewrite(flip, program)
+            local after = graph.definitions_in_order(rewritten)[1].blocks[1].instructions
+            assert(after[1].opcode == "less_equal" and before[1].opcode == "less")
+            assert(not graph.same(program, rewritten))
+        end
+    end
+    with
+        name = "writers refuse misuse"
+        run = do()
+            local supply = identity.supply()
+            local origin = supply.fresh identity.OriginId
+            local site = || -> data.Site { id = supply.fresh identity.InstructionId, .origin }
+            local trap = data.Trap { .origin, message = u32 0 }
+            local kept
+            refuses(|| -> graph.building(nil, supply, do(writer)
+                local block = writer.block("only", {})
+                writer.terminate(block, trap)
+                writer.append(block, data.Fence { site = site(), order = "sequential" })
+            end), "append after the terminator")
+            refuses(|| -> graph.building(nil, supply, do(writer)
+                local block = writer.block("only", {})
+                writer.terminate(block, trap)
+                writer.terminate(block, trap)
+            end), "terminated twice")
+            local other = supply.fresh identity.BlockId
+            refuses(|| -> graph.building(nil, supply, do(writer)
+                writer.terminate(other, trap)
+            end), "not a block of this writer")
+            local discarded = graph.building(nil, supply, do(writer)
+                kept = writer
+                writer.block("unused", {})
+                return "discard"
+            end)
+            assert(discarded { built = f -> false, discarded = || -> true })
+            refuses(|| -> kept.block("late", {}), "was discarded")
+            refuses(|| -> graph.building(nil, supply, writer -> "maybe"), "not \"adopt\"")
+            local open_tail = graph.building(nil, supply, do(writer)
+                writer.block("open", {})
+                return "adopt"
+            end)
+            refuses(|| -> graph.seal(open_tail { built = f -> f, discarded = || -> nil }), "open tail")
+        end
+    end
+    with
+        name = "a fragment is adopted once, and its writer stops"
+        run = do()
+            local supply = identity.supply()
+            local origin = supply.fresh identity.OriginId
+            local child_writer
+            local child = graph.building(nil, supply, do(writer)
+                child_writer = writer
+                local block = writer.block("child", {})
+                writer.terminate(block, data.Trap { .origin, message = u32 1 })
+                return "adopt"
+            end)
+            local fragment = child { built = f -> f, discarded = || -> nil }
+            graph.building(nil, supply, do(parent)
+                parent.adopt fragment
+                refuses(|| -> parent.adopt fragment, "adopted")
+                return "adopt"
+            end)
+            refuses(|| -> child_writer.block("again", {}), "was adopted")
+        end
+    end
+end

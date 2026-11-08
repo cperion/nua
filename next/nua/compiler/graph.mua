@@ -1,0 +1,445 @@
+-- The graph vocabulary (compiler activities §4.3, §4.4): building fragments of the program
+-- graph, sealing them into blocks, and the walks, rewrites, comparison and printing over a
+-- finished program.
+--
+-- Building owns its output. `building(attempt, supply, body)` gives `body` a writer over fresh
+-- block buffers; the body's decision adopts or discards what it wrote, once. An adopted
+-- fragment moves into its parent writer, which alone can continue it; its own writer is then
+-- unusable. Sealing turns finished block buffers into immutable `Block` records and refuses an
+-- open tail.
+
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+
+local BlockId, InstructionId = identity.BlockId, identity.InstructionId
+local Instruction, Terminator, Operand = data.Instruction, data.Terminator, data.Operand
+
+local fail = do(message) error("graph: " .. message, 3) end
+
+------------------------------------------------------------------------------------------------
+-- Fragments and writers
+
+-- a private construction product: block buffers whose tails may still be open
+local GraphFragment = struct {
+    attempt: Optional(identity.AttemptId), entry: Optional(BlockId), order: Table, blocks: Table,
+    places: Table, lifetimes: Table, values: Table, borrows: Table, exits: Table, requests: Table,
+    state: String
+}
+
+local empty_fragment = attempt -> GraphFragment with
+    .attempt
+    order = {}
+    blocks = {}
+    places = {}
+    lifetimes = {}
+    values = {}
+    borrows = {}
+    exits = {}
+    requests = {}
+    state = "open"
+end
+
+-- the writer over one fragment; every verb checks that the fragment is still open and that a
+-- block belongs to it
+local writer_for = do(fragment, supply)
+    local open = do(verb)
+        if fragment.state ~= "open" then fail(("%s on a writer whose fragment was %s"):format(verb, fragment.state)) end
+    end
+    local owned_block = do(block, verb)
+        local draft = fragment.blocks[block]
+        if draft == nil then fail(("%s: %s is not a block of this writer"):format(verb, identity.describe block)) end
+        return draft
+    end
+    local GraphWriter = define
+        block = do(label, parameter_types)
+            open "block"
+            local id = supply.fresh BlockId
+            local arguments = {}
+            for index, type in ipairs(parameter_types or {}) do arguments[index] = data.BlockParameter { .type } end
+            fragment.blocks[id] = { .id, .label, .arguments, instructions = {}, terminator = nil }
+            fragment.order[#fragment.order + 1] = id
+            if fragment.entry == nil then fragment.entry = id end
+            return id
+        end
+        parameter = do(block, index)
+            open "parameter"
+            local draft = owned_block(block, "parameter")
+            local argument = draft.arguments[index]
+            if argument == nil then fail(("parameter: %s has no parameter %d"):format(identity.describe block, index)) end
+            return data.BlockArgument { .block, .index, type = argument.type }
+        end
+        declare = do(place)
+            open "declare"
+            if fragment.places[place.id] then fail("declare: " .. identity.describe(place.id) .. " is declared twice") end
+            fragment.places[place.id] = place
+        end
+        lifetime = do(lifetime)
+            open "lifetime"
+            fragment.lifetimes[lifetime.id] = lifetime
+        end
+        append = do(block, instruction)
+            open "append"
+            local draft = owned_block(block, "append")
+            if draft.terminator ~= nil then fail("append after the terminator of " .. identity.describe block) end
+            if not check(Instruction, instruction) then fail("append: " .. tostring instruction .. " is not an instruction") end
+            draft.instructions[#draft.instructions + 1] = instruction
+        end
+        terminate = do(block, terminator)
+            open "terminate"
+            local draft = owned_block(block, "terminate")
+            if draft.terminator ~= nil then fail(identity.describe block .. " is terminated twice") end
+            if not check(Terminator, terminator) then fail("terminate: " .. tostring terminator .. " is not a terminator") end
+            draft.terminator = terminator
+        end
+        terminated = do(block)
+            return owned_block(block, "terminated").terminator ~= nil
+        end
+        remember = do(operand, info)
+            open "remember"
+            fragment.values[data.operand_key operand] = info
+        end
+        borrow = do(info)
+            open "borrow"
+            fragment.borrows[info.id] = info
+        end
+        exit = do(site)
+            open "exit"
+            fragment.exits[#fragment.exits + 1] = site
+        end
+        require_definition = do(definition)
+            open "require"
+            fragment.requests[definition] = true
+        end
+        -- a child's fragment joins this one; the child's writer can no longer write it
+        adopt = do(child)
+            open "adopt"
+            if not check(GraphFragment, child) then fail("adopt: " .. tostring child .. " is not a fragment") end
+            if child.state ~= "built" then fail("adopt: the fragment is " .. child.state .. ", not built") end
+            child.state = "adopted"
+            for _, id in ipairs child.order do
+                fragment.blocks[id] = child.blocks[id]
+                fragment.order[#fragment.order + 1] = id
+            end
+            for id, place in pairs child.places do fragment.places[id] = place end
+            for id, lifetime in pairs child.lifetimes do fragment.lifetimes[id] = lifetime end
+            for key, info in pairs child.values do fragment.values[key] = info end
+            for id, info in pairs child.borrows do fragment.borrows[id] = info end
+            for _, site in ipairs child.exits do fragment.exits[#fragment.exits + 1] = site end
+            for definition in pairs child.requests do fragment.requests[definition] = true end
+            return child.entry
+        end
+    end
+    return GraphWriter
+end
+
+-- run `body` with a writer over a new fragment; it answers "adopt" or "discard"
+local BuildResult = oneof { built: GraphFragment, discarded: Unit }
+local building = do(attempt, supply, body)
+    local fragment = empty_fragment attempt
+    local writer = writer_for(fragment, supply)
+    local completed, decision = pcall(body, writer)
+    if not completed then
+        fragment.state = "discarded"
+        error(decision, 0)
+    end
+    if decision == "adopt" then
+        fragment.state = "built"
+        return BuildResult.built fragment
+    end
+    if decision == "discard" then
+        fragment.state = "discarded"
+        return BuildResult.discarded()
+    end
+    fragment.state = "discarded"
+    fail("building: the body decided " .. tostring decision .. ", not \"adopt\" or \"discard\"")
+end
+
+-- immutable blocks from a finished fragment, in the order they were made
+local seal = do(fragment)
+    if not check(GraphFragment, fragment) then fail("seal: " .. tostring fragment .. " is not a fragment") end
+    if fragment.state ~= "built" then fail("seal: the fragment is " .. fragment.state .. ", not built") end
+    local blocks = {}
+    for _, id in ipairs fragment.order do
+        local draft = fragment.blocks[id]
+        if draft.terminator == nil then fail("seal: " .. identity.describe id .. " (" .. tostring draft.label .. ") has an open tail") end
+        blocks[#blocks + 1] = data.Block { .id, arguments = draft.arguments, instructions = draft.instructions, terminator = draft.terminator }
+    end
+    fragment.state = "sealed"
+    return blocks
+end
+
+------------------------------------------------------------------------------------------------
+-- Programs: ordered traversal, index, walk and rewrite
+
+-- definitions in the order they were created, so every traversal is stable
+local definitions_in_order = do(program)
+    local list = {}
+    for _, definition in pairs program.definitions do list[#list + 1] = definition end
+    table.sort(list, |a, b| -> a.id.serial < b.id.serial)
+    return list
+end
+
+local edges_of = do(terminator)
+    if Terminator.is(terminator, data.Jump) then return { terminator.edge } end
+    if Terminator.is(terminator, data.Branch) then return { terminator.when_true, terminator.when_false } end
+    return {}
+end
+
+local GraphIndex = struct { definitions: Table, blocks: Table, sites: Table, predecessors: Table, edges: Table, definitions_of: Table }
+local index = do(program)
+    local built = GraphIndex { definitions = {}, blocks = {}, sites = {}, predecessors = {}, edges = {}, definitions_of = {} }
+    for _, definition in ipairs(definitions_in_order program) do
+        built.definitions[definition.id] = definition
+        for _, block in ipairs definition.blocks do
+            if built.blocks[block.id] then fail("index: " .. identity.describe(block.id) .. " appears twice") end
+            built.blocks[block.id] = block
+            built.predecessors[block.id] = built.predecessors[block.id] or {}
+        end
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do
+                built.sites[instruction.site.id] = instruction
+                if instruction.result then built.definitions_of[instruction.result] = instruction end
+            end
+            for _, edge in ipairs(edges_of block.terminator) do
+                built.edges[edge.id] = edge
+                local predecessors = built.predecessors[edge.target]
+                if predecessors == nil then fail("index: an edge of " .. identity.describe(block.id) .. " targets a block outside its program") end
+                predecessors[#predecessors + 1] = edge.id
+            end
+        end
+    end
+    return built
+end
+
+-- visit every instruction of every definition, in order
+local walk = do(pass, program, state)
+    for _, definition in ipairs(definitions_in_order program) do
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do pass(instruction, state) end
+        end
+    end
+end
+
+-- a rewrite answers each instruction with its replacements; it owns the lists it writes, so
+-- its handlers see them only through the work table it makes for each block
+local rewrite = do(pass, program, state)
+    local definitions = {}
+    for _, definition in ipairs(definitions_in_order program) do
+        local blocks = {}
+        for _, block in ipairs definition.blocks do
+            local written = {}
+            local work = { ..(state or {}), .written, .block, .definition }
+            for _, instruction in ipairs block.instructions do
+                for _, replacement in ipairs(pass(instruction, work)) do written[#written + 1] = replacement end
+            end
+            blocks[#blocks + 1] = data.Block { id = block.id, arguments = block.arguments, instructions = written, terminator = block.terminator }
+        end
+        definitions[definition.id] = data.Definition { ..definition, .blocks }
+    end
+    return data.Program { ..program, revision = program.revision + 1, .definitions }
+end
+
+-- the identity rewrite every rewrite extends by spread: each kind stands for itself
+local itself = node -> { node }
+local Unchanged = {}
+for _, kind in ipairs Instruction.kinds do Unchanged[kind] = itself end
+
+------------------------------------------------------------------------------------------------
+-- Comparing programs: the same kinds, constants and types, and the same structure of
+-- identities under one bijection between the two programs' identities.
+
+local ffi = require "ffi"
+local same_program = do(left, right)
+    local forward, backward = {}, {}
+    local same
+    local same_identity = do(a, b)
+        if forward[a] == nil and backward[b] == nil then
+            forward[a] = b
+            backward[b] = a
+            return getmetatable a == getmetatable b
+        end
+        return forward[a] == b and backward[b] == a
+    end
+    -- the keys of a map, in the order their identities were made (identities) or by value
+    local ordered_keys = do(map)
+        local keys = {}
+        for key in pairs map do keys[#keys + 1] = key end
+        table.sort(keys, do(a, b)
+            if check(identity.Identity, a) and check(identity.Identity, b) then return a.serial < b.serial end
+            return tostring a < tostring b
+        end)
+        return keys
+    end
+    same = do(a, b)
+        if a == b then return true end
+        if type a ~= type b then return false end
+        if type a == "cdata" then return a == b end
+        if type a ~= "table" then return false end
+        if check(types.NativeType, a) or check(types.NativeType, b) then return a == b end
+        if check(identity.Identity, a) then return check(identity.Identity, b) and same_identity(a, b) end
+        if getmetatable a ~= getmetatable b then return false end
+        local left_keys, right_keys = ordered_keys a, ordered_keys b
+        if #left_keys ~= #right_keys then return false end
+        for position, key in ipairs left_keys do
+            local other = right_keys[position]
+            if type key == "table" then
+                if not same(key, other) then return false end
+            elseif key ~= other then
+                return false
+            end
+            if not same(a[key], b[other]) then return false end
+        end
+        return true
+    end
+    local left_definitions, right_definitions = definitions_in_order left, definitions_in_order right
+    if #left_definitions ~= #right_definitions or #left.exports ~= #right.exports then return false end
+    for position, definition in ipairs left_definitions do
+        if not same(definition, right_definitions[position]) then return false end
+    end
+    return same(left.exports, right.exports)
+end
+
+------------------------------------------------------------------------------------------------
+-- Printing: stable names by role and order of appearance, never Lua addresses.
+
+local opcode_spelling = define
+    add = "+"
+    subtract = "-"
+    multiply = "*"
+    divide = "/"
+    remainder = "%"
+    bit_and = "&"
+    bit_or = "|"
+    bit_xor = "^"
+    shift_left = "<<"
+    equal = "=="
+    not_equal = "~="
+    less = "<"
+    less_equal = "<="
+end
+
+local printing = do()
+    local counts, assigned = {}, {}
+    local name_of = do(id, role)
+        local found = assigned[id]
+        if found then return found end
+        counts[role] = (counts[role] or 0) + 1
+        found = role .. counts[role]
+        assigned[id] = found
+        return found
+    end
+    local block_name = id -> name_of(id, "block")
+    local value_name = id -> "%" .. name_of(id, "v")
+    local place_name = id -> name_of(id, "place")
+    local constant_text = do(constant)
+        local bits = constant.bits
+        if data.NativeConstant.is(bits, data.IntegerBits) then
+            if constant.type.signed then return (tostring(ffi.cast("int64_t", bits.bits)):gsub("LL$", "")) end
+            return (tostring(bits.bits):gsub("ULL$", ""))
+        end
+        if data.NativeConstant.is(bits, data.FloatBits) then return tostring bits.value end
+        if data.NativeConstant.is(bits, data.BooleanBit) then return tostring bits.value end
+        if data.NativeConstant.is(bits, data.UnitBits) then return "()" end
+        if data.NativeConstant.is(bits, data.StaticBytes) then return ("%q"):format(bits.bytes) end
+        return types.describe(constant.type) .. " constant"
+    end
+    local Naming = define
+        Constant = do(node, recurse) return constant_text node end
+        Parameter = do(node, recurse) return "%parameter" .. node.index end
+        BlockArgument = do(node, recurse) return block_name(node.block) .. "." .. node.index end
+        Result = do(node, recurse) return value_name node.value end
+    end
+    local operand = Operand.pass "name an operand for printing" with ..Naming end
+    local operands = do(list)
+        local texts = {}
+        for position, item in ipairs list do texts[position] = operand item end
+        return table.concat(texts, ", ")
+    end
+    local edge = item -> block_name(item.target) .. "(" .. operands(item.arguments) .. ")"
+    local typed = |id, type| -> value_name(id) .. ": " .. types.describe(type)
+    local Listing = define
+        Compute = do(node, recurse)
+            local spelled = opcode_spelling[node.opcode]
+            if spelled and #node.arguments == 2 then
+                return ("%s = %s %s %s"):format(typed(node.result, node.type), operand(node.arguments[1]), spelled, operand(node.arguments[2]))
+            end
+            return ("%s = %s %s"):format(typed(node.result, node.type), node.opcode, operands(node.arguments))
+        end
+        Pack = do(node, recurse) return ("%s = pack %s"):format(typed(node.result, node.type), operands(node.components)) end
+        Extract = do(node, recurse) return ("%s = extract %s"):format(typed(node.result, node.type), operand(node.aggregate)) end
+        Load = do(node, recurse) return ("%s = load %s"):format(value_name(node.result), place_name(node.place)) end
+        Store = do(node, recurse) return ("store %s, %s"):format(place_name(node.place), operand(node.value)) end
+        Address = do(node, recurse) return ("%s = address %s"):format(value_name(node.result), place_name(node.place)) end
+        Check = do(node, recurse) return ("check %s"):format(operand(node.condition)) end
+        Invoke = do(node, recurse)
+            local call = "invoke " .. operands(node.arguments)
+            if node.result then return value_name(node.result) .. " = " .. call end
+            return call
+        end
+        Atomic = do(node, recurse) return ("atomic %s %s"):format(node.opcode, operand(node.address)) end
+        Fence = do(node, recurse) return "fence " .. node.order end
+        LifetimeStart = do(node, recurse) return "lifetime start" end
+        LifetimeEnd = do(node, recurse) return "lifetime end" end
+        Moves = do(node, recurse) return "moves " .. place_name(node.target.place) end
+        Ends = do(node, recurse) return ("ends %s (%s)"):format(place_name(node.target.place), node.reason) end
+        Budget = do(node, recurse) return "budget " .. node.reason end
+        Mechanism = do(node, recurse)
+            local call = ("mechanism %s(%s)"):format(node.binding, operands(node.arguments))
+            if node.result then return value_name(node.result) .. " = " .. call end
+            return call
+        end
+    end
+    local instruction = Instruction.pass "list an instruction" with ..Listing end
+    local Ending = define
+        Jump = do(node, recurse) return "jump " .. edge(node.edge) end
+        Branch = do(node, recurse) return ("branch %s, %s, %s"):format(operand(node.condition), edge(node.when_true), edge(node.when_false)) end
+        Return = do(node, recurse)
+            if node.value then return "return " .. operand(node.value) end
+            return "return"
+        end
+        Trap = do(node, recurse) return "trap " .. operand(node.message) end
+    end
+    local terminator = Terminator.pass "list a terminator" with ..Ending end
+    return define
+        .block_name
+        .instruction
+        .terminator
+    end
+end
+
+local print_program = do(program)
+    local listing = printing()
+    local lines = {}
+    for position, definition in ipairs(definitions_in_order program) do
+        local parameters = {}
+        for index, type in ipairs definition.signature.parameters do parameters[index] = "%parameter" .. index .. ": " .. types.describe(type) end
+        lines[#lines + 1] = ("definition%d(%s): %s"):format(position, table.concat(parameters, ", "), types.describe(definition.signature.result))
+        for _, block in ipairs definition.blocks do
+            local arguments = {}
+            for index, argument in ipairs block.arguments do arguments[index] = types.describe(argument.type) end
+            local header = listing.block_name(block.id)
+            if #arguments > 0 then header = header .. "(" .. table.concat(arguments, ", ") .. ")" end
+            lines[#lines + 1] = header .. ":"
+            for _, item in ipairs block.instructions do lines[#lines + 1] = "    " .. listing.instruction(item) end
+            lines[#lines + 1] = "    " .. listing.terminator(block.terminator)
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+return define
+    .GraphFragment
+    .BuildResult
+    .GraphIndex
+    .building
+    .seal
+    .index
+    .walk
+    .rewrite
+    .Unchanged
+    .edges_of
+    .definitions_in_order
+    same = same_program
+    print = print_program
+end

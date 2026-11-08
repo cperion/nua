@@ -1,0 +1,66 @@
+local types = require "nua.types"
+
+local target = { pointer_bits = 64 }
+
+return define
+    with
+        name = "composite types are interned; records are nominal"
+        run = do()
+            assert(types.reference(types.U32) == types.reference(types.U32))
+            assert(types.view(types.U8) ~= types.Str)
+            assert(types.buffer(types.U8, true) ~= types.buffer(types.U8))
+            assert(types.function_type({ types.U32 }, types.Bool) == types.function_type({ types.U32 }, types.Bool))
+            local fields = { { name = "x", type = types.U32 } }
+            assert(types.record("Point", fields) ~= types.record("Point", fields))
+        end
+    end
+    with
+        name = "types describe themselves as the source spells them"
+        run = do()
+            assert(types.describe(types.reference(types.U32)) == "Ref U32")
+            assert(types.describe(types.view(types.U32, true)) == "Slice.mut U32")
+            assert(types.describe(types.Str) == "Str")
+            assert(types.describe(types.fixed_array(types.F64, 4)) == "Array(F64, 4)")
+            assert(types.describe(types.buffer(types.U8, true)) == "Buffer.pinned U8")
+            assert(types.describe(types.function_type({ types.U32, types.Str }, types.Unit)) == "Fn(U32, Str): Unit")
+        end
+    end
+    with
+        name = "owners are buffers and what holds them; borrows are references and views"
+        run = do()
+            local text = types.record("Text", { { name = "bytes", type = types.buffer(types.U8) } })
+            local player = types.record("Player", { { name = "score", type = types.U32 }, { name = "name", type = text } })
+            local token = types.record("Token", { { name = "text", type = types.Str } })
+            local document = types.sum("Doc", { { name = "empty", payload = types.Unit }, { name = "text", payload = text } })
+            assert(types.owns(player) and types.owns(document) and types.owns(types.fixed_array(text, 2)))
+            assert(not types.owns(token) and not types.owns(types.reference(text)) and not types.owns(types.pointer(text)))
+            assert(types.borrows(token) and types.borrows(types.reference(types.U8)))
+            assert(not types.borrows(player) and not types.borrows(types.pointer(types.U8)))
+        end
+    end
+    with
+        name = "layouts follow C on a 64-bit target"
+        run = do()
+            assert(types.layout(types.U8, target).size == 1)
+            assert(types.layout(types.Str, target).size == 16)
+            local buffer = types.layout(types.buffer(types.U32), target)
+            assert(buffer.size == 24 and buffer.fields[3].name == "capacity" and buffer.fields[3].offset == 16)
+            assert(types.layout(types.buffer(types.U32, true), target).size == 32)
+            local mixed = types.record("Mixed", { { name = "flag", type = types.Bool }, { name = "count", type = types.U64 }, { name = "small", type = types.U16 } })
+            local laid = types.layout(mixed, target)
+            assert(laid.fields[2].offset == 8 and laid.size == 24 and laid.alignment == 8)
+            local choice = types.sum("Choice", { { name = "none", payload = types.Unit }, { name = "big", payload = types.U64 } })
+            local laid_choice = types.layout(choice, target)
+            assert(laid_choice.fields[2].offset == 8 and laid_choice.size == 16)
+            assert(types.layout(types.fixed_array(types.U16, 3), target).size == 6)
+        end
+    end
+    with
+        name = "constructors refuse what is not a native type"
+        run = do()
+            assert(not pcall(types.reference, 5))
+            assert(not pcall(types.fixed_array, types.U8, -1))
+            assert(not pcall(types.record, "Twice", { { name = "a", type = types.U8 }, { name = "a", type = types.U8 } }))
+        end
+    end
+end

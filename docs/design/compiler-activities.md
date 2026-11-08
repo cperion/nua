@@ -42,29 +42,37 @@ contracts; C/assembly supplies platform mechanisms.
 
 ### 1.1 Modules and their exported vocabularies
 
-These are the selected replacement module boundaries. Names under `nua/compiler/`
-are implementation targets, not claims that those files already exist.
+The replacement lives in `next/`, written in Mua and **self-contained**: it requires nothing
+from the current compiler in `nua/`, which stays runnable until the cutover and is then
+deleted. Module names resolve under `next/` (`nua.compiler.data` is
+`next/nua/compiler/data.mua`); `make test-next` runs `next/tests/` on upstream LuaJIT. Rows
+marked *built* exist with tests; the others are implementation targets.
 
 | Module | Exports | May depend on |
 |---|---|---|
-| `nua/compiler/data.mua` | Checked wire shapes below; identity/list/map checkers | Mua contracts; `nua.types` |
-| `nua/compiler/graph.mua` | `building`, `rewrite`, `walk`, `index`, `same`, `print` | `data` |
-| `nua/compiler/facts.mua` | `fork`, `agree`, `substitute`, `borrow`, `use`, `store`, `moves`, `ends`, `move_owner` | `data`; graph indices |
-| `nua/compiler/evaluate.mua` | `evaluating`, `apply`, `invoke`, `release` | `data`, `graph`, `facts`; supplied definition capability and Nua word bindings |
+| `nua/shapes.mua` *built* | `list_of`, `map_of`, `set_of`, `names`, `Natural`, `Positive` | Mua |
+| `nua/identity.mua` *built* | The identity brands of §1.2, `supply`, `describe` | `shapes` |
+| `nua/types.mua` *built* | The native-type family, interned constructors, `describe`, `owns`, `borrows`, `layout` | `shapes` |
+| `nua/compiler/data.mua` *built* | The records of §2–§3, from `values`, `places`, `program`, `contracts`; `operand_key` | `shapes`, `identity`, `types` |
+| `nua/compiler/rules.mua` *built* | `check_types`, `fold`, constant constructors: the native rules of §3.2 | `types`, `data` |
+| `nua/compiler/graph.mua` *built* | `building`, `seal`, `index`, `walk`, `rewrite`, `Unchanged`, `same`, `print` | `data` |
+| `nua/compiler/facts.mua` *built* | `fork`, `empty`, `tracking` (`borrow`, `use`, `cache`, `store`, `moves`, `ends`, `move_owner`, `agree`, `join_borrows`, `overlap`) | `data` |
+| `nua/compiler/verify.mua` *built* | `shape`, `graph`, `types`, `all` | `data`, `graph`, `rules` |
+| `nua/compiler/verify_lifetimes.mua` *built* | `lifetimes` | `data`, `graph`, `facts`, `verify` |
+| `nua/compiler/evaluate.mua` | `evaluating`, `apply`, `invoke`, `release` | `data`, `graph`, `facts`, `rules`; supplied definition capability and Nua word bindings |
 | `nua/compiler/control.mua` | `branching`, `looping`, `complete_exits` | `data`, `graph`, `facts`; supplied evaluation capability |
 | `nua/compiler/definitions.mua` | `defining`, `request`, `agree_group` | `data`, `graph`, `facts`; supplied evaluation capability |
 | `nua/compiler/budgets.mua` | `budgets` | `data`, `graph`; supplied evaluation and the scheduler's budget word |
-| `nua/compiler/verify.mua` | `shape`, `graph`, `types`, `lifetimes`, `task_access`, `ready` | `data`, `graph`, `facts` |
-| `nua/compiler/optimize.mua` | `fold`, `reach`, `sweep`, `optimize` | `data`, `graph`, `facts`, `verify` |
+| `nua/compiler/optimize.mua` | `fold`, `reach`, `sweep`, `optimize` | `data`, `graph`, `facts`, `rules`, `verify` |
 | `nua/compiler/diagnostics.mua` | `reporting`, `render` | `data`; supplied source text |
 | `nua/compiler/compile.mua` | `compiling`, `prepare` | Wires the preceding vocabularies and backend adapters |
-| `nua/front.lua` | Existing Mua host, changed to the hosted-body contract in §5 | Mua AST/emitter; supplied hosting vocabulary |
-| C/JIT adapters | `emit prepared target -> BackendProduct` | Ready program, native layouts and mechanism bindings |
+| `nua/front.mua` | The Mua host emitting hosted bodies (§5) | Mua parser/emitter; supplied hosting vocabulary |
+| `nua/emit_c.mua`, JIT adapter | `emit prepared target -> BackendProduct` | Ready program, native layouts and mechanism bindings |
 
 `compile` wires the mutually cooperating activities by passing functions; their
 modules do not recursively `require` one another or consult a global current
-compiler. `nua.loader` still owns the scoped use of Lua's module machinery.
-Native type construction remains in `nua.types`; this is not another type system.
+compiler. The compilation root owns the scoped use of Lua's module machinery.
+Native types are `nua/types.mua`'s; there is no second type system.
 
 ### 1.2 Contract notation and representation choices
 
@@ -213,14 +221,14 @@ BorrowPath   { root: PlaceId, steps: AccessPath, range: Option Range }
 Range        { first: Operand, count: Operand }
 BorrowInfo   { id: BorrowId, form: BorrowForm, origins: List Access,
                mutable: Bool, lifetime: LifetimeId, acquired: OriginId }
-BorrowForm   = Held(path: BorrowPath, pointer: Option Operand)
+BorrowForm   = Held(path: BorrowPath)
              | Stored(pointer: Operand)
-BorrowState  = Live | Ended(at: OriginId, reason: EndReason)
+BorrowState  = Live(pointer: Option Operand) | Ended(at: OriginId, reason: EndReason)
 EndReason    = Grew | Shrank | Removed | Cleared | Replaced | Moved | Released
 ```
 
-A **held** borrow is a path. `pointer` caches the derived native pointer and is
-dropped by a `Moves` on the path; the next use derives it again from the current
+A **held** borrow is a path. On each path of control its `Live` state may cache the
+derived native pointer, dropped by a `Moves` on the borrow's storage; the next use derives it again from the current
 headers. A **stored** borrow is a fixed pointer: it was written into data, passed to a
 compiled word or to foreign code. `origins` lists every buffer the borrow may point
 into; after a join it is the union of the incoming origins. `lifetime` is the
@@ -228,7 +236,7 @@ shortest owner lifetime among the origins, checked by the lifetime rule (syntax 
 
 | Event | Held borrow overlapping it | Stored borrow overlapping it |
 |---|---|---|
-| `Moves access` | drop `pointer` | `Ended(Grew)` |
+| `Moves access` | `Live` without its cached pointer | `Ended(Grew)` |
 | `Ends access reason` | `Ended(reason)` | `Ended(reason)` |
 | owner moved out of, replaced in or released from a place | `Ended(Moved / Replaced / Released)` | same |
 
@@ -784,8 +792,9 @@ Evaluation = {
 
 All handlers validate path ownership/liveness first. `read` of a named owner in
 value context is `move_owner`; borrowing contexts use `borrow`/`address`, never a
-header-copy escape. `write` of an owner releases the old value and stores the new
-header (replacement); it cannot emit a raw owner-typed `Store` otherwise. `release`
+header-copy escape. `write` of an owner into a place releases the place's old value,
+if live, then stores the new header: an owner-typed `Store` is a transfer, and the
+lifetimes verifier counts it as the value's one transfer on that path. `release`
 evaluates the owner type's release walk. `moves`/`ends` are the effect declarations
 of §3.3. Spawning and waiting are Nua words over `mechanism` (§7.2).
 
@@ -1042,8 +1051,8 @@ foreign contract; the checker does not claim to inspect arbitrary C.
 |---|---|
 | `shape` | Nominal kinds, exact fields, dense lists, registered native types/opcodes/bindings |
 | `graph` | Unique identities, complete targets, one terminator, edge arity, SSA dominance |
-| `types` | Operand/result/native ABI rules; initialized/tag/index proofs; no raw owner Store |
-| `lifetimes` | Lifetime starts/ends, borrow uses against `Moves`/`Ends` in order, correlated joins, owner linearity, no trapping site between the header writes of one owner move, complete exits |
+| `types` | Operand/result/native ABI rules against `rules`; place, component, callee and return types; initialized/tag/index proofs |
+| `lifetimes` | Borrow uses against `Moves`/`Ends` in order and across joins; an owner value transferred at most once on every path (a store, owning argument, return, edge argument or pack); lifetime starts/ends; no trapping site between the header writes of one owner move. That every owner is released exactly once is checked at runtime against an allocation ledger |
 | `task_access` | Reachable task/blocking/callback accesses; global policy, pointer origins and sendability; no `may_wait` callee as a C callback |
 | `ready` | All preceding checks; closed definition graph; budget coverage; target mechanisms available |
 

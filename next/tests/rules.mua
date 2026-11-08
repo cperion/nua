@@ -1,0 +1,111 @@
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local rules = require "nua.compiler.rules"
+
+local integer, float, boolean = rules.integer, rules.float, rules.boolean
+
+-- fold and read the result: a number (via its type), a boolean, or "invalid: reason"
+local folded = do(opcode, result, arguments)
+    local decision = rules.fold(opcode, result, arguments)
+    return decision with
+        folded = do(constant)
+            if data.NativeConstant.is(constant, data.IntegerBits) then
+                return tonumber(rules.integer_value(data.Constant { type = result, bits = constant }))
+            end
+            return constant.value
+        end
+        not_foldable = || -> "not foldable"
+        invalid = reason -> "invalid: " .. reason
+    end
+end
+
+local is_invalid = |value, part| -> type value == "string" and value:find("invalid", 1, true) and value:find(part, 1, true)
+
+return define
+    with
+        name = "operand types are checked per opcode"
+        run = do()
+            assert(rules.check_types("add", types.U32, { types.U32, types.U32 }) == nil)
+            assert(rules.check_types("add", types.U32, { types.U32, types.U8 }):find("one type", 1, true))
+            assert(rules.check_types("remainder", types.F64, { types.F64, types.F64 }):find("not defined", 1, true))
+            assert(rules.check_types("shift_left", types.U64, { types.U64, types.U8 }) == nil)
+            assert(rules.check_types("less", types.Bool, { types.I32, types.I32 }) == nil)
+            assert(rules.check_types("less", types.U32, { types.I32, types.I32 }):find("Bool", 1, true))
+            assert(rules.check_types("bit_and", types.Bool, { types.Bool, types.Bool }) == nil)
+            assert(rules.check_types("negate", types.U32, { types.U32, types.U32 }):find("takes 1 operand", 1, true))
+            assert(rules.check_types("reinterpret", types.U32, { types.F32 }) == nil)
+            assert(rules.check_types("reinterpret", types.U64, { types.F32 }):find("cannot reinterpret", 1, true))
+            assert(rules.check_types("convert", types.Bool, { types.U8 }):find("cannot convert", 1, true))
+        end
+    end
+    with
+        name = "narrow and unsigned integers wrap to their width"
+        run = do()
+            assert(folded("add", types.U8, { integer(types.U8, 200), integer(types.U8, 100) }) == 44)
+            assert(folded("subtract", types.U16, { integer(types.U16, 0), integer(types.U16, 1) }) == 65535)
+            assert(folded("multiply", types.U32, { integer(types.U32, 65536), integer(types.U32, 65536) }) == 0)
+            local wrapped = rules.fold("add", types.U64, { integer(types.U64, -1), integer(types.U64, 2) })
+            assert(wrapped { folded = c -> c.bits == 1ULL, not_foldable = || -> false, invalid = r -> false })
+            assert(folded("negate", types.U8, { integer(types.U8, 1) }) == 255)
+        end
+    end
+    with
+        name = "signed overflow is undefined behaviour, never folded"
+        run = do()
+            assert(folded("add", types.I8, { integer(types.I8, 100), integer(types.I8, 27) }) == 127)
+            assert(is_invalid(folded("add", types.I8, { integer(types.I8, 100), integer(types.I8, 28) }), "overflows I8"))
+            assert(is_invalid(folded("multiply", types.I32, { integer(types.I32, 65536), integer(types.I32, 32768) }), "overflows I32"))
+            assert(is_invalid(folded("add", types.I64, { integer(types.I64, 0x7fffffffffffffffLL), integer(types.I64, 1) }), "overflows I64"))
+            assert(is_invalid(folded("multiply", types.I64, { integer(types.I64, 0x100000000LL), integer(types.I64, 0x80000000LL) }), "overflows I64"))
+            assert(is_invalid(folded("negate", types.I32, { integer(types.I32, -2147483648) }), "overflows"))
+            assert(folded("subtract", types.I32, { integer(types.I32, -5), integer(types.I32, 7) }) == -12)
+        end
+    end
+    with
+        name = "division truncates toward zero; zero divisors and MIN / -1 are refused"
+        run = do()
+            assert(folded("divide", types.I32, { integer(types.I32, -7), integer(types.I32, 2) }) == -3)
+            assert(folded("remainder", types.I32, { integer(types.I32, -7), integer(types.I32, 2) }) == -1)
+            assert(folded("divide", types.U8, { integer(types.U8, 250), integer(types.U8, 7) }) == 35)
+            assert(is_invalid(folded("divide", types.U32, { integer(types.U32, 1), integer(types.U32, 0) }), "division by zero"))
+            assert(is_invalid(folded("remainder", types.I16, { integer(types.I16, 1), integer(types.I16, 0) }), "remainder by zero"))
+            assert(is_invalid(folded("divide", types.I8, { integer(types.I8, -128), integer(types.I8, -1) }), "minimum I8"))
+            assert(folded("divide", types.F64, { float(types.F64, 1), float(types.F64, 0) }) == math.huge)
+        end
+    end
+    with
+        name = "shifts take any integer count below the width"
+        run = do()
+            assert(folded("shift_left", types.U8, { integer(types.U8, 0x81), integer(types.U32, 1) }) == 2)
+            assert(folded("shift_right_signed", types.I8, { integer(types.I8, -8), integer(types.U8, 1) }) == -4)
+            assert(folded("shift_right_unsigned", types.U8, { integer(types.U8, 0x80), integer(types.U8, 7) }) == 1)
+            assert(is_invalid(folded("shift_left", types.U32, { integer(types.U32, 1), integer(types.U8, 32) }), "shift by 32"))
+            assert(is_invalid(folded("shift_left", types.I8, { integer(types.I8, 64), integer(types.U8, 1) }), "overflows I8"))
+            assert(is_invalid(folded("shift_left", types.I32, { integer(types.I32, -1), integer(types.U8, 1) }), "overflows I32"))
+            assert(folded("shift_left", types.I32, { integer(types.I32, 0x20000000), integer(types.U8, 1) }) == 0x40000000)
+        end
+    end
+    with
+        name = "comparisons read signed and unsigned bits by their type"
+        run = do()
+            assert(folded("less", types.Bool, { integer(types.U8, 255), integer(types.U8, 1) }) == false)
+            assert(folded("less", types.Bool, { integer(types.I8, -1), integer(types.I8, 1) }) == true)
+            assert(folded("equal", types.Bool, { integer(types.U64, -1), integer(types.U64, 0xffffffffffffffffULL) }) == true)
+            assert(folded("bit_xor", types.Bool, { boolean(true), boolean(true) }) == false)
+        end
+    end
+    with
+        name = "F32 rounds after every operation; conversions follow C"
+        run = do()
+            local tenth = folded("add", types.F32, { float(types.F32, 0.1), float(types.F32, 0) })
+            assert(tenth ~= 0.1 and math.abs(tenth - 0.1) < 1e-8)
+            assert(folded("convert", types.U8, { integer(types.I32, -1) }) == 255)
+            assert(folded("convert", types.I32, { float(types.F64, -3.9) }) == -3)
+            assert(is_invalid(folded("convert", types.I32, { float(types.F64, 3e9) }), "does not fit"))
+            assert(is_invalid(folded("convert", types.U8, { float(types.F64, 0 / 0) }), "NaN"))
+            assert(folded("convert", types.F64, { integer(types.U64, 4096) }) == 4096)
+            assert(folded("reinterpret", types.U32, { float(types.F32, 1) }) == 0x3f800000)
+            assert(folded("reinterpret", types.F32, { integer(types.U32, 0x40000000) }) == 2)
+        end
+    end
+end

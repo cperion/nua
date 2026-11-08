@@ -257,16 +257,16 @@ Access       { place: PlaceId, path: AccessPath }
 BorrowPath   { root: PlaceId, steps: AccessPath, range: Option Range }
 Range        { first: Operand, count: Operand }
 BorrowInfo   { id: BorrowId, form: BorrowForm, origins: List Access, acquired: OriginId }
-BorrowForm   = Held(path: BorrowPath, pointer: Option Operand)
+BorrowForm   = Held(path: BorrowPath)
              | Stored(pointer: Operand)
-BorrowState  = Live | Ended(at: OriginId, reason: EndReason)
+BorrowState  = Live(pointer: Option Operand) | Ended(at: OriginId, reason: EndReason)
 EndReason    = Grew | Shrank | Removed | Cleared | Replaced | Moved | Released
 Contents     = Uninitialized | Tracked(value: NativeValue)
              | Resident(info: ValueInfo) | Moved(at: OriginId)
 ```
 
-`Held.pointer` is the cached native pointer, valid until a `Moves` on the path; `absent`
-means "derive it at the next use". `origins` lists every buffer the borrow may point
+`Live.pointer` is the cached native pointer on one path of control, valid until a `Moves`
+of the borrow's storage; `absent` means "derive it at the next use". `origins` lists every buffer the borrow may point
 into (several after a join). A borrow whose steps include an unknown element index uses
 `AnyElement` in its origins; its path keeps the actual index operand.
 
@@ -311,7 +311,7 @@ inherit their effects. A container may refine `ends` by key or ID, as `Store:rem
 
 | Event | Held borrows whose origins overlap | Stored borrows whose origins overlap | Owner places |
 |---|---|---|---|
-| `moves access` | drop `pointer` | `Ended(Grew)` | – |
+| `moves access` | `Live` without its cached pointer | `Ended(Grew)` | – |
 | `ends access reason` | `Ended(reason)` | `Ended(reason)` | – |
 | owner move out of a place | `Ended(Moved)` | `Ended(Moved)` | `Moved(at)` |
 | owner replaced | `Ended(Replaced)` | `Ended(Replaced)` | new `Tracked` |

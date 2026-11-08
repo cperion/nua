@@ -1,0 +1,454 @@
+-- Verifiers (compiler activities §7.3): checks of a finished program that do not trust the
+-- activity that built it. Each answers a list of problems; an empty list is a pass.
+--
+--   shape   every record is what its family says, with dense lists
+--   graph   unique identities, edges into the same definition with the target's arity and
+--           types, an entry without parameters, and every operand defined where it is used
+--           (SSA dominance)
+--   types   every instruction against the native rules and the types of its places, values,
+--           callees and components; returns against the signature
+--
+-- `lifetimes` (borrows and owner linearity) is in verify_lifetimes.mua.
+
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local rules = require "nua.compiler.rules"
+
+local Instruction, Terminator, Operand = data.Instruction, data.Terminator, data.Operand
+local NativeType = types.NativeType
+
+local Problem = struct { verifier: String, definition: Optional(identity.DefinitionId), message: String, origin: Optional(identity.OriginId) }
+
+local reporter = do(verifier)
+    local problems = {}
+    local report = do(definition, message, origin)
+        problems[#problems + 1] = Problem { .verifier, definition = definition and definition.id, .message, .origin }
+    end
+    return problems, report
+end
+
+------------------------------------------------------------------------------------------------
+-- shape
+
+local shape = do(program)
+    local problems, report = reporter "shape"
+    if not check(data.Program, program) then
+        local _, why = check(data.Program, program)
+        report(nil, "the program is malformed: " .. tostring why)
+        return problems
+    end
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        local valid, why = check(data.Definition, definition)
+        if not valid then report(definition, "malformed definition: " .. tostring why, definition.origin) end
+    end
+    return problems
+end
+
+------------------------------------------------------------------------------------------------
+-- graph
+
+-- the operands an instruction uses, in order
+local operand_lists = define
+    Compute = node -> node.arguments
+    Pack = node -> node.components
+    Extract = node -> { node.aggregate }
+    Load = node -> {}
+    Store = node -> { node.value }
+    Address = node -> {}
+    Check = node -> { node.condition, node.message }
+    Invoke = do(node)
+        local list = {}
+        local callee = node.callee
+        if data.Callee.is(callee, data.IndirectNua) or data.Callee.is(callee, data.Foreign) then list[1] = callee.pointer end
+        for _, argument in ipairs node.arguments do list[#list + 1] = argument end
+        return list
+    end
+    Atomic = do(node)
+        local list = { node.address }
+        for _, argument in ipairs node.arguments do list[#list + 1] = argument end
+        return list
+    end
+    Fence = node -> {}
+    LifetimeStart = node -> {}
+    LifetimeEnd = node -> {}
+    Moves = node -> {}
+    Ends = node -> {}
+    Budget = node -> {}
+    Mechanism = node -> node.arguments
+end
+local Using = {}
+for kind, list in pairs operand_lists do Using[kind] = |node, recurse| -> list node end
+local operands_of = Instruction.pass "the operands an instruction uses" with ..Using end
+
+local terminator_operands = do(terminator)
+    local list = {}
+    if Terminator.is(terminator, data.Branch) then list[1] = terminator.condition end
+    if Terminator.is(terminator, data.Return) and terminator.value then list[1] = terminator.value end
+    if Terminator.is(terminator, data.Trap) then list[1] = terminator.message end
+    for _, edge in ipairs(graph.edges_of terminator) do
+        for _, argument in ipairs edge.arguments do list[#list + 1] = argument end
+    end
+    return list
+end
+
+-- dominators by the iterative algorithm over reverse postorder
+local dominators_of = do(definition, blocks_by_id)
+    local order, visited = {}, {}
+    local visit
+    visit = do(id)
+        if visited[id] then return end
+        visited[id] = true
+        local block = blocks_by_id[id]
+        if block then
+            for _, edge in ipairs(graph.edges_of block.terminator) do visit(edge.target) end
+        end
+        order[#order + 1] = id
+    end
+    visit(definition.entry)
+    local reverse = {}
+    for position = #order, 1, -1 do reverse[#reverse + 1] = order[position] end
+    local position_of = {}
+    for position, id in ipairs reverse do position_of[id] = position end
+    local predecessors = {}
+    for _, id in ipairs reverse do
+        for _, edge in ipairs(graph.edges_of(blocks_by_id[id].terminator)) do
+            predecessors[edge.target] = predecessors[edge.target] or {}
+            table.insert(predecessors[edge.target], id)
+        end
+    end
+    local immediate = { [definition.entry] = definition.entry }
+    local intersect = do(a, b)
+        while a ~= b do
+            while position_of[a] > position_of[b] do a = immediate[a] end
+            while position_of[b] > position_of[a] do b = immediate[b] end
+        end
+        return a
+    end
+    local changed = true
+    while changed do
+        changed = false
+        for position = 2, #reverse do
+            local id = reverse[position]
+            local chosen = nil
+            for _, predecessor in ipairs(predecessors[id] or {}) do
+                if immediate[predecessor] then chosen = chosen and intersect(predecessor, chosen) or predecessor end
+            end
+            if chosen and immediate[id] ~= chosen then
+                immediate[id] = chosen
+                changed = true
+            end
+        end
+    end
+    local dominates = do(a, b)
+        while true do
+            if a == b then return true end
+            local up = immediate[b]
+            if up == nil or up == b then return false end
+            b = up
+        end
+    end
+    return dominates, visited
+end
+
+local verify_graph = do(program)
+    local problems, report = reporter "graph"
+    local seen_blocks, seen_sites, seen_values = {}, {}, {}
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        local blocks_by_id = {}
+        local where_defined = {}   -- value -> { block, position }
+        for _, block in ipairs definition.blocks do
+            if seen_blocks[block.id] then report(definition, identity.describe(block.id) .. " appears twice") end
+            seen_blocks[block.id] = true
+            blocks_by_id[block.id] = block
+            for position, instruction in ipairs block.instructions do
+                local site = instruction.site.id
+                if seen_sites[site] then report(definition, identity.describe(site) .. " appears twice", instruction.site.origin) end
+                seen_sites[site] = true
+                if instruction.result then
+                    if seen_values[instruction.result] then report(definition, identity.describe(instruction.result) .. " is defined twice", instruction.site.origin) end
+                    seen_values[instruction.result] = true
+                    where_defined[instruction.result] = { block = block.id, .position }
+                end
+            end
+        end
+        local entry = blocks_by_id[definition.entry]
+        if entry == nil then
+            report(definition, "the entry is not a block of the definition", definition.origin)
+        else
+            if #entry.arguments > 0 then report(definition, "the entry block takes parameters; a definition's inputs are its Parameters", definition.origin) end
+            local dominates = dominators_of(definition, blocks_by_id)
+            local defined_before = do(operand, block, position, origin)
+                if Operand.is(operand, data.Result) then
+                    local found = where_defined[operand.value]
+                    if found == nil then
+                        report(definition, identity.describe(operand.value) .. " is used but never defined", origin)
+                    elseif found.block == block then
+                        if position and found.position >= position then report(definition, identity.describe(operand.value) .. " is used before its definition", origin) end
+                    elseif not dominates(found.block, block) then
+                        report(definition, identity.describe(operand.value) .. " does not dominate its use", origin)
+                    end
+                elseif Operand.is(operand, data.BlockArgument) then
+                    local owner = blocks_by_id[operand.block]
+                    if owner == nil then
+                        report(definition, "a block argument of a block outside the definition is used", origin)
+                    elseif operand.index > #owner.arguments then
+                        report(definition, identity.describe(operand.block) .. " has no parameter " .. operand.index, origin)
+                    elseif not dominates(operand.block, block) then
+                        report(definition, "a parameter of " .. identity.describe(operand.block) .. " is used where that block does not dominate", origin)
+                    elseif owner.arguments[operand.index].type ~= operand.type then
+                        report(definition, "a block argument is used at a type other than its parameter's", origin)
+                    end
+                elseif Operand.is(operand, data.Parameter) then
+                    if operand.definition ~= definition.id then
+                        report(definition, "a parameter of another definition is used", origin)
+                    elseif operand.index > #definition.signature.parameters then
+                        report(definition, "the definition has no parameter " .. operand.index, origin)
+                    elseif definition.signature.parameters[operand.index] ~= operand.type then
+                        report(definition, "parameter " .. operand.index .. " is used at a type other than its signature's", origin)
+                    end
+                end
+            end
+            for _, block in ipairs definition.blocks do
+                for position, instruction in ipairs block.instructions do
+                    for _, operand in ipairs(operands_of instruction) do defined_before(operand, block.id, position, instruction.site.origin) end
+                end
+                local terminator = block.terminator
+                for _, operand in ipairs(terminator_operands terminator) do defined_before(operand, block.id, nil, terminator.origin) end
+                for _, edge in ipairs(graph.edges_of terminator) do
+                    local target = blocks_by_id[edge.target]
+                    if target == nil then
+                        report(definition, "an edge of " .. identity.describe(block.id) .. " leaves the definition", terminator.origin)
+                    elseif #edge.arguments ~= #target.arguments then
+                        report(definition, ("an edge into %s passes %d arguments for %d parameters"):format(identity.describe(edge.target), #edge.arguments, #target.arguments), terminator.origin)
+                    else
+                        for index, argument in ipairs edge.arguments do
+                            if argument.type ~= target.arguments[index].type then
+                                report(definition, ("argument %d of an edge into %s is %s, not %s"):format(index, identity.describe(edge.target), types.describe(argument.type), types.describe(target.arguments[index].type)), terminator.origin)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return problems
+end
+
+------------------------------------------------------------------------------------------------
+-- types
+
+-- the parts a native value is packed from, in order
+local parts_of = do(type)
+    if NativeType.is(type, types.RecordType) then
+        local list = {}
+        for index, field in ipairs type.fields do list[index] = field.type end
+        return list
+    end
+    if NativeType.is(type, types.ViewType) then return { types.pointer(type.element), types.U64 } end
+    if NativeType.is(type, types.BufferType) then
+        local list = { types.pointer(type.element), types.U64, types.U64 }
+        if type.pinned then list[4] = types.U64 end
+        return list
+    end
+    if NativeType.is(type, types.FixedArrayType) then
+        local list = {}
+        for index = 1, type.count do list[index] = type.element end
+        return list
+    end
+    return nil
+end
+
+local header_fields = { data = 1, length = 2, capacity = 3, limit = 4 }
+
+-- the type of one component of a native value, or nil and why not
+local component_type = do(type, component)
+    local Component = data.Component
+    if Component.is(component, data.FieldComponent) then
+        if NativeType.is(type, types.RecordType) then
+            for _, field in ipairs type.fields do
+                if field.name == component.name then return field.type end
+            end
+            return nil, types.describe(type) .. " has no field " .. component.name
+        end
+        local parts = (NativeType.is(type, types.ViewType) or NativeType.is(type, types.BufferType)) and parts_of type
+        local index = header_fields[component.name]
+        if parts and index and parts[index] then return parts[index] end
+        return nil, types.describe(type) .. " has no field " .. component.name
+    end
+    if Component.is(component, data.ElementComponent) then
+        if NativeType.is(type, types.FixedArrayType) and rules.is_integer(component.index.type) then return type.element end
+        return nil, "an element of " .. types.describe(type) .. " needs a fixed array and an integer index"
+    end
+    if NativeType.is(type, types.SumType) then
+        for _, alternative in ipairs type.alternatives do
+            if alternative.name == component.name then return alternative.payload end
+        end
+    end
+    return nil, types.describe(type) .. " has no alternative " .. tostring(component.name)
+end
+
+local verify_types = do(program, capabilities)
+    local problems, report = reporter "types"
+    local mechanisms = capabilities and capabilities.mechanisms or {}
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        local result_types = {}
+        local place_type = do(place, origin)
+            local found = definition.places[place]
+            if found == nil then report(definition, identity.describe(place) .. " is not a place of the definition", origin) end
+            return found and found.type
+        end
+        local expect = do(operand, type, what, origin)
+            if type and operand.type ~= type then
+                report(definition, ("%s is %s, not %s"):format(what, types.describe(operand.type), types.describe(type)), origin)
+            end
+        end
+        local Typing = define
+            Compute = do(node, recurse)
+                local argument_types = {}
+                for index, argument in ipairs node.arguments do argument_types[index] = argument.type end
+                local reason = rules.check_types(node.opcode, node.type, argument_types)
+                if reason then report(definition, reason, node.site.origin) end
+                return node.type
+            end
+            Pack = do(node, recurse)
+                local parts = parts_of node.type
+                if NativeType.is(node.type, types.SumType) then
+                    if #node.components ~= 2 or node.components[1].type ~= types.U32 then
+                        report(definition, "a sum is packed from its U32 tag and a payload", node.site.origin)
+                    end
+                elseif parts == nil then
+                    report(definition, types.describe(node.type) .. " is not packed from parts", node.site.origin)
+                elseif #parts ~= #node.components then
+                    report(definition, ("%s is packed from %d parts, got %d"):format(types.describe(node.type), #parts, #node.components), node.site.origin)
+                else
+                    for index, component in ipairs node.components do expect(component, parts[index], "part " .. index .. " of " .. types.describe(node.type), node.site.origin) end
+                end
+                return node.type
+            end
+            Extract = do(node, recurse)
+                local type = node.aggregate.type
+                for _, component in ipairs node.path do
+                    local next_type, why = component_type(type, component)
+                    if next_type == nil then
+                        report(definition, why, node.site.origin)
+                        return node.type
+                    end
+                    type = next_type
+                end
+                if type ~= node.type then report(definition, ("the extracted component is %s, not %s"):format(types.describe(type), types.describe(node.type)), node.site.origin) end
+                return node.type
+            end
+            Load = |node, recurse| -> place_type(node.place, node.site.origin)
+            Store = do(node, recurse)
+                expect(node.value, place_type(node.place, node.site.origin), "the stored value", node.site.origin)
+            end
+            Address = do(node, recurse)
+                local type = place_type(node.place, node.site.origin)
+                return type and types.pointer(type)
+            end
+            Check = do(node, recurse)
+                expect(node.condition, types.Bool, "a check's condition", node.site.origin)
+            end
+            Invoke = do(node, recurse)
+                local signature
+                if data.Callee.is(node.callee, data.DirectNua) then
+                    local callee = program.definitions[node.callee.definition]
+                    if callee == nil then
+                        report(definition, "a call of a definition outside the program", node.site.origin)
+                        return nil
+                    end
+                    signature = callee.signature
+                else
+                    signature = node.callee.signature
+                end
+                if #node.arguments ~= #signature.parameters and not signature.variadic then
+                    report(definition, ("a call passes %d arguments for %d parameters"):format(#node.arguments, #signature.parameters), node.site.origin)
+                end
+                for index, argument in ipairs node.arguments do
+                    if signature.parameters[index] then expect(argument, signature.parameters[index], "argument " .. index, node.site.origin) end
+                end
+                return signature.result
+            end
+            Atomic = do(node, recurse)
+                local pointer = node.address.type
+                if not NativeType.is(pointer, types.PointerType) then
+                    report(definition, "an atomic operation needs a pointer", node.site.origin)
+                    return nil
+                end
+                for index, argument in ipairs node.arguments do expect(argument, pointer.target, "atomic argument " .. index, node.site.origin) end
+                return pointer.target
+            end
+            Fence = |node, recurse| -> nil
+            LifetimeStart = |node, recurse| -> nil
+            LifetimeEnd = |node, recurse| -> nil
+            Moves = |node, recurse| -> nil
+            Ends = |node, recurse| -> nil
+            Budget = |node, recurse| -> nil
+            Mechanism = do(node, recurse)
+                local binding = mechanisms[node.binding]
+                if capabilities and capabilities.mechanisms and binding == nil then
+                    report(definition, "the target has no mechanism " .. node.binding, node.site.origin)
+                end
+                return binding and binding.signature.result
+            end
+        end
+        local type_of = Instruction.pass "the type an instruction yields" with ..Typing end
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do
+                local yielded = type_of instruction
+                if instruction.result then result_types[instruction.result] = yielded end
+            end
+        end
+        -- every result operand claims the type its instruction yields
+        local claims = do(operand, origin)
+            if Operand.is(operand, data.Result) then
+                local yielded = result_types[operand.value]
+                if yielded and yielded ~= operand.type then
+                    report(definition, ("%s is used as %s but is %s"):format(identity.describe(operand.value), types.describe(operand.type), types.describe(yielded)), origin)
+                end
+            end
+        end
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do
+                for _, operand in ipairs(operands_of instruction) do claims(operand, instruction.site.origin) end
+            end
+            local terminator = block.terminator
+            for _, operand in ipairs(terminator_operands terminator) do claims(operand, terminator.origin) end
+            if Terminator.is(terminator, data.Branch) then expect(terminator.condition, types.Bool, "a branch condition", terminator.origin) end
+            if Terminator.is(terminator, data.Return) then
+                local result = definition.signature.result
+                if terminator.value then
+                    expect(terminator.value, result, "the returned value", terminator.origin)
+                elseif result ~= types.Unit then
+                    report(definition, "a return without a value from a definition yielding " .. types.describe(result), terminator.origin)
+                end
+            end
+        end
+    end
+    return problems
+end
+
+-- every verifier in order; the problems of all of them
+local all = do(program, capabilities)
+    local problems = shape program
+    if #problems > 0 then return problems end
+    for _, verifier in ipairs { verify_graph, verify_types } do
+        for _, problem in ipairs(verifier(program, capabilities)) do problems[#problems + 1] = problem end
+    end
+    return problems
+end
+
+return define
+    .Problem
+    .shape
+    .operands_of
+    .terminator_operands
+    .dominators_of
+    .parts_of
+    .component_type
+    graph = verify_graph
+    types = verify_types
+    .all
+end

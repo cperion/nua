@@ -1,0 +1,112 @@
+-- Places, their contents and access paths, and the facts of borrows (compiler activities §2.3,
+-- §2.4).
+-- Published records are read-only by convention: an activity builds new records instead of
+-- changing ones it did not make.
+
+local ffi = require "ffi"
+local shapes = require "nua.shapes"
+local identity = require "nua.identity"
+local types = require "nua.types"
+
+local list_of, map_of, set_of, names = shapes.list_of, shapes.map_of, shapes.set_of, shapes.names
+local Natural, Positive = shapes.Natural, shapes.Positive
+local NativeType = types.NativeType
+local WordId, EnvironmentId, DefinitionId = identity.WordId, identity.EnvironmentId, identity.DefinitionId
+local BlockId, EdgeId, InstructionId, ValueId = identity.BlockId, identity.EdgeId, identity.InstructionId, identity.ValueId
+local PlaceId, BorrowId, LifetimeId, InvocationId = identity.PlaceId, identity.BorrowId, identity.LifetimeId, identity.InvocationId
+local GlobalId, OriginId, HostId, BoundaryId = identity.GlobalId, identity.OriginId, identity.HostId, identity.BoundaryId
+
+local values = require "nua.compiler.values"
+local NativeValue, Operand, ComponentPath = values.NativeValue, values.Operand, values.ComponentPath
+
+------------------------------------------------------------------------------------------------
+-- §2.3 Places, contents and access
+
+local AccessStep = family "access step"
+local FieldStep = struct { name: String }
+local KnownElement = struct { index: Natural }
+local AnyElement = struct {}
+local AlternativeStep = struct { name: String }
+local ContentsStep = struct {}
+AccessStep { FieldStep, KnownElement, AnyElement, AlternativeStep, ContentsStep }
+local AccessPath = list_of(AccessStep)
+
+local Access = struct { place: PlaceId, path: AccessPath }
+local ForeignEffects = struct { reads: list_of(Access), writes: list_of(Access), retains: list_of(Access), may_reenter: Boolean, noreturn: Boolean }
+local ForeignAccess = struct { lifetime: LifetimeId, type: NativeType, mutable: Boolean, retains: Boolean, effects: ForeignEffects }
+
+local PlaceRoot = family "place root"
+local LocalRoot = struct { invocation: InvocationId, local_index: Positive }
+local GlobalRoot = struct { global: GlobalId }
+local ParameterRoot = struct { definition: DefinitionId, parameter: Positive }
+local IndirectRoot = struct { pointer: Operand, borrow: BorrowId }
+local ForeignRoot = struct { pointer: Operand, contract: ForeignAccess }
+PlaceRoot { LocalRoot, GlobalRoot, ParameterRoot, IndirectRoot, ForeignRoot }
+
+local Place = struct { id: PlaceId, type: NativeType, root: PlaceRoot, path: ComponentPath, lifetime: LifetimeId, origin: OriginId }
+
+local ValueInfo = struct { type: NativeType, components: Table, proofs: Table }
+local Contents = family "contents of a place"
+local Uninitialized = struct {}
+local Tracked = struct { value: NativeValue }
+local Resident = struct { info: ValueInfo }
+local Moved = struct { at: OriginId }
+Contents { Uninitialized, Tracked, Resident, Moved }
+
+------------------------------------------------------------------------------------------------
+-- §2.4 Borrows and owner linearity
+
+local EndReason, end_reasons = names("reason a borrow ended", { "grew", "shrank", "removed", "cleared", "replaced", "moved", "released" })
+
+local Range = struct { first: Operand, count: Operand }
+local BorrowPath = struct { root: PlaceId, steps: AccessPath, range: Optional(Range) }
+
+local BorrowForm = family "form of a borrow"
+local Held = struct { path: BorrowPath }
+local Stored = struct { pointer: Operand }
+BorrowForm { Held, Stored }
+
+local BorrowInfo = struct { id: BorrowId, form: BorrowForm, origins: list_of(Access), mutable: Boolean, lifetime: LifetimeId, acquired: OriginId }
+
+local BorrowState = family "state of a borrow"
+-- a live held borrow may cache its derived pointer on this path, until a move of its storage
+local Live = struct { pointer: Optional(Operand) }
+local Ended = struct { at: OriginId, reason: EndReason }
+BorrowState { Live, Ended }
+
+return define
+    .AccessStep
+    .FieldStep
+    .KnownElement
+    .AnyElement
+    .AlternativeStep
+    .ContentsStep
+    .AccessPath
+    .Access
+    .ForeignEffects
+    .ForeignAccess
+    .PlaceRoot
+    .LocalRoot
+    .GlobalRoot
+    .ParameterRoot
+    .IndirectRoot
+    .ForeignRoot
+    .Place
+    .ValueInfo
+    .Contents
+    .Uninitialized
+    .Tracked
+    .Resident
+    .Moved
+    .EndReason
+    .end_reasons
+    .Range
+    .BorrowPath
+    .BorrowForm
+    .Held
+    .Stored
+    .BorrowInfo
+    .BorrowState
+    .Live
+    .Ended
+end

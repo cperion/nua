@@ -1,0 +1,16 @@
+-- The published data of the compiler (compiler activities §2, §3): one vocabulary made of
+-- its four parts. Closed alternatives are families; codes without payload are closed sets of
+-- names; private working state belongs to each activity, not here. Two parts that offered one
+-- name would clash here, by spread.
+
+local values = require "nua.compiler.values"
+local places = require "nua.compiler.places"
+local program = require "nua.compiler.program"
+local contracts = require "nua.compiler.contracts"
+
+return define
+    ..values
+    ..places
+    ..program
+    ..contracts
+end

@@ -1,0 +1,184 @@
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local facts = require "nua.compiler.facts"
+
+-- a fresh activity: its supply, its borrow registry, its tracking vocabulary
+local activity = do(may_alias)
+    local supply = identity.supply()
+    local borrows = {}
+    local tracking = facts.tracking { .supply, .borrows, .may_alias }
+    local origin = supply.fresh identity.OriginId
+    local lifetime = supply.fresh identity.LifetimeId
+    local pointer = || -> data.Result { value = supply.fresh identity.ValueId, type = types.pointer(types.U8) }
+    return define
+        .supply
+        .borrows
+        .tracking
+        .origin
+        .lifetime
+        .pointer
+        place = || -> supply.fresh identity.PlaceId
+    end
+end
+
+local contents_of = place -> data.Access { .place, path = { data.ContentsStep {} } }
+local held_path = place -> data.BorrowPath { root = place, steps = { data.ContentsStep {} } }
+local kind = |use| -> use { derive = p -> "derive", cached = p -> "cached", fixed = p -> "fixed", ended = e -> "ended " .. e.reason }
+
+return define
+    with
+        name = "rule 1: growth never ends a held borrow; its pointer is derived again"
+        run = do()
+            local a = activity()
+            local buffer = a.place()
+            local flow = facts.empty()
+            local view = a.tracking.borrow(flow, held_path buffer, false, a.lifetime, a.origin)
+            assert(kind(a.tracking.use(flow, view.id)) == "derive")
+            a.tracking.cache(flow, view.id, a.pointer())
+            assert(kind(a.tracking.use(flow, view.id)) == "cached")
+            a.tracking.moves(flow, contents_of buffer, a.origin)
+            assert(kind(a.tracking.use(flow, view.id)) == "derive")
+        end
+    end
+    with
+        name = "rule 3: a stored borrow ends when its storage grows"
+        run = do()
+            local a = activity()
+            local source = a.place()
+            local flow = facts.empty()
+            local view = a.tracking.borrow(flow, held_path source, false, a.lifetime, a.origin)
+            local in_token = a.tracking.store(flow, view.id, a.pointer(), a.origin)
+            a.tracking.moves(flow, contents_of source, a.origin)
+            assert(kind(a.tracking.use(flow, in_token.id)) == "ended grew")
+            assert(kind(a.tracking.use(flow, view.id)) == "derive")
+        end
+    end
+    with
+        name = "rule 2: shrinking or clearing ends held and stored borrows alike"
+        run = do()
+            local a = activity()
+            local buffer = a.place()
+            local flow = facts.empty()
+            local view = a.tracking.borrow(flow, held_path buffer, false, a.lifetime, a.origin)
+            local stored = a.tracking.store(flow, view.id, a.pointer(), a.origin)
+            a.tracking.ends(flow, contents_of buffer, "cleared", a.origin)
+            assert(kind(a.tracking.use(flow, view.id)) == "ended cleared")
+            assert(kind(a.tracking.use(flow, stored.id)) == "ended cleared")
+        end
+    end
+    with
+        name = "a moved owner ends its borrows, and moves once"
+        run = do()
+            local a = activity()
+            local owner = a.place()
+            local flow = facts.empty()
+            local header = data.Result { value = a.supply.fresh identity.ValueId, type = types.buffer(types.U8) }
+            flow.contents[owner] = data.Tracked { value = data.Owned { type = types.buffer(types.U8), .header } }
+            local view = a.tracking.borrow(flow, held_path owner, false, a.lifetime, a.origin)
+            local first = a.tracking.move_owner(flow, owner, a.origin)
+            assert(first { moved = v -> v.header == header, already_moved = m -> false, uninitialized = || -> false })
+            assert(kind(a.tracking.use(flow, view.id)) == "ended moved")
+            local second = a.tracking.move_owner(flow, owner, a.origin)
+            assert(second { moved = v -> false, already_moved = m -> true, uninitialized = || -> false })
+            local empty_place = a.place()
+            local never = a.tracking.move_owner(flow, empty_place, a.origin)
+            assert(never { moved = v -> false, already_moved = m -> false, uninitialized = || -> true })
+        end
+    end
+    with
+        name = "growing a nested owner at an unknown index reaches every element, held views survive"
+        run = do()
+            local a = activity()
+            local lines = a.place()
+            local flow = facts.empty()
+            -- the bytes of lines[3] (known index) and of lines[i] (unknown)
+            local text_bytes = index_step -> { data.ContentsStep {}, index_step, data.FieldStep { name = "bytes" }, data.ContentsStep {} }
+            local known = a.tracking.borrow(flow, data.BorrowPath { root = lines, steps = text_bytes(data.KnownElement { index = 3 }) }, false, a.lifetime, a.origin)
+            local stored = a.tracking.store(flow, known.id, a.pointer(), a.origin)
+            local other = a.tracking.borrow(flow, data.BorrowPath { root = lines, steps = text_bytes(data.KnownElement { index = 4 }) }, false, a.lifetime, a.origin)
+            local stored_other = a.tracking.store(flow, other.id, a.pointer(), a.origin)
+            -- lines[5] grows: other elements are untouched
+            a.tracking.moves(flow, data.Access { place = lines, path = text_bytes(data.KnownElement { index = 5 }) }, a.origin)
+            assert(kind(a.tracking.use(flow, stored.id)) == "fixed")
+            -- lines[j] grows, j unknown: every stored view ends, held views survive
+            a.tracking.moves(flow, data.Access { place = lines, path = text_bytes(data.AnyElement {}) }, a.origin)
+            assert(kind(a.tracking.use(flow, stored.id)) == "ended grew")
+            assert(kind(a.tracking.use(flow, stored_other.id)) == "ended grew")
+            assert(kind(a.tracking.use(flow, known.id)) == "derive")
+            -- growing the container itself also moves its elements' headers, not their bytes'
+            local fresh_stored = a.tracking.store(flow, known.id, a.pointer(), a.origin)
+            a.tracking.moves(flow, data.Access { place = lines, path = { data.ContentsStep {} } }, a.origin)
+            assert(kind(a.tracking.use(flow, fresh_stored.id)) == "ended grew", "a prefix of the path overlaps")
+        end
+    end
+    with
+        name = "a fork is an independent copy"
+        run = do()
+            local a = activity()
+            local buffer = a.place()
+            local flow = facts.empty()
+            local view = a.tracking.borrow(flow, held_path buffer, false, a.lifetime, a.origin)
+            local arm = facts.fork flow
+            a.tracking.ends(arm, contents_of buffer, "cleared", a.origin)
+            assert(kind(a.tracking.use(arm, view.id)) == "ended cleared")
+            assert(kind(a.tracking.use(flow, view.id)) == "derive")
+        end
+    end
+    with
+        name = "a join: ended on one arm is ended; contents that differ are named"
+        run = do()
+            local a = activity()
+            local buffer, count = a.place(), a.place()
+            local flow = facts.empty()
+            local view = a.tracking.borrow(flow, held_path buffer, false, a.lifetime, a.origin)
+            local zero = data.Constant { type = types.U32, bits = data.IntegerBits { bits = ffi.new("uint64_t", 0) } }
+            local one = data.Constant { type = types.U32, bits = data.IntegerBits { bits = ffi.new("uint64_t", 1) } }
+            flow.contents[count] = data.Tracked { value = data.Bits { type = types.U32, operand = zero } }
+            local left, right = facts.fork flow, facts.fork flow
+            a.tracking.ends(right, contents_of buffer, "removed", a.origin)
+            right.contents[count] = data.Tracked { value = data.Bits { type = types.U32, operand = one } }
+            local decision = a.tracking.agree { left, right }
+            assert(kind(a.tracking.use(decision.flow, view.id)) == "ended removed")
+            assert(#decision.differing == 1 and decision.differing[1] == count)
+            local same = a.tracking.agree { left, facts.fork left }
+            assert(#same.differing == 0 and kind(a.tracking.use(same.flow, view.id)) == "derive")
+        end
+    end
+    with
+        name = "a loop backedge: a refreshed view is live, a stale one is ended"
+        run = do()
+            local a = activity()
+            local h = a.place()
+            local entry = facts.empty()
+            local view = a.tracking.borrow(entry, held_path h, false, a.lifetime, a.origin)
+            -- the body replaces h, ending view, then takes view2
+            local body = facts.fork entry
+            a.tracking.ends(body, contents_of h, "replaced", a.origin)
+            local view2 = a.tracking.borrow(body, held_path h, false, a.lifetime, a.origin)
+            local header = a.tracking.agree { entry, body }.flow
+            local refreshed = a.tracking.join_borrows({ entry, body }, { view.id, view2.id }, header, a.lifetime, a.origin)
+            assert(kind(a.tracking.use(header, refreshed.id)) == "derive")
+            assert(#refreshed.origins == 2)
+            local stale_header = a.tracking.agree { entry, body }.flow
+            local stale = a.tracking.join_borrows({ entry, body }, { view.id, view.id }, stale_header, a.lifetime, a.origin)
+            assert(kind(a.tracking.use(stale_header, stale.id)) == "ended replaced")
+        end
+    end
+    with
+        name = "distinct places overlap only where the activity says they may alias"
+        run = do()
+            local first, second = nil, nil
+            local a = activity(|x, y| -> (x == first and y == second) or (x == second and y == first))
+            first, second = a.place(), a.place()
+            local third = a.place()
+            local flow = facts.empty()
+            local view = a.tracking.borrow(flow, held_path first, false, a.lifetime, a.origin)
+            a.tracking.ends(flow, contents_of third, "cleared", a.origin)
+            assert(kind(a.tracking.use(flow, view.id)) == "derive")
+            a.tracking.ends(flow, contents_of second, "cleared", a.origin)
+            assert(kind(a.tracking.use(flow, view.id)) == "ended cleared")
+        end
+    end
+end

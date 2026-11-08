@@ -1,0 +1,162 @@
+-- The values evaluation works with (compiler activities §2.1, §2.2): source positions, words
+-- and their supply, native constants, operands and native values.
+-- Published records are read-only by convention: an activity builds new records instead of
+-- changing ones it did not make.
+
+local ffi = require "ffi"
+local shapes = require "nua.shapes"
+local identity = require "nua.identity"
+local types = require "nua.types"
+
+local list_of, map_of, set_of, names = shapes.list_of, shapes.map_of, shapes.set_of, shapes.names
+local Natural, Positive = shapes.Natural, shapes.Positive
+local NativeType = types.NativeType
+local WordId, EnvironmentId, DefinitionId = identity.WordId, identity.EnvironmentId, identity.DefinitionId
+local BlockId, EdgeId, InstructionId, ValueId = identity.BlockId, identity.EdgeId, identity.InstructionId, identity.ValueId
+local PlaceId, BorrowId, LifetimeId, InvocationId = identity.PlaceId, identity.BorrowId, identity.LifetimeId, identity.InvocationId
+local GlobalId, OriginId, HostId, BoundaryId = identity.GlobalId, identity.OriginId, identity.HostId, identity.BoundaryId
+
+local Bits64 = checker("64 bits", value -> ffi.istype("uint64_t", value))
+
+------------------------------------------------------------------------------------------------
+-- §2.1 Source, words and supply
+
+local Span = struct { source: String, line: Positive, column: Optional(Positive) }
+local Origin = struct { id: OriginId, span: Span, expanded_from: Optional(OriginId), introduced_by: Optional(WordId) }
+local RelatedLocation = struct { origin: OriginId, message: String }
+local Diagnostic = struct { rule: String, primary: OriginId, message: String, related: list_of(RelatedLocation) }
+
+local Requirement = struct { name: String, native_type: Optional(NativeType), opened: Boolean }
+
+local Argument = family "argument"
+local Application = struct { word: WordId, supplied: list_of(Argument) }
+local HostArgument = struct { identity: HostId, value: Any }
+local NativeValue = family "native value"
+local NativeArgument = struct { value: NativeValue }
+local WordArgument = struct { application: Application }
+local PackArgument = struct { arguments: list_of(Argument) }
+Argument { HostArgument, NativeArgument, WordArgument, PackArgument }
+
+local Binding = family "binding"
+local HostBinding = struct { identity: HostId, value: Any }
+local ValueBinding = struct { value: NativeValue }
+local PlaceBinding = struct { place: PlaceId }
+local WordBinding = struct { application: Application }
+local PackBinding = struct { arguments: list_of(Argument) }
+Binding { HostBinding, ValueBinding, PlaceBinding, WordBinding, PackBinding }
+
+local Environment = struct { id: EnvironmentId, parent: Optional(EnvironmentId), bindings: map_of(String, Binding) }
+
+-- a hosted body is the Lua closure the front end emits (compiler activities §5.1)
+local Word = struct {
+    id: WordId, name: String, requirements: list_of(Requirement), rest: Optional(String),
+    result_type: NativeType, environment: EnvironmentId, body: Function, origin: OriginId
+}
+
+------------------------------------------------------------------------------------------------
+-- §2.2 Native values and observations
+
+local NativeConstant = family "native constant"
+local IntegerBits = struct { bits: Bits64 }
+local FloatBits = struct { value: Number }
+local BooleanBit = struct { value: Boolean }
+local UnitBits = struct {}
+local AggregateBits = struct { parts: list_of(NativeConstant) }
+local StaticBytes = struct { bytes: String }
+local SymbolAddress = struct { name: String, offset: Natural }
+local DefinitionAddress = struct { definition: DefinitionId }
+NativeConstant { IntegerBits, FloatBits, BooleanBit, UnitBits, AggregateBits, StaticBytes, SymbolAddress, DefinitionAddress }
+
+local Operand = family "operand"
+local Constant = struct { type: NativeType, bits: NativeConstant }
+local Parameter = struct { definition: DefinitionId, index: Positive, type: NativeType }
+local BlockArgument = struct { block: BlockId, index: Positive, type: NativeType }
+local Result = struct { value: ValueId, type: NativeType }
+Operand { Constant, Parameter, BlockArgument, Result }
+
+local Component = family "component of a native value"
+local FieldComponent = struct { name: String }
+local ElementComponent = struct { index: Operand }
+local AlternativeComponent = struct { name: String }
+Component { FieldComponent, ElementComponent, AlternativeComponent }
+local ComponentPath = list_of(Component)
+
+local Bits = struct { type: NativeType, operand: Operand }
+local Aggregate = struct { type: NativeType, packed: Optional(Operand), parts: Table }
+local Reference = struct { type: NativeType, borrow: BorrowId }
+local Owned = struct { type: NativeType, header: Operand }
+NativeValue { Bits, Aggregate, Reference, Owned }
+
+------------------------------------------------------------------------------------------------
+-- Canonical operand identity, for maps keyed by operands (§3.4). A result is its value's
+-- identity; a parameter or block argument is one interned key per position. A constant has
+-- no facts of its own to key.
+
+local positions = setmetatable({}, { __mode = "k" })
+local position_key = do(owner, index)
+    local by_index = positions[owner]
+    if by_index == nil then
+        by_index = {}
+        positions[owner] = by_index
+    end
+    local key = by_index[index]
+    if key == nil then
+        key = { owner = owner, index = index }
+        by_index[index] = key
+    end
+    return key
+end
+local Keying = define
+    Constant = do(node, recurse) error("a constant operand has no facts to key", 2) end
+    Parameter = do(node, recurse) return position_key(node.definition, node.index) end
+    BlockArgument = do(node, recurse) return position_key(node.block, node.index) end
+    Result = do(node, recurse) return node.value end
+end
+local operand_key = Operand.pass "key an operand by its identity" with ..Keying end
+
+return define
+    .Span
+    .Origin
+    .RelatedLocation
+    .Diagnostic
+    .Requirement
+    .Argument
+    .Application
+    .HostArgument
+    .NativeValue
+    .NativeArgument
+    .WordArgument
+    .PackArgument
+    .Binding
+    .HostBinding
+    .ValueBinding
+    .PlaceBinding
+    .WordBinding
+    .PackBinding
+    .Environment
+    .Word
+    .NativeConstant
+    .IntegerBits
+    .FloatBits
+    .BooleanBit
+    .UnitBits
+    .AggregateBits
+    .StaticBytes
+    .SymbolAddress
+    .DefinitionAddress
+    .Operand
+    .Constant
+    .Parameter
+    .BlockArgument
+    .Result
+    .Component
+    .FieldComponent
+    .ElementComponent
+    .AlternativeComponent
+    .ComponentPath
+    .Bits
+    .Aggregate
+    .Reference
+    .Owned
+    .operand_key
+end

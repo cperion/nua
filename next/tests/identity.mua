@@ -1,0 +1,40 @@
+local identity = require "nua.identity"
+
+return define
+    with
+        name = "a supply makes distinct identities of each brand"
+        run = do()
+            local supply = identity.supply()
+            local first = supply.fresh identity.PlaceId
+            local second = supply.fresh identity.PlaceId
+            local block = supply.fresh identity.BlockId
+            assert(first ~= second)
+            assert(check(identity.PlaceId, first) and not check(identity.PlaceId, block))
+            assert(check(identity.Identity, block))
+            assert(identity.describe(second) == "place 2")
+            assert(identity.describe(block) == "block 3")
+        end
+    end
+    with
+        name = "two compilations never share identities"
+        run = do()
+            local one = identity.supply()
+            local other = identity.supply()
+            assert(one.compilation ~= other.compilation)
+            local a = one.fresh identity.ValueId
+            local b = other.fresh identity.ValueId
+            assert(a.serial == b.serial and a ~= b and a.compilation ~= b.compilation)
+        end
+    end
+    with
+        name = "only brands are supplied; identities key maps by themselves"
+        run = do()
+            local supply = identity.supply()
+            assert(not pcall(supply.fresh, struct { serial: Number }))
+            local place = supply.fresh identity.PlaceId
+            local facts = { [place] = "tracked" }
+            assert(facts[place] == "tracked")
+            assert(not check(identity.Identity, { compilation = supply.compilation, serial = 1 }))
+        end
+    end
+end

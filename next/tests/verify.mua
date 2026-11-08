@@ -1,0 +1,156 @@
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local verify = require "nua.compiler.verify"
+local programs = require "tests.support.programs"
+
+local messages = do(problems)
+    local list = {}
+    for _, problem in ipairs problems do list[#list + 1] = problem.message end
+    return table.concat(list, "\n")
+end
+local reports = do(problems, expected)
+    local text = messages problems
+    assert(text:find(expected, 1, true), "expected a problem mentioning: " .. expected .. "\ngot:\n" .. text)
+end
+
+-- max(x, y), with a local that keeps the larger value
+local max_program = do()
+    local p = programs()
+    p.definition("max", { types.U32, types.U32 }, types.U32, do(writer, parameters)
+        local x, y = parameters[1], parameters[2]
+        local entry = writer.block("entry")
+        local join = writer.block("join", { types.U32 })
+        local take_y, take_x = writer.block "take y", writer.block "take x"
+        local less = p.value()
+        writer.append(entry, data.Compute { site = p.site(), result = less, type = types.Bool, opcode = "less", arguments = { x, y } })
+        writer.terminate(entry, data.Branch { origin = p.origin, condition = p.result(less, types.Bool), when_true = p.edge take_y, when_false = p.edge take_x })
+        writer.terminate(take_y, data.Jump { origin = p.origin, edge = p.edge(join, { y }) })
+        writer.terminate(take_x, data.Jump { origin = p.origin, edge = p.edge(join, { x }) })
+        writer.terminate(join, data.Return { origin = p.origin, value = writer.parameter(join, 1) })
+    end)
+    return p.program(), p
+end
+
+return define
+    with
+        name = "a well-formed program passes every verifier"
+        run = do()
+            local program = max_program()
+            local problems = verify.all program
+            assert(#problems == 0, messages problems)
+        end
+    end
+    with
+        name = "graph: an operand must be defined where it is used"
+        run = do()
+            local p = programs()
+            local later = p.value()
+            p.definition("early", {}, types.U32, do(writer)
+                local entry = writer.block "entry"
+                local other = writer.block "other"
+                writer.append(entry, data.Compute { site = p.site(), result = p.value(), type = types.U32, opcode = "add", arguments = { p.result(later, types.U32), p.constant(types.U32, 1) } })
+                writer.append(entry, data.Compute { site = p.site(), result = later, type = types.U32, opcode = "add", arguments = { p.constant(types.U32, 1), p.constant(types.U32, 1) } })
+                writer.terminate(entry, data.Jump { origin = p.origin, edge = p.edge other })
+                writer.terminate(other, data.Return { origin = p.origin, value = p.result(later, types.U32) })
+            end)
+            reports(verify.graph(p.program()), "is used before its definition")
+        end
+    end
+    with
+        name = "graph: a value defined in one arm does not dominate the join"
+        run = do()
+            local p = programs()
+            p.definition("arm", { types.Bool }, types.U32, do(writer, parameters)
+                local entry, left, right, join = writer.block "entry", writer.block "left", writer.block "right", writer.block "join"
+                local in_left = p.value()
+                writer.terminate(entry, data.Branch { origin = p.origin, condition = parameters[1], when_true = p.edge left, when_false = p.edge right })
+                writer.append(left, data.Compute { site = p.site(), result = in_left, type = types.U32, opcode = "add", arguments = { p.constant(types.U32, 1), p.constant(types.U32, 2) } })
+                writer.terminate(left, data.Jump { origin = p.origin, edge = p.edge join })
+                writer.terminate(right, data.Jump { origin = p.origin, edge = p.edge join })
+                writer.terminate(join, data.Return { origin = p.origin, value = p.result(in_left, types.U32) })
+            end)
+            reports(verify.graph(p.program()), "does not dominate its use")
+        end
+    end
+    with
+        name = "graph: an edge passes its target's arity and types"
+        run = do()
+            local p = programs()
+            p.definition("arity", {}, types.U32, do(writer)
+                local entry = writer.block "entry"
+                local join = writer.block("join", { types.U32 })
+                writer.terminate(entry, data.Jump { origin = p.origin, edge = p.edge(join, { p.constant(types.U8, 1) }) })
+                writer.terminate(join, data.Return { origin = p.origin, value = writer.parameter(join, 1) })
+            end)
+            reports(verify.graph(p.program()), "argument 1 of an edge")
+            local q = programs()
+            q.definition("count", {}, types.U32, do(writer)
+                local entry = writer.block "entry"
+                local join = writer.block("join", { types.U32 })
+                writer.terminate(entry, data.Jump { origin = q.origin, edge = q.edge(join, {}) })
+                writer.terminate(join, data.Return { origin = q.origin, value = writer.parameter(join, 1) })
+            end)
+            reports(verify.graph(q.program()), "passes 0 arguments for 1 parameters")
+        end
+    end
+    with
+        name = "types: computations, places and returns are checked"
+        run = do()
+            local p = programs()
+            p.definition("typed", { types.U32 }, types.U32, do(writer, parameters)
+                local entry = writer.block "entry"
+                local counter = p.place(writer, types.U64)
+                local sum = p.value()
+                writer.append(entry, data.Compute { site = p.site(), result = sum, type = types.U32, opcode = "add", arguments = { parameters[1], p.constant(types.U8, 1) } })
+                writer.append(entry, data.Store { site = p.site(), place = counter.id, value = parameters[1] })
+                local loaded = p.value()
+                writer.append(entry, data.Load { site = p.site(), result = loaded, place = counter.id })
+                writer.terminate(entry, data.Return { origin = p.origin, value = p.result(loaded, types.U32) })
+            end)
+            local problems = verify.types(p.program())
+            reports(problems, "add needs two operands of one type")
+            reports(problems, "the stored value is U32, not U64")
+            reports(problems, "is used as U32 but is U64")
+        end
+    end
+    with
+        name = "types: packing and extracting follow the parts of a type"
+        run = do()
+            local point = types.record("Point", { { name = "x", type = types.U32 }, { name = "y", type = types.U32 } })
+            local p = programs()
+            p.definition("pack", { types.U32 }, types.U32, do(writer, parameters)
+                local entry = writer.block "entry"
+                local packed, extracted, wrong = p.value(), p.value(), p.value()
+                writer.append(entry, data.Pack { site = p.site(), result = packed, type = point, components = { parameters[1], parameters[1] } })
+                writer.append(entry, data.Extract { site = p.site(), result = extracted, type = types.U32, aggregate = p.result(packed, point), path = { data.FieldComponent { name = "y" } } })
+                writer.append(entry, data.Extract { site = p.site(), result = wrong, type = types.U32, aggregate = p.result(packed, point), path = { data.FieldComponent { name = "z" } } })
+                writer.terminate(entry, data.Return { origin = p.origin, value = p.result(extracted, types.U32) })
+            end)
+            local problems = verify.types(p.program())
+            assert(#problems == 1, messages problems)
+            reports(problems, "Point has no field z")
+            local view_parts = verify.parts_of(types.Str)
+            assert(#view_parts == 2 and view_parts[1] == types.pointer(types.U8) and view_parts[2] == types.U64)
+            assert(verify.component_type(types.buffer(types.U8), data.FieldComponent { name = "capacity" }) == types.U64)
+        end
+    end
+    with
+        name = "types: a call matches its callee's signature"
+        run = do()
+            local p = programs()
+            local callee = p.definition("double", { types.U32 }, types.U32, do(writer, parameters)
+                local entry = writer.block "entry"
+                local doubled = p.value()
+                writer.append(entry, data.Compute { site = p.site(), result = doubled, type = types.U32, opcode = "add", arguments = { parameters[1], parameters[1] } })
+                writer.terminate(entry, data.Return { origin = p.origin, value = p.result(doubled, types.U32) })
+            end)
+            p.definition("caller", {}, types.U32, do(writer)
+                local entry = writer.block "entry"
+                local called = p.value()
+                writer.append(entry, data.Invoke { site = p.site(), result = called, callee = data.DirectNua { definition = callee.id }, arguments = { p.constant(types.U64, 1) }, boundary = p.fresh(require("nua.identity").BoundaryId) })
+                writer.terminate(entry, data.Return { origin = p.origin, value = p.result(called, types.U32) })
+            end)
+            reports(verify.types(p.program()), "argument 1 is U64, not U32")
+        end
+    end
+end

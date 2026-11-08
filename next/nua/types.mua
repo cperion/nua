@@ -1,0 +1,313 @@
+-- Native types: what a native value can be. A closed family; the compiler's questions about a
+-- type (its name, whether it owns or borrows storage, its layout on a target) are passes over
+-- it. Constructed types are interned, so one type is one record and compares by identity.
+-- Records and sums are nominal: each declaration is a new type.
+--
+-- `Buffer T` is the one storage primitive (docs/design/buffers.md); the containers (`Grow`,
+-- `Text`, `Store`, `Map`) are records over buffers, declared by the Nua library, not here.
+
+local shapes = require "nua.shapes"
+local list_of = shapes.list_of
+local Natural = shapes.Natural
+local Positive = shapes.Positive
+
+local NativeType = family "native type"
+local IntegerType = struct { name: String, bits: Positive, signed: Boolean }
+local FloatType = struct { name: String, bits: Positive }
+local BooleanType = struct { name: String }
+local UnitType = struct { name: String }
+local PointerType = struct { target: NativeType }
+local ReferenceType = struct { target: NativeType }
+local ViewType = struct { element: NativeType, mutable: Boolean, text: Boolean }
+local FixedArrayType = struct { element: NativeType, count: Natural }
+local Field = struct { name: String, type: NativeType }
+local RecordType = struct { name: String, fields: list_of(Field) }
+local Alternative = struct { name: String, payload: NativeType }
+local SumType = struct { name: String, alternatives: list_of(Alternative) }
+local BufferType = struct { element: NativeType, pinned: Boolean }
+local FunctionType = struct { parameters: list_of(NativeType), result: NativeType, variadic: Boolean }
+NativeType {
+    IntegerType, FloatType, BooleanType, UnitType, PointerType, ReferenceType, ViewType,
+    FixedArrayType, RecordType, SumType, BufferType, FunctionType
+}
+
+------------------------------------------------------------------------------------------------
+-- Construction. Scalars exist once; composite types are interned by their components.
+
+local integer = |name, bits, signed| -> IntegerType { .name, .bits, .signed }
+local U8, U16, U32, U64 = integer("U8", 8, false), integer("U16", 16, false), integer("U32", 32, false), integer("U64", 64, false)
+local I8, I16, I32, I64 = integer("I8", 8, true), integer("I16", 16, true), integer("I32", 32, true), integer("I64", 64, true)
+local F32 = FloatType { name = "F32", bits = 32 }
+local F64 = FloatType { name = "F64", bits = 64 }
+local Bool = BooleanType { name = "Bool" }
+local Unit = UnitType { name = "Unit" }
+
+-- one table per constructor, keyed by its components in order; weak, so unused types go
+local interned = do()
+    local root = setmetatable({}, { __mode = "k" })
+    return do(components, make)
+        local level = root
+        for index = 1, #components - 1 do
+            local key = components[index]
+            local next_level = level[key]
+            if next_level == nil then
+                next_level = setmetatable({}, { __mode = "k" })
+                level[key] = next_level
+            end
+            level = next_level
+        end
+        local last = components[#components]
+        local found = level[last]
+        if found == nil then
+            found = make()
+            level[last] = found
+        end
+        return found
+    end
+end
+
+local need_type = do(value, what)
+    if not check(NativeType, value) then
+        error(what .. " expects a native type, got " .. tostring value, 3)
+    end
+end
+
+local pointers, references, views, arrays, buffers, functions = interned(), interned(), interned(), interned(), interned(), interned()
+
+local pointer = do(target)
+    need_type(target, "Ptr")
+    return pointers({ target }, || -> PointerType { .target })
+end
+local reference = do(target)
+    need_type(target, "Ref")
+    return references({ target }, || -> ReferenceType { .target })
+end
+local view = do(element, mutable)
+    need_type(element, "Slice")
+    return views({ element, mutable == true, false }, || -> ViewType { .element, mutable = mutable == true, text = false })
+end
+-- Str is the read-only view of bytes with the text words
+local Str = ViewType { element = U8, mutable = false, text = true }
+local fixed_array = do(element, count)
+    need_type(element, "Array")
+    if not check(Natural, count) then error("Array(T, n) expects a natural count, got " .. tostring count, 2) end
+    return arrays({ element, count }, || -> FixedArrayType { .element, .count })
+end
+local buffer = do(element, pinned)
+    need_type(element, "Buffer")
+    return buffers({ element, pinned == true }, || -> BufferType { .element, pinned = pinned == true })
+end
+local function_type = do(parameters, result, variadic)
+    for _, parameter in ipairs parameters do need_type(parameter, "a function parameter") end
+    need_type(result, "a function result")
+    local key = { #parameters, variadic == true }
+    for _, parameter in ipairs parameters do key[#key + 1] = parameter end
+    key[#key + 1] = result
+    return functions(key, || -> FunctionType { .parameters, .result, variadic = variadic == true })
+end
+
+-- nominal declarations: two records with the same fields are different types
+local record = do(name, fields)
+    local seen = {}
+    local checked = {}
+    for _, entry in ipairs fields do
+        if seen[entry.name] then error(("record %s: two fields are named %s"):format(name, entry.name), 2) end
+        seen[entry.name] = true
+        checked[#checked + 1] = Field { name = entry.name, type = entry.type }
+    end
+    return RecordType { .name, fields = checked }
+end
+local sum = do(name, alternatives)
+    local seen = {}
+    local checked = {}
+    for _, entry in ipairs alternatives do
+        if seen[entry.name] then error(("sum %s: two alternatives are named %s"):format(name, entry.name), 2) end
+        seen[entry.name] = true
+        checked[#checked + 1] = Alternative { name = entry.name, payload = entry.payload }
+    end
+    if #checked == 0 then error(("sum %s needs at least one alternative"):format(name), 2) end
+    return SumType { .name, alternatives = checked }
+end
+
+------------------------------------------------------------------------------------------------
+-- Passes.
+
+local named = do(node, recurse) return node.name end
+local Describing = define
+    IntegerType = named
+    FloatType = named
+    BooleanType = named
+    UnitType = named
+    PointerType = do(node, recurse) return "Ptr " .. recurse node.target end
+    ReferenceType = do(node, recurse) return "Ref " .. recurse node.target end
+    ViewType = do(node, recurse)
+        if node.text then return "Str" end
+        return (node.mutable and "Slice.mut " or "Slice ") .. recurse node.element
+    end
+    FixedArrayType = do(node, recurse) return ("Array(%s, %d)"):format(recurse node.element, node.count) end
+    RecordType = named
+    SumType = named
+    BufferType = do(node, recurse) return (node.pinned and "Buffer.pinned " or "Buffer ") .. recurse node.element end
+    FunctionType = do(node, recurse)
+        local parameters = {}
+        for index, parameter in ipairs node.parameters do parameters[index] = recurse parameter end
+        if node.variadic then parameters[#parameters + 1] = "..." end
+        return ("Fn(%s): %s"):format(table.concat(parameters, ", "), recurse node.result)
+    end
+end
+local describe = NativeType.pass "describe a native type" with ..Describing end
+
+-- Does a value of the type own storage? Buffers do, and aggregates holding them. References,
+-- views, pointers and functions never own what they reach.
+local never = do(node, recurse) return false end
+local Owning = define
+    IntegerType = never
+    FloatType = never
+    BooleanType = never
+    UnitType = never
+    PointerType = never
+    ReferenceType = never
+    ViewType = never
+    FunctionType = never
+    BufferType = do(node, recurse) return true end
+    FixedArrayType = do(node, recurse) return recurse node.element end
+    RecordType = do(node, recurse)
+        for _, field in ipairs node.fields do
+            if recurse field.type then return true end
+        end
+        return false
+    end
+    SumType = do(node, recurse)
+        for _, alternative in ipairs node.alternatives do
+            if recurse alternative.payload then return true end
+        end
+        return false
+    end
+end
+local owns = NativeType.pass "does a native type own storage" with ..Owning end
+
+-- Does a value of the type hold a borrow? Raw pointers are not borrows (they carry no lifetime).
+local Borrowing = define ..Owning
+    ReferenceType = do(node, recurse) return true end
+    ViewType = do(node, recurse) return true end
+    BufferType = do(node, recurse) return false end
+end
+local borrows = NativeType.pass "does a native type hold a borrow" with ..Borrowing end
+
+------------------------------------------------------------------------------------------------
+-- Layout on a target: size, alignment and the offsets of the parts a native value has.
+
+local NativeLayout = struct { size: Natural, alignment: Positive, fields: Table }
+local align_up = |offset, alignment| -> math.ceil(offset / alignment) * alignment
+
+-- C's rule for a sequence of parts: each at its alignment, the whole rounded to the largest
+local sequence = do(parts)
+    local offset, alignment, fields = 0, 1, {}
+    for _, part in ipairs parts do
+        offset = align_up(offset, part.layout.alignment)
+        fields[#fields + 1] = { name = part.name, offset = offset, layout = part.layout }
+        offset += part.layout.size
+        alignment = math.max(alignment, part.layout.alignment)
+    end
+    return NativeLayout { size = align_up(offset, alignment), .alignment, .fields }
+end
+
+local scalar = bytes -> NativeLayout { size = bytes, alignment = math.max(bytes, 1), fields = {} }
+
+local Laying = define
+    IntegerType = do(node, recurse, target) return scalar(node.bits / 8) end
+    FloatType = do(node, recurse, target) return scalar(node.bits / 8) end
+    BooleanType = do(node, recurse, target) return scalar 1 end
+    UnitType = do(node, recurse, target) return NativeLayout { size = 0, alignment = 1, fields = {} } end
+    PointerType = do(node, recurse, target) return scalar(target.pointer_bits / 8) end
+    ReferenceType = do(node, recurse, target) return scalar(target.pointer_bits / 8) end
+    FunctionType = do(node, recurse, target) return scalar(target.pointer_bits / 8) end
+    ViewType = do(node, recurse, target)
+        return sequence {
+            { name = "data", layout = scalar(target.pointer_bits / 8) },
+            { name = "length", layout = recurse(U64, target) },
+        }
+    end
+    BufferType = do(node, recurse, target)
+        local parts = {
+            { name = "data", layout = scalar(target.pointer_bits / 8) },
+            { name = "length", layout = recurse(U64, target) },
+            { name = "capacity", layout = recurse(U64, target) },
+        }
+        if node.pinned then parts[#parts + 1] = { name = "limit", layout = recurse(U64, target) } end
+        return sequence parts
+    end
+    FixedArrayType = do(node, recurse, target)
+        local element = recurse(node.element, target)
+        local stride = align_up(element.size, element.alignment)
+        return NativeLayout { size = stride * node.count, alignment = element.alignment, fields = {} }
+    end
+    RecordType = do(node, recurse, target)
+        local parts = {}
+        for index, field in ipairs node.fields do
+            parts[index] = { name = field.name, layout = recurse(field.type, target) }
+        end
+        return sequence parts
+    end
+    -- a tag, then the payloads sharing one region aligned for the most demanding of them
+    SumType = do(node, recurse, target)
+        local size, alignment = 0, 1
+        local payloads = {}
+        for _, alternative in ipairs node.alternatives do
+            local layout = recurse(alternative.payload, target)
+            payloads[#payloads + 1] = { name = alternative.name, layout = layout }
+            size = math.max(size, layout.size)
+            alignment = math.max(alignment, layout.alignment)
+        end
+        local payload = NativeLayout { .size, .alignment, fields = payloads }
+        return sequence {
+            { name = "tag", layout = recurse(U32, target) },
+            { name = "payload", layout = payload },
+        }
+    end
+end
+local layout = NativeType.pass "lay out a native type on a target" with ..Laying end
+
+return define
+    .NativeType
+    .IntegerType
+    .FloatType
+    .BooleanType
+    .UnitType
+    .PointerType
+    .ReferenceType
+    .ViewType
+    .FixedArrayType
+    .Field
+    .RecordType
+    .Alternative
+    .SumType
+    .BufferType
+    .FunctionType
+    .NativeLayout
+    .U8
+    .U16
+    .U32
+    .U64
+    .I8
+    .I16
+    .I32
+    .I64
+    .F32
+    .F64
+    .Bool
+    .Unit
+    .Str
+    .pointer
+    .reference
+    .view
+    .fixed_array
+    .buffer
+    .function_type
+    .record
+    .sum
+    .describe
+    .owns
+    .borrows
+    .layout
+end

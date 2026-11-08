@@ -1,0 +1,47 @@
+local shapes = require "nua.shapes"
+
+local refuses = do(test)
+    local done = pcall test
+    assert(not done, "expected a refusal")
+end
+
+return define
+    with
+        name = "a list checker refuses holes and wrong elements"
+        run = do()
+            local Numbers = shapes.list_of Number
+            assert(check(Numbers, { 1, 2, 3 }))
+            assert(check(Numbers, {}))
+            assert(not check(Numbers, { 1, "two" }))
+            assert(not check(Numbers, { 1, nil, 3 }))
+            assert(not check(Numbers, { 1, extra = 2 }))
+        end
+    end
+    with
+        name = "a map checker checks keys and values"
+        run = do()
+            local Counts = shapes.map_of(String, shapes.Natural)
+            assert(check(Counts, { a = 1, b = 0 }))
+            assert(not check(Counts, { a = -1 }))
+            assert(not check(Counts, { [1] = 1 }))
+        end
+    end
+    with
+        name = "a set holds members mapped to true"
+        run = do()
+            local Strings = shapes.set_of String
+            assert(check(Strings, { a = true }))
+            assert(not check(Strings, { a = 1 }))
+        end
+    end
+    with
+        name = "names are a closed vocabulary"
+        run = do()
+            local Order, orders = shapes.names("memory order", { "relaxed", "acquire" })
+            assert(check(Order, "relaxed") and not check(Order, "release"))
+            assert(#orders == 2 and orders[2] == "acquire")
+            local Holder = struct { order: Order }
+            refuses(|| -> Holder { order = "sequential" })
+        end
+    end
+end

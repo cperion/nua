@@ -1,0 +1,115 @@
+-- Identities: one nominal brand per kind of thing the compiler names (compiler activities
+-- §1.2). An identity is a record of its compilation and a serial. The supply of a compilation
+-- makes each identity once, so identities compare by the record itself: a map keyed by them
+-- needs no key function. They are not source locations, payload addresses or allocation sites.
+
+local shapes = require "nua.shapes"
+local Natural = shapes.Natural
+
+local CompilationId = struct { serial: Natural }
+
+local WordId = struct { compilation: CompilationId, serial: Natural }
+local EnvironmentId = struct { compilation: CompilationId, serial: Natural }
+local DefinitionId = struct { compilation: CompilationId, serial: Natural }
+local BlockId = struct { compilation: CompilationId, serial: Natural }
+local EdgeId = struct { compilation: CompilationId, serial: Natural }
+local InstructionId = struct { compilation: CompilationId, serial: Natural }
+local ValueId = struct { compilation: CompilationId, serial: Natural }
+local PlaceId = struct { compilation: CompilationId, serial: Natural }
+local BorrowId = struct { compilation: CompilationId, serial: Natural }
+local LifetimeId = struct { compilation: CompilationId, serial: Natural }
+local InvocationId = struct { compilation: CompilationId, serial: Natural }
+local AttemptId = struct { compilation: CompilationId, serial: Natural }
+local LoopId = struct { compilation: CompilationId, serial: Natural }
+local BoundaryId = struct { compilation: CompilationId, serial: Natural }
+local GlobalId = struct { compilation: CompilationId, serial: Natural }
+local OriginId = struct { compilation: CompilationId, serial: Natural }
+local HostId = struct { compilation: CompilationId, serial: Natural }
+
+-- the brands, with the word a printed identity uses
+local brands = define
+    { brand = WordId, word = "word" }
+    { brand = EnvironmentId, word = "environment" }
+    { brand = DefinitionId, word = "definition" }
+    { brand = BlockId, word = "block" }
+    { brand = EdgeId, word = "edge" }
+    { brand = InstructionId, word = "instruction" }
+    { brand = ValueId, word = "value" }
+    { brand = PlaceId, word = "place" }
+    { brand = BorrowId, word = "borrow" }
+    { brand = LifetimeId, word = "lifetime" }
+    { brand = InvocationId, word = "invocation" }
+    { brand = AttemptId, word = "attempt" }
+    { brand = LoopId, word = "loop" }
+    { brand = BoundaryId, word = "boundary" }
+    { brand = GlobalId, word = "global" }
+    { brand = OriginId, word = "origin" }
+    { brand = HostId, word = "host value" }
+end
+local word_of = {}
+for _, entry in ipairs brands do word_of[entry.brand] = entry.word end
+
+-- a checker for any identity of any brand
+local brand_of = do(value)
+    if type value ~= "table" then return nil end
+    for brand in pairs word_of do
+        if check(brand, value) then return brand end
+    end
+    return nil
+end
+local Identity = checker("identity", value -> brand_of value ~= nil)
+
+-- compilations are numbered in this process only; a compilation's identities never meet
+-- another's
+local compilations = 0
+
+-- the supply of one compilation: `fresh(Brand)` makes the next identity of that brand.
+-- Serials count per compilation, so gaps left by discarded work carry no meaning.
+local supply = do()
+    compilations += 1
+    local compilation = CompilationId { serial = compilations }
+    local serial = 0
+    local fresh = do(brand)
+        if not word_of[brand] then
+            error("fresh: " .. tostring brand .. " is not an identity brand", 2)
+        end
+        serial += 1
+        return brand { .compilation, .serial }
+    end
+    return define
+        .compilation
+        .fresh
+    end
+end
+
+-- "place 3": the brand's word and the serial, for messages and debugging only. Printed
+-- programs use role-based names instead (graph.print).
+local describe = do(identity)
+    local brand = brand_of identity
+    if not brand then error("describe: " .. tostring identity .. " is not an identity", 2) end
+    return word_of[brand] .. " " .. identity.serial
+end
+
+return define
+    .CompilationId
+    .WordId
+    .EnvironmentId
+    .DefinitionId
+    .BlockId
+    .EdgeId
+    .InstructionId
+    .ValueId
+    .PlaceId
+    .BorrowId
+    .LifetimeId
+    .InvocationId
+    .AttemptId
+    .LoopId
+    .BoundaryId
+    .GlobalId
+    .OriginId
+    .HostId
+    .Identity
+    .supply
+    .describe
+end

@@ -1,0 +1,66 @@
+-- Checkers every family of the compiler uses: lists, maps and sets of checked values, closed
+-- sets of names, and the integers of identities and positions. A checker is Mua's named
+-- predicate; a field typed with one is checked when its record is built.
+
+local list_of = do(element_type)
+    local every = do(value)
+        if type value ~= "table" then return false end
+        local count = 0
+        for _ in pairs value do
+            count += 1
+        end
+        if count ~= #value then return false end
+        for _, element in ipairs value do
+            if not check(element_type, element) then return false end
+        end
+        return true
+    end
+    return checker("list of " .. tostring element_type, every)
+end
+
+-- a map's keys and values are both checked; a key is a value of identity (an ID record, a
+-- string), never a structure compared by its contents
+local map_of = do(key_type, value_type)
+    local every = do(value)
+        if type value ~= "table" then return false end
+        for key, entry in pairs value do
+            if not check(key_type, key) or not check(value_type, entry) then return false end
+        end
+        return true
+    end
+    return checker(("map from %s to %s"):format(tostring key_type, tostring value_type), every)
+end
+
+-- a set is a table whose keys are its members, each mapped to true
+local set_of = do(member_type)
+    local every = do(value)
+        if type value ~= "table" then return false end
+        for member, present in pairs value do
+            if present ~= true or not check(member_type, member) then return false end
+        end
+        return true
+    end
+    return checker("set of " .. tostring member_type, every)
+end
+
+-- a closed set of names, for codes that carry no payload (opcodes, orders, reasons): the
+-- checker, and the names in their declared order
+local names = do(description, list)
+    local member = {}
+    for _, name in ipairs list do member[name] = true end
+    local test = value -> type value == "string" and member[value] == true
+    return checker(description, test), list
+end
+
+local is_integer = value -> type value == "number" and value == math.floor value
+local Natural = checker("natural number", value -> is_integer value and value >= 0)
+local Positive = checker("positive number", value -> is_integer value and value >= 1)
+
+return define
+    .list_of
+    .map_of
+    .set_of
+    .names
+    .Natural
+    .Positive
+end

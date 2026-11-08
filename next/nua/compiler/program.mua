@@ -1,0 +1,200 @@
+-- The one program graph (compiler activities §3.1, §3.2): instructions with their opcodes and
+-- callees, terminators, blocks, definitions, globals and the program.
+-- Published records are read-only by convention: an activity builds new records instead of
+-- changing ones it did not make.
+
+local ffi = require "ffi"
+local shapes = require "nua.shapes"
+local identity = require "nua.identity"
+local types = require "nua.types"
+
+local list_of, map_of, set_of, names = shapes.list_of, shapes.map_of, shapes.set_of, shapes.names
+local Natural, Positive = shapes.Natural, shapes.Positive
+local NativeType = types.NativeType
+local WordId, EnvironmentId, DefinitionId = identity.WordId, identity.EnvironmentId, identity.DefinitionId
+local BlockId, EdgeId, InstructionId, ValueId = identity.BlockId, identity.EdgeId, identity.InstructionId, identity.ValueId
+local PlaceId, BorrowId, LifetimeId, InvocationId = identity.PlaceId, identity.BorrowId, identity.LifetimeId, identity.InvocationId
+local GlobalId, OriginId, HostId, BoundaryId = identity.GlobalId, identity.OriginId, identity.HostId, identity.BoundaryId
+
+local values = require "nua.compiler.values"
+local Origin, Requirement, NativeConstant, Operand = values.Origin, values.Requirement, values.NativeConstant, values.Operand
+local ComponentPath = values.ComponentPath
+local places = require "nua.compiler.places"
+local Access, ForeignEffects, Place, EndReason = places.Access, places.ForeignEffects, places.Place, places.EndReason
+
+------------------------------------------------------------------------------------------------
+-- §3.2 Instructions, opcodes and callees (the terminators of §3.1 follow them)
+
+local NumericOpcode, numeric_opcodes = names("numeric opcode", {
+    "add", "subtract", "multiply", "divide", "remainder", "negate",
+    "bit_and", "bit_or", "bit_xor", "bit_not", "shift_left", "shift_right_signed", "shift_right_unsigned",
+    "equal", "not_equal", "less", "less_equal",
+    "convert", "reinterpret", "pointer_offset", "pointer_difference",
+})
+local AtomicOpcode, atomic_opcodes = names("atomic opcode", {
+    "read", "write", "exchange", "compare_exchange", "fetch_add", "fetch_subtract", "fetch_and", "fetch_or", "fetch_xor",
+})
+local MemoryOrder, memory_orders = names("memory order", { "relaxed", "consume", "acquire", "release", "acquire_release", "sequential" })
+local BudgetReason, budget_reasons = names("budget reason", { "loop_edge", "recursive_edge" })
+local NativeABI, native_abis = names("native ABI", { "nua_boundary", "c_boundary", "task_entry" })
+local DefinitionKind, definition_kinds = names("definition kind", { "native_word", "task_entry_word", "blocking_entry" })
+
+local CheckClaim = family "check claim"
+local Bounds = struct { place: PlaceId, index: Operand, length: Operand }
+local ActiveAlternative = struct { value: Operand, name: String }
+local Condition = struct { value: Operand }
+CheckClaim { Bounds, ActiveAlternative, Condition }
+
+local Signature = struct { parameters: list_of(NativeType), result: NativeType, abi: NativeABI, variadic: Boolean }
+
+local NuaEntry = family "Nua entry"
+local DefinitionEntry = struct { definition: DefinitionId }
+local RuntimeEntry = struct { name: String }
+NuaEntry { DefinitionEntry, RuntimeEntry }
+
+local Callee = family "callee"
+local DirectNua = struct { definition: DefinitionId }
+local IndirectNua = struct { pointer: Operand, signature: Signature, provenance: NuaEntry }
+local Foreign = struct { pointer: Operand, signature: Signature, contract: ForeignEffects }
+Callee { DirectNua, IndirectNua, Foreign }
+
+local Site = struct { id: InstructionId, origin: OriginId }
+
+local Instruction = family "instruction"
+local Compute = struct { site: Site, result: ValueId, type: NativeType, opcode: NumericOpcode, arguments: list_of(Operand) }
+local Pack = struct { site: Site, result: ValueId, type: NativeType, components: list_of(Operand) }
+local Extract = struct { site: Site, result: ValueId, type: NativeType, aggregate: Operand, path: ComponentPath }
+local Load = struct { site: Site, result: ValueId, place: PlaceId }
+local Store = struct { site: Site, place: PlaceId, value: Operand }
+local Address = struct { site: Site, result: ValueId, place: PlaceId }
+local Check = struct { site: Site, condition: Operand, message: Operand, claim: CheckClaim }
+local Invoke = struct { site: Site, result: Optional(ValueId), callee: Callee, arguments: list_of(Operand), boundary: BoundaryId }
+local Atomic = struct {
+    site: Site, result: Optional(ValueId), opcode: AtomicOpcode, address: Operand, arguments: list_of(Operand),
+    order: MemoryOrder, failure_order: Optional(MemoryOrder)
+}
+local Fence = struct { site: Site, order: MemoryOrder }
+local LifetimeStart = struct { site: Site, lifetime: LifetimeId }
+local LifetimeEnd = struct { site: Site, lifetime: LifetimeId }
+local Moves = struct { site: Site, target: Access }
+local Ends = struct { site: Site, target: Access, reason: EndReason }
+local Budget = struct { site: Site, reason: BudgetReason }
+local Mechanism = struct { site: Site, result: Optional(ValueId), binding: String, arguments: list_of(Operand) }
+Instruction {
+    Compute, Pack, Extract, Load, Store, Address, Check, Invoke, Atomic, Fence,
+    LifetimeStart, LifetimeEnd, Moves, Ends, Budget, Mechanism
+}
+
+------------------------------------------------------------------------------------------------
+-- §3.1 Containers and control
+
+local Edge = struct { id: EdgeId, target: BlockId, arguments: list_of(Operand) }
+
+local Terminator = family "terminator"
+local Jump = struct { origin: OriginId, edge: Edge }
+local Branch = struct { origin: OriginId, condition: Operand, when_true: Edge, when_false: Edge }
+local Return = struct { origin: OriginId, value: Optional(Operand) }
+local Trap = struct { origin: OriginId, message: Operand }
+Terminator { Jump, Branch, Return, Trap }
+
+local BlockParameter = struct { type: NativeType }
+local Block = struct { id: BlockId, arguments: list_of(BlockParameter), instructions: list_of(Instruction), terminator: Terminator }
+
+local LifetimeKind, lifetime_kinds = names("lifetime kind", { "global", "invocation", "lexical", "task_scope", "foreign_view" })
+local CompletionAction = family "completion action"
+local ReleaseLocal = struct { place: PlaceId }
+local JoinScope = struct { operation: Operand }
+local FinishForeign = struct { operation: Operand }
+CompletionAction { ReleaseLocal, JoinScope, FinishForeign }
+local Lifetime = struct { id: LifetimeId, parent: Optional(LifetimeId), kind: LifetimeKind, completion: list_of(CompletionAction) }
+
+local Definition = struct {
+    id: DefinitionId, word: WordId, kind: DefinitionKind, signature: Signature, entry: BlockId,
+    blocks: list_of(Block), places: map_of(PlaceId, Place), origin: OriginId
+}
+
+local GlobalPolicy, global_policies = names("global policy", { "plain", "thread_local", "atomic", "unchecked_shared", "thread_affine_owner" })
+local GlobalInitializer = family "global initializer"
+local StaticValue = struct { value: NativeConstant }
+local FirstUse = struct { definition: DefinitionId }
+GlobalInitializer { StaticValue, FirstUse }
+local Global = struct { id: GlobalId, name: String, type: NativeType, initializer: GlobalInitializer, policy: GlobalPolicy, lifetime: LifetimeId, origin: OriginId }
+
+local Export = struct { name: String, definition: DefinitionId }
+local WordInfo = struct { id: WordId, name: String, requirements: list_of(Requirement), result_type: NativeType, origin: OriginId }
+
+local Program = struct {
+    revision: Natural, definitions: map_of(DefinitionId, Definition), words: map_of(WordId, WordInfo),
+    globals: map_of(GlobalId, Global), exports: list_of(Export), lifetimes: map_of(LifetimeId, Lifetime),
+    origins: map_of(OriginId, Origin)
+}
+
+return define
+    .NumericOpcode
+    .numeric_opcodes
+    .AtomicOpcode
+    .atomic_opcodes
+    .MemoryOrder
+    .memory_orders
+    .BudgetReason
+    .budget_reasons
+    .NativeABI
+    .native_abis
+    .DefinitionKind
+    .definition_kinds
+    .CheckClaim
+    .Bounds
+    .ActiveAlternative
+    .Condition
+    .Signature
+    .NuaEntry
+    .DefinitionEntry
+    .RuntimeEntry
+    .Callee
+    .DirectNua
+    .IndirectNua
+    .Foreign
+    .Site
+    .Instruction
+    .Compute
+    .Pack
+    .Extract
+    .Load
+    .Store
+    .Address
+    .Check
+    .Invoke
+    .Atomic
+    .Fence
+    .LifetimeStart
+    .LifetimeEnd
+    .Moves
+    .Ends
+    .Budget
+    .Mechanism
+    .Edge
+    .Terminator
+    .Jump
+    .Branch
+    .Return
+    .Trap
+    .BlockParameter
+    .Block
+    .LifetimeKind
+    .lifetime_kinds
+    .CompletionAction
+    .ReleaseLocal
+    .JoinScope
+    .FinishForeign
+    .Lifetime
+    .Definition
+    .GlobalPolicy
+    .global_policies
+    .GlobalInitializer
+    .StaticValue
+    .FirstUse
+    .Global
+    .Export
+    .WordInfo
+    .Program
+end

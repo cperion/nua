@@ -1,0 +1,87 @@
+-- Hand-built programs for tests: a `programs()` session supplies identities and helpers;
+-- `definition(name, parameter_types, result_type, body)` builds one definition whose blocks
+-- `body(writer, parameters)` writes, and `program()` gathers the definitions made so far.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+
+return do()
+    local supply = identity.supply()
+    local fresh = supply.fresh
+    local origin = fresh identity.OriginId
+    local definitions, exports = {}, {}
+
+    local site = || -> data.Site { id = fresh identity.InstructionId, .origin }
+    local edge = |target, arguments| -> data.Edge { id = fresh identity.EdgeId, .target, arguments = arguments or {} }
+    local constant = |type, value| -> data.Constant { .type, bits = data.IntegerBits { bits = ffi.cast("uint64_t", value) } }
+    local result = |value, type| -> data.Result { .value, .type }
+    local value = || -> fresh identity.ValueId
+
+    local definition = do(name, parameter_types, result_type, body)
+        local id = fresh identity.DefinitionId
+        local parameters = {}
+        for index, type in ipairs parameter_types do parameters[index] = data.Parameter { definition = id, .index, .type } end
+        local places = {}
+        local outcome = graph.building(nil, supply, do(writer)
+            body(writer, parameters, places)
+            return "adopt"
+        end)
+        local fragment = outcome { built = f -> f, discarded = || -> error "discarded" }
+        local blocks = graph.seal fragment
+        for place_id, place in pairs fragment.places do places[place_id] = place end
+        local built = data.Definition with
+            .id
+            word = fresh identity.WordId
+            kind = "native_word"
+            signature = data.Signature { parameters = parameter_types, result = result_type, abi = "nua_boundary", variadic = false }
+            entry = blocks[1].id
+            .blocks
+            .places
+            .origin
+        end
+        definitions[id] = built
+        exports[#exports + 1] = data.Export { .name, definition = id }
+        return built
+    end
+
+    local program = || -> data.Program with
+        revision = 0
+        .definitions
+        words = {}
+        globals = {}
+        .exports
+        lifetimes = {}
+        origins = {}
+    end
+
+    -- a local place of the given type, declared on the writer
+    local place = do(writer, type)
+        local declared = data.Place with
+            id = fresh identity.PlaceId
+            .type
+            root = data.LocalRoot { invocation = fresh identity.InvocationId, local_index = 1 }
+            path = {}
+            lifetime = fresh identity.LifetimeId
+            .origin
+        end
+        writer.declare declared
+        return declared
+    end
+
+    return define
+        .supply
+        .fresh
+        .origin
+        .site
+        .edge
+        .constant
+        .result
+        .value
+        .definition
+        .program
+        .place
+    end
+end

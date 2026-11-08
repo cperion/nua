@@ -1,0 +1,204 @@
+-- The lifetimes verifier (compiler activities §7.3; buffers §2.3, §4.2): it replays a finished
+-- definition's borrow states and owner transfers over its control-flow graph, from the facts
+-- its builder published, without trusting that builder's own checks.
+--
+--   * A value whose facts say it carries a borrow must be used only while that borrow is live.
+--     `Moves` ends the stored borrows it overlaps; `Ends` ends every borrow it overlaps.
+--   * A borrow carried into a block argument is ended there if it ended on any incoming edge.
+--   * An owner value is transferred at most once on every path: by a store, an owning call
+--     argument, a return, an edge argument or a pack. That is what prevents a double release.
+--     That every owner is released exactly once is a property of execution, checked against an
+--     independent allocation ledger, not claimed by this verifier.
+--
+-- `facts` for a definition: { values = map operand key -> ValueInfo, borrows = map BorrowId ->
+-- BorrowInfo }, as DefinitionFacts publishes them.
+
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local facts_module = require "nua.compiler.facts"
+local verify = require "nua.compiler.verify"
+
+local Instruction, Terminator, Operand = data.Instruction, data.Terminator, data.Operand
+local BorrowState, BorrowForm, PlaceRoot = data.BorrowState, data.BorrowForm, data.PlaceRoot
+
+-- the borrows a value carries, from its facts
+local borrows_of = do(values, operand)
+    if Operand.is(operand, data.Constant) then return {} end
+    local info = values[data.operand_key operand]
+    if info == nil then return {} end
+    local list = {}
+    for _, component in pairs info.components do
+        if data.ComponentInfo.is(component, data.Borrowed) then list[#list + 1] = component.borrow end
+    end
+    table.sort(list, |a, b| -> a.serial < b.serial)
+    return list
+end
+
+-- the operands an instruction transfers, if they own storage
+local transferred = do(instruction, program)
+    if Instruction.is(instruction, data.Store) then return { instruction.value } end
+    if Instruction.is(instruction, data.Pack) then return instruction.components end
+    if Instruction.is(instruction, data.Invoke) then return instruction.arguments end
+    return {}
+end
+
+local copy_states = do(states)
+    local copy = {}
+    for id, state in pairs states do copy[id] = state end
+    return copy
+end
+local copy_set = do(set)
+    local copy = {}
+    for key in pairs set do copy[key] = true end
+    return copy
+end
+
+local verify_definition = do(program, definition, published, report)
+    local values, registry = published.values or {}, published.borrows or {}
+    local supply = identity.supply()
+    local places = definition.places
+    -- two parameter or indirect places may name the same storage; locals and globals never do
+    local may_alias = do(left, right)
+        local a, b = places[left], places[right]
+        if a == nil or b == nil then return true end
+        local outside = place -> PlaceRoot.is(place.root, data.ParameterRoot) or PlaceRoot.is(place.root, data.IndirectRoot)
+        return outside a and outside b
+    end
+    local tracking = facts_module.tracking { borrows = registry, .supply, .may_alias }
+    local blocks_by_id = {}
+    for _, block in ipairs definition.blocks do blocks_by_id[block.id] = block end
+
+    -- borrow states and owner transfers at a block's entry, joined from its incoming edges
+    local entry_states, entry_moved = {}, {}
+    local exit_states, exit_moved = {}, {}
+    local start = {}
+    for _, info in pairs registry do
+        if BorrowForm.is(info.form, data.Stored) then start[info.id] = data.Live {} end
+    end
+    entry_states[definition.entry] = start
+    entry_moved[definition.entry] = {}
+
+    local apply = do(block, states, moved, reporting)
+        local flow = data.FlowFacts { contents = {}, borrows = states, live_lifetimes = {} }
+        local use = do(operand, origin)
+            for _, borrow in ipairs(borrows_of(values, operand)) do
+                local state = flow.borrows[borrow]
+                if state == nil then
+                    flow.borrows[borrow] = data.Live {}
+                elseif BorrowState.is(state, data.Ended) and reporting then
+                    report(definition, ("a borrow is used after it ended (%s)"):format(state.reason), origin)
+                end
+            end
+        end
+        local transfer = do(operand, origin)
+            if Operand.is(operand, data.Constant) or not types.owns(operand.type) then return end
+            local key = data.operand_key operand
+            if moved[key] and reporting then report(definition, "an owner value is transferred twice", origin) end
+            moved[key] = true
+        end
+        -- a block's parameters and an instruction's result are new values each time they are
+        -- defined: a transfer of an earlier round's value does not count against them
+        for index, parameter in ipairs block.arguments do
+            moved[data.operand_key(data.BlockArgument { block = block.id, .index, type = parameter.type })] = nil
+        end
+        for _, instruction in ipairs block.instructions do
+            local origin = instruction.site.origin
+            if instruction.result then moved[instruction.result] = nil end
+            for _, operand in ipairs(verify.operands_of instruction) do use(operand, origin) end
+            for _, operand in ipairs(transferred(instruction, program)) do transfer(operand, origin) end
+            if Instruction.is(instruction, data.Moves) then tracking.moves(flow, instruction.target, origin) end
+            if Instruction.is(instruction, data.Ends) then tracking.ends(flow, instruction.target, instruction.reason, origin) end
+            if instruction.result then
+                for _, borrow in ipairs(borrows_of(values, data.Result { value = instruction.result, type = types.Unit })) do
+                    if flow.borrows[borrow] == nil then flow.borrows[borrow] = data.Live {} end
+                end
+            end
+        end
+        local terminator = block.terminator
+        for _, operand in ipairs(verify.terminator_operands terminator) do use(operand, terminator.origin) end
+        if Terminator.is(terminator, data.Return) and terminator.value then transfer(terminator.value, terminator.origin) end
+        for _, edge in ipairs(graph.edges_of terminator) do
+            for _, argument in ipairs edge.arguments do transfer(argument, terminator.origin) end
+        end
+        return flow.borrows, moved
+    end
+
+    -- the state a target block's arguments start with, from one incoming edge
+    local carry = do(edge, states)
+        local target = blocks_by_id[edge.target]
+        local carried = copy_states states
+        for index, argument in ipairs edge.arguments do
+            local parameter = data.BlockArgument { block = edge.target, .index, type = target.arguments[index].type }
+            local incoming = borrows_of(values, argument)
+            for _, joined in ipairs(borrows_of(values, parameter)) do
+                local state = data.Live {}
+                for _, borrow in ipairs incoming do
+                    local incoming_state = states[borrow]
+                    if incoming_state and BorrowState.is(incoming_state, data.Ended) then state = incoming_state end
+                end
+                carried[joined] = state
+            end
+        end
+        return carried
+    end
+
+    -- iterate to a fixed point. It terminates without a bound: a borrow state only moves from
+    -- live to ended, and the set of transferred values at an entry only grows.
+    local order = {}
+    for _, block in ipairs definition.blocks do order[#order + 1] = block.id end
+    local changed = true
+    while changed do
+        changed = false
+        for _, id in ipairs order do
+            if entry_states[id] then
+                local states, moved = apply(blocks_by_id[id], copy_states(entry_states[id]), copy_set(entry_moved[id]), false)
+                exit_states[id], exit_moved[id] = states, moved
+                for _, edge in ipairs(graph.edges_of(blocks_by_id[id].terminator)) do
+                    local carried = carry(edge, states)
+                    local known = entry_states[edge.target]
+                    if known == nil then
+                        entry_states[edge.target] = carried
+                        entry_moved[edge.target] = copy_set moved
+                        changed = true
+                    else
+                        for borrow, state in pairs carried do
+                            local previous = known[borrow]
+                            if previous == nil or (BorrowState.is(state, data.Ended) and BorrowState.is(previous, data.Live)) then
+                                known[borrow] = state
+                                changed = true
+                            end
+                        end
+                        for key in pairs moved do
+                            if not entry_moved[edge.target][key] then
+                                entry_moved[edge.target][key] = true
+                                changed = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- the reporting pass, over the fixed point
+    for _, id in ipairs order do
+        if entry_states[id] then apply(blocks_by_id[id], copy_states(entry_states[id]), copy_set(entry_moved[id]), true) end
+    end
+end
+
+-- `analysis`: map DefinitionId -> { values, borrows } for the definitions to check
+local lifetimes = do(program, analysis)
+    local problems = {}
+    local report = do(definition, message, origin)
+        problems[#problems + 1] = verify.Problem { verifier = "lifetimes", definition = definition.id, .message, .origin }
+    end
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        verify_definition(program, definition, analysis[definition.id] or {}, report)
+    end
+    return problems
+end
+
+return define
+    .lifetimes
+end

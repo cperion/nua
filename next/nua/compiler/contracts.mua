@@ -1,0 +1,105 @@
+-- Fact products, effects and native boundary contracts (compiler activities §3.4, §3.5).
+-- Published records are read-only by convention: an activity builds new records instead of
+-- changing ones it did not make.
+
+local ffi = require "ffi"
+local shapes = require "nua.shapes"
+local identity = require "nua.identity"
+local types = require "nua.types"
+
+local list_of, map_of, set_of, names = shapes.list_of, shapes.map_of, shapes.set_of, shapes.names
+local Natural, Positive = shapes.Natural, shapes.Positive
+local NativeType = types.NativeType
+local WordId, EnvironmentId, DefinitionId = identity.WordId, identity.EnvironmentId, identity.DefinitionId
+local BlockId, EdgeId, InstructionId, ValueId = identity.BlockId, identity.EdgeId, identity.InstructionId, identity.ValueId
+local PlaceId, BorrowId, LifetimeId, InvocationId = identity.PlaceId, identity.BorrowId, identity.LifetimeId, identity.InvocationId
+local GlobalId, OriginId, HostId, BoundaryId = identity.GlobalId, identity.OriginId, identity.HostId, identity.BoundaryId
+
+local places = require "nua.compiler.places"
+local AccessPath, Access, ValueInfo, Contents = places.AccessPath, places.Access, places.ValueInfo, places.Contents
+local BorrowInfo, BorrowState = places.BorrowInfo, places.BorrowState
+local program = require "nua.compiler.program"
+local CheckClaim, NuaEntry = program.CheckClaim, program.NuaEntry
+
+------------------------------------------------------------------------------------------------
+-- §3.4 Fact products
+
+local ComponentInfo = family "component information"
+local Plain = struct {}
+local Borrowed = struct { borrow: BorrowId }
+local Owning = struct {}
+local Callable = struct { entry: Optional(NuaEntry) }
+ComponentInfo { Plain, Borrowed, Owning, Callable }
+
+local Proof = family "proof"
+local Checked = struct { site: InstructionId }
+local Taken = struct { edge: EdgeId }
+local Known = struct { claim: CheckClaim }
+Proof { Checked, Taken, Known }
+
+local FlowFacts = struct { contents: map_of(PlaceId, Contents), borrows: map_of(BorrowId, BorrowState), live_lifetimes: set_of(LifetimeId) }
+local EdgeFacts = struct { edge: EdgeId, flow: FlowFacts, arguments: list_of(ValueInfo) }
+local JoinRelation = struct { block: BlockId, incoming: list_of(EdgeFacts) }
+
+------------------------------------------------------------------------------------------------
+-- §3.5 Effects and native boundary contracts
+
+local Effects = struct {
+    reads: list_of(Access), writes: list_of(Access), moves: list_of(Access), ends: list_of(Access), consumes: list_of(Access),
+    may_trap: Boolean, may_wait: Boolean, may_switch: Boolean, foreign_extent: Boolean, nonreturning: Boolean
+}
+local SiteFacts = struct { before: FlowFacts, after: FlowFacts, effects: Effects }
+local DefinitionFacts = struct {
+    values: Table, borrows: map_of(BorrowId, BorrowInfo), entries: map_of(BlockId, FlowFacts),
+    edges: map_of(EdgeId, EdgeFacts), joins: map_of(BlockId, JoinRelation),
+    sites: map_of(InstructionId, SiteFacts), terminators: map_of(BlockId, Effects)
+}
+
+local InterfaceOrigin = family "interface origin"
+local Incoming = struct { parameter: Positive, path: AccessPath }
+local GlobalOrigin = struct { global: GlobalId, path: AccessPath }
+InterfaceOrigin { Incoming, GlobalOrigin }
+
+local InterfacePart = family "interface part"
+local PlainPart = struct {}
+local BorrowPart = struct { origins: list_of(InterfaceOrigin), mutable: Boolean }
+local OwnerPart = struct {}
+InterfacePart { PlainPart, BorrowPart, OwnerPart }
+
+local InterfaceInfo = struct { type: NativeType, parts: Table }
+local AliasRequirement = struct { moved: Access, stored: Access, at: InstructionId }
+local BoundaryContract = struct {
+    definition: DefinitionId, inputs: list_of(InterfaceInfo), returns: map_of(BlockId, InterfaceInfo),
+    effects: map_of(InstructionId, Effects), terminators: map_of(BlockId, Effects),
+    requires_disjoint: list_of(AliasRequirement), normal_exits: set_of(BlockId), revision: Natural
+}
+local Analysis = struct { revision: Natural, definitions: map_of(DefinitionId, DefinitionFacts), contracts: map_of(DefinitionId, BoundaryContract) }
+
+return define
+    .ComponentInfo
+    .Plain
+    .Borrowed
+    .Owning
+    .Callable
+    .Proof
+    .Checked
+    .Taken
+    .Known
+    .FlowFacts
+    .EdgeFacts
+    .JoinRelation
+    .Effects
+    .SiteFacts
+    .DefinitionFacts
+    .InterfaceOrigin
+    .Incoming
+    .GlobalOrigin
+    .InterfacePart
+    .PlainPart
+    .BorrowPart
+    .OwnerPart
+    .InterfaceInfo
+    .AliasRequirement
+    .BoundaryContract
+    .Analysis
+end
