@@ -1,9 +1,0 @@
--- Experimental storage words, hosted by nua.front and evaluated by the activities probe.
--- Access supplies primitive top observation/write, not an opaque reset algorithm.
--- Roles already denote valid logical positions; observing an unused one returns zero.
-local capture = do(access, role): U64 = access.top role
-local restore = do(access, role, mark: U64): Unit
-    if mark > access.top role then access.fail "data stack reset above its top" end
-    access.store role mark
-end
-return { .capture, .restore }

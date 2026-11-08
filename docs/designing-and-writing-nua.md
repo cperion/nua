@@ -1197,7 +1197,7 @@ L1:;
 * **A check a branch proved goes.** The loop's own `xs[i]` has none: the loop condition proved `i < xs.length`.
 * **Lookups are checked once per stretch.** `store[id]`, `g[i]` and `pool[slot]` look again after anything that could change the answer (a structural change, a slot moving, a call into C, a loop round), and not otherwise.
 * **Waits remain work.** Calls into runtime mechanisms are visible in generated C; reached runtime policy is also Nua code built with the program, not necessarily a separate function at every source operation.
-* **Storage has a concrete cost.** Fixed-size residual values use registers or stack storage. Current resizable collections use data stacks; the [approved replacement](design/region-completion.md) uses affine regions/blocks, possible relocation and per-task native stacks, with real reservation/metadata costs. Tasks, channels and pools also need runtime storage. A word can reach any of these operations: evaluating it in place removes no allocation that its behavior still requires.
+* **Storage has a concrete cost.** Fixed-size residual values use registers or stack storage. Current resizable collections use data stacks; the approved [buffer model](design/buffers.md) gives every owner its own buffers from a size-class allocator, and [tasks](design/tasks.md) their own native stacks. Tasks, channels and pools also need runtime storage. A word can reach any of these operations: evaluating it in place removes no allocation that its behavior still requires.
 
 ### 11.2 Code size and compile time
 

@@ -6,8 +6,9 @@ below are contracts, not placeholders for a later inventory. Implementation may
 change a contract through an explicit design revision, not by hiding extra state
 in a builder or treating an unspecified case as a language restriction.
 
-[Syntax](../syntax.md) owns language/ABI semantics. [Region completion](region-completion.md)
-owns the approved allocator, transfer, recovery and native-task architecture.
+[Syntax](../syntax.md) owns language/ABI semantics. [Buffers](buffers.md) owns the
+memory model; this document carries its compiler data and operations.
+[Tasks](tasks.md) owns native task stacks and scheduling.
 [Architecture](../architecture.md) describes the current implementation separately.
 This specification does not claim replacement code or executable acceptance exists.
 
@@ -24,7 +25,7 @@ Mua parser + nua.front
        \       |       /
          one Program graph
               |
-     checking + realizing Nua words       same evaluator, same Program kinds
+     checking + budget insertion          same evaluator, same Program kinds
               |
        preparing + verifying
               |
@@ -48,12 +49,12 @@ are implementation targets, not claims that those files already exist.
 |---|---|---|
 | `nua/compiler/data.mua` | Checked wire shapes below; identity/list/map checkers | Mua contracts; `nua.types` |
 | `nua/compiler/graph.mua` | `building`, `rewrite`, `walk`, `index`, `same`, `print` | `data` |
-| `nua/compiler/facts.mua` | `fork`, `agree`, `substitute`, `observe`, `invalidate`, `transfer`, `rebind`, `check_edge` | `data`; graph indices |
-| `nua/compiler/evaluate.mua` | `evaluating`, `apply`, `invoke` | `data`, `graph`, `facts`; supplied definition/storage capabilities |
+| `nua/compiler/facts.mua` | `fork`, `agree`, `substitute`, `borrow`, `use`, `store`, `moves`, `ends`, `move_owner` | `data`; graph indices |
+| `nua/compiler/evaluate.mua` | `evaluating`, `apply`, `invoke`, `release` | `data`, `graph`, `facts`; supplied definition capability and Nua word bindings |
 | `nua/compiler/control.mua` | `branching`, `looping`, `complete_exits` | `data`, `graph`, `facts`; supplied evaluation capability |
 | `nua/compiler/definitions.mua` | `defining`, `request`, `agree_group` | `data`, `graph`, `facts`; supplied evaluation capability |
-| `nua/compiler/realize.mua` | `realizing`, `storage`, `tasks`, `budgets` | `data`, `graph`; supplied evaluation and Nua word bindings |
-| `nua/compiler/verify.mua` | `shape`, `graph`, `types`, `lifetimes`, `task_access`, `publication`, `ready` | `data`, `graph`, `facts` |
+| `nua/compiler/budgets.mua` | `budgets` | `data`, `graph`; supplied evaluation and the scheduler's budget word |
+| `nua/compiler/verify.mua` | `shape`, `graph`, `types`, `lifetimes`, `task_access`, `ready` | `data`, `graph`, `facts` |
 | `nua/compiler/optimize.mua` | `fold`, `reach`, `sweep`, `optimize` | `data`, `graph`, `facts`, `verify` |
 | `nua/compiler/diagnostics.mua` | `reporting`, `render` | `data`; supplied source text |
 | `nua/compiler/compile.mua` | `compiling`, `prepare` | Wires the preceding vocabularies and backend adapters |
@@ -83,8 +84,8 @@ argument is the trailing callback of an activity.
   tests and construction APIs. Mua `struct` alone does not make them immutable.
 - IDs are separate nominal brands with `{ compilation: CompilationId, serial: U64 }`.
   The brands are `WordId`, `EnvironmentId`, `DefinitionId`, `BlockId`, `EdgeId`,
-  `InstructionId`, `ValueId`, `PlaceId`, `HoldingId`, `LoanId`, `LifetimeId`,
-  `InvocationId`, `AttemptId`, `LoopId`, `BoundaryId`, `GlobalId`, `TaskId`,
+  `InstructionId`, `ValueId`, `PlaceId`, `BorrowId`, `LifetimeId`,
+  `InvocationId`, `AttemptId`, `LoopId`, `BoundaryId`, `GlobalId`,
   `OriginId`, `HostId`. `CompilationId` is a fresh opaque identity. IDs are not
   source locations, payload addresses or allocation-site numbers.
 
@@ -135,10 +136,8 @@ the compiler does not serialize their arbitrary upvalues.
 NativeValue = Bits       { type: NativeType, operand: Operand }
             | Aggregate  { type: NativeType, packed: Option Operand,
                            parts: Map ComponentPath NativeValue }
-            | Reference  { type: NativeType, representation: Option Operand,
-                           access: ReferenceInfo }
-            | Owned      { type: NativeType, header: Operand, holding: HoldingId,
-                           endpoint: Endpoint }
+            | Reference  { type: NativeType, borrow: BorrowId }
+            | Owned      { type: NativeType, header: Operand }
 
 ComponentPath = List Component
 Component     = Field(name: String) | Element(index: Operand) | Alternative(name: String)
@@ -153,25 +152,24 @@ Operand = Constant       { type: NativeType, bits: NativeConstant }
 `BooleanBit(value)`, `UnitBits`, `AggregateBits(parts)`, `StaticBytes(bytes)`,
 `SymbolAddress(name, offset)` and `DefinitionAddress(definition)`. Bytes use a
 canonical byte order; the associated native type checks width, layout and legal
-interpretation. This is not “any Lua number”. `Bits` excludes safe references and
+interpretation. This is not “any Lua number”. `Bits` excludes references and
 owning types: their facts cannot be omitted by selecting a convenient constructor.
 
-A reference to an exact tracked place may have no materialized representation yet.
-Reification produces its pointer or pointer/length representation only when needed;
-constructing `Ref` does not by itself force a pending scalar store. An indirect
-reference must have its captured native representation. An `Owned` use must match
-both its holding and current endpoint; an old host wrapper cannot consume that
-holding again after it has transferred elsewhere.
+A `Reference` names its borrow; the borrow's facts (§2.4) say whether it is held
+(a path, with a cached pointer or none yet) or stored (a fixed pointer operand).
+Constructing `Ref` does not by itself force a pending scalar store or produce a
+pointer. An `Owned` value is the operand holding its header bits; ownership of it is
+linear in the graph (§2.4), not a separate identity.
 
 An aggregate can have known parts and a residual packed representation. Every
 missing part must be recoverable from `packed`; otherwise construction fails.
-Owning/borrowed components retain their facts when packed. Extracting a header
-operand does not manufacture a second holding. Dynamic sum alternatives are
-accessed only under their active-tag proof. Fixed arrays use element paths;
-container payload lengths are runtime data, not a compiler list of every element.
+Owning/borrowed components retain their facts when packed. Dynamic sum alternatives
+are accessed only under their active-tag proof. Fixed arrays use element paths;
+buffer lengths are runtime data, not a compiler list of every element.
 
 A read returns an observation now. Later place mutation cannot turn its `operand`
-into a recipe that rereads the place. Borrowed observations still require live loans.
+into a recipe that rereads the place. A borrowed observation still requires its
+borrow to be live.
 
 ### 2.3 Places, contents and access
 
@@ -181,7 +179,7 @@ Place            { id: PlaceId, type: NativeType, root: PlaceRoot,
 PlaceRoot        = LocalRoot(invocation: InvocationId, local: Positive)
                  | GlobalRoot(global: GlobalId)
                  | ParameterRoot(definition: DefinitionId, parameter: Positive)
-                 | IndirectRoot(pointer: Operand, access: ReferenceInfo)
+                 | IndirectRoot(pointer: Operand, borrow: BorrowId)
                  | ForeignRoot(pointer: Operand, contract: ForeignAccess)
 
 Contents         = Uninitialized
@@ -189,72 +187,63 @@ Contents         = Uninitialized
                  | Resident(info: ValueInfo)
                  | Moved(at: OriginId)
 
-StorageGuarantee = Stable | SharedPosition
-ReferenceInfo    { targets: TargetRelation, loans: List LoanId,
-                   guarantee: StorageGuarantee, mutable: Bool }
-TargetRelation   = Exact(place: PlaceId)
-                 | Selected(join: BlockId, component: ComponentPath)
-                 | Relative(parameter: Positive, path: AccessPath)
-                 | BoundedUnknown(lifetime: LifetimeId, path: AccessPath)
+Access           { place: PlaceId, path: AccessPath }
 AccessPath       = List AccessStep
 AccessStep       = FieldStep(name: String) | KnownElement(index: U64)
-                 | AnyElement | AlternativeStep(name: String)
+                 | AnyElement | AlternativeStep(name: String) | Contents
 ForeignAccess    { lifetime: LifetimeId, type: NativeType, mutable: Bool,
                    retains: Bool, effects: ForeignEffects }
 ```
 
-Here `BoundedUnknown` means **lifetime-bounded**, not a bound on the number of
-possible targets. It represents late-selected runtime targets without scanning
-their collection or allocating one compiler root per element. Unknown-index
-aliasing remains conservative. It does not weaken a proved stable guarantee.
-The existing prohibition on owning moves through unknown Ref targets remains.
+`Contents` as an access step names a buffer's elements, as distinct from its header.
+Unknown-index aliasing is conservative: `AnyElement` overlaps every element.
+Local/global place IDs persist across content replacement. Field-place identities are
+interned by root and path. `LocalRoot.invocation` is an identity namespace, not a
+pointer to a retained `InvocationWork` record. An indirect access uses its borrow's
+facts; it never silently substitutes the destination of a prior owner move. An element
+place needs the dominating bounds/active-tag checks recorded in `ValueInfo.proofs`
+(§3). Raw pointers use their existing unsafe contract.
 
-Local/global place IDs persist across content replacement. Field-place identities
-are interned by root and path. `LocalRoot.invocation` is an identity namespace,
-not a pointer to a retained `InvocationWork` record. An indirect access uses its captured pointer and
-access facts; it never silently substitutes the destination of a prior source move.
-An element place additionally needs the dominating bounds/active-tag checks recorded
-in `ValueInfo.proofs` (§3). Unsafe raw pointers use their existing unsafe contract.
+### 2.4 Borrows and owner linearity
 
-### 2.4 Holdings, loans and loop epochs
+These are the compiler facts of the [buffer model](buffers.md#33-compiler-facts):
 
 ```text
-Holding          { id: HoldingId, type: NativeType, endpoint: Endpoint,
-                   header: Operand, guarantee: StorageGuarantee,
-                   custody: Custody, lifetime: LifetimeId }
-Endpoint         = InPlace(place: PlaceId) | InCapture(value: ValueId)
-                 | InResult(boundary: BoundaryId) | InOperation(instruction: InstructionId)
-Custody          = WholeRegion | Fragment(custodian: HoldingId, path: AccessPath)
-                 | BorrowedCustody(parameter: Positive, path: AccessPath)
-
-Loan             { id: LoanId, lender: LifetimeId, subject: LoanSubject,
-                   acquired: OriginId }
-LoanSubject      = Header(place: PlaceId)
-                 | ContentsOf(place: PlaceId, position: AccessPath, epoch: Epoch)
-                 | ForeignContents(contract: ForeignAccess)
-Epoch            = EntryEpoch(place: PlaceId)
-                 | CutEpoch(site: InstructionId, place: PlaceId)
-                 | HeaderEpoch(block: BlockId, place: PlaceId)
-LoanState        = Live | Ended(at: OriginId)
+BorrowPath   { root: PlaceId, steps: AccessPath, range: Option Range }
+Range        { first: Operand, count: Operand }
+BorrowInfo   { id: BorrowId, form: BorrowForm, origins: List Access,
+               mutable: Bool, lifetime: LifetimeId, acquired: OriginId }
+BorrowForm   = Held(path: BorrowPath, pointer: Option Operand)
+             | Stored(pointer: Operand)
+BorrowState  = Live | Ended(at: OriginId, reason: EndReason)
+EndReason    = Grew | Shrank | Removed | Cleared | Replaced | Moved | Released
 ```
 
-These are compiler facts; runtime ownership uses the region/header ABI in
-[region completion](region-completion.md#2-actual-resources-and-exclusive-custody).
-There are no runtime per-borrow objects and no concrete epoch history vector.
-`BorrowedCustody` gives a native callee access to an existing owner through Ref;
-it does not give that callee authority to release its caller's whole region.
+A **held** borrow is a path. `pointer` caches the derived native pointer and is
+dropped by a `Moves` on the path; the next use derives it again from the current
+headers. A **stored** borrow is a fixed pointer: it was written into data, passed to a
+compiled word or to foreign code. `origins` lists every buffer the borrow may point
+into; after a join it is the union of the incoming origins. `lifetime` is the
+shortest owner lifetime among the origins, checked by the lifetime rule (syntax §9.5).
 
-An epoch is relative to one execution of its block, not globally identified by
-its instruction address. On a loop edge, first compare a loan's epoch with that
-edge's current owner epoch. Only a matching current relation is renamed to the
-header's `HeaderEpoch`. An old loan does not become current merely because its
-syntax or address repeats. A refreshed loan passes this substitution; a stale one
-fails. Backedge transport itself creates neither a cut nor a source move.
+| Event | Held borrow overlapping it | Stored borrow overlapping it |
+|---|---|---|
+| `Moves access` | drop `pointer` | `Ended(Grew)` |
+| `Ends access reason` | `Ended(reason)` | `Ended(reason)` |
+| owner moved out of, replaced in or released from a place | `Ended(Moved / Replaced / Released)` | same |
 
-Whole regions transfer their actual current custody. A fragment can escape only
-through detachment before its custodian ends. Equal/empty header bits do not prove
-which holding was selected. Partial moves change only the selected component's
-endpoint and leave sibling authority intact.
+Using an `Ended` borrow is a diagnostic naming the event and the use.
+
+**Owners are linear values.** An `Owned` operand must be consumed exactly once on every
+path: moved into a place, passed to an owning parameter, returned, or released. A
+named owner place has `Contents` `Tracked`, `Resident` or `Moved`. A conditional move
+releases the owner on the edges that did not move it, before the join, so places agree
+at every join; no drop flag exists at runtime. There are no holding identities,
+endpoints, custody records, loan subjects or epochs: SSA values and block arguments
+already say which header went where.
+
+Releasing is a typed walk generated from the native type (owning contents, then the
+owner's buffers), evaluated as ordinary Nua words.
 
 ## 3. The one program graph
 
@@ -268,11 +257,9 @@ Program          { revision: U64, definitions: Map DefinitionId Definition,
 WordInfo         { id: WordId, name: String, requirements: List Requirement,
                    result_type: NativeType, origin: OriginId }
 Definition       { id: DefinitionId, word: WordId, kind: DefinitionKind,
-                   wait_mode: WaitMode,
                    signature: Signature, entry: BlockId, blocks: List Block,
                    places: Map PlaceId Place, origin: OriginId }
-DefinitionKind   = NativeWord | TaskStep | BlockingEntry | StorageHelper
-WaitMode         = PlainBlocking | TaskSuspending | NoSourceWait
+DefinitionKind   = NativeWord | TaskEntryWord | BlockingEntry
 Signature        { parameters: List NativeType, result: NativeType,
                    abi: NativeABI, variadic: Bool }
 NativeABI        = NuaBoundary | CBoundary | TaskEntry
@@ -293,24 +280,18 @@ Terminator = Jump       { origin: OriginId, edge: Edge }
                           when_true: Edge, when_false: Edge }
            | Return     { origin: OriginId, value: Operand }
            | Trap       { origin: OriginId, message: Operand }
-           | SourceWait { origin: OriginId, operation: Operand, resume: Edge }
 ```
 
 `WordInfo` retains source identity without retaining a hosted body or its builder.
 A block has one terminator; its edge arguments are simultaneous. `Return` is an
-actual native return after completion, not an inline body return. `SourceWait`
-marks the existing source-wait operation, not budget suspension. Before emission,
-`PlainBlocking` waits become ordinary Nua blocking-wait calls; `TaskSuspending`
-waits become step-function control and typed frame access in this same graph.
-`NoSourceWait` rejects a source wait. `SourceWait` may not remain in a ready program.
-Root plain entries select PlainBlocking; task steps select TaskSuspending. Ordinary
-inline invocations inherit their caller's mode. Shared/materialized native bodies
-and blocking-job bodies retain NoSourceWait; budget capability does not relax it.
+actual native return after completion, not an inline body return. A source wait is
+not a terminator: it is a call of the scheduler's Nua wait word, which switches
+context and returns when the operation completes (§7.2). Any definition may contain
+one; a blocking-job body may not (it runs outside the scheduler).
 
-The Nua boundary ABI passes each owning result through one caller-provided complete
-result holding of its fixed native layout. Non-owning results use their native
-result convention. An aggregate's independently owning fields remain distinct
-holdings in that fixed layout. C-boundary signatures retain their restrictions on
+The Nua boundary ABI passes each owning result through one caller-provided result
+slot of its fixed native layout, into which the callee writes the header(s).
+Non-owning results use their native result convention. C-boundary signatures retain their restrictions on
 owners; task entry has the trusted runtime ABI, not a signature-based guess.
 
 ### 3.2 Instruction family: complete top-level membership
@@ -321,7 +302,7 @@ top-level instruction kinds; there is no `Other`, C template, or untyped payload
 | Kind | Remaining fields | Evaluation/effect contract |
 |---|---|---|
 | `Compute` | `result: ValueId, type: NativeType, opcode: NumericOpcode, arguments: List Operand` | Native typed computation; validity classified by opcode/type |
-| `Pack` | `result: ValueId, type: NativeType, components: List Operand` | Representation assembly; transports existing facts, never duplicates custody |
+| `Pack` | `result: ValueId, type: NativeType, components: List Operand` | Representation assembly; transports existing facts, never duplicates an owner |
 | `Extract` | `result: ValueId, type: NativeType, aggregate: Operand, path: ComponentPath` | Projection under required tag/index proofs; no new owning move |
 | `Load` | `result: ValueId, place: PlaceId` | Ordered observation; result facts taken at this site |
 | `Store` | `place: PlaceId, value: Operand` | Non-owning assignment only; preserves reference facts when materialized |
@@ -330,12 +311,10 @@ top-level instruction kinds; there is no `Other`, C template, or untyped payload
 | `Invoke` | `result: Option ValueId, callee: Callee, arguments: List Operand, boundary: BoundaryId` | Complete ordered argument captures, callee effects and caller completion |
 | `Atomic` | `result: Option ValueId, opcode: AtomicOpcode, address: Operand, arguments: List Operand, order: MemoryOrder, failure_order: Option MemoryOrder` | Atomic read/write/RMW with native legality checks |
 | `Fence` | `order: MemoryOrder` | Atomic ordering; not a pure unused computation |
-| `Storage` | `result: Option ValueId, request: StorageRequest` | Logical resource/custody operation, realized by Nua words |
 | `LifetimeStart` | `lifetime: LifetimeId` | Begin the declared logical lifetime |
-| `LifetimeEnd` | `lifetime: LifetimeId` | End its loans after required source completion and ownership cleanup |
-| `Borrow` | `loan: LoanId` | Record acquisition at this graph site; does not force address materialization |
-| `LoanCut` | `target: PlaceId, position: AccessPath, reason: CutReason` | Explicit semantic invalidation; no runtime per-loan bookkeeping |
-| `StartTask` | `result: ValueId, task: TaskId, captures: List Operand` | Typed capture and child publication protocol, realized by Nua words |
+| `LifetimeEnd` | `lifetime: LifetimeId` | End its borrows after source completion and owner release |
+| `Moves` | `target: Access` | Declared effect of a library word: the buffers at `target` may relocate (§2.4) |
+| `Ends` | `target: Access, reason: EndReason` | Declared effect of a library word: borrows of `target` end (§2.4) |
 | `Budget` | `reason: BudgetReason` | Permitted native scheduling point; ordered control/memory effect |
 | `Mechanism` | `result: Option ValueId, binding: String, arguments: List Operand` | A declared platform mechanism, never an opaque Nua algorithm |
 
@@ -348,9 +327,7 @@ NumericOpcode = Add | Subtract | Multiply | Divide | Remainder | Negate
 AtomicOpcode  = Read | Write | Exchange | CompareExchange
               | FetchAdd | FetchSubtract | FetchAnd | FetchOr | FetchXor
 MemoryOrder   = Relaxed | Consume | Acquire | Release | AcquireRelease | Sequential
-BudgetReason  = LoopEdge | RecursiveEdge | StorageStep
-CutReason     = OwningTransfer | SharedGrowth | TruncateContents
-              | RootCompletion | NativeCompletion | ExplicitCompact
+BudgetReason  = LoopEdge | RecursiveEdge
 CheckClaim    = Bounds(place: PlaceId, index: Operand, length: Operand)
               | ActiveAlternative(value: Operand, name: String)
               | Condition(value: Operand)
@@ -358,7 +335,6 @@ Callee        = DirectNua(definition: DefinitionId)
               | IndirectNua(pointer: Operand, signature: Signature, provenance: NuaEntry)
               | Foreign(pointer: Operand, signature: Signature, contract: ForeignEffects)
 NuaEntry      = DefinitionEntry(definition: DefinitionId)
-              | TaskStepEntry(task: TaskId)
               | RuntimeEntry(name: String)
 ```
 
@@ -370,90 +346,65 @@ requires those rules, not merely a new string accepted by `Compute`.
 
 `Mechanism.binding` must resolve in the target's checked mechanism vocabulary.
 Each entry has `{ signature, effects, c_symbol, jit_symbol }`. The required storage/
-context entries are `reserve`, `commit_pages`, `release`, `move_bytes`,
-`context_initialize`, `context_switch`, `context_finish`, `recover_jump` and
-`fatal_trap`. OS threading, TLS and I/O use separately declared platform bindings.
+context entries are `map_pages`, `unmap_pages`, `reserve_range`, `commit_range`,
+`release_range`, `move_bytes`, `context_initialize`, `context_switch`,
+`context_finish`, `recover_jump` and `fatal_trap`; `remap_pages` is optional. OS threading, TLS and I/O use separately declared platform bindings.
 Unknown bindings fail construction. `context_switch` is explicitly switching,
-not an opaque foreign call that would fence its own switch. Reserve returns
-status/provenance; allocation policy and all resource-list algorithms stay Nua.
+not an opaque foreign call that would fence its own switch. Page mechanisms
+return status; allocation policy, size classes and free lists stay Nua.
 
-### 3.3 Storage requests and their realization bindings
+### 3.3 Buffer words and effect declarations
+
+There are no storage requests. Buffer operations are ordinary Nua words of the
+`buffers` library ([buffers §4](buffers.md#4-the-operations)), evaluated in place like
+any word: their checks, stores and mechanism calls appear at their source point.
+The compiler supplies two general primitives that any library word may use:
 
 ```text
-StorageRequest = CreateOwner { type: NativeType, destination: PlaceId }
-               | TransferOwner { source: HoldingId, destination: Endpoint,
-                                 kind: TransferKind }
-               | CopyOwner { source: PlaceId, destination: Endpoint }
-               | EndOwner { holding: HoldingId }
-               | ReserveStorage { owner: PlaceId, position: AccessPath, capacity: Operand }
-               | InitializeElement { owner: PlaceId, index: Operand, value: Operand }
-               | EndElements { owner: PlaceId, first: Operand, limit: Operand }
-               | CompactStorage { owner: PlaceId, position: AccessPath }
-TransferKind   = SourceTransfer | Transport
+moves access                       -> emits Moves, applies §2.4
+ends access reason                 -> emits Ends, applies §2.4
+initialize buffer index value      -> extends the checked initialized prefix
+finish buffer first limit          -> shrinks it; ends the affected elements
 ```
 
-These are general typed-storage capabilities, not Map/Text/Store-specific
-instructions. `InitializeElement` is a trusted initialized-buffer transition,
-not a public uninitialized-slot API. Public append/pop/replace/truncate algorithms
-are Nua words composing checked operations; compiler code does not choose their
-capacity policy, walk payloads or rebuild map indices.
-
-| Request | Nua binding selected by realization |
-|---|---|
-| `CreateOwner` | `regions.create type` |
-| `TransferOwner` | `regions.transfer type kind` |
-| `CopyOwner` | `regions.copy type` |
-| `EndOwner` | `regions.end_value type` |
-| `ReserveStorage` | `buffers.reserve type position guarantee` |
-| `InitializeElement` | `buffers.initialize type` |
-| `EndElements` | `buffers.end_range type` |
-| `CompactStorage` | `regions.compact type position` |
-
-These bindings live in the replacement Nua runtime/storage vocabulary. Their type
-arguments specialize finite structural visitors; their native arguments carry
-captured headers, addresses, indices, capacities and durable operation/context
-records. Realization replaces `Storage` with their evaluated graph and retains the
-associated source `LoanCut` exactly once. Private helper copies do not add another
-cut. Adoption avoiding a payload copy does not erase that event. `Storage` may not
-remain in backend-ready code. `Transport` changes the receiving endpoint of the
-same installed holding without a source cut. It must preserve existing valid
-loans; required fragment detachment occurs at the actual source transfer, not as
-an unexpected relocation during later compiler transport.
+`Grow`, `Text`, `Store`, `Map` and their `.pinned` variants are written over these
+words. A pinned buffer's `reserve` declares no `moves`. A container may refine `ends`
+by key or ID. The typed release walk of an owner type is generated from its schema:
+owning fields, the active alternative of a sum, initialized ranges of buffers;
+runtime lengths become native loops. References and IDs are not owning edges.
 
 ### 3.4 Fact products, not a second program
 
 ```text
 ValueInfo       { type: NativeType, components: Map ComponentPath ComponentInfo,
                   proofs: Set Proof }
-ComponentInfo   = Plain | Borrowed(info: ReferenceInfo) | Owning(holding: HoldingId)
+ComponentInfo   = Plain | Borrowed(borrow: BorrowId) | Owning
                 | Callable(entry: Option NuaEntry)
 Proof           = Checked(site: InstructionId) | Taken(edge: EdgeId)
                 | Known(claim: CheckClaim)
-FlowFacts       { contents: Map PlaceId Contents, holdings: Map HoldingId Holding,
-                  loans: Map LoanId LoanState,
-                  epochs: Map PlaceId (Map AccessPath Epoch),
+FlowFacts       { contents: Map PlaceId Contents,
+                  borrows: Map BorrowId BorrowState,
                   live_lifetimes: Set LifetimeId }
 EdgeFacts       { edge: EdgeId, flow: FlowFacts, arguments: List ValueInfo }
 JoinRelation    { block: BlockId, incoming: List EdgeFacts }
 SiteFacts       { before: FlowFacts, after: FlowFacts, effects: Effects }
-DefinitionFacts { values: Map Operand ValueInfo, loans: Map LoanId Loan,
+DefinitionFacts { values: Map Operand ValueInfo, borrows: Map BorrowId BorrowInfo,
                   entries: Map BlockId FlowFacts, edges: Map EdgeId EdgeFacts,
                   joins: Map BlockId JoinRelation, sites: Map InstructionId SiteFacts,
                   terminators: Map BlockId Effects }
 Analysis        { revision: U64, definitions: Map DefinitionId DefinitionFacts,
-                  contracts: Map DefinitionId BoundaryContract,
-                  tasks: Map TaskId TaskPlan, realizations: Map RealizationSite Realization }
+                  contracts: Map DefinitionId BoundaryContract }
 ```
 
 `Map Operand` uses canonical operand identity, not a deep Lua-table key comparison.
 Facts are tied to `Program.revision`. A rewrite returns a new revision and the
 analyses it has actually rebuilt; it cannot reuse a certificate for changed code.
 
-Each `JoinRelation` row is keyed by the actual incoming edge. The row contains
-owner, reference and current-contents facts together. Selection consults that row,
-not independent unions of possible owners and borrows. Nested relations refer to
-other joins by ID; the driver does not enumerate every whole-program path.
-Loops have finite header-relative facts, not a row for every runtime iteration.
+Each `JoinRelation` row is keyed by the actual incoming edge and carries contents and
+borrow states together. A borrow-typed block argument gets a new borrow whose origins
+are the union of its incoming borrows' origins and whose state is `Ended` if any live
+incoming edge ended it. Loops have finite facts at the header, not a row for every
+runtime iteration.
 
 `Analysis` has no executable control of its own. Ordered checking follows the
 actual blocks, instructions and edges of `Program`. It does not execute an
@@ -462,51 +413,41 @@ ownership-only copy of that program.
 ### 3.5 Effects and native boundary contracts
 
 ```text
-Effects          { reads: List Access, writes: List Access, exposes: List Access,
-                   consumes: List Access, cuts: List Access,
+Effects          { reads: List Access, writes: List Access,
+                   moves: List Access, ends: List Access, consumes: List Access,
                    may_trap: Bool, may_wait: Bool, may_switch: Bool,
                    foreign_extent: Bool, nonreturning: Bool }
-Access           { target: TargetRelation, path: AccessPath }
 ForeignEffects   { reads: List Access, writes: List Access, retains: List Access,
                    may_reenter: Bool, noreturn: Bool }
 InterfaceOrigin  = Incoming(parameter: Positive, path: AccessPath)
                  | GlobalOrigin(global: GlobalId, path: AccessPath)
-                 | FreshResult(path: ComponentPath)
-                 | SelectedResult(join: BlockId, component: ComponentPath)
-InterfaceLoan    = HeaderLoan | InputContents(position: AccessPath)
-                 | AcquiredContents(position: AccessPath, site: InstructionId)
 InterfacePart    = PlainPart
-                 | BorrowPart(origin: InterfaceOrigin, loan: InterfaceLoan,
-                              guarantee: StorageGuarantee)
-                 | OwnerPart(origin: InterfaceOrigin, guarantee: StorageGuarantee)
+                 | BorrowPart(origins: List InterfaceOrigin, mutable: Bool)
+                 | OwnerPart
 InterfaceInfo    { type: NativeType, parts: Map ComponentPath InterfacePart }
-AliasRequirement { left: Access, right: Access, at: InstructionId }
+AliasRequirement { moved: Access, stored: Access, at: InstructionId }
 BoundaryContract { definition: DefinitionId, inputs: List InterfaceInfo,
                    returns: Map BlockId InterfaceInfo,
                    effects: Map InstructionId Effects,
                    terminators: Map BlockId Effects,
                    requires_disjoint: List AliasRequirement,
-                   completion_cuts: List Access,
                    normal_exits: Set BlockId, revision: U64 }
 ```
 
 `Effects` describes **one execution site**. The boundary contract retains the
 instruction/terminator maps and the definition's actual CFG, including nonreturning
-prefixes and source waits. A trap/wait terminator is not lost because it has no
-instruction result. It is not an unordered final may-read/may-kill summary. A call substitutes parameter
-accesses with actual argument relations, then checks ordered use/kill constraints
-on that graph. Required separation of an invalidator and a subsequent old-view
-observation is represented by `requires_disjoint`; it is not inferred from final
-return facts. Return rows preserve which actual exit supplies each result origin;
-`SelectedResult` refers to that definition's correlated join rows after projection.
-`completion_cuts` are applied at caller completion before returned-loan validation.
-An `AcquiredContents` site is the actual `Borrow` instruction, not a fictional
-post-call acquisition. A header loan is distinct from a contents loan.
+prefixes. A call substitutes parameter accesses with the actual argument origins, then
+applies the callee's `moves`, `ends` and `consumes` to the caller's facts in order.
+`requires_disjoint` records each `moves` of a parameter's buffer while a stored borrow
+parameter may point into it; a call whose arguments alias such a pair is rejected.
 
-Contract projection replaces local IDs by incoming/global/result paths. A remaining
-callee-local place, loan or holding in the outward interface is a verification
-error. Actual header custody crosses the native boundary; compile-time origin
-alternatives do not become a runtime cleanup-history vector.
+A returned borrow's `origins` name incoming parameters or globals, never callee
+locals (the lifetime rule). When they name exactly one buffer, the caller re-roots the
+result as a held borrow: its path is that buffer and the offset of the returned
+pointer from the buffer's current `data`. Otherwise the result is stored.
+
+Contract projection replaces local IDs by incoming/global paths. A remaining
+callee-local place or borrow in the outward interface is a verification error.
 
 ## 4. Private state and completion outcomes
 
@@ -526,7 +467,7 @@ Draft           { attempt: AttemptId, parent: Option AttemptId,
                   definition: Option DefinitionId, blocks: Map BlockId BlockDraft,
                   places: Map PlaceId Place, values: Map Operand ValueInfo,
                   lifetimes: Map LifetimeId Lifetime,
-                  loans: Map LoanId Loan, exits: List ExitSite,
+                  borrows: Map BorrowId BorrowInfo, exits: List ExitSite,
                   requests: Set DefinitionId, state: DraftState }
 DraftState      = Open | Adopted | Discarded
 BlockDraft      { id: BlockId, arguments: List BlockArgument,
@@ -535,20 +476,18 @@ Path            { attempt: AttemptId, block: Option BlockId,
                   environment: EnvironmentId, lifetime: LifetimeId, facts: FlowFacts }
 InvocationWork  { id: InvocationId, word: WordId, draft: Draft,
                   entry: Path, locals: List PlaceId, exits: List ExitSite,
-                  result_type: NativeType, mode: EvaluationMode, wait_mode: WaitMode }
+                  result_type: NativeType, mode: EvaluationMode }
 EvaluationMode  = HostOnly | Residual
 ExitSite        { kind: ExitKind, path: Path, capture: Capture, origin: OriginId }
 ExitKind        = InvocationReturn(target: InvocationId)
                 | LoopBreak(target: LoopId) | LoopNext(target: LoopId)
-Capture         { value: NativeValue, ready_after: Set LifetimeId,
-                  transfer: Option PendingTransfer }
-PendingTransfer { source: HoldingId, destination: Endpoint }
-CapturePurpose  = Observation | ArgumentCapture | ReturnCapture | Transport
+Capture         { value: NativeValue }
+CapturePurpose  = Observation | ArgumentCapture | ReturnCapture
 Lifetime        { id: LifetimeId, parent: Option LifetimeId,
                   kind: LifetimeKind, completion: List CompletionAction }
 LifetimeKind    = GlobalLife | InvocationLife | LexicalLife | TaskScopeLife | ForeignViewLife
-CompletionAction = EndLocal(place: PlaceId) | JoinScope(operation: Operand)
-                 | FinishForeign(operation: Operand) | ApplyNativeCuts(boundary: BoundaryId)
+CompletionAction = ReleaseLocal(place: PlaceId) | JoinScope(operation: Operand)
+                 | FinishForeign(operation: Operand)
 ```
 
 `LoaderScope` is the restoration handle owned by `nua.loader.with_context`:
@@ -557,14 +496,10 @@ registry/package values. It is not another module cache. The compilation driver
 restores it on success and failure; it does not promise concurrent compilation.
 
 A `Capture` contains the value already observed, never a callback that rereads
-it. Owning captures retain complete header/custody information. `ready_after`
-records existing legal protectors that must complete before destructive transfer;
-it does not introduce new task-borrow permissions. Source capture, activity
-completion and the final owning transfer are three distinct operations.
-`Observation`/`Transport` add no owning move. An owning argument is transferred
-into its complete argument holding before the next argument is evaluated.
-`ReturnCapture` records a pending transfer when existing legal protectors defer it;
-the complete captured value, not a future reread, survives that interval.
+it. An owning capture is the header operand; the place it came from is `Moved`.
+Source capture, activity completion and writing the result header are three distinct
+steps. `Observation` adds no owning move. An owning argument is moved before the next
+argument is evaluated.
 
 ### 4.1 Outcomes returned by the drivers
 
@@ -578,8 +513,7 @@ LoopResult       = Exited(path: Path) | NoContinuation
 HeaderAgreement  = Holds | Weaken(changes: List HeaderChange)
 HeaderChange     = ForgetContents(place: PlaceId)
                  | Materialize(place: PlaceId)
-                 | WidenTargets(place: PlaceId, targets: TargetRelation)
-                 | WidenGuarantee(place: PlaceId, guarantee: StorageGuarantee)
+                 | WidenOrigins(borrow: BorrowId, origins: List Access)
 DefinitionResult = Complete(definition: Definition, contract: BoundaryContract)
                  | Awaiting(group: Set DefinitionId)
 CompileResult    = Compiled(product: CompilationProduct)
@@ -617,17 +551,17 @@ source exception mechanism or an eight-retry failure policy.
 |---|---|---|---|
 | `compiling` | `CompilationWork`, loading scope, diagnostic list | Source entries, target, backend | Return product or refusals; restore loader/bridge; product owns retained JIT resources |
 | `building` | `Draft`, fresh block buffers | Identity supplier, parent destination | Adopt once or discard once; reject later writes; definition completion seals blocks |
-| `evaluating` | `InvocationWork`, local lifetimes, evaluation vocabulary | Entry `Path`, word, supply, definition requests | Complete exits and local holdings; return value/path or no continuation |
+| `evaluating` | `InvocationWork`, local lifetimes, evaluation vocabulary | Entry `Path`, word, supply, definition requests | Complete exits and release local owners; return value/path or no continuation |
 | `branching` | Two child drafts and predecessor facts | Captured condition and entry facts | Adopt both valid residual arms; reconcile only continuing edges |
 | `looping` | `LoopWork` (§6), round draft, header agreement | Entry path, carried places, hosted condition/body | Keep accepted known prefix; revise only rejected round/body; finish exits |
 | `defining` | Definition drafts and recursive agreement group | Word/specialization request | Publish group only after contracts close; discard caller-local contributions |
-| `realizing` | Working graph, queue of logical sites, realization records | Completed semantic graph, Nua bindings | Resolve all reachable logical storage/task sites and verify protocols |
+| `budgets` | New output with budget points | Closed program, its call graph | Return the rewritten program; facts rebuilt for changed definitions |
 | `rewriting` | New output, evolving analysis state | Read-only input and explicit shared capabilities | Return replacement graph/facts; never mutate inspected input |
 | `emitting` | Names, declarations, backend handles | Verified ready program and target | Return backend product; close nonretained resources |
 
-`facts.fork` copies the four `FlowFacts` maps and the live-lifetime set; their entries
+`facts.fork` copies the two `FlowFacts` maps and the live-lifetime set; their entries
 are immutable records. A later write replaces an entry rather than changing a
-shared holding/loan record. Name environments extend by fallback. These are two different operations.
+shared borrow record. Name environments extend by fallback. These are two different operations.
 
 ### 4.3 Graph building vocabulary
 
@@ -643,14 +577,14 @@ GraphWriter = {
     append       : BlockId -> Instruction -> Unit,
     terminate    : BlockId -> Terminator -> Unit,
     remember     : Operand -> ValueInfo -> Unit,
-    loan         : Loan -> Unit,
+    borrow       : BorrowInfo -> Unit,
     exit         : ExitSite -> Unit,
     require      : DefinitionId -> Unit
 }
 GraphFragment { entry: Option BlockId, blocks: Map BlockId BlockDraft,
                 places: Map PlaceId Place,
                 lifetimes: Map LifetimeId Lifetime,
-                values: Map Operand ValueInfo, loans: Map LoanId Loan,
+                values: Map Operand ValueInfo, borrows: Map BorrowId BorrowInfo,
                 exits: List ExitSite, requests: Set DefinitionId }
 ```
 
@@ -677,11 +611,12 @@ Facts = {
     fork        : FlowFacts -> FlowFacts,
     agree       : List EdgeFacts -> BlockId -> JoinDecision,
     substitute  : InterfaceInfo -> List NativeValue -> ValueInfo,
-    observe     : FlowFacts -> NativeValue -> OriginId -> Unit,
-    invalidate  : FlowFacts -> Access -> CutReason -> Site -> Unit,
-    transfer    : FlowFacts -> HoldingId -> Endpoint -> Site -> Holding,
-    rebind      : FlowFacts -> HoldingId -> Endpoint -> Holding,
-    check_edge  : EdgeFacts -> FlowFacts -> EdgeFacts
+    borrow      : FlowFacts -> BorrowPath -> Bool -> OriginId -> BorrowInfo,
+    use         : FlowFacts -> BorrowId -> OriginId -> BorrowUse,
+    store       : FlowFacts -> BorrowId -> Operand -> Unit,
+    moves       : FlowFacts -> Access -> Site -> Unit,
+    ends        : FlowFacts -> Access -> EndReason -> Site -> Unit,
+    move_owner  : FlowFacts -> PlaceId -> Site -> Operand
 }
 Graph = {
     building    : Option AttemptId -> IdentitySupply -> (GraphWriter -> BuildDecision)
@@ -704,14 +639,19 @@ GraphIndex      { definitions: Map DefinitionId Definition,
 output. Constants and formal/block parameters have no defining instruction, hence
 `definitions_of` uses `Option`; their own kind records establish their definition.
 
-`observe` checks current loans and owner endpoints; it does not mark mere pointer
-transport as dereferencing contents. `invalidate` changes matching current epochs
-and loan states under the target relation. `transfer` moves one authority, updates
-source/destination facts and records the required source cut. `rebind` implements
-compiler transport with no new cut or duplicated authority. `check_edge` verifies
-and normalizes incoming facts, including the loop epoch substitution. `agree` and
-`substitute` return data; their enclosing activity performs any required stores or
-cleanup. None of these functions allocates native storage during compilation.
+```text
+BorrowUse = Derive(path: BorrowPath) | Cached(pointer: Operand) | Fixed(pointer: Operand)
+```
+
+`borrow` records a new held borrow. `use` checks that a borrow is live and says how
+to obtain its pointer: derive it from the current headers, reuse the cached pointer,
+or use the stored one; it is a diagnostic for an ended borrow. `store` turns a held
+borrow into a stored one with its materialized pointer. `moves` and `ends` apply the
+table of §2.4 to every overlapping borrow. `move_owner` marks a place `Moved`, ends
+the borrows of its contents and returns its header operand. Pointer transport alone is
+not a use. `agree` and `substitute` return data; their enclosing activity performs any
+required stores or releases. None of these functions allocates native storage during
+compilation.
 
 `Graph.same` compares kinds, native constant bits and ID-consistent graph structure,
 with an explicit bijection for fresh local IDs. It preserves global/word/type
@@ -743,8 +683,7 @@ the evaluation vocabulary; it is not translated back into a second syntax tree.
 The frontend sequences callee/receiver and operand evaluation in separate ordered
 steps. It captures each supplied argument under its receiving requirement before
 evaluating the next; partial applications retain that captured supply. Installing
-an already captured argument at invocation entry uses transport, not another source
-move. Known branch selection invokes only the selected delayed body.
+an already captured argument at invocation entry is not another source move. Known branch selection invokes only the selected delayed body.
 
 `Hosting.supply` never runs the body. `Hosting.apply` requires saturation, then
 enters `evaluating`; source partial application uses `supply`. Native and host
@@ -797,11 +736,10 @@ EvaluationServices {
     add_environment: Environment -> EnvironmentId,
     native_rules: NativeRules,
     request_definition: AttemptId -> Application -> List ValueInfo
-                        -> NativeABI -> WaitMode -> DefinitionId,
+                        -> NativeABI -> DefinitionId,
     branching: Path -> NativeValue -> HostedBody -> HostedBody -> BranchResult,
     looping: Path -> List PlaceId -> ConditionBody -> HostedBody -> LoopResult,
-    mode: EvaluationMode,
-    wait_mode: WaitMode
+    mode: EvaluationMode
 }
 NativeRules {
     result_type: NumericOpcode -> List NativeType -> NativeType,
@@ -820,13 +758,13 @@ Evaluation = {
     field         : Path -> PlaceId -> String -> PlaceId,
     element       : Path -> PlaceId -> NativeValue -> PlaceId,
     address       : Path -> PlaceId -> NativeValue,
-    borrow        : Path -> PlaceId -> AccessPath -> NativeValue,
+    borrow        : Path -> PlaceId -> AccessPath -> Option Range -> NativeValue,
     capture       : Path -> CapturePurpose -> NativeValue -> Capture,
-    transfer      : Path -> HoldingId -> Endpoint -> NativeValue,
-    transport     : Path -> HoldingId -> Endpoint -> NativeValue,
-    copy          : Path -> PlaceId -> Endpoint -> NativeValue,
-    end_value     : Path -> HoldingId -> Unit,
-    storage       : Path -> StorageRequest -> Option NativeValue,
+    move_owner    : Path -> PlaceId -> NativeValue,
+    copy          : Path -> PlaceId -> PlaceId -> Unit,
+    release       : Path -> PlaceId -> Unit,
+    moves         : Path -> Access -> Unit,
+    ends          : Path -> Access -> EndReason -> Unit,
     apply         : Path -> Application -> List Argument -> InvocationResult,
     call          : Path -> Application -> List Argument -> InvocationResult,
     foreign       : Path -> Callee -> List NativeValue -> InvocationResult,
@@ -840,38 +778,37 @@ Evaluation = {
     atomic        : Path -> AtomicOpcode -> NativeValue -> List NativeValue
                    -> MemoryOrder -> Option MemoryOrder -> Option NativeValue,
     fence         : Path -> MemoryOrder -> Unit,
-    start_task    : Path -> TaskPlan -> List NativeValue -> NativeValue,
-    wait          : Path -> NativeValue -> Path,
     mechanism     : Path -> String -> List NativeValue -> Option NativeValue
 }
 ```
 
 All handlers validate path ownership/liveness first. `read` of a named owner in
-value context captures its current holding for the prescribed move; borrowing
-contexts use `borrow`/`address`, never a header-copy escape. `write` dispatches an
-owning assignment to `transfer`; it cannot emit a raw owner-typed `Store`.
+value context is `move_owner`; borrowing contexts use `borrow`/`address`, never a
+header-copy escape. `write` of an owner releases the old value and stores the new
+header (replacement); it cannot emit a raw owner-typed `Store` otherwise. `release`
+evaluates the owner type's release walk. `moves`/`ends` are the effect declarations
+of §3.3. Spawning and waiting are Nua words over `mechanism` (§7.2).
 
 | Verb | Known case | Residual case | Facts changed |
 |---|---|---|---|
 | `compute` | Native rule computes exact result if valid | Emit `Compute`; return `Bits(Result)` | None beyond result/proof registration |
 | `read` | Return valid tracked observation | Emit `Load` and register its complete `ValueInfo` | Observation/owner capture as appropriate |
-| `write` | Replace tracked contents; keep pending store lazy | Emit required store at observation/exposure boundary | Contents and reference/holding facts |
+| `write` | Replace tracked contents; keep pending store lazy | Emit required store at observation/exposure boundary | Contents and borrow facts |
 | `address` | Preserve the exact source place | Flush pending contents before `Address` | Exposure and loss of invalid private knowledge |
 | `branch` | Execute selected body | Build isolated arms and a join | Edge-correlated flow facts |
-| `transfer` | Still requires runtime owner storage | Emit `Storage(TransferOwner)` and its logical cut | Source moved, destination custody, old loans ended |
+| `move_owner` | Still requires the runtime header | Return the header operand; no instruction | Source `Moved`; borrows of its contents ended |
+| `borrow` | Record a held path; no instruction | Same; pointer derived at first use | New live borrow |
 | `call` | HostOnly follows in-place source rule | Request definition; emit `Invoke` even for a known result with effects | Ordered substituted boundary effects |
 | `trap` | Source/host diagnostic when native execution is unavailable | Terminate path with `Trap` | No continuation; no dummy result |
 
 The handler's returned value is not its whole effect. A known result cannot erase
 an invocation, allocation, check, atomic operation or completion that must execute.
-A helper word uses these same handlers; there is no second evaluator for storage.
+Buffer and container words use these same handlers; there is no second evaluator for
+storage.
 `Evaluation.apply` receives saturated supply; the frontend uses `Hosting.supply`
 until then. Untyped callbacks can return host values, words and packs through
 `CallbackResult`; they are not forced into a native result type. A typed body's
-fallthrough is Unit only when its declared result permits Unit. `wait` terminates
-the current block with `SourceWait` and returns its resume path; it does not end
-the logical invocation. The Nua operation word reads its completed result from
-the operation record on that path.
+fallthrough is Unit only when its declared result permits Unit.
 
 ## 6. Control and native-definition construction
 
@@ -894,10 +831,11 @@ EdgeStore { edge: EdgeId, place: PlaceId, value: Operand }
 4. For each live place, keep equal tracked native contents. For unequal values
    of one native type, create a block argument and supply its edge-specific value.
    A place exposed to memory gets its required edge stores before the jump.
-5. For owner/reference components, create one `JoinRelation` with whole incoming
-   rows. Rebind each block argument to its row's actual holding and loans. Do not
-   merge their metadata independently. Apply required conditional-move cleanup
-   on the nonmoving edge before that edge enters the join.
+5. For owner components, each incoming edge supplies its header operand; an owner
+   moved on one edge only is released on the other edges before they enter the join.
+   For borrow components, create a joined borrow per block argument: union of
+   origins, `Ended` if any live incoming edge ended it, no cached pointer unless all
+   edges agree. Record the whole incoming rows in one `JoinRelation`.
 6. Establish missing-initialization/moved facts conservatively: another edge's
    initialized/live state is not permission to read. Check future observations
    against every feasible incoming row.
@@ -906,7 +844,7 @@ EdgeStore { edge: EdgeId, place: PlaceId, value: Operand }
 
 `facts.agree` decides from captured facts; it does not emit stores or evaluate
 source. `branching` owns establishment of that decision, including edge stores,
-loan effects and cleanup, and rejects the whole construction if establishment fails.
+borrow states and owner releases, and rejects the whole construction if establishment fails.
 
 ### 6.2 Loops: entry, header, body, continuing edges, exits
 
@@ -929,29 +867,29 @@ The driver is this sequence, not a generic retry framework:
 3. Evaluate the condition and body in a child draft under the header assumptions.
    Gather `LoopNext(this loop)` separately from breaks, returns and inner-loop edges.
 4. Check every continuing edge. Equal restored contents can preserve an assumption;
-   merely discovering a write/participant does not force a retry. Normalize current
-   owner/loan relations using the epoch substitution in §2.4.
+   merely discovering a write/participant does not force a retry. Join borrow states
+   over the entry and continuing edges as in §6.1: a borrow refreshed in the body is
+   live on the backedge, a stale one carries its `Ended` state into the header.
 5. On `Weaken`, discard that child draft and its contributions, update only the
    named assumptions, and reconstruct that body. Known scalar agreement weakens to
    a typed dynamic value on disagreement; it does not accumulate all encountered
-   constants. Reference information weakens by the existing conservative alias and
-   stable/shared rules, never by a physical root-count limit.
+   constants. Borrow information weakens by widening origins and dropping cached
+   pointers, never by a physical root-count limit.
 6. On `Holds`, establish simultaneous edge captures/stores, add the required budget
    point on each residual cycling edge, and seal the backedges. Complete exiting
    paths at their own continuations. Exit-only changes do not alter the next header.
 
 The analysis domain contains native types, finite source/parameter component paths,
-known-or-dynamic contents, stable/shared guarantees, initialization/move states,
-and current/ended loan relations. Unknown array indices use `AnyElement`; runtime
-cohort sizes are not enumerated. Each header weakening removes an assumption rather
-than allocating a new concrete epoch. Known host unfolding can still fail to
+known-or-dynamic contents, initialization/move states, and live/ended borrows with
+their origins. Unknown array indices use `AnyElement`; runtime cohort sizes are not
+enumerated. Each header weakening removes an assumption. Known host unfolding can still fail to
 terminate; that does not justify a placement-based rejection of a residual program.
 
 ### 6.3 Definition requests, captures and recursive agreement
 
 ```text
 DefinitionKey   { word: WordId, supply: List SpecializationInput,
-                  captures: List CaptureRequirement, abi: NativeABI, wait_mode: WaitMode }
+                  captures: List CaptureRequirement, abi: NativeABI }
 SpecializationInput = KnownNative(type: NativeType, bits: NativeConstant)
                     | DynamicNative(info: InterfaceInfo)
                     | KnownHost(identity: HostId)
@@ -970,13 +908,13 @@ DefinitionRegistry { entries: Map DefinitionId DefinitionEntry,
 HostDependency  = BindingRead(environment: EnvironmentId, name: String, value: Argument)
                 | RawTableRead(table: HostId, key: Argument, value: Argument)
 
-request requester application argument_info abi wait_mode -> DefinitionId
+request requester application argument_info abi -> DefinitionId
 require_capture definition binding mode -> Parameter
 agree_group definitions -> List DefinitionResult
 ```
 
-The key contains no caller-local place, absolute allocation index or concrete loan
-identity. `InterfaceInfo` carries the native reference/storage guarantees. A
+The key contains no caller-local place, allocation address or concrete borrow
+identity. `InterfaceInfo` carries the borrow origins of the arguments. A
 capture of a native value becomes a value parameter; a capture of a native place
 becomes a Ref parameter to that same place. Capture order is stable first discovery
 order after explicit parameters. Calls fill those parameters from their own path,
@@ -997,7 +935,7 @@ The definition driver:
 
 1. Register the requested identity before evaluating its body. Recursive calls
    reference that identity, not a depth-specific definition.
-2. Evaluate with fresh formal native parameters, parameter-relative holdings/loans
+2. Evaluate with fresh formal native parameters, stored borrows relative to them
    and the same evaluation vocabulary. Discover captures and dependencies in owned
    draft state. No outward contract is published yet.
 3. Build the reachable call graph and its strongly connected components. Insert
@@ -1022,101 +960,53 @@ The definition driver:
 ```text
 capture observed value
     -> run remaining source activity completion in lexical order
-    -> wait for separately legal protectors / joins
-    -> transfer complete result to the receiver
-    -> end remaining local holdings
-    -> apply pending caller-side native cuts at caller completion
-    -> validate returned borrows
+    -> write the result header into the receiver's place (owners) or return it
+    -> release remaining local owners in reverse declaration order
+    -> end the local lifetimes; check that no returned borrow names a local
     -> continue caller, or emit native Return
 ```
 
-For a native boundary, callee-side transfer/local completion precede its `Return`;
-the pending cuts and returned-borrow validation are caller-side operations. The
-sequence above is across both sides of that boundary, not code placed after a
-terminator in the callee. Inline completion has no native ABI return.
+For a compiled word the receiver is the caller's result slot, which exists before the
+callee's frame disappears. Releasing a local owner evaluates its typed release walk at
+that point; a frozen source cannot move early, and a legal capture cannot be delayed
+past a mutation that would change its value. Inline completion has no native ABI
+return.
 
-The receiver exists before a native callee's frame disappears. Complete holdings
-survive legal waits. A frozen source cannot move early; a legal capture cannot be
-delayed past a mutation that would change its value. The caller-side cut remains
-at caller completion even if physical retirement earlier moved no payload.
+## 7. Storage, tasks and backend readiness
 
-## 7. Realization, task planning and backend readiness
+### 7.1 No storage realization
 
-### 7.1 Realization work and protocol checks
+Storage needs no late phase. Buffer words are evaluated where their source operation
+occurs (§3.3); owner release is evaluated by scope completion, conditional-move edges,
+replacement and returns (§6.1, §6.4). The graph that leaves evaluation contains only
+the instruction kinds of §3.2, all of them ready for the optimizer and the backends.
 
-```text
-RealizationSite = AtInstruction(instruction: InstructionId) | AtTerminator(block: BlockId)
-RealizationWork { input_revision: U64, writer: GraphWriter,
-                  pending: List RealizationSite, completed: Map RealizationSite Realization,
-                  definitions: Set DefinitionId }
-Realization     { source: RealizationSite, origin: OriginId, word: WordId,
-                  entry: BlockId, exits: Set BlockId,
-                  generated: Set InstructionId, protocol: Option StorageProtocol }
-StorageProtocol { prepare: Set BlockId, ready: Set EdgeId,
-                  commit: Set BlockId, retire: Set BlockId,
-                  operation_record: Operand, current_custody: List Operand }
+Storage consistency at a trap comes from the order every buffer word follows: build the
+new storage completely, write the header, then release what it replaced. A header write
+is a `Store` that cannot trap; moving an owner writes headers only. The verifier checks
+that no `Check`, `Invoke` or `Mechanism` that may trap sits between the header writes of
+one owner move. No recovery record or publication region exists.
 
-realizing program analysis bindings -> (Program, Analysis)
-```
+### 7.2 Tasks: native stacks and context switches
 
-The worklist starts with reachable `Storage`, `StartTask` and `SourceWait` sites.
-For each site, use the already captured operands to evaluate its selected Nua word
-or generate its typed step/frame control. Adopt the resulting blocks and definition
-requests into the same program. Enqueue newly introduced logical sites. Type schema
-recursion visits owning fields/active sums/initialized ranges; runtime lengths
-remain native loops. Raw metadata allocation does not invoke ordinary owner
-construction recursively. This is the selected bootstrap boundary.
+A task runs on its own nonmoving native stack ([tasks](tasks.md),
+[buffers §2.6](buffers.md#26-tasks-and-waits)). Spawning, waiting and
+budget service are ordinary Nua words of the scheduler library:
 
-`StorageProtocol` names real blocks/edges, not a Boolean “trusted” label. Verification
-checks all reachable commit instructions and transitive call effects: no allocation,
-fallible arithmetic/check, user callback, foreign reentry, wait, budget or runtime-
-length loop. Prepared resources are registered before another fallible action;
-retirement entries cannot cover one allocation twice. Recovery state/cursors are
-in durable native records, not Lua builders or abandoned native frames. Raw-kernel
-correctness additionally requires independent runtime ledgers/failure injection;
-a graph certificate alone is not a proof of an allocator algorithm.
+- `spawn` captures values in order, takes a stack (a pinned reservation of bytes with
+  a guard page) and a context through mechanisms, moves the captured owners into the
+  start record and publishes the child.
+- A **source wait** registers its operation and switches context. A **budget point**
+  switches context. Both keep the actual native frames, including words compiled on
+  their own; resuming returns to the native continuation. The resumed wait reads the
+  completed result from its operation record.
+- Every residual Nua cycle has budget coverage (§7.3). Opaque foreign extents defer
+  service; a word whose effects include `may_wait` cannot become a C callback.
 
-A realized helper's logical effects remain in its checked call/site contract and
-explicit `LoanCut`s. Pure SSA/header transport is not assigned another transfer cut.
-The `Realization` source ID is historical provenance; all executable targets in
-its generated set resolve in the current graph. Rewriting that region invalidates
-its protocol record and requires rechecking it.
-
-### 7.2 Task data and the two continuation kinds
-
-```text
-TaskPlan        { id: TaskId, entry: DefinitionId, frame_type: NativeType,
-                  captures: List TaskCapture, waits: Map BlockId WaitState,
-                  native_stack_bytes: U64, origin: OriginId }
-TaskCapture     { field: String, type: NativeType, source: Operand, info: ValueInfo }
-WaitState       { number: U32, operation_field: String, resume: BlockId,
-                  live_fields: List String }
-TaskResume      = Start | SourceResume(state: U32) | BudgetResume
-```
-
-These are compiler plans for the approved runtime records. Runtime task state
-includes the typed frame, native stack/context, storage context, executor affinity,
-run state and resume kind specified in [region completion §7](region-completion.md#7-native-tasks-without-a-second-evaluator).
-
-- `StartTask` captures values in order, constructs/registers frame/control/context/
-  stack resources, then publishes the child through ordinary Nua scheduler words.
-- In TaskSuspending mode, `SourceWait` assigns a `WaitState`, stores live values
-  in the typed frame and returns the waiting step status. Source-resume completion/Slot adoption occurs
-  once. PlainBlocking mode instead calls the Nua plain-wait driver, with the approved
-  worker/no-worker execution policy. NoSourceWait bodies are rejected at the source
-  operation; they are not silently converted to either form.
-- `Budget` calls the trusted Nua budget entry. It saves the actual native continuation
-  on the nonmoving task stack; it does not store a source state number or replay
-  arguments. Nua scheduler policy handles service rounds, seed draws and affinity.
-- Every residual Nua cycle has budget coverage. Known recursive native-call SCC
-  edges charge after argument capture and before callee entry. Storage walks use
-  completed bounded steps; COMMIT has none. Opaque foreign extents defer service.
-- Variable-size cleanup finishes on the task stack before DONE. Only fixed release
-  after permanent switch-out runs on the scheduler stack. No second step may run
-  while a budget continuation remains claimed.
-
-Both C and JIT preserve these distinctions. The context platform port, guard/probe
-rules and fatal task trap policy are not replaceable by an OS-thread fallback.
+There is no typed frame, step function, wait state or wait mode. `TaskEntry` is the
+trusted runtime ABI of a task's entry definition. Both C and JIT emit the same graph;
+the context platform port, guard/probe rules and fatal task trap policy are not
+replaceable by an OS-thread fallback.
 
 ### 7.3 Preparation order and invalidation
 
@@ -1129,19 +1019,16 @@ ReadyCertificate { revision: U64, definitions: Set DefinitionId }
 The selected driver order is:
 
 1. Close reachable native-definition groups and verify semantic graph/contracts.
-2. Realize storage, task construction and source waits; include helper definitions
-   in closure and contract checking.
-3. Run optional folding, reachability and dead pure-result elimination on this graph.
-4. Add/verify budget coverage for the resulting loop and native-call cycles, then
+2. Run optional folding, reachability and dead pure-result elimination on this graph.
+3. Add/verify budget coverage for the resulting loop and native-call cycles, then
    recompute affected graph/alias/effect/lifetime facts, including switching effects.
-   Verify storage publication regions. A newly discovered semantic effect that
-   invalidates construction targets its owning attempt; it is not ignored because
-   an optimizer already ran.
-5. Verify backend readiness and produce `ReadyCertificate` for exactly this revision.
+   A newly discovered semantic effect that invalidates construction targets its
+   owning attempt; it is not ignored because an optimizer already ran.
+4. Verify backend readiness and produce `ReadyCertificate` for exactly this revision.
 
 The optional optimizer has eight rounds, stopping earlier on graph-aware equality.
-Every round must preserve a valid program. Mandatory agreement/realization has no
-“publish at cap” path. A structural change after step 5 invalidates the certificate.
+Every round must preserve a valid program. Mandatory agreement has no
+“publish at cap” path. A structural change after step 4 invalidates the certificate.
 No backend accepts a bare `Program` without a matching certificate.
 
 `task_access` propagates parameter/global/callback origins across the reachable
@@ -1156,12 +1043,11 @@ foreign contract; the checker does not claim to inspect arbitrary C.
 | `shape` | Nominal kinds, exact fields, dense lists, registered native types/opcodes/bindings |
 | `graph` | Unique identities, complete targets, one terminator, edge arity, SSA dominance |
 | `types` | Operand/result/native ABI rules; initialized/tag/index proofs; no raw owner Store |
-| `lifetimes` | Use/kill order, explicit lifetime starts/ends, correlated joins, unique custody, current loan relations, complete exits |
-| `task_access` | Reachable task/blocking/callback accesses; global policy, pointer origins and sendability |
-| `publication` | PREPARE/READY/COMMIT/RETIRE regions, transitive effects, recovery records, budget exclusion |
-| `ready` | All preceding checks; no Storage/StartTask/SourceWait; closed helper graph; budget coverage; target mechanisms available |
+| `lifetimes` | Lifetime starts/ends, borrow uses against `Moves`/`Ends` in order, correlated joins, owner linearity, no trapping site between the header writes of one owner move, complete exits |
+| `task_access` | Reachable task/blocking/callback accesses; global policy, pointer origins and sendability; no `may_wait` callee as a C callback |
+| `ready` | All preceding checks; closed definition graph; budget coverage; target mechanisms available |
 
-`LifetimeStart`, `LifetimeEnd`, `Borrow` and `LoanCut` remain checked zero-machine-code
+`LifetimeStart`, `LifetimeEnd`, `Moves` and `Ends` remain checked zero-machine-code
 events, not unresolved physical work. A materialized reference still needs its
 separate address/packed operand. `Budget` and `Mechanism` are executable effects. Backend adapters cannot
 classify these kinds together as ignorable bookkeeping.
@@ -1179,7 +1065,6 @@ All family handlers have `(node, recurse, ...)`. These are the selected operatio
 | `fold` | List Instruction | Evolving native-value facts; own replacement output |
 | `reach` | Reachability map | Worklist over actual CFG, not a forward-label flag |
 | `sweep` | List Instruction | Liveness and effect/validity facts; own output |
-| `realize_instruction` | GraphFragment | Realization-owned pending sites and definitions |
 | `emit_c` | Unit | C emitter's declarations, labels and text buffer |
 | `emit_jit` | Unit | JIT emitter's handle maps and resource owner |
 
@@ -1231,8 +1116,8 @@ by statements, never delegated to unspecified C argument evaluation order.
 
 The root creates identity, reporting, bridge and definition-registry instances,
 installs the Nua source loader, and binds `Hosting` to `evaluating`. It supplies
-`request` to evaluation and the evaluation function back to definition/control/
-realization activities. Hosting collects the actual export requests. The root
+`request` to evaluation and the evaluation function back to the definition, control
+and budget activities. Hosting collects the actual export requests. The root
 closes those requests, calls `prepare`, calls the selected backend adapter, restores
 its loading/bridge scopes, and returns `CompilationProduct`. It does not publish
 partial output when a child construction was refused.
@@ -1260,112 +1145,86 @@ local transform = affine 4 3
 
 ### 8.2 Owners, observations and current contents
 
-The first source situation selects an ordering of two independent owners A/B.
-A header alias must not retarget when A moves; an earlier scalar observation must
-not change. The following loop then exercises replacement through a persistent H.
-The schema below omits only native type spelling, not the choice/custody edges. It is an architectural trace, not a test-run report.
+The first source situation selects an ordering of two independent owners A/B. A
+header alias must not follow a moved owner; an earlier scalar observation must not
+change. It is an architectural trace, not a test-run report.
 
 ```text
 entry facts:
-    A -> Tracked(Owned(type=T, header=%a, holding=ha, endpoint=InPlace(A)))
-    B -> Tracked(Owned(type=T, header=%b, holding=hb, endpoint=InPlace(B)))
-    ha.endpoint = InPlace(A); hb.endpoint = InPlace(B)
-    epochs[A] = EntryEpoch(A); epochs[B] = EntryEpoch(B)
+    A -> Tracked(Owned(type=T, header=%a)); B -> Tracked(Owned(type=T, header=%b))
 
 body:
     %before = Load A.count
-    %alias  = Address A
+    %alias  = Address A                       -- a borrow of A's header
     Branch %choice -> choose_a(), choose_b()
 
 choose_a:
-    capture actual A; transfer ha -> InCapture(%left_a)
-    capture actual B; transfer hb -> InCapture(%right_a)
-    Jump join(%left_a, %right_a)
+    move A (A: Moved); move B (B: Moved)
+    Jump join(%a, %b)
 
 choose_b:
-    capture actual B; transfer hb -> InCapture(%left_b)
-    capture actual A; transfer ha -> InCapture(%right_b)
-    Jump join(%left_b, %right_b)
+    move B (B: Moved); move A (A: Moved)
+    Jump join(%b, %a)
 
 join(%left, %right):
-    JoinRelation rows are:
-      choose_a edge: left owns ha; right owns hb
-      choose_b edge: left owns hb; right owns ha
-    ... use/end left; observe right ...
+    each Owned block argument is consumed exactly once below
+    ... use/release left; observe right; release right ...
 ```
 
-The alias to A still names A, not whichever joined result owns ha. The count
-observation still means `%before`, not a fresh read through `%alias`. Actual owner
-moves end their old contents loans on their edges. The selected result transports
-its actual region handle; no header comparison reconstructs the branch. An empty
-owner has the same custody requirements as a nonempty one.
+The alias to A still names A's place, now `Moved`; using it through the header is
+rejected. The count observation still means `%before`, not a fresh read through
+`%alias`. Moving A and B ended the borrows of their contents. No holding identity or
+join relation is needed: the block arguments carry the headers, and linearity checks
+that each is consumed once.
 
-For replacement of a separate live H in a loop, these interfaces produce:
+For replacement of a live owner H inside a loop, with a view of its contents:
 
 ```text
-header(%current_header, %refreshed_view):
-    H.epoch = HeaderEpoch(header, H)
-    view.loan.subject = ContentsOf(H, position, HeaderEpoch(header, H))
-    ... observe view ...
-    Storage TransferOwner(source=next_holding, destination=InPlace(H), kind=SourceTransfer)
-    LoanCut(H, position, OwningTransfer)
-    H.epoch = CutEpoch(transfer_site, H)
-    view2 = borrow(H, position)       -- new loan of that current epoch
+header(%view):
+    use %view                                  -- borrow v (Held, origins H.contents)
+    %next = build replacement                  -- a new owner
+    replace H with %next                       -- releases old H; v: Ended(Replaced)
+    %view2 = view H 0 n                        -- borrow v2, Live
     Budget LoopEdge
-    Jump header(H.header, view2)
+    Jump header(%view2)
 ```
 
-The backedge verifies `view2` against its current H before renaming both to the
-header relation. Supplying the earlier view instead fails: its HeaderEpoch is not
-the backedge's CutEpoch. Reusing that printed site on another runtime iteration
-never revives the earlier loan.
-
-Realization replaces the `Storage` site with `regions.transfer T SourceTransfer` through
-`Evaluation`. Its result has recorded prepare/commit/retire blocks; current custody
-is published before old exclusive blocks retire. The existing `LoanCut` is linked
-to that source transition, not duplicated for helper copies. C/JIT receive the same
-verified blocks. Plain recovery uses the operation/domain records; task traps stay
-fatal. No completed replacement retains obsolete blocks merely because a later
-owner happened to allocate after them.
+At the header, the entry edge supplies a live view and the backedge supplies v2, live:
+the header borrow is live. Passing `%view` on the backedge instead supplies an ended
+borrow; its use at the top of the next round is rejected. A growth of H instead of a
+replacement would only drop v's cached pointer: the view survives and is derived again.
 
 ## 9. Acceptance and implementation boundary
 
 The first replacement milestone must connect actual Mua hosting, these evaluation
-interfaces, owner/reference/partial-move facts, control agreement, Nua storage
-realization and one backend product. A scalar-only evaluator or a family declaration
+interfaces, owner linearity and borrow facts, control agreement, buffer words in Nua
+and one backend product. A scalar-only evaluator or a family declaration
 library is not that milestone. Task/platform implementation follows the same selected
 interfaces; it is not grounds to weaken the architectural contract meanwhile.
 
 The concrete acceptance set is:
 
 1. Load every family/pass with contracts enabled; reject missing handlers, unknown
-   fields, sparse node lists and malformed graph/owner/loan facts.
+   fields, sparse node lists and malformed graph/owner/borrow facts.
 2. Host real Nua source for partial/known/mixed supply, earlier observations, branch
    correlation, partial moves, current-header replacement and refreshed/stale loops.
 3. Repeat and nest factories; reject stale writers; accept child then reject parent;
    verify independent prior output and surviving prefix/sibling state are unchanged.
 4. Exercise definition capture, argument/fresh results, recursive forwarding and
    combination, ordered aliased kill/use, and nonreturning call prefixes.
-5. Independently account for raw acquisition, current custody, preparation failure,
-   publication, obsolete retirement, shared-fragment escape and surviving globals.
-6. Verify task source/budget resume separation, single executing continuation,
-   foreign fencing, long storage work, cleanup-before-DONE and seeded service rounds.
+5. Account every allocation against an independent ledger (freed exactly once,
+   never twice), including recursion, conditional moves and replacement; after traps
+   at every buffer word, globals and caller storage are valid (leaks reported).
+6. Verify waits and budget switches inside compiled words, a single executing
+   continuation, foreign fencing, cleanup-before-DONE and seeded service rounds.
 7. Compare known results, unoptimized/optimized prepared execution and C/JIT against
    independent expected values/effect/resource traces. Agreement between shared
    handlers/backends alone is not an independent oracle.
 
-Positive partners must accompany refusals: refreshed versus stale loan; stable
-independent growth versus genuinely shared invalidation; valid large/late target
-cohorts versus an actual lifetime violation. An optimizer limit may reduce
+Positive partners must accompany refusals: refreshed versus stale borrow; a held
+borrow surviving growth versus a stored one ending; a pinned buffer's stored borrow
+surviving growth; valid large/late target cohorts versus an actual lifetime violation. An optimizer limit may reduce
 optimization, not accepted source coverage or correctness.
-
-The historical [activities](compiler-activities-experiment.md),
-[completion](compiler-completion-experiment.md), [native-boundary](compiler-boundary-experiment.md),
-[join](compiler-join-experiment.md) and [regional](compiler-region-experiment.md)
-experiments remain unchanged evidence. Their fixed positions/ports and counts do
-not implement or validate this region architecture. Their raw failures remain
-preserved. This document replaces the earlier deferred constructor/API descriptions;
-it does not rewrite their reports or claim their probes implement these schemas.
 
 The method is Mua's [compiler guide](https://github.com/cperion/mua/blob/b93e36fa75c9d23cc1e68c70bdb5834e8c17b476/docs/writing-compilers.md):
 name the data, list the operations, give each activity its state and completion.
