@@ -91,9 +91,19 @@ local words = do(T, V)
     return members
 end
 
+-- `view_of(p, n, body)` (syntax §12.6): a read-only view of foreign elements lent to the body:
+-- it borrows a loan that ends with the body, so it cannot escape it
+local foreign_view = do(pointer, count, body): Inferred
+    local loan: U8 = 0
+    local result = body(loaned_view(Ref loan, pointer, count))
+    end_loan(Ref loan)
+    return result
+end
+
 -- the members of every view type (syntax §16.1: served once per family)
 family(Slice, |element, view_type| -> words(element, view_type))
 
 return define
     .words
+    .foreign_view
 end

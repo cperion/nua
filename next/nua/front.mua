@@ -178,13 +178,25 @@ local generating = do(filename, start_line)
     -- requirement it fills decides whether it is read, moved or lent (syntax §9.2)
     -- (`by_place`: `Ptr` and `copy`, whose element arguments are places too)
     local supplied = do(nodes, by_place)
-        local items = {}
+        local items, spreads = {}, false
         for index, node in ipairs nodes do
             local place = node.k == "name" and lookup(node.name) == "cell" and node.name
                 or node.k == "field" and place_chain(node.obj) and (by_place or node.obj.k ~= "index") and target(node)
                 or by_place and node.k == "index" and place_chain(node) and target(node)
-            items[index] = ("__capture(%d, %s)"):format(index, place or expression node)
+            if node.k == "spread" then
+                spreads = true
+                items[index] = "for _, __item in ipairs(__E.pack_items(__path, " .. expression node.e .. ")) do __n = __n + 1; __a[__n] = __capture(__n, __item) end"
+            else
+                items[index] = place or expression node
+            end
         end
+        if spreads then
+            for index, node in ipairs nodes do
+                if node.k ~= "spread" then items[index] = "__n = __n + 1; __a[__n] = __capture(__n, " .. items[index] .. ")" end
+            end
+            return "function(__capture) local __n, __a = 0, {}; " .. table.concat(items, "; ") .. "; return __a end"
+        end
+        for index in ipairs nodes do items[index] = "__capture(" .. index .. ", " .. items[index] .. ")" end
         return ("function(__capture) return { %s } end"):format(table.concat(items, ", "))
     end
     local lambda_arm = node -> ("function(__path) return %s end"):format(expression node)
@@ -424,7 +436,6 @@ local generating = do(filename, start_line)
         if receiver then parameters[1] = { name = "self", receiver = receiver } end
         for _, parameter in ipairs fn.params do parameters[#parameters + 1] = parameter end
         for index, parameter in ipairs parameters do
-            if parameter.rest then fail("a rest requirement is not available yet", parameter.line) end
             local annotation = parameter.receiver and ("__nua.receiver(%s)"):format(parameter.receiver)
                 or parameter.type and host_expression parameter.type or "nil"
             requirements[index] = ("{ name = %q, type = %s }"):format(parameter.name, annotation)
@@ -439,6 +450,11 @@ local generating = do(filename, start_line)
                 declare(parameter.name, "cell")
             end
             emit(table.concat(bindings, " "))
+            -- `..args`: a pack, second-class: a host value of the body (syntax §10.8)
+            if fn.rest then
+                emit((" local %s = __E.rest_argument(__path);"):format(fn.rest))
+                declare(fn.rest, "host")
+            end
             if fn.expr then
                 statement { k = "return", exprs = { fn.expr }, line = fn.expr.line }
             else
@@ -447,8 +463,8 @@ local generating = do(filename, start_line)
         end))
         local has_tail_calls = tail_calls
         tail_calls = outer_tail_calls
-        return ("__nua.word { name = %s, source = %q, line = %d, requirements = { %s }, result = %s, tail_calls = %s, body = function(__E, __path) %s return __E.fall(__path) end }"):format(
-            quote(name or fn.name or "a word"), filename, fn.line or line, table.concat(requirements, ", "), result, tostring has_tail_calls, body)
+        return ("__nua.word { name = %s, source = %q, line = %d, requirements = { %s }, result = %s, tail_calls = %s, rest = %s, body = function(__E, __path) %s return __E.fall(__path) end }"):format(
+            quote(name or fn.name or "a word"), filename, fn.line or line, table.concat(requirements, ", "), result, tostring has_tail_calls, fn.rest and "true" or "false", body)
     end
 
     return define

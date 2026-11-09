@@ -145,6 +145,16 @@ return do(E, core)
         return wrap(E.apply(binding.path, primitive, arguments, false))
     end
 
+    -- the bytes of a view of static text, or nil
+    local static_view = do(value)
+        if not (E.is_view value) then return nil end
+        local form = core.compilation.borrows[value.borrow].form
+        local pointer = data.BorrowForm.is(form, data.Stored) and form.pointer
+        if not (pointer and data.Operand.is(pointer, data.Constant) and data.NativeConstant.is(pointer.bits, data.AggregateBits)) then return nil end
+        local start, count = pointer.bits.parts[1], pointer.bits.parts[2]
+        if not data.NativeConstant.is(start, data.StaticAddress) then return nil end
+        return start.bytes:sub(start.offset + 1, start.offset + tonumber(count.bits))
+    end
     -- whether a native value is known while compiling, all of it
     local known
     known = do(value)
@@ -157,7 +167,7 @@ return do(E, core)
             return true
         end
         if NativeValue.is(value, data.Tagged) then return value.payload == nil or known(value.payload) end
-        return false
+        return static_view(value) ~= nil
     end
 
     -- a saturated application from Lua (syntax §3.7, compiler activities §5.1): inside a call
@@ -190,13 +200,21 @@ return do(E, core)
     E.same_value = |a, b| -> facts.same_value(unwrap a, unwrap b)
 
     -- `is_known(v)`: whether a value is known while compiling (a Lua value always is)
-    E.is_known = value -> known(lua_type value == "table" and wrapped[value] or value)
+    E.is_known = do(value)
+        local inner = lua_type value == "table" and wrapped[value] or value
+        -- a reference stands for what it reaches, on the path of the call
+        if is_native inner and is_place inner and bridge.active() then inner = E.deref(bridge.active().path, inner) end
+        return known(inner)
+    end
 
     -- `host(v)`: the Lua value of a value known while compiling (syntax §3.7)
     E.host_value = do(value)
         value = lua_type value == "table" and wrapped[value] or value
+        if is_native value and is_place value and bridge.active() then value = E.deref(bridge.active().path, value) end
         if not is_native value then return value end
         if not known(value) then error("host: the value is not known while compiling", 2) end
+        local text = static_view value
+        if text then return text end
         if NativeValue.is(value, data.Bits) then
             local constant = value.operand
             if rules.is_integer constant.type then

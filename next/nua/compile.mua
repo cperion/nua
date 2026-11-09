@@ -15,6 +15,7 @@ local data = require "nua.compiler.data"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local hosting = require "nua.compiler.hosting"
+local rules = require "nua.compiler.rules"
 local evaluate = require "nua.compiler.evaluate"
 local definitions_module = require "nua.compiler.definitions"
 local verify = require "nua.compiler.verify"
@@ -44,8 +45,8 @@ local prelude = define
     Str = types.Str
     Ptr = types.pointer
     Ref = types.reference
-    Buffer = types.buffer
-    Grow = types.buffer
+    Buffer = types.growable
+    Grow = types.growable
     Slice = types.slice
     Text = types.buffer types.U8
     size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
@@ -69,6 +70,7 @@ local new_compilation = do()
         place_scope = {}
         borrows = {}
         exports = {}
+        globals = {}
         .origins
         origin = do(origin_source, line)
             local key = tostring origin_source .. ":" .. tostring line
@@ -146,9 +148,10 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret", "hold_structure", "release_structure", "null", "static_cstring" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    for _, name in ipairs { "trap", "moves", "ends", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret", "hold_structure", "release_structure", "null", "static_cstring", "buffer_view", "loaned_view", "raw_view", "view_as", "end_loan" } do environment[name] = hosting.primitive(name, E.host_primitive) end
     environment.copy = hosting.primitive("copy", E.host_primitive, true)
     environment.owns = types.owns
+    environment.Inferred = hosting.Inferred
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
     environment.family = types.define_family
     -- `host(v)`: the Lua value of a known value (syntax §3.7); `type_of(v)`: a staged value's
@@ -163,6 +166,37 @@ local hosting_environment = do(compilation, filename, E)
         return hosting.foreign({ .name, .parameters, .result, header = options.header, variadic = options.variadic == true }, do(foreign, arguments)
             error(("%s is a foreign function: it is applied inside an evaluation, never while compiling at top level"):format(name), 3)
         end)
+    end
+    -- a Text of its own limit (syntax §9.12)
+    types.define_member(types.buffer types.U8, "pinned", types.buffer(types.U8, true))
+    -- `global(T, options)` (syntax §21.1): the `Ptr T` of a C object
+    local global_count = 0
+    environment.global = do(native_type, options)
+        options = options or {}
+        if not check(types.NativeType, native_type) then error("global takes a native type, got " .. tostring native_type, 2) end
+        if native_type == types.Unit or types.borrows native_type or types.NativeType.is(native_type, types.OpaqueType) then
+            error(("a global cannot be %s"):format(types.describe native_type), 2)
+        end
+        if (options.exported or options.imported) and not options.name then error("an exported or imported global needs a name", 2) end
+        global_count += 1
+        local c_name = (options.exported or options.imported) and options.name or ("nua_global_%s_%d"):format((options.name or "unnamed"):gsub("[^%w_]", "_"), global_count)
+        local policy = options.thread_local and "thread_local" or options.shared and "unchecked_shared" or types.owns native_type and "thread_affine_owner" or "plain"
+        local zero = data.Constant { type = native_type, bits = data.ZeroBits {} }
+        local initial = options.init and (rules.is_float native_type and rules.float(native_type, options.init) or rules.integer(native_type, options.init)) or zero
+        local id = compilation.supply.fresh identity.GlobalId
+        compilation.globals[id] = data.Global with
+            .id
+            name = c_name
+            type = native_type
+            initializer = data.StaticValue { value = initial.bits }
+            .policy
+            lifetime = compilation.supply.fresh identity.LifetimeId
+            origin = compilation.origin(filename, 0)
+            exported = options.exported == true
+            imported = options.imported == true
+            header = options.header
+        end
+        return data.Bits { type = types.pointer native_type, operand = data.Constant { type = types.pointer native_type, bits = data.SymbolAddress { name = c_name, offset = 0 } } }
     end
     environment.opaque = types.opaque
     environment.CString = types.CString
@@ -246,6 +280,8 @@ local compiling_with_members = do(source, filename)
     environment.import "buffer"
     environment.import "slice"
     environment.import "array"
+    environment.view_of = environment.import("slice").foreign_view
+    types.slice.of_raw(|pointer, count, view_type| -> environment.raw_view(pointer, count, view_type))
     environment.Chars = environment.import("chars").Chars
     environment.Store = environment.import("store").Store
     environment.Id = environment.import("store").Id
@@ -265,7 +301,7 @@ local compiling_with_members = do(source, filename)
         revision = 0
         .definitions
         words = registry.words()
-        globals = {}
+        globals = compilation.globals
         .exports
         lifetimes = {}
         origins = compilation.origins

@@ -70,7 +70,7 @@ local Fields = define
             { name = "length", type = types.U64 },
             { name = "capacity", type = types.U64 },
         }
-        if node.pinned then fields[4] = { name = "limit", type = types.U64 } end
+        if node.reserved then fields[4] = { name = "limit", type = types.U64 } end
         return fields
     end
     FunctionType = no_fields
@@ -121,6 +121,7 @@ local record_declarations = do(program)
         for _, field in ipairs(fields_of native_type) do fields[#fields + 1] = ("%s %s;"):format(c_type field.type, field.name) end
         order[#order + 1] = ("typedef struct %s { %s } %s;"):format(record_name native_type, table.concat(fields, " "), record_name native_type)
     end
+    for _, global in pairs program.globals do visit(global.type) end
     for _, definition in ipairs(graph.definitions_in_order program) do
         for _, parameter in ipairs definition.signature.parameters do visit(parameter) end
         visit(definition.signature.result)
@@ -214,7 +215,7 @@ local Constants = define
         return ("((%s){ %s })"):format(c_type constant.type, table.concat(parts, ", "))
     end
     StaticBytes = unspelled_constant
-    SymbolAddress = unspelled_constant
+    SymbolAddress = |bits, recurse, constant| -> ("((%s)&%s)"):format(c_type constant.type, bits.name)
     ZeroBits = |bits, recurse, constant| -> ("((%s)%s)"):format(c_type constant.type, zero_initializer constant.type)
     StaticAddress = |bits, recurse, constant| -> ("((%s)%s + %d)"):format(c_type constant.type, c_string bits.bytes, bits.offset)
     DefinitionAddress = unspelled_constant
@@ -613,8 +614,27 @@ local emit = do(program)
     end
     local declarations = record_declarations program
     if #declarations > 0 then parts[#parts + 1] = table.concat(declarations, "\n") .. "\n" end
+    -- globals (syntax §21.1): static objects, thread-local or exported as asked
+    local global_text = {}
+    local ordered_globals = {}
+    for _, global in pairs program.globals do ordered_globals[#ordered_globals + 1] = global end
+    table.sort(ordered_globals, |a, b| -> a.id.serial < b.id.serial)
+    for _, global in ipairs ordered_globals do
+        if global.imported then
+            if global.header == nil then global_text[#global_text + 1] = ("extern %s %s;"):format(c_type global.type, global.name) end
+        else
+            local storage = (global.exported and "" or "static ") .. (global.policy == "thread_local" and "__thread " or "")
+            local value = global.initializer.value
+            local zeroed = data.NativeConstant.is(value, data.ZeroBits)
+            local initial = zeroed and (" = " .. zero_initializer global.type) or (" = " .. constant_text(data.Constant { type = global.type, bits = value }))
+            global_text[#global_text + 1] = ("%s%s %s%s;"):format(storage, c_type global.type, global.name, initial)
+        end
+    end
     -- foreign functions: a header included, or a prototype
     local headers, foreign = {}, {}
+    for _, global in ipairs ordered_globals do
+        if global.imported and global.header then headers[global.header] = true end
+    end
     for _, definition in ipairs ordered do
         for _, block in ipairs definition.blocks do
             for _, instruction in ipairs block.instructions do
@@ -641,6 +661,7 @@ local emit = do(program)
     for _, prototype in pairs foreign do sorted[#sorted + 1] = prototype end
     table.sort sorted
     if #sorted > 0 then parts[#parts + 1] = table.concat(sorted, "\n") .. "\n" end
+    if #global_text > 0 then parts[#parts + 1] = table.concat(global_text, "\n") .. "\n" end
     parts[#parts + 1] = table.concat(prototypes, "\n") .. "\n"
     -- a host declaring the exports needs the records they use first
     local interface = {}

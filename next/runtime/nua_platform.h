@@ -48,6 +48,31 @@ static inline uint8_t *nua_storage_context(void) {
 
 static inline uint64_t nua_ledger_mapped_bytes(void) { return nua_ledger_bytes; }
 
+/* a pinned buffer: its limit reserved as address space, committed from the start as it grows */
+static inline uint8_t *nua_reserve_range(uint64_t bytes) {
+    void *range = mmap(0, (size_t)bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (range == MAP_FAILED) {
+        fprintf(stderr, "nua: cannot reserve %llu bytes\n", (unsigned long long)bytes);
+        abort();
+    }
+    nua_ledger_bytes += bytes;
+    return (uint8_t *)range;
+}
+
+static inline void nua_commit_range(uint8_t *range, uint64_t bytes) {
+    uint64_t page = 4096;
+    uint64_t rounded = (bytes + page - 1) / page * page;
+    if (mprotect(range, (size_t)rounded, PROT_READ | PROT_WRITE) != 0) {
+        fprintf(stderr, "nua: cannot commit %llu bytes\n", (unsigned long long)rounded);
+        abort();
+    }
+}
+
+static inline void nua_release_range(uint8_t *range, uint64_t bytes) {
+    munmap(range, (size_t)bytes);
+    nua_ledger_bytes -= bytes;
+}
+
 /* the process's hash key, read from the system once */
 #include <sys/random.h>
 static inline uint64_t nua_hash_seed(uint64_t which) {

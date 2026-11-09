@@ -409,6 +409,32 @@ return do(E, core)
         if cells.is_raw(reached) then return E.load(path, reached.place) end
         return E.deref(path, E.reached_value(path, reached))
     end
+    -- a reference to element `index` of a buffer reached through a stored reference: a fixed
+    -- pointer computed from the header now (a stored borrow: growth ends it)
+    E.stored_element = do(path, reference, index)
+        index = E.from_host(path, types.U64, index, "the index")
+        local info = compilation.borrows[reference.borrow]
+        local header = E.deref(path, reference)
+        local data_pointer = E.part(path, header, "data")
+        local element_type = reference.type.target.element
+        local reference_type = types.reference element_type
+        local pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index })
+        local operand = E.compute(path, "reinterpret", reference_type, { pointer }).operand
+        local origins = {}
+        for _, origin in ipairs info.origins do
+            local extended = {}
+            for position, step in ipairs origin.path do extended[position] = step end
+            extended[#extended + 1] = data.ContentsStep {}
+            extended[#extended + 1] = data.AnyElement {}
+            origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+        end
+        local element = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = data.Stored { pointer = operand }, .origins, acquired = origin_of path, source = reference.borrow }
+        compilation.borrows[element.id] = element
+        path.flow.borrows[element.id] = path.flow.borrows[reference.borrow]
+        remember_reference(path, operand, element.id)
+        return data.Reference { type = reference_type, borrow = element.id }
+    end
+
     -- a reference to element `index` of the buffer `reference` reaches (buffers §2.3)
     E.element_reference = do(path, reference, index)
         if E.is_reference reference and data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
@@ -422,9 +448,11 @@ return do(E, core)
                 derive = p -> p
                 select = selected -> error("a selected element reference must be dispatched", 0)
                 cached = pointer -> info.form.path
-                fixed = pointer -> fail(path, "a stored reference is not available yet")
+                fixed = pointer -> nil
                 ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
             end
+            -- through a stored header: the element's address from the current header, stored
+            if base_path == nil then return E.stored_element(path, reference, index) end
         else
             fail(path, "an element reference starts from a reference to a buffer")
         end

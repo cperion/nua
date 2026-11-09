@@ -134,3 +134,62 @@ local signed = do(): U32 = 1
 export signed
 ]], "the C name 'signed' is a C keyword")
 end
+
+test "cstring, parse(F64), Str.of, raw and scoped views, UTF-8":
+    local library, text = native("text_more", [[
+local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local text_cstring = do(s: Str): U64
+    return s:cstring() do(c)
+        return strlen c
+    end
+end
+export text_cstring
+local parsed_float = do(s: Str): F64
+    local result: F64 = -1
+    s:parse(F64) {
+        value = do(v) result = v end,
+        bad = do() result = -2 end,
+    }
+    return result
+end
+export parsed_float
+local from_c = do(c: CString): U64 = (Str.of c).length
+export from_c
+local raw_sum = do(p: Ptr U8, n: U32): U32
+    local s = Slice(p, n)
+    return U32 s[0] + U32 s.length
+end
+export raw_sum
+local scoped = do(p: Ptr U8, n: U32): U64
+    return view_of(p, n) do(bytes)
+        return (Str.of bytes).length
+    end
+end
+export scoped
+local runes_of = do(s: Str): U32
+    local total: U32 = 0
+    s:runes() do(cp, at)
+        total = total + cp
+    end
+    return total
+end
+export runes_of
+]])
+    local v = s -> view_of_text(text, s)
+    assert(library.text_cstring(v "hello") == 5)
+    assert(library.parsed_float(v "2.5e1") == 25 and library.parsed_float(v "x") == -2 and library.parsed_float(v "1e") == -2)
+    assert(library.from_c(ffi.cast("char *", "abc")) == 3)
+    local bytes = ffi.new("uint8_t[3]", { 7, 8, 9 })
+    assert(library.raw_sum(bytes, 3) == 10 and library.scoped(bytes, 3) == 3)
+    assert(library.runes_of(v "a\xC3\xA9") == 97 + 233)
+    refuses([[
+local leak = do(p: Ptr U8, n: U32): U64
+    local kept = Grow(Slice U8) {}
+    view_of(p, n) do(bytes)
+        kept:push bytes
+    end
+    return kept.length
+end
+export leak
+]], "outlives it")
+end

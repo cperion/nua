@@ -1,0 +1,116 @@
+-- finish, pinned buffers, globals and rest requirements (buffers §4.1; syntax §9.12, §21.1, §10.8).
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "a pinned buffer never moves: even a stored view survives its growth":
+    local library = native("remaining_pinned", [[
+local Token = struct { text: Slice U32 }
+local pinned_survives = do(n: U32): U32
+    local src = Grow.pinned(U32) {}
+    src:push 7
+    local tok = Token { text = src:sub(0, 1) }
+    for i: U32 = 1, n do
+        src:push i
+    end
+    return tok.text[0]
+end
+export pinned_survives
+local pinned_limit = do(n: U32): U64
+    local src = Grow.pinned(U32) { limit = 4 }
+    for i: U32 = 1, n do
+        src:push i
+    end
+    return src.length
+end
+export pinned_limit
+local pinned_ledger = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local kept = pinned_survives n
+    return platform.ledger_mapped_bytes() - before
+end
+export pinned_ledger
+local pinned_text = do(): U64
+    local out = Text.pinned {}
+    out:write("abc", 12)
+    return out.length
+end
+export pinned_text
+]])
+    assert(library.pinned_survives(100000) == 7)
+    assert(library.pinned_limit(4) == 4)
+    library.pinned_ledger(1)
+    assert(library.pinned_ledger(1000) == 0)
+    assert(library.pinned_text() == 5)
+end
+
+test "globals are static objects, read and written as memory":
+    local library, text = native("remaining_globals", [[
+local hits = global(U32, { name = "hits" })
+local per_thread = global(U32, { name = "per_thread", thread_local = true })
+local seed = global(U32, { name = "seed", init = 100 })
+local Point = struct { x: U32, y: U32 }
+local origin = global(Point, { name = "origin" })
+local journal = global(Grow U32, { name = "journal" })
+local global_bump = do(n: U32): U32
+    hits[0] = hits[0] + n
+    per_thread[0] = hits[0]
+    origin.y = n
+    origin[0].x = origin.y + 1
+    return hits[0] + seed[0] + origin.x
+end
+export global_bump
+local global_journal = do(n: U32): U64
+    journal[0]:push n
+    return journal[0].length
+end
+export global_journal
+]])
+    assert(library.global_bump(2) == 2 + 100 + 3)
+    assert(library.global_bump(1) == 3 + 100 + 2)
+    assert(library.global_journal(1) == 1 and library.global_journal(2) == 2)
+    assert(text:find("static __thread uint32_t", 1, true) and text:find("= 100u;", 1, true), text)
+    refuses([[
+local g = global(Slice U32, { name = "views" })
+]], "a global cannot be")
+end
+
+test "rest requirements take the remaining arguments as a pack":
+    local library, text = native("remaining_rest", [[
+local add3 = do(a: U32, b: U32, c: U32): U32 = a + b + c
+local twice = do(a: U32): U32 = a * 2
+local logged = do(f, ..args): U32
+    return f(..args) + args.length * 1000
+end
+local rest_use = do(x: U32, y: U32): U32 = logged(twice, x) + logged(add3, x, y, 1)
+export rest_use
+local rest_first = do(a, ..args): U32
+    return args[1] + args[2]
+end
+local rest_index = do(x: U32): U32 = rest_first(0, x, 5)
+export rest_index
+]])
+    assert(library.rest_use(3, 4) == 6 + 1000 + 8 + 3000)
+    assert(library.rest_index(2) == 7)
+    refuses([[
+local g = do(x): U32 = 1
+local f = do(..args): U32
+    return g args
+end
+local h = do(): U32 = f(1)
+export h
+]], "pack-use")
+    refuses([[
+local f = do(..args): U32
+    return args[3]
+end
+local h = do(): U32 = f(1)
+export h
+]], "pack-index")
+end

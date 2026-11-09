@@ -286,6 +286,70 @@ for _, pair in ipairs { { I8, U8 }, { I16, U16 }, { I32, U32 }, { I64, U64 } } d
     end
 end
 
+-- decimal text: the grammar is checked here, so strtod only ever sees text it consumes whole; a
+-- known text folds
+local strtod = extern("strtod", { CString, Ptr CString }, F64, { header = "<stdlib.h>" })
+local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local is_digit = do(c: U8): Bool = c >= 48 and c <= 57
+
+local float_syntax = do(s: Str): Bool
+    local n = s.length
+    local i: U64 = 0
+    if i < n and (s[i] == 43 or s[i] == 45) then i = i + 1 end
+    local count: U64 = 0
+    while i < n and is_digit s[i] do
+        count = count + 1
+        i = i + 1
+    end
+    if i < n and s[i] == 46 then
+        i = i + 1
+        while i < n and is_digit s[i] do
+            count = count + 1
+            i = i + 1
+        end
+    end
+    if count == 0 then return false end
+    if i < n and (s[i] == 101 or s[i] == 69) then
+        i = i + 1
+        if i < n and (s[i] == 43 or s[i] == 45) then i = i + 1 end
+        local exponent: U64 = 0
+        while i < n and is_digit s[i] do
+            exponent = exponent + 1
+            i = i + 1
+        end
+        if exponent == 0 then return false end
+    end
+    return i == n
+end
+
+-- a NUL-terminated copy lent to the body, released after it: `s:cstring() do(c) … end`
+str.cstring = do(s: Str, body): Inferred
+    local text = copy s
+    text:push 0
+    return body(CString text.data)
+end
+
+local ParsedF64 = str.parsed F64
+local known_parsed = do(value: F64): ParsedF64 = ParsedF64.value value
+parse_words[F64] = do(s: Str): ParsedF64
+    if not float_syntax s then return ParsedF64.bad() end
+    if is_known s then return known_parsed(tonumber(host s)) end
+    return str.cstring(s) do(c)
+        return ParsedF64.value(strtod(c, null(Ptr CString)))
+    end
+end
+
+-- `Str.of(x)`: a view of a `Slice U8`, or of a `CString` (`strlen` once)
+local of_cstring = do(c: CString): Str = Slice(Ptr(U8)(c), strlen c, Str)
+local of_bytes = do(bytes: Slice U8): Str = view_as(bytes, Str)
+Str.of = do(given)
+    if type_of given == CString or type given == "string" then return of_cstring given end
+    return of_bytes given
+end
+
+local utf8 = import "utf8"
+str.utf8 = utf8
+
 -- the methods: a Lua string argument (a needle known while compiling) picks the word that
 -- takes it as a compile-time parameter
 local known = value -> type value == "string"
@@ -330,6 +394,14 @@ end
 
 function Str:lines()
     return str.lines self
+end
+
+function Str:cstring()
+    return str.cstring(self)
+end
+
+function Str:runes()
+    return utf8.runes(self)
 end
 
 function Str:parse(T)

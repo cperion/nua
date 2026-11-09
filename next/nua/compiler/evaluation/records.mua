@@ -60,7 +60,7 @@ return do(E, core)
                 { name = "length", type = types.U64 },
                 { name = "capacity", type = types.U64 },
             }
-            if native_type.pinned then found[4] = { name = "limit", type = types.U64 } end
+            if native_type.reserved then found[4] = { name = "limit", type = types.U64 } end
             E.header_fields[native_type] = found
         end
         return found

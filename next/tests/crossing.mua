@@ -1,0 +1,129 @@
+-- Owners and borrows across compiled boundaries: by value, as results, inside structs and sums,
+-- through recursion and loops. Each owner is released exactly once (the ledger shows it).
+
+local native = require "tests.support.native"
+
+local measure = do(name, body)
+    return ([[
+local %s_body = do(n: U32): U64
+%s
+end
+local %s = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local result = %s_body n
+    return result * 1000000 + (platform.ledger_mapped_bytes() - before)
+end
+export %s
+]]):format(name, body, name, name, name)
+end
+
+local prelude = [[
+local Bag = struct { n: U32, xs: Grow U32 }
+local Doc = oneof { empty: Unit, text: Grow U32 }
+local big = do(n: U32): Grow U32
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push i
+    end
+    return xs
+end
+local cross_size = do(xs: Grow U32): U64 = xs.length
+local make_bag = do(n: U32): Bag
+    local b = Bag { .n }
+    b.xs = call big n
+    return b
+end
+local take_bag = do(b: Bag): U64 = b.xs.length
+local make_doc = do(n: U32): Doc
+    if n > 0 then return Doc.text(call big n) end
+    return Doc.empty
+end
+local function fill(xs: Ref (Grow U32), n: U32): Unit
+    if n == 0 then return end
+    xs:push n
+    call fill(xs, n - 1)
+end
+local P = struct { x: U32, y: U32 }
+local pick = do(p: Ref P, flag: Bool): Ref U32
+    if flag then return Ref p.x end
+    return Ref p.y
+end
+local T = struct { s: Slice U32 }
+local first_of = do(t: T): U32 = t.s[0]
+local M = Map(U32, U32)
+local map_put = do(m: Ref M, k: U32): Unit
+    m[k] = k + 1
+end
+]]
+
+test "owners cross a call boundary and are released exactly once":
+    local source = prelude
+        .. measure("cross_param", "    return call cross_size(call big n)")
+        .. measure("cross_result", "    local xs = call big n\n    xs:push 1\n    return xs.length")
+        .. measure("cross_struct", "    local b = call make_bag n\n    b.xs:push 2\n    return b.xs.length + U64 b.n")
+        .. measure("cross_struct_param", "    local b = call make_bag n\n    return call take_bag b")
+        .. measure("cross_sum", [[
+    local d = call make_doc n
+    local size = d with
+        empty = do(): U64 = 0
+        text = do(t: Ref (Grow U32)): U64 = t.length
+    end
+    return size]])
+        .. measure("cross_loop", [[
+    local total: U64 = 0
+    for i: U32 = 1, 5 do
+        local xs = call big(n * i)
+        total = total + xs.length
+    end
+    return total]])
+        .. measure("cross_recursive", "    local xs = Grow(U32) {}\n    call fill(Ref xs, n)\n    return xs.length")
+        .. measure("cross_map", "    local m = M {}\n    call map_put(Ref m, n)\n    return U64 m[n]")
+    local library = native("crossing_owners", source)
+    local check = do(name, n, expected)
+        library[name](1)
+        local value = library[name](n)
+        local result, leaked = tonumber(value / 1000000ULL), tonumber(value % 1000000ULL)
+        assert(result == expected and leaked == 0, ("%s: %d, %d bytes left"):format(name, result, leaked))
+    end
+    check("cross_param", 100000, 100000)
+    check("cross_result", 100000, 100001)
+    check("cross_struct", 100000, 200001)
+    check("cross_struct_param", 100000, 100000)
+    check("cross_sum", 100000, 100000)
+    check("cross_loop", 10000, 150000)
+    check("cross_recursive", 7, 7)
+    check("cross_map", 8, 9)
+end
+
+test "borrows cross a call inside aggregates, and through references to parts":
+    local library = native("crossing_borrows", prelude .. [[
+local cross_field_ref = do(flag: Bool): U32
+    local p = P { x = 1, y = 2 }
+    local r = call pick(Ref p, flag)
+    r = r + 10
+    return p.x * 100 + p.y
+end
+export cross_field_ref
+local cross_view_record = do(k: U32): U32
+    local xs = Grow(U32) { k }
+    local t = T { s = xs:all() }
+    return call first_of t
+end
+export cross_view_record
+local H = struct { r: Ref U32 }
+local cross_ref_loop = do(n: U32, flag: Bool): U32
+    local a: U32 = 1
+    local b: U32 = 2
+    local h = H { r = Ref a }
+    for i: U32 = 1, n do
+        if flag then h.r = Ref b end
+        h.r = h.r + 1
+    end
+    return a * 100 + b
+end
+export cross_ref_loop
+]])
+    assert(library.cross_field_ref(true) == 1102 and library.cross_field_ref(false) == 112)
+    assert(library.cross_view_record(9) == 9)
+    assert(library.cross_ref_loop(3, false) == 402 and library.cross_ref_loop(3, true) == 105)
+end

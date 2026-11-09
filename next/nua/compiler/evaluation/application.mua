@@ -80,7 +80,25 @@ return do(E, core)
         return E.value_of_operand(result_type, data.Result { value = result, type = result_type })
     end
 
+    -- packs (syntax §10.8): `args.length`, `args[i]` from 1, `..args`; nothing else
+    local Pack = {}
+    E.new_pack = do(items)
+        return setmetatable({ length = #items, items = items }, Pack)
+    end
+    Pack.__index = do(pack, key)
+        local item = rawget(pack, "items")[key]
+        if item == nil then error(("pack-index: a pack of %d has no component %s"):format(rawget(pack, "length"), tostring key), 0) end
+        return item
+    end
+    E.is_pack = value -> lua_type value == "table" and getmetatable value == Pack
+    E.rest_argument = path -> path.invocation.pack
+    E.pack_items = do(path, value)
+        if not E.is_pack value then fail(path, "spread-source: `..` expands a pack") end
+        return rawget(value, "items")
+    end
+
     E.call_definition = do(path, word, arguments, generalized)
+        if word.rest then fail(path, ("%s takes a rest requirement: a call boundary needs a fixed shape"):format(word.name)) end
         if word.result == nil then fail(path, word.name .. " is untyped: it evaluates in place, and has no native boundary") end
         for index, argument in ipairs arguments do
             if E.is_reference argument and types.NativeType.is(argument.type, types.ReferenceType) and data.BorrowForm.is(compilation.borrows[argument.borrow].form, data.Selected) then
@@ -256,6 +274,13 @@ return do(E, core)
                 end
             end
         end
+        -- what a rest requirement takes: a pack, static in length, second-class (syntax §10.8)
+        local pack_of = do(supplied)
+            if not word.rest then return nil end
+            local items = {}
+            for index = #word.requirements + 1, #supplied do items[#items + 1] = supplied[index] end
+            return E.new_pack items
+        end
         local new_invocation = || -> {
             id = fresh identity.InvocationId, .word, arguments = {}, argument_values = {}, exits = {}, places = {},
             lifetime = fresh identity.LifetimeId, parent = path.invocation, entry_depth = path.depth,
@@ -281,6 +306,7 @@ return do(E, core)
         if not word.tail_calls then
             local invocation = new_invocation()
             local callee = paths_of.callee(path, invocation, path.writer, path.block, path.flow, word)
+            invocation.pack = pack_of(arguments)
             bind_arguments(invocation, callee)
             run_body(invocation, callee)
             return join_exits invocation
@@ -293,6 +319,7 @@ return do(E, core)
             local outcome = graph.building(nil, supply, do(writer)
                 local block = writer.block("call " .. word.name)
                 callee = paths_of.callee(path, invocation, writer, block, facts.fork path.flow, word)
+                invocation.pack = pack_of(arguments)
                 enter callee
                 bind_arguments(invocation, callee)
                 if invocation.loop_mode then

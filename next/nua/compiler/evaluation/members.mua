@@ -139,6 +139,7 @@ return do(E, core)
         return E.get(path, cell)
     end
     E.capture_argument = do(path, callee, position, argument)
+        if E.is_pack argument then fail(path, "pack-use: a pack is expanded (`..args`), not passed whole") end
         if not E.is_cell argument or cells.Cell.is(argument, cells.HostCell) then return E.is_cell argument and E.get(path, argument) or argument end
         if (hosting.is_primitive callee and callee.by_place) or callee == types.pointer then return E.reference_to(path, argument) end
         local requirement = requirement_of(callee, position)

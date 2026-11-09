@@ -119,7 +119,8 @@ local GlobalInitializer = family "global initializer"
 local StaticValue = struct { value: NativeConstant }
 local FirstUse = struct { definition: DefinitionId }
 GlobalInitializer { StaticValue, FirstUse }
-local Global = struct { id: GlobalId, name: String, type: NativeType, initializer: GlobalInitializer, policy: GlobalPolicy, lifetime: LifetimeId, origin: OriginId }
+-- `exported`: external linkage; `imported`: defined elsewhere, declared by `header` if given
+local Global = struct { id: GlobalId, name: String, type: NativeType, initializer: GlobalInitializer, policy: GlobalPolicy, lifetime: LifetimeId, origin: OriginId, exported: Boolean, imported: Boolean, header: Optional(String) }
 
 local Export = struct { name: String, definition: DefinitionId }
 local WordInfo = struct { id: WordId, name: String, requirements: list_of(Requirement), result_type: NativeType, origin: OriginId }

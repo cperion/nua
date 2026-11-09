@@ -256,7 +256,7 @@ local parts_of = do(type)
     if NativeType.is(type, types.ViewType) then return { types.pointer(type.element), types.U64 } end
     if NativeType.is(type, types.BufferType) then
         local list = { types.pointer(type.element), types.U64, types.U64 }
-        if type.pinned then list[4] = types.U64 end
+        if type.reserved then list[4] = types.U64 end
         return list
     end
     if NativeType.is(type, types.FixedArrayType) then

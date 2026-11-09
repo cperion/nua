@@ -54,7 +54,15 @@ return do(E, core)
             local element = E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
             E.initialize_reference(path, element, arguments[3], "an element")
         end
-        view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3], arguments[4])
+        loaned_view = |path, arguments, boundary| -> E.loaned_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3])
+        raw_view = |path, arguments, boundary| -> E.raw_view(path, arguments[1], arguments[2], arguments[3])
+        view_as = |path, arguments, boundary| -> E.view_as(path, E.deref(path, reference_argument(path, arguments[1])), arguments[2])
+        end_loan = do(path, arguments, boundary)
+            local reference = reference_argument(path, arguments[1])
+            local info = compilation.borrows[reference.borrow]
+            append(path, data.Ends { site = site path, target = info.origins[1], reason = "released" })
+        end
+        buffer_view = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3], arguments[4])
         static_text = |path, arguments, boundary| -> E.static_text(path, arguments[1])
         array_element_of = |path, arguments, boundary| -> E.array_element_of(path, reference_argument(path, arguments[1]), arguments[2])
         array_view = |path, arguments, boundary| -> E.array_view(path, reference_argument(path, arguments[1]), arguments[2])
@@ -257,6 +265,11 @@ return do(E, core)
             if lua_type base == "table" then return base[name] end
             fail(path, ("'.%s' of %s is not a member"):format(name, tostring base))
         end
+        -- a raw pointer to a record held only as a value (a global): that field's place
+        if rules.is_pointer base.type and types.NativeType.is(base.type.target, types.RecordType) then
+            local reference = E.reference_to(path, cells.RawCell { place = E.raw_place(path, base, 0), name = "a pointer's target" })
+            return E.deref(path, E.part_reference(path, reference, data.FieldStep { .name }))
+        end
         -- syntax §16.3: the `__member` hook, then a field, then a method
         local found = E.member_hook(path, place, base, name)
         if found ~= nil then return found end
@@ -308,6 +321,8 @@ return do(E, core)
     E.element = do(path, base, key)
         if path.dead then return nil end
         local place = E.raw_place(path, base, key)
+        -- an owner behind a pointer is reached by reference, never copied out
+        if place and types.owns place.type then return E.reference_to(path, cells.RawCell { .place, name = "a pointer's target" }) end
         if place then return E.load(path, place) end
         local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
         -- the type's `__index` hook (syntax §16)
@@ -325,6 +340,7 @@ return do(E, core)
     E.member = do(path, base, name)
         if path.dead then return nil end
         if E.is_cell base then return cells.FieldCell { .base, .name } end
+        if is_native base and rules.is_pointer base.type then return cells.FieldCell { base = cells.RawCell { place = E.raw_place(path, base, 0), name = "a pointer's target" }, .name } end
         if E.is_reference base and types.NativeType.is(base.type, types.ReferenceType) then return E.part_reference(path, base, data.FieldStep { .name }) end
         return E.dot(path, base, name)
     end

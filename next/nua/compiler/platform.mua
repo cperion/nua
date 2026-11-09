@@ -27,6 +27,9 @@ local bindings = define
     ledger_mapped_bytes = declare("ledger_mapped_bytes", {}, types.U64)
     next_store_token = declare("next_store_token", {}, types.U64)
     hash_seed = declare("hash_seed", { types.U64 }, types.U64)
+    reserve_range = declare("reserve_range", { types.U64 }, bytes)
+    commit_range = declare("commit_range", { bytes, types.U64 }, types.Unit)
+    release_range = declare("release_range", { bytes, types.U64 }, types.Unit)
 end
 
 return define

@@ -27,7 +27,7 @@ local RecordType = struct { name: String, fields: list_of(Field) }
 local Alternative = struct { name: String, payload: NativeType }
 local SumType = struct { name: String, alternatives: list_of(Alternative) }
 -- `fixed`: the owner `Array T` (syntax §9.3): a buffer whose length is set when it is built
-local BufferType = struct { element: NativeType, pinned: Boolean, fixed: Boolean }
+local BufferType = struct { element: NativeType, reserved: Boolean, fixed: Boolean }
 local FunctionType = struct { parameters: list_of(NativeType), result: NativeType, variadic: Boolean }
 -- an opaque C type, usable only behind a `Ptr` (syntax §17.2)
 local OpaqueType = struct { name: String }
@@ -94,9 +94,15 @@ end
 -- Str is the read-only view of bytes with the text words
 local Str = ViewType { element = U8, mutable = false, text = true }
 -- `Slice T`, `Slice.mut T`: the view constructors, as one object (the family's constructor)
+-- (`Slice(p, n)`, a raw view at a pointer, is answered by the compilation's evaluation)
+local raw_slice = nil
 local slice = setmetatable(define
     mut = element -> view(element, true)
-end, { __call = |_, element| -> view element, __tostring = || -> "Slice" })
+    of_raw = maker -> do raw_slice = maker end
+end, { __call = function(_, element, count, view_type)
+    if count ~= nil then return raw_slice(element, count, view_type) end
+    return view element
+end, __tostring = || -> "Slice" })
 local opaques = {}
 local opaque = do(name)
     if opaques[name] == nil then opaques[name] = OpaqueType { .name } end
@@ -111,8 +117,12 @@ local fixed_array = do(element, count)
 end
 local buffer = do(element, pinned, fixed)
     need_type(element, "Buffer")
-    return buffers({ element, pinned == true, fixed == true }, || -> BufferType { .element, pinned = pinned == true, fixed = fixed == true })
+    return buffers({ element, pinned == true, fixed == true }, || -> BufferType { .element, reserved = pinned == true, fixed = fixed == true })
 end
+-- `Grow T`, `Grow.pinned T`: the buffer constructors, as one object (the family's constructor)
+local growable = setmetatable(define
+    pinned = element -> buffer(element, true)
+end, { __call = function(_, element, pinned, fixed) return buffer(element, pinned, fixed) end, __tostring = || -> "Grow" })
 local function_type = do(parameters, result, variadic)
     for _, parameter in ipairs parameters do need_type(parameter, "a function parameter") end
     need_type(result, "a function result")
@@ -233,7 +243,7 @@ local Describing = define
     RecordType = named
     SumType = named
     OpaqueType = named
-    BufferType = do(node, recurse) return (node.fixed and "Array " or node.pinned and "Buffer.pinned " or "Buffer ") .. recurse node.element end
+    BufferType = do(node, recurse) return (node.fixed and "Array " or node.reserved and "Buffer.pinned " or "Buffer ") .. recurse node.element end
     FunctionType = do(node, recurse)
         local parameters = {}
         for index, parameter in ipairs node.parameters do parameters[index] = recurse parameter end
@@ -322,7 +332,7 @@ local Laying = define
             { name = "length", layout = recurse(U64, target) },
             { name = "capacity", layout = recurse(U64, target) },
         }
-        if node.pinned then parts[#parts + 1] = { name = "limit", layout = recurse(U64, target) } end
+        if node.reserved then parts[#parts + 1] = { name = "limit", layout = recurse(U64, target) } end
         return sequence parts
     end
     FixedArrayType = do(node, recurse, target)
@@ -386,6 +396,7 @@ local kinds_of_constructors = define
     [slice] = ViewType
     [fixed_array] = FixedArrayType
     [buffer] = BufferType
+    [growable] = BufferType
 end
 
 local define_member = do(native_type, name, value)
@@ -510,6 +521,7 @@ return define
     .slice
     .fixed_array
     .buffer
+    .growable
     .function_type
     .record
     .sum

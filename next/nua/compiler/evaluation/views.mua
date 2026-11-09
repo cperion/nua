@@ -31,6 +31,18 @@ return do(E, core)
 
 
     -- `view_of(self, first, count)`: the primitive a buffer's words make views with
+    -- a stored view of these parts
+    local packed_view = do(path, view_type, pointer, count, origins, lifetime, source)
+        local result = fresh identity.ValueId
+        append(path, data.Pack { site = site path, .result, type = view_type, components = { pointer.operand, count.operand } })
+        local operand = data.Result { value = result, type = view_type }
+        local info = data.BorrowInfo { id = fresh identity.BorrowId, form = data.Stored { pointer = operand }, .origins, mutable = view_type.mutable, .lifetime, acquired = origin_of path, .source }
+        compilation.borrows[info.id] = info
+        path.flow.borrows[info.id] = data.Live {}
+        remember_reference(path, operand, info.id)
+        return data.Reference { type = view_type, borrow = info.id }
+    end
+
     -- (`view_type`, when given, the view to make of a buffer's elements: a `Slice.mut`, or a
     -- `Str` of a buffer of bytes)
     E.make_view = do(path, reference, first, count, view_type)
@@ -44,7 +56,22 @@ return do(E, core)
         local buffer_type = reference.type.target
         local base_info = compilation.borrows[reference.borrow]
         local base = base_info.form
-        if not data.BorrowForm.is(base, data.Held) then fail(path, "a held view through this stored header reference is not available yet") end
+        -- through a stored header: the current data pointer and the count, a stored view
+        if not data.BorrowForm.is(base, data.Held) then
+            local header = E.deref(path, reference)
+            local stored_first = E.from_host(path, types.U64, first, "the first element of the view")
+            local stored_count = E.from_host(path, types.U64, count, "the length of the view")
+            local data_pointer = E.part(path, header, "data")
+            local start = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, stored_first })
+            local origins = {}
+            for _, origin in ipairs base_info.origins do
+                local extended = {}
+                for position, step in ipairs origin.path do extended[position] = step end
+                extended[#extended + 1] = data.ContentsStep {}
+                origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+            end
+            return packed_view(path, view_type or types.view reference.type.target.element, start, stored_count, origins, base_info.lifetime, reference.borrow)
+        end
         local steps = {}
         for index, step in ipairs base.path.steps do steps[index] = step end
         steps[#steps + 1] = data.ContentsStep {}
@@ -161,6 +188,29 @@ return do(E, core)
         path.flow.borrows[info.id] = data.Live {}
         path.writer.borrow info
         return data.Reference { type = types.Str, borrow = info.id }
+    end
+
+    -- `Slice(p, n)`: a view of n elements at a pointer, the boundary where a length is trusted
+    -- (syntax §12.2): a stored borrow of nothing the compiler knows
+    local count_of = do(path, count)
+        local value = E.deref(path, count)
+        if is_native value and value.type ~= types.U64 then return E.compute(path, "convert", types.U64, { value }) end
+        return E.from_host(path, types.U64, value, "the length of the view")
+    end
+    E.raw_view = do(path, pointer, count, view_type)
+        pointer = E.deref(path, pointer)
+        return packed_view(path, view_type or types.view pointer.type.target, pointer, count_of(path, count), {}, fresh identity.LifetimeId, nil)
+    end
+    -- `loaned_view(r, p, n)`: a view at a pointer borrowing the loan `r` reaches (syntax §12.6)
+    E.loaned_view = do(path, loan, pointer, count)
+        pointer = E.deref(path, pointer)
+        local info = compilation.borrows[loan.borrow]
+        return packed_view(path, types.view pointer.type.target, pointer, count_of(path, count), info.origins, info.lifetime, loan.borrow)
+    end
+    -- the same view as another view type of its elements (`Str.of` of bytes)
+    E.view_as = do(path, view, view_type)
+        local info = compilation.borrows[view.borrow]
+        return data.Reference { type = view_type, borrow = info.id }
     end
 
     -- `view_data(s)`: the raw pointer to a view's first element (for the bytes of a mechanism)

@@ -22,7 +22,7 @@ local supply = do(application, arguments)
     local supplied = {}
     for index, argument in ipairs application.supplied do supplied[index] = argument end
     for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
-    if #supplied > #application.word.requirements then
+    if #supplied > #application.word.requirements and not application.word.rest then
         error(("%s takes %d arguments, %d supplied"):format(application.word.name, #application.word.requirements, #supplied), 3)
     end
     return setmetatable({ word = application.word, .supplied }, Application)
@@ -31,7 +31,7 @@ end
 -- supply from Lua: a saturated application is applied by its word's applier
 local supplied_from_lua = do(application, arguments)
     local next = supply(application, arguments)
-    if #next.supplied == #next.word.requirements and next.word.applier then return next.word.applier(next) end
+    if (#next.supplied == #next.word.requirements or (next.word.rest and #next.supplied >= #next.word.requirements)) and next.word.applier then return next.word.applier(next) end
     return next
 end
 Word.__call = |word, ...| -> supplied_from_lua(setmetatable({ .word, supplied = {} }, Application), { ... })
@@ -40,8 +40,11 @@ Application.__call = |application, ...| -> supplied_from_lua(application, { ... 
 Application.__tostring = application -> ("application of %s (%d of %d supplied)"):format(application.word.name, #application.supplied, #application.word.requirements)
 
 -- `applier(application)`: how the compilation making the word applies it saturated from Lua
+-- the result annotation of a library word that answers what its body answers
+local Inferred = setmetatable({}, { __tostring = || -> "Inferred" })
 local word = do(description, applier)
     local name = description.name
+    if description.result == Inferred then description.result = nil end
     for index, requirement in ipairs description.requirements do
         if requirement.type ~= nil and not check(types.NativeType, requirement.type) then
             error(("%s:%d: the parameter '%s' of %s is annotated with %s, not a native type"):format(
@@ -60,6 +63,7 @@ local word = do(description, applier)
         result = description.result
         body = description.body
         tail_calls = description.tail_calls == true
+        rest = description.rest
         .applier
     end, Word)
 end
@@ -71,7 +75,7 @@ local supplied_of = do(value)
     return nil
 end
 
-local saturated = application -> #application.supplied == #application.word.requirements
+local saturated = application -> #application.supplied == #application.word.requirements or (application.word.rest and #application.supplied >= #application.word.requirements)
 
 -- a primitive: one of the few operations the compiler supplies to the Nua library (trap, effect
 -- declarations, views, element references, drop), named so evaluation can dispatch on it
@@ -102,6 +106,7 @@ local is_foreign = value -> getmetatable value == Foreign
 
 return define
     .word
+    .Inferred
     .is_word
     .is_application
     .supply
