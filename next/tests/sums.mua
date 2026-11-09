@@ -505,12 +505,8 @@ export f
 local f = do(k: U32): U32
     local fig = Figure.rect { width = k, height = 2 }
     local width = fig with
-        circle = do(c: Ref Circle): Ref U32
-            return Ref c.radius
-        end
-        rect = do(r: Ref Rect): Ref U32
-            return Ref r.width
-        end
+        circle = do(c: Ref Circle): Ref U32 = Ref c.radius
+        rect = do(r: Ref Rect): Ref U32 = Ref r.width
     end
     fig = Figure.circle { radius = 1 }
     return width
