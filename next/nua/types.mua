@@ -26,7 +26,8 @@ local Field = struct { name: String, type: NativeType }
 local RecordType = struct { name: String, fields: list_of(Field) }
 local Alternative = struct { name: String, payload: NativeType }
 local SumType = struct { name: String, alternatives: list_of(Alternative) }
-local BufferType = struct { element: NativeType, pinned: Boolean }
+-- `fixed`: the owner `Array T` (syntax §9.3): a buffer whose length is set when it is built
+local BufferType = struct { element: NativeType, pinned: Boolean, fixed: Boolean }
 local FunctionType = struct { parameters: list_of(NativeType), result: NativeType, variadic: Boolean }
 NativeType {
     IntegerType, FloatType, BooleanType, UnitType, PointerType, ReferenceType, ViewType,
@@ -99,9 +100,9 @@ local fixed_array = do(element, count)
     if not check(Natural, count) then error("Array(T, n) expects a natural count, got " .. tostring count, 2) end
     return arrays({ element, count }, || -> FixedArrayType { .element, .count })
 end
-local buffer = do(element, pinned)
+local buffer = do(element, pinned, fixed)
     need_type(element, "Buffer")
-    return buffers({ element, pinned == true }, || -> BufferType { .element, pinned = pinned == true })
+    return buffers({ element, pinned == true, fixed == true }, || -> BufferType { .element, pinned = pinned == true, fixed = fixed == true })
 end
 local function_type = do(parameters, result, variadic)
     for _, parameter in ipairs parameters do need_type(parameter, "a function parameter") end
@@ -222,7 +223,7 @@ local Describing = define
     FixedArrayType = do(node, recurse) return ("Array(%s, %d)"):format(recurse node.element, node.count) end
     RecordType = named
     SumType = named
-    BufferType = do(node, recurse) return (node.pinned and "Buffer.pinned " or "Buffer ") .. recurse node.element end
+    BufferType = do(node, recurse) return (node.fixed and "Array " or node.pinned and "Buffer.pinned " or "Buffer ") .. recurse node.element end
     FunctionType = do(node, recurse)
         local parameters = {}
         for index, parameter in ipairs node.parameters do parameters[index] = recurse parameter end

@@ -5,7 +5,6 @@
 -- length are known (`index-range`), so the check costs nothing then.
 
 local index = import "index"
-local buffer = import "buffer"
 
 local made = setmetatable({}, { __mode = "k" })
 
@@ -48,10 +47,18 @@ local words = do(T, V)
     -- an owner where a view is expected lends its elements (syntax §9.2): a reference to a
     -- buffer of T, given by capture (a `Slice`) or marked at the call (`f(Ref xs)`)
     local lent = Ref(Buffer T)
+    local fixed_lent = Ref(Buffer(T, false, true))
     local cast = do(value, view_type)
-        if type_of value ~= lent then return nil end
-        if V.mutable then return buffer.words(T).all_mut value end
-        return buffer.words(T).all value
+        local given = type_of value
+        -- a buffer lends its elements (a `Grow T`, an `Array T`)
+        if given == lent or given == fixed_lent then
+            if V.mutable then return value:all_mut() end
+            return value:all()
+        end
+        -- an array lends its elements too
+        local array = given and given.target
+        if array and array.count and array.element == T and not V.mutable then return value:slice() end
+        return nil
     end
 
     local members = define

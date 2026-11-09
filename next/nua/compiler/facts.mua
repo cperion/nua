@@ -113,6 +113,7 @@ local SameConstants = define
     StaticBytes = |a, recurse, b| -> a.bytes == b.bytes
     SymbolAddress = |a, recurse, b| -> a.name == b.name and a.offset == b.offset
     StaticAddress = |a, recurse, b| -> a.bytes == b.bytes and a.offset == b.offset
+    ZeroBits = |a, recurse, b| -> true
     DefinitionAddress = |a, recurse, b| -> a.definition == b.definition
     AggregateBits = do(a, recurse, b)
         if #a.parts ~= #b.parts then return false end

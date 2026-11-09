@@ -25,7 +25,8 @@ local record_name = do(record)
     local found = record_names[record]
     if found then return found end
     record_count += 1
-    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or NativeType.is(record, types.ViewType) and "View" or (record.name:gsub("[^%w_]", "_"))
+    local base_name = NativeType.is(record, types.BufferType) and "Buffer" or NativeType.is(record, types.ViewType) and "View"
+        or NativeType.is(record, types.FixedArrayType) and "Array" or (record.name:gsub("[^%w_]", "_"))
     found = ("%s_%d"):format(base_name, record_count)
     record_names[record] = found
     return found
@@ -40,7 +41,7 @@ local CSpelling = define
     PointerType = |node, recurse| -> recurse node.target .. " *"
     ReferenceType = |node, recurse| -> recurse node.target .. " *"
     ViewType = |node, recurse| -> record_name node
-    FixedArrayType = unsupported
+    FixedArrayType = |node, recurse| -> record_name node
     RecordType = |node, recurse| -> record_name node
     SumType = |node, recurse| -> record_name node
     BufferType = |node, recurse| -> record_name node
@@ -76,6 +77,7 @@ end
 local fields_of = NativeType.pass "the fields of a type C spells as a struct" with ..Fields end
 local is_record_like = native_type -> fields_of native_type ~= nil
 local is_sum = native_type -> NativeType.is(native_type, types.SumType)
+local is_array = native_type -> NativeType.is(native_type, types.FixedArrayType)
 -- the C name of a sum's tag constant for an alternative
 local tag_name = |sum_type, name| -> record_name sum_type .. "_" .. name
 -- a sum in C (syntax §11.1): its tag constants, then a tag and a union of the payloads that are
@@ -103,6 +105,13 @@ local record_declarations = do(program)
             order[#order + 1] = sum_declaration native_type
             return
         end
+        if is_array native_type and not done[native_type] then
+            done[native_type] = true
+            if native_type.count == 0 then fail "an array of no elements has no C spelling" end
+            visit native_type.element
+            order[#order + 1] = ("typedef struct %s { %s e[%d]; } %s;"):format(record_name native_type, c_type native_type.element, native_type.count, record_name native_type)
+            return
+        end
         if not is_record_like native_type or done[native_type] then return end
         done[native_type] = true
         for _, field in ipairs(fields_of native_type) do visit(field.type) end
@@ -117,6 +126,8 @@ local record_declarations = do(program)
             for _, argument in ipairs block.arguments do visit(argument.type) end
             for _, instruction in ipairs block.instructions do
                 if instruction.type then visit(instruction.type) end
+                -- the storage an instruction uses is spelled too (a local's home)
+                if instruction.place then visit(definition.places[instruction.place].type) end
             end
         end
     end
@@ -189,6 +200,7 @@ local Constants = define
     end
     StaticBytes = unspelled_constant
     SymbolAddress = unspelled_constant
+    ZeroBits = |bits, recurse, constant| -> ("((%s){ 0 })"):format(c_type constant.type)
     StaticAddress = |bits, recurse, constant| -> ("((%s)%s + %d)"):format(c_type constant.type, c_string bits.bytes, bits.offset)
     DefinitionAddress = unspelled_constant
 end
@@ -282,7 +294,7 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         FieldComponent = |component, recurse| -> "." .. component.name
         AlternativeComponent = |component, recurse| -> ".as." .. component.name
         PayloadComponent = |component, recurse| -> fail "a payload component has no C spelling as a place"
-        ElementComponent = |component, recurse| -> fail "an element component has no C spelling as a place"
+        ElementComponent = |component, recurse| -> ".e[" .. operand component.index .. "]"
         AnyElementComponent = |component, recurse| -> fail "an element component has no C spelling as a place"
     end
     local component_text = data.Component.pass "spell a place component in C" with ..Components end
@@ -351,9 +363,10 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
                 local payload = node.components[2] and (", .as.%s = %s"):format(alternative.name, operand node.components[2]) or ""
                 return ("%s = (%s){ .tag = %s%s };"):format(value_name(node.result, node.type), c_type node.type, tag_name(node.type, alternative.name), payload)
             end
-            if not is_record_like node.type then fail("packing " .. types.describe node.type .. " has no C spelling yet") end
             local components = {}
             for index, component in ipairs node.components do components[index] = operand component end
+            if is_array node.type then return ("%s = (%s){ { %s } };"):format(value_name(node.result, node.type), c_type node.type, table.concat(components, ", ")) end
+            if not is_record_like node.type then fail("packing " .. types.describe node.type .. " has no C spelling yet") end
             return ("%s = (%s){ %s };"):format(value_name(node.result, node.type), c_type node.type, table.concat(components, ", "))
         end
         Extract = do(node, recurse)
@@ -363,8 +376,10 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
                     text = text .. "." .. component.name
                 elseif data.Component.is(component, data.AlternativeComponent) then
                     text = text .. ".as." .. component.name
+                elseif data.Component.is(component, data.ElementComponent) then
+                    text = text .. ".e[" .. operand component.index .. "]"
                 else
-                    fail "extracting an element has no C spelling yet"
+                    fail "extracting this component has no C spelling"
                 end
             end
             return ("%s = %s;"):format(value_name(node.result, node.type), text)

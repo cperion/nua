@@ -81,7 +81,7 @@ an aliased container slot is overwritten before the effect.
 known overwrite versus wildcard storage, aliasing, recursive/nonreturning groups and independent
 verifier replay after callee mutation. The original clear–store–clear stale-view probe is now
 refused; storing a fresh view after the final clear is accepted. Latest full check:
-**`make test-next`: 185 passed, 0 failed.**
+**`make test-next`: 189 passed, 0 failed.**
 
 ## Design-to-source gap inventory
 
@@ -92,7 +92,7 @@ refused; storing a fresh view after the final clear is accepted. Latest full che
 | Memory provenance | Resident component facts, pointerless provenance, strong/weak stores, load state preservation, resident-local branch/loop agreement | Extend component transport/proofs to the remaining aggregate forms and storage mechanisms; complete alias/provenance validation |
 | Native boundaries | Ordered contracts and substitution, returned-borrow re-rooting, alias requirements, recursive CFG agreement, independent call replay | Complete interface-key/capture/dependency protocols, global/foreign/indirect boundaries, owning ABI/parameter-payload transport and remaining component-path coverage |
 | Owners/buffers | Nua allocator and moving buffer words; nested release and selected conditional moves; owner structs; partial moves (fields, payloads) through places, inline `Ref`s and callee contracts, joined and carried across loop rounds; replacement through any place | `finish`, initialized-prefix proofs, pinned storage, complete allocation-ledger and trap-recovery acceptance |
-| Language coverage | Sums and matching end to end, `Ref` handlers borrowing payloads in place; `Slice`/`Str` words in Nua (`lib/slice.nua`, `lib/str.nua`), static text literals folding while compiling; branch proofs dropping proved checks (§12.2); owners lent to `Slice`/`Slice.mut`/`Str` requirements | `Text`, `Chars(n)`, fixed arrays, `Str` words needing foreign calls (`parse(F64)`, `cstring`) and UTF-8 |
+| Language coverage | Sums and matching end to end, `Ref` handlers borrowing payloads in place; `Slice`/`Str` words in Nua (`lib/slice.nua`, `lib/str.nua`), static text literals folding while compiling; branch proofs dropping proved checks (§12.2); owners lent to `Slice`/`Slice.mut`/`Str` requirements; `Array(T, n)` values and the owner `Array T` (`lib/array.nua`) | `Text`, `Chars(n)`, `Str` words needing foreign calls (`parse(F64)`, `cstring`) and UTF-8 |
 | Preparation | Graph/type/lifetime checks on emitted C programs | Optimizer, budget insertion, complete effect/alias recomputation, `task_access`, `ready`, revision-matching readiness certificates |
 | Tasks/platform | Storage mapping/copy mechanisms | Native context/stack mechanisms, Nua scheduler/waits, foreign extents, task/channel/slot acceptance |
 | Backends/diagnostics | C for the implemented subset; source-line errors | Shared prepared-IR C/JIT adapters, structured related-location diagnostics and the full independent acceptance set |

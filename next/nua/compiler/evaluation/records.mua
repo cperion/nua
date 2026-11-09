@@ -32,10 +32,26 @@ return do(E, core)
     E.is_reference = value -> is_native value and NativeValue.is(value, data.Reference)
     E.is_view = value -> E.is_reference value and types.NativeType.is(value.type, types.ViewType)
     E.is_buffer = native_type -> types.NativeType.is(native_type, types.BufferType)
-    -- records, and buffers (whose header is a record of its data, length and capacity)
-    E.is_record = native_type -> types.NativeType.is(native_type, types.RecordType) or E.is_buffer native_type
+    E.is_array = native_type -> types.NativeType.is(native_type, types.FixedArrayType)
+    -- records, buffers (whose header is a record of its data, length and capacity) and arrays
+    -- (whose parts are their elements, named by position from 0)
+    E.is_record = native_type -> types.NativeType.is(native_type, types.RecordType) or E.is_buffer native_type or E.is_array native_type
     E.header_fields = setmetatable({}, { __mode = "k" })
+    -- the component of a value a part of its type is: an array's parts are elements
+    E.component_of = do(native_type, name)
+        if E.is_array native_type then return data.ElementComponent { index = rules.integer(types.U64, tonumber name) } end
+        return data.FieldComponent { .name }
+    end
     E.fields_of = do(native_type)
+        if E.is_array native_type then
+            local found = E.header_fields[native_type]
+            if found == nil then
+                found = {}
+                for position = 1, native_type.count do found[position] = { name = tostring(position - 1), type = native_type.element } end
+                E.header_fields[native_type] = found
+            end
+            return found
+        end
         if not E.is_buffer native_type then return native_type.fields end
         local found = E.header_fields[native_type]
         if found == nil then
@@ -68,10 +84,16 @@ return do(E, core)
         local found = value.parts[name]
         if found then return found end
         if value.packed == nil then fail(path, ("the field '%s' of %s has no value"):format(name, types.describe value.type)) end
-        local extracted = E.extract(path, value.packed, data.FieldComponent { .name }, field.type)
+        -- a part of zeroed contents is zero
+        if Operand.is(value.packed, data.Constant) and data.NativeConstant.is(value.packed.bits, data.ZeroBits) then return E.zero_value field.type end
+        local extracted = E.extract(path, value.packed, E.component_of(value.type, name), field.type)
         local components = {}
         for component_path, component in pairs E.information(path, value).components do
-            if component_path[1] and data.Component.is(component_path[1], data.FieldComponent) and component_path[1].name == name then
+            local first = component_path[1]
+            local named = first and data.Component.is(first, data.FieldComponent) and first.name == name
+            local element = first and E.is_array value.type and data.Component.is(first, data.ElementComponent)
+                and (not Operand.is(first.index, data.Constant) or tostring(tonumber(first.index.bits.bits)) == name)
+            if named or element then
                 local rest = {}
                 for index = 2, #component_path do rest[#rest + 1] = component_path[index] end
                 components[rest] = component
@@ -112,14 +134,14 @@ return do(E, core)
             return value.operand and not Operand.is(value.operand, data.Constant) and path.writer.information(value.operand) or provenance.plain(value.type)
         end
         local components = E.is_buffer(value.type) and { [{}] = data.Owning {} } or {}
-        if value.packed then
+        if value.packed and not Operand.is(value.packed, data.Constant) then
             local packed = path.writer.information(value.packed)
             if packed then for key, member in pairs packed.components do components[key] = member end end
         end
         for name, member in pairs value.parts do
             for key in pairs components do if key[1] and key[1].name == name then components[key] = nil end end
             for key, component in pairs E.information(path, member).components do
-                components[provenance.concat({ data.FieldComponent { .name } }, key)] = component
+                components[provenance.concat({ E.component_of(value.type, name) }, key)] = component
             end
         end
         return data.ValueInfo { type = value.type, .components, proofs = {} }
@@ -144,6 +166,7 @@ return do(E, core)
     end
 
     E.zero_value = do(native_type)
+        if E.is_array native_type then return data.Aggregate { type = native_type, packed = data.Constant { type = native_type, bits = data.ZeroBits {} }, parts = {} } end
         if E.is_record native_type then
             local parts = {}
             for _, field in ipairs(E.fields_of native_type) do parts[field.name] = E.zero_value(field.type) end
@@ -162,8 +185,11 @@ return do(E, core)
         for key in pairs entries do
             if lua_type key == "string" and E.field_of(record, key) == nil then fail(path, ("%s has no field '%s'"):format(types.describe record, key)) end
         end
+        if E.is_array record and #entries ~= record.count then
+            fail(path, ("%s lists every element: %d given"):format(types.describe record, #entries))
+        end
         local parts = {}
-        for index, field in ipairs record.fields do
+        for index, field in ipairs(E.fields_of record) do
             local given = entries[field.name]
             if given == nil then given = entries[index] end
             if given == nil then

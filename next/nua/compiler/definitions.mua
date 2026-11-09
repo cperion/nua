@@ -53,6 +53,7 @@ local constant_key_of_bits = data.NativeConstant.pass "a known constant in a def
     StaticBytes = unkeyed
     SymbolAddress = unkeyed
     StaticAddress = |bits, recurse, constant| -> ("static:%d:%q"):format(bits.offset, bits.bytes)
+    ZeroBits = |bits, recurse, constant| -> "zero"
     DefinitionAddress = unkeyed
 end
 local constant_key = constant -> constant_key_of_bits(constant.bits, constant)

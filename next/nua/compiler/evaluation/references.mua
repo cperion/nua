@@ -60,6 +60,7 @@ return do(E, core)
     -- extended by `step`; a stored borrow's pointer to the part's address
     -- the type of the part one step names: a record's field, a sum's alternative's payload
     E.step_type = do(native_type, step)
+        if E.is_array native_type and (data.AccessStep.is(step, data.KnownElement) or data.AccessStep.is(step, data.AnyElement)) then return native_type.element end
         if data.AccessStep.is(step, data.FieldStep) then
             local field = E.is_record native_type and E.field_of(native_type, step.name)
             return field and field.type
@@ -71,19 +72,24 @@ return do(E, core)
         return nil
     end
     -- the component of a value's facts one step names
-    E.step_component = step -> data.AccessStep.is(step, data.FieldStep) and data.FieldComponent { name = step.name } or data.AlternativeComponent { name = step.name }
+    E.step_component = do(step, index)
+        if data.AccessStep.is(step, data.FieldStep) then return data.FieldComponent { name = step.name } end
+        if data.AccessStep.is(step, data.AlternativeStep) then return data.AlternativeComponent { name = step.name } end
+        return data.ElementComponent { .index }
+    end
 
-    E.part_reference = do(path, reference, step)
+    -- `index`, for an element step of an array: the operand of the element
+    E.part_reference = do(path, reference, step, index)
         if not (E.is_reference reference and types.NativeType.is(reference.type, types.ReferenceType)) then
-            fail(path, ("'.%s' is borrowed through a reference to its record"):format(step.name))
+            fail(path, ("'.%s' is borrowed through a reference to its record"):format(tostring step.name))
         end
         local info = compilation.borrows[reference.borrow]
         if data.BorrowForm.is(info.form, data.Selected) then
-            return E.dispatch_reference(path, reference, |arm, selected| -> E.part_reference(arm, selected, step))
+            return E.dispatch_reference(path, reference, |arm, selected| -> E.part_reference(arm, selected, step, index))
         end
         local target = reference.type.target
         -- a place holding a reference stands for its target (syntax §9.4)
-        if types.NativeType.is(target, types.ReferenceType) then return E.part_reference(path, E.reached_value(path, E.reach(path, reference)), step) end
+        if types.NativeType.is(target, types.ReferenceType) then return E.part_reference(path, E.reached_value(path, E.reach(path, reference)), step, index) end
         local field = { type = E.step_type(target, step) }
         if not field.type then
             local kind = data.AccessStep.is(step, data.FieldStep) and "field" or "alternative"
@@ -99,7 +105,13 @@ return do(E, core)
         local origins = {}
         for _, origin in ipairs info.origins do origins[#origins + 1] = data.Access { place = origin.place, path = extend(origin.path) } end
         local held = do(base_path)
-            local part = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, steps = extend(base_path.steps), indices = base_path.indices }, info.mutable, info.lifetime, origin_of path, reference.borrow)
+            local indices = base_path.indices
+            if index then
+                indices = {}
+                for position, operand in ipairs(base_path.indices or {}) do indices[position] = operand end
+                indices[#indices + 1] = index
+            end
+            local part = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, steps = extend(base_path.steps), .indices }, info.mutable, info.lifetime, origin_of path, reference.borrow)
             part = data.BorrowInfo { ..part, .origins }
             compilation.borrows[part.id] = part
             return data.Reference { type = part_type, borrow = part.id }
@@ -111,7 +123,7 @@ return do(E, core)
             select = selected -> error("a selected reference must be dispatched before its part is borrowed", 0)
             fixed = do(pointer)
                 local reached = E.reach(path, reference)
-                local place = E.component_place(path, reached.place, field.type, step)
+                local place = index and E.element_place(path, reached.place, field.type, index) or E.component_place(path, reached.place, field.type, step)
                 local result = fresh identity.ValueId
                 append(path, data.Address { site = site path, .result, place = place.id })
                 local address = data.Result { value = result, type = types.pointer field.type }
@@ -133,6 +145,52 @@ return do(E, core)
         local steps = provenance.access_path(place.path)
         steps[#steps + 1] = step
         return memory.intern(data.Access { place = root, path = steps }, part_type, path.writer)
+    end
+
+    -- the place of element `index` of an array in memory: one per reach, since the index is
+    -- an operand (compiler activities §2.3: an element place needs its proofs, its identity no)
+    E.element_place = do(path, array, element_type, index)
+        local components = {}
+        for position, component in ipairs array.path do components[position] = component end
+        components[#components + 1] = data.ElementComponent { .index }
+        local place = data.Place { id = fresh identity.PlaceId, type = element_type, root = array.root, path = components, lifetime = array.lifetime, origin = origin_of path }
+        compilation.places[place.id] = place
+        path.writer.declare place
+        return place
+    end
+
+    -- `array_element_of(a, i)`: a reference to element `i` of an array (syntax §13); checks
+    -- nothing: the words of the Nua library do
+    E.array_element_of = do(path, reference, index)
+        index = E.from_host(path, types.U64, index, "the index")
+        local constant = E.constant_of index
+        local step = constant and data.KnownElement { index = tonumber(rules.integer_value constant) } or data.AnyElement {}
+        return E.part_reference(path, reference, step, index.operand)
+    end
+
+    -- `array_view(a)`: the elements of an array in memory as a read-only view
+    E.array_view = do(path, reference)
+        local array_type = reference.type.target
+        local pointer = E.pack_reference(path, reference)
+        local element_pointer = types.pointer array_type.element
+        local data_pointer = E.compute(path, "reinterpret", element_pointer, { E.bits(pointer.type, pointer) })
+        local view_type = types.view array_type.element
+        local result = fresh identity.ValueId
+        append(path, data.Pack { site = site path, .result, type = view_type, components = { data_pointer.operand, rules.integer(types.U64, array_type.count) } })
+        local operand = data.Result { value = result, type = view_type }
+        local info = compilation.borrows[reference.borrow]
+        local origins = {}
+        for _, origin in ipairs info.origins do
+            local extended = {}
+            for position, step in ipairs origin.path do extended[position] = step end
+            extended[#extended + 1] = data.AnyElement {}
+            origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+        end
+        local view = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = data.Stored { pointer = operand }, .origins, mutable = false, acquired = origin_of path, source = reference.borrow }
+        compilation.borrows[view.id] = view
+        path.flow.borrows[view.id] = path.flow.borrows[reference.borrow]
+        remember_reference(path, operand, view.id)
+        return data.Reference { type = view_type, borrow = view.id }
     end
 
     -- where a reference reaches: walking its path's steps from the root's current contents. A
@@ -170,6 +228,31 @@ return do(E, core)
                     for at, component in ipairs prefix do extended[at] = component end
                     extended[#extended + 1] = E.step_component step
                     position = cells.TrackedPart { place = position.place, path = extended }
+                end
+                position_index += 1
+            elseif data.AccessStep.is(step, data.KnownElement) or data.AccessStep.is(step, data.AnyElement) then
+                -- an element of an array, inline in what holds it
+                index_position += 1
+                local index = borrow_path.indices[index_position]
+                if not cells.is_raw position and data.AccessStep.is(step, data.KnownElement) and not Contents.is(path.flow.contents[position.place], data.Resident) then
+                    local prefix = cells.Reached.is(position, cells.TrackedPart) and position.path or {}
+                    local extended = {}
+                    for at, component in ipairs prefix do extended[at] = component end
+                    extended[#extended + 1] = data.ElementComponent { .index }
+                    position = cells.TrackedPart { place = position.place, path = extended }
+                else
+                    -- a run-time index: the array is materialized (syntax §13)
+                    if not cells.is_raw position then
+                        local root = compilation.places[position.place]
+                        E.resident_place(path, root)
+                        local place = root
+                        for _, component in ipairs(cells.Reached.is(position, cells.TrackedPart) and position.path or {}) do
+                            local component_step = provenance.access_path({ component })[1]
+                            place = E.component_place(path, place, E.step_type(place.type, component_step), component_step)
+                        end
+                        position = cells.RawPlace { .place }
+                    end
+                    position = cells.RawPlace { place = E.element_place(path, position.place, position.place.type.element, index) }
                 end
                 position_index += 1
             else
@@ -223,6 +306,10 @@ return do(E, core)
         if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
         return contents.value
     end
+    local component_name = do(component)
+        if data.Component.is(component, data.ElementComponent) then return tostring(tonumber(component.index.bits.bits)) end
+        return component.name
+    end
     local ReachedValues = define
         RawPlace = |reached, recurse, path| -> E.load(path, reached.place)
         TrackedPlace = |reached, recurse, path| -> tracked_contents(path, reached.place)
@@ -237,7 +324,7 @@ return do(E, core)
     -- value holds there (a payload is reached only under its tag)
     E.component_value = do(path, value, component)
         if data.Component.is(component, data.AlternativeComponent) then return E.payload_of(path, value, component.name) end
-        return E.part(path, value, component.name)
+        return E.part(path, value, component_name component)
     end
     E.reached_value = |path, reached| -> reached_value(reached, path)
 
@@ -361,10 +448,19 @@ return do(E, core)
                     local payload = last and E.stored_borrow(path, written) or rebuilt(E.payload_of(path, value, component.name), position + 1)
                     return data.Tagged { type = value.type, alternative = component.name, .payload }
                 end
+                local name = component_name component
+                -- an array's untouched elements stay where they are (its contents may be
+                -- compact); a record is taken apart
+                if E.is_array value.type then
+                    local parts = {}
+                    for key, existing in pairs value.parts do parts[key] = existing end
+                    parts[name] = last and E.stored_borrow(path, written) or rebuilt(E.part(path, value, name), position + 1)
+                    return data.Aggregate { type = value.type, packed = value.packed, .parts }
+                end
                 local exploded = E.explode(path, value)
                 local parts = {}
-                for name, existing in pairs exploded.parts do parts[name] = existing end
-                parts[component.name] = last and E.stored_borrow(path, written) or rebuilt(exploded.parts[component.name], position + 1)
+                for key, existing in pairs exploded.parts do parts[key] = existing end
+                parts[name] = last and E.stored_borrow(path, written) or rebuilt(exploded.parts[name], position + 1)
                 return data.Aggregate { type = value.type, packed = nil, .parts }
             end
             E.check_local_borrow(path, reached.place, written)

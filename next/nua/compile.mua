@@ -145,7 +145,7 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of" } do environment[name] = hosting.primitive(name, E.host_primitive) end
     environment.owns = types.owns
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
     environment.family = types.define_family
@@ -154,6 +154,15 @@ local hosting_environment = do(compilation, filename, E)
     environment.host = E.host_value
     environment.type_of = E.type_of
     environment.is_known = E.is_known
+    -- `Array(T, n)`: n known while compiling makes the value type (syntax §13)
+    -- and, n known only when the program runs, the builder of the owner `Array T` (§9.3);
+    -- `Array(T)` is the owner's type
+    environment.Array = do(element, count)
+        if count == nil then return types.buffer(element, false, true) end
+        if E.is_known count then return types.fixed_array(element, E.host_value count) end
+        return environment.import("buffer").words(element, types.buffer(element, false, true)).build(count)
+    end
+    environment.FixedArray = types.fixed_array
     return environment, load_nua
 end
 
@@ -224,6 +233,7 @@ local compiling_with_members = do(source, filename)
     -- the built-in kinds the Nua library serves register their members (syntax §16.1)
     environment.import "buffer"
     environment.import "slice"
+    environment.import "array"
     environment.import "str"
     load_nua(source, filename)
 

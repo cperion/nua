@@ -29,7 +29,7 @@ return do(E, core)
         local position = 1
         while position <= #steps do
             local step = steps[position]
-            if data.AccessStep.is(step, data.FieldStep) or data.AccessStep.is(step, data.AlternativeStep) then
+            if data.AccessStep.is(step, data.FieldStep) or data.AccessStep.is(step, data.AlternativeStep) or E.is_array(type) then
                 type = E.step_type(type, step)
                 if not type then return nil end
                 position += 1

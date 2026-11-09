@@ -71,8 +71,8 @@ return do(E, core)
             E.check_local_borrow(path, place.id, converted)
             path.flow.contents[place.id] = data.Tracked { value = converted }
             if types.owns(type) then E.install_payload(path, place.id, converted) end
-        elseif types.owns type and not E.is_sum type then
-            -- an owner declared without a value starts empty (syntax §9.2)
+        elseif (types.owns type and not E.is_sum type) or E.is_array type then
+            -- an owner declared without a value starts empty (syntax §9.2), an array zeroed (§13)
             path.flow.contents[place.id] = data.Tracked { value = E.zero_value type }
         else
             path.flow.contents[place.id] = data.Uninitialized {}

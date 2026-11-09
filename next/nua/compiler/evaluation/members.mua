@@ -144,7 +144,7 @@ return do(E, core)
         local wanted = requirement and requirement.type
         if wanted and types.NativeType.is(wanted, types.ViewType) then
             local held = E.deref(path, E.peek(path, argument))
-            if is_native held and types.owns held.type then
+            if is_native held and (types.owns held.type or E.is_array held.type) then
                 if wanted.mutable then
                     fail(path, ("a %s takes the elements of an owner marked at the call: f(Ref %s)"):format(types.describe wanted, cell_name argument))
                 end

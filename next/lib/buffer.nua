@@ -15,10 +15,11 @@ local index = import "index"
 
 local made = {}
 
-local words = do(T)
-    if made[T] then return made[T] end
+-- `B`: the buffer type served (`Buffer T` when not given, or the fixed-length owner `Array T`)
+local words = do(T, B)
+    B = B or Buffer T
+    if made[B] then return made[B] end
     local size = size_of T
-    local B = Buffer T
     -- elements that own storage are reached by reference, and released with their buffer
     local owning = owns T
 
@@ -119,29 +120,48 @@ local words = do(T)
         return nil
     end
 
-    local members = define
+    -- `Array(T, n) {}` (syntax §9.3): n zeroed elements, a length fixed when built
+    local build = do(count: U64, entries): B
+        local built: B
+        reserve(Ref built, count)
+        local i: U64 = 0
+        while i < count do
+            initialize(Ref built, i, zero_of T)
+            i = i + 1
+        end
+        built.length = count
+        return built
+    end
+
+    local shared = define
+        .sub
+        .all
+        .all_mut
+        __index = element
+        __release = release
+    end
+    local members = B.fixed and define
+        ..shared
+        .build
+    end or define
+        ..shared
         .reserve
         .push
         .pop
         .truncate
         .clear
-        .sub
-        .all
-        .all_mut
-        __index = element
         __cast = cast
-        __release = release
     end
     -- a buffer of bytes is text being built (syntax §14.2): it lends a `Str`
     if T == U8 then
         members.str = do(self: Ref B): Str = view_of(self, 0, self.length, Str)
     end
-    made[T] = members
+    made[B] = members
     return members
 end
 
--- the members of every `Buffer T` (syntax §16.1: served once per family)
-family(Buffer, |element, native_type| -> words element)
+-- the members of every `Buffer T` and `Array T` (syntax §16.1: served once per family)
+family(Buffer, |element, native_type| -> words(element, native_type))
 
 return {
     words = words,

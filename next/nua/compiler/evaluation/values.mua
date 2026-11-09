@@ -58,7 +58,7 @@ return do(E, core)
             local cast = E.cast(path, type, value)
             if cast ~= nil then return cast end
         end
-        if types.NativeType.is(type, types.RecordType) and not is_native value and lua_type value == "table" then
+        if (types.NativeType.is(type, types.RecordType) or E.is_array type) and not is_native value and lua_type value == "table" then
             return E.construct_record(path, type, value)
         end
         local described = not is_native value and types.variant_of value
@@ -118,7 +118,7 @@ return do(E, core)
     -- `component` of an aggregate operand, extracted once on a path: an extraction already
     -- made where this point is reached is the same operand (syntax §12.2: one view's length)
     E.extract = do(path, aggregate, component, result_type)
-        local key = aggregate and not Operand.is(aggregate, data.Constant) and (proofs.key_of(aggregate) .. "." .. component.name)
+        local key = aggregate and not Operand.is(aggregate, data.Constant) and (proofs.key_of(aggregate) .. "." .. provenance.key { component })
         if key and path.flow.available[key] then return path.flow.available[key] end
         local result = fresh identity.ValueId
         append(path, data.Extract { site = site path, .result, type = result_type, .aggregate, path = { component } })

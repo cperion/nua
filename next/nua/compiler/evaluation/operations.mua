@@ -56,6 +56,10 @@ return do(E, core)
         end
         view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3], arguments[4])
         static_text = |path, arguments, boundary| -> E.static_text(path, arguments[1])
+        array_element_of = |path, arguments, boundary| -> E.array_element_of(path, reference_argument(path, arguments[1]), arguments[2])
+        array_view = |path, arguments, boundary| -> E.array_view(path, reference_argument(path, arguments[1]))
+        -- `zero_of(T)`: the zero value of a type, for a word that zeroes storage
+        zero_of = |path, arguments, boundary| -> E.zero_value(arguments[1])
         view_length = |path, arguments, boundary| -> E.view_length(path, E.deref(path, reference_argument(path, arguments[1])))
         view_element_of = |path, arguments, boundary| -> E.view_element_of(path, E.deref(path, reference_argument(path, arguments[1])), arguments[2])
         subview_of = |path, arguments, boundary| -> E.subview_of(path, E.deref(path, reference_argument(path, arguments[1])), arguments[2], arguments[3])
@@ -111,6 +115,8 @@ return do(E, core)
     -- applying a native type: `Grow(T) { … }` builds a buffer, `Record { … }` a record, `U32(x)`
     -- converts (a pointer's bits are reinterpreted, never converted)
     E.apply_type = do(path, callee, arguments)
+        -- `Array(T, n)()` is zeroed (syntax §13)
+        if #arguments == 0 and E.is_array callee then return E.zero_value callee end
         if #arguments ~= 1 then fail(path, types.describe callee .. " takes one argument") end
         -- `T(v)`: T's `__cast` hook first (syntax §16), then the default conversions
         local given = arguments[1]
