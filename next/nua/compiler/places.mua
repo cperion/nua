@@ -53,6 +53,8 @@ local Uninitialized = struct {}
 local Tracked = struct { value: NativeValue }
 local Resident = struct { info: ValueInfo }
 local Moved = struct { at: OriginId }
+-- a part of a place whose owner was moved out (syntax §9.2): the place still holds the rest
+local Vacated = struct { place: PlaceId, path: AccessPath, at: OriginId }
 Contents { Uninitialized, Tracked, Resident, Moved }
 
 ------------------------------------------------------------------------------------------------
@@ -108,6 +110,7 @@ return define
     .Tracked
     .Resident
     .Moved
+    .Vacated
     .EndReason
     .end_reasons
     .Range

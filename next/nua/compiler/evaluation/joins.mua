@@ -173,6 +173,18 @@ return do(E, core)
                     flow.contents[place] = data.Moved { at = moved_at }
                 end
             end
+            -- a part moved out on some edges only: released on the others, vacated after
+            for _, part in ipairs decision.partly_vacated do
+                local joined = flow.contents[part.place]
+                if not (joined and Contents.is(joined, data.Moved)) then
+                    for _, edge_path in ipairs edge_paths do
+                        local contents = edge_path.flow.contents[part.place]
+                        local live = contents and (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident))
+                        if live and not E.vacated_at(edge_path, part.place, part.path) then E.release_part(edge_path, part.place, part.path) end
+                    end
+                    tracking.vacate(flow, data.Access { place = part.place, path = part.path }, part.at)
+                end
+            end
         end
         -- a place tracked on every edge with differing values holds their merge
         local merge_places = do()

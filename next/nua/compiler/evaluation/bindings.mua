@@ -82,8 +82,10 @@ return do(E, core)
     E.get = do(path, cell)
         if path.dead then return nil end
         local value = E.peek(path, cell)
-        -- using an owner as a value moves it (syntax §9.2)
+        -- using an owner as a value moves it (syntax §9.2); one with a part moved out is not
+        -- whole
         if cells.Cell.is(cell, cells.PlaceCell) and types.owns(compilation.places[cell.place].type) then
+            E.check_vacancy(path, cell.place, {})
             local previous = E.information(path, value)
             local info = memory.capture(path.flow, cell.place, previous)
             if E.is_aggregate value and (next(memory.payloads(info)) or next(memory.payloads(previous))) then
@@ -110,8 +112,15 @@ return do(E, core)
         HostCell = |cell, recurse, path| -> cell.value
         FieldCell = do(cell, recurse, path)
             local whole = E.deref(path, recurse(cell.base, path))
+            if not is_native whole and lua_type whole == "table" then return whole[cell.name] end
             if not E.is_aggregate whole then fail(path, ("'.%s' of a value that is not a record"):format(cell.name)) end
-            return E.part(path, whole, cell.name)
+            local part = E.part(path, whole, cell.name)
+            -- an owner part is read where it is: not after it was moved out
+            if types.owns part.type then
+                local root, steps = E.held_access(path, E.reference_to(path, cell))
+                if root then E.check_vacancy(path, root, steps) end
+            end
+            return part
         end
         RawCell = |cell, recurse, path| -> E.load(path, cell.place)
         ElementCell = |cell, recurse, path| -> E.method(path, cell.base, "get", { cell.key }, false)
@@ -127,17 +136,8 @@ return do(E, core)
         ElementCell = do(cell, recurse, path, value)
             E.method(path, cell.base, "set", { cell.key, value }, false)
         end
-        FieldCell = do(cell, recurse, path, value)
-            local whole = E.deref(path, E.peek(path, cell.base))
-            if not E.is_aggregate whole then fail(path, ("'.%s' of a value that is not a record"):format(cell.name)) end
-            local field = E.field_of(whole.type, cell.name)
-            if field == nil then fail(path, ("%s has no field '%s'"):format(types.describe whole.type, cell.name)) end
-            local exploded = E.explode(path, whole)
-            local parts = {}
-            for name, existing in pairs exploded.parts do parts[name] = existing end
-            parts[cell.name] = E.stored_borrow(path, E.from_host(path, field.type, value, ("the field '%s'"):format(cell.name)))
-            recurse(cell.base, path, data.Aggregate { type = whole.type, packed = nil, .parts })
-        end
+        -- a field is assigned through a reference to it (an owner there is replaced)
+        FieldCell = |cell, recurse, path, value| -> E.write_reference(path, E.reference_to(path, cell), value, cell.name)
         RawCell = do(cell, recurse, path, value)
             local stored = E.from_host(path, cell.place.type, value, "the stored value")
             append(path, data.Store { site = site path, place = cell.place.id, value = E.materialize(path, stored) })
@@ -156,14 +156,27 @@ return do(E, core)
             end
             local converted = E.from_host(path, type, value, "the value assigned to '" .. cell.name .. "'")
             E.check_local_borrow(path, cell.place, converted)
+            E.end_variants(path, cell.place, {}, type, converted)
             -- An addressed place remains resident while its value is live: subsequent writes
             -- must reach references already stored elsewhere, not just a compiler-side cache.
-            local resident = path.flow.contents[cell.place] and Contents.is(path.flow.contents[cell.place], data.Resident)
-            if types.owns type then E.release_place(path, cell.place) end
+            local contents = path.flow.contents[cell.place]
+            local resident = contents and Contents.is(contents, data.Resident)
+            -- an owner replaced: the new header written first, then the borrows of the old
+            -- storage end and it is released; a reference to the place itself survives (§9.7)
+            local old = nil
+            if types.owns type and contents then
+                if resident then old = E.load(path, compilation.places[cell.place])
+                elseif Contents.is(contents, data.Tracked) then old = contents.value end
+            end
             if resident then
                 append(path, data.Store { site = site(path), place = cell.place, value = E.materialize(path, converted) })
                 if not types.borrows(type) then path.flow.contents[cell.place] = data.Resident { info = E.information(path, converted) } end
             else path.flow.contents[cell.place] = data.Tracked { value = converted } end
+            if old then
+                E.end_storage(path, cell.place, {}, type, "replaced")
+                E.release_value(path, old, cell.place, {})
+            end
+            if types.owns type then tracking.refill(path.flow, cell.place, {}) end
             if types.owns(type) then E.install_payload(path, cell.place, converted) end
         end
     end

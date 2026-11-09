@@ -230,9 +230,10 @@ local filled = do(n: U32): Grow(U32)
     end
     return xs
 end
+-- a payload that owns is matched by reference (syntax §9.13)
 local size = do(d: Doc): U64 = d with
     empty = do() = 0
-    text = do(t) = t.length
+    text = do(t: Ref (Grow U32)): U64 = t.length
 end
 ]]
 
@@ -259,7 +260,7 @@ local owner_chosen = do(flag: Bool, n: U32): U64
     return platform.ledger_mapped_bytes() - before
 end
 export owner_chosen
--- matching consumes the sum: its payload moves to the handler, which releases it
+-- the sum moves to size, whose match borrows the payload; size releases the sum
 local owner_measured = do(flag: Bool, n: U32): U64
     local before = platform.ledger_mapped_bytes()
     local d = Doc.empty
@@ -345,4 +346,189 @@ local widen = do(p: Pair): U32 = p with
 end
 export widen
 ]], "yield different types")
+end
+
+local pair = [[
+local Circle = struct { radius: U32 }
+local Rect = struct { width: U32, height: U32 }
+local Figure = oneof { circle: Circle, rect: Rect }
+local Doc = oneof { empty: Unit, text: Grow(U32) }
+local Shelf = struct { count: U32, doc: Doc }
+local area_of = do(f: Figure): U32 = f with
+    circle = do(c) = c.radius * c.radius * 3
+    rect = do(r) = r.width * r.height
+end
+local widen = do(f: Ref Figure, by: U32): Unit
+    f with
+        circle = do(c: Ref Circle): Unit
+            c.radius = c.radius + by
+        end
+        rect = do(r: Ref Rect): Unit
+            r.width = r.width + by
+        end
+    end
+end
+local append_to = do(d: Ref Doc, value: U32): Unit
+    d with
+        empty = do(): Unit
+        end
+        text = do(t: Ref (Grow U32)): Unit
+            t:push value
+        end
+    end
+end
+local length_of = do(d: Ref Doc): U64 = d with
+    empty = do(): U64 = 0
+    text = do(t: Ref (Grow U32)): U64 = t.length
+end
+local filled = do(n: U32): Doc
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push i
+    end
+    return Doc.text xs
+end
+]]
+
+test "a Ref handler borrows the payload in place, on a runtime or a known tag":
+    local library = native("sum_ref_handlers", pair .. [[
+local sum_widened = do(rect: Bool, k: U32): U32
+    local f = Figure.circle { radius = 1 }
+    if rect then f = Figure.rect { width = 2, height = 3 } end
+    widen(Ref f, k)
+    return area_of f
+end
+export sum_widened
+local sum_known = do(k: U32): U32
+    local f = Figure.rect { width = k, height = 2 }
+    widen(Ref f, 1)
+    return area_of f
+end
+export sum_known
+local sum_through_call = do(rect: Bool, k: U32): U32
+    local f = Figure.circle { radius = 1 }
+    if rect then f = Figure.rect { width = 2, height = 3 } end
+    call widen (Ref f) k
+    return area_of f
+end
+export sum_through_call
+]])
+    assert(library.sum_widened(true, 4) == 6 * 3 and library.sum_widened(false, 1) == 2 * 2 * 3)
+    assert(library.sum_known(5) == 6 * 2)
+    assert(library.sum_through_call(true, 4) == 6 * 3 and library.sum_through_call(false, 1) == 12)
+end
+
+test "an owning payload is grown in place through a Ref handler, wherever the sum is held":
+    -- each body runs inside a word that measures the bytes it leaves mapped
+    local measured = do(name, body)
+        return ([[
+local %s_body = do(n: U32): U64
+%s
+end
+local %s = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local length = %s_body n
+    return length * 1000000000 + (platform.ledger_mapped_bytes() - before)
+end
+export %s
+]]):format(name, body, name, name, name)
+    end
+    local library = native("sum_ref_owners", pair
+        .. measured("sum_in_local", [[
+    local d = filled n
+    append_to(Ref d, 7)
+    return length_of(Ref d)]])
+        .. measured("sum_in_field", [[
+    local shelf = Shelf { count = 1, doc = filled n }
+    shelf.doc with
+        empty = do(): Unit
+        end
+        text = do(t: Ref (Grow U32)): Unit
+            t:push 1
+        end
+    end
+    return length_of(Ref shelf.doc)]])
+        .. measured("sum_in_element", [[
+    local docs = Grow(Doc) {}
+    docs:push(filled n)
+    docs[0] with
+        empty = do(): Unit
+        end
+        text = do(t: Ref (Grow U32)): Unit
+            t:push 1
+        end
+    end
+    return length_of(docs[0])]])
+        -- a sum that is not a place is held for the match, and released after it
+        .. measured("sum_temporary", [[
+    local length = (filled n) with
+        empty = do(): U64 = 0
+        text = do(t: Ref (Grow U32)): U64 = t.length
+    end
+    return length]])
+        -- the payload moved out through the handler: its new owner releases it, the sum does not
+        .. measured("sum_moved_out", [[
+    local d = filled n
+    local length = d with
+        empty = do(): U64 = 0
+        text = do(t: Ref (Grow U32)): U64
+            local mine: Grow U32 = t
+            return mine.length
+        end
+    end
+    return length]]))
+    library.sum_in_local(1)
+    for _, name in ipairs { "sum_in_local", "sum_in_field", "sum_in_element", "sum_temporary", "sum_moved_out" } do
+        local result = library[name](100000)
+        local extra = (name == "sum_temporary" or name == "sum_moved_out") and 0 or 1
+        assert(result == (100000 + extra) * 1000000000ULL, name .. " " .. tostring result)
+    end
+end
+
+test "matching an owning payload by value is rejected; another variant ends its borrows":
+    refuses(pair .. [[
+local f = do(n: U32): U64
+    local d = filled n
+    local length = d with
+        empty = do()
+            return 0
+        end
+        text = do(t)
+            return t.length
+        end
+    end
+    return length
+end
+export f
+]], "the payload of Doc.text owns storage: its handler takes it by reference")
+    refuses(pair .. [[
+local f = do(k: U32): U32
+    local fig = Figure.rect { width = k, height = 2 }
+    local width = fig with
+        circle = do(c: Ref Circle): Ref U32
+            return Ref c.radius
+        end
+        rect = do(r: Ref Rect): Ref U32
+            return Ref r.width
+        end
+    end
+    fig = Figure.circle { radius = 1 }
+    return width
+end
+export f
+]], "a borrow is used after it ended (replaced)")
+    refuses(pair .. [[
+local f = do(n: U32): U64
+    local d = filled n
+    local length = d with
+        empty = do(): U64 = 0
+        text = do(t: Ref (Grow U32)): U64
+            local mine: Grow U32 = t
+            return mine.length
+        end
+    end
+    return length_of(Ref d)
+end
+export f
+]], "'d.text' was moved")
 end

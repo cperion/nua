@@ -26,56 +26,180 @@ return do(E, core)
     local compilation = core.compilation
 
     -- references: `Ref x` is a held borrow of x's place; reading through it reads that place's
-    -- current contents, writing writes them (buffers §2.3)
-    E.reference_to = do(path, cell)
-        if not (cells.Cell.is(cell, cells.PlaceCell)) then fail(path, "Ref takes a local of the body") end
-        local place_type = compilation.places[cell.place].type
-        local contents = path.flow.contents[cell.place]
-        if types.NativeType.is(place_type, types.ReferenceType) and contents and Contents.is(contents, data.Tracked) then return contents.value end
-        local lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
-        local info = tracking.borrow(path.flow, data.BorrowPath { root = cell.place, steps = {} }, true, lifetime, origin_of path)
-        return data.Reference { type = types.reference place_type, borrow = info.id }
+    -- current contents, writing writes them (buffers §2.3). `Ref s.field` borrows part of a
+    -- place: the borrow of its record extended by a field step (syntax §9.4); `Ref g[i]` the
+    -- buffer's element, through its library word.
+    local Referencing = define
+        PlaceCell = do(cell, recurse, path)
+            local place_type = compilation.places[cell.place].type
+            local contents = path.flow.contents[cell.place]
+            if types.NativeType.is(place_type, types.ReferenceType) and contents and Contents.is(contents, data.Tracked) then return contents.value end
+            local lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+            local info = tracking.borrow(path.flow, data.BorrowPath { root = cell.place, steps = {} }, true, lifetime, origin_of path)
+            return data.Reference { type = types.reference place_type, borrow = info.id }
+        end
+        FieldCell = |cell, recurse, path| -> E.part_reference(path, recurse(cell.base, path), data.FieldStep { name = cell.name })
+        ElementCell = |cell, recurse, path| -> E.method(path, cell.base, "element", { cell.key }, false)
+        HostCell = |cell, recurse, path| -> fail(path, ("Ref takes a place of the body; '%s' holds a host value"):format(cell.name))
+        -- storage behind a raw pointer borrows nothing the compiler knows (syntax §9.5): a
+        -- stored borrow of no origins, under the programmer's contract
+        RawCell = do(cell, recurse, path)
+            local reference_type = types.reference cell.place.type
+            local pointer = E.compute(path, "reinterpret", reference_type, { E.bits(cell.place.root.pointer.type, cell.place.root.pointer) }).operand
+            local info = data.BorrowInfo { id = fresh identity.BorrowId, form = data.Stored { .pointer }, origins = {}, mutable = true, lifetime = fresh identity.LifetimeId, acquired = origin_of path }
+            compilation.borrows[info.id] = info
+            path.flow.borrows[info.id] = data.Live {}
+            remember_reference(path, pointer, info.id)
+            return data.Reference { type = reference_type, borrow = info.id }
+        end
     end
-    -- where a reference reaches: a tracked place, or (for an element path) a raw place
-    -- derived from the root's current header, element by element
-    E.reach_path = do(path, borrow_path, borrow)
+    local reference_of_cell = cells.Cell.pass "borrow the place a cell names" with ..Referencing end
+    E.reference_to = |path, cell| -> reference_of_cell(cell, path)
+
+    -- a reference to part of what `reference` reaches: a held borrow's path and every origin
+    -- extended by `step`; a stored borrow's pointer to the part's address
+    -- the type of the part one step names: a record's field, a sum's alternative's payload
+    E.step_type = do(native_type, step)
+        if data.AccessStep.is(step, data.FieldStep) then
+            local field = E.is_record native_type and E.field_of(native_type, step.name)
+            return field and field.type
+        end
+        if data.AccessStep.is(step, data.AlternativeStep) and E.is_sum native_type then
+            local alternative = types.alternative_of(native_type, step.name)
+            return alternative and alternative.payload
+        end
+        return nil
+    end
+    -- the component of a value's facts one step names
+    E.step_component = step -> data.AccessStep.is(step, data.FieldStep) and data.FieldComponent { name = step.name } or data.AlternativeComponent { name = step.name }
+
+    E.part_reference = do(path, reference, step)
+        if not (E.is_reference reference and types.NativeType.is(reference.type, types.ReferenceType)) then
+            fail(path, ("'.%s' is borrowed through a reference to its record"):format(step.name))
+        end
+        local info = compilation.borrows[reference.borrow]
+        if data.BorrowForm.is(info.form, data.Selected) then
+            return E.dispatch_reference(path, reference, |arm, selected| -> E.part_reference(arm, selected, step))
+        end
+        local target = reference.type.target
+        -- a place holding a reference stands for its target (syntax §9.4)
+        if types.NativeType.is(target, types.ReferenceType) then return E.part_reference(path, E.reached_value(path, E.reach(path, reference)), step) end
+        local field = { type = E.step_type(target, step) }
+        if not field.type then
+            local kind = data.AccessStep.is(step, data.FieldStep) and "field" or "alternative"
+            fail(path, ("%s has no %s '%s'"):format(types.describe target, kind, step.name))
+        end
+        local part_type = types.reference field.type
+        local extend = do(steps)
+            local extended = {}
+            for position, existing in ipairs steps do extended[position] = existing end
+            extended[#extended + 1] = step
+            return extended
+        end
+        local origins = {}
+        for _, origin in ipairs info.origins do origins[#origins + 1] = data.Access { place = origin.place, path = extend(origin.path) } end
+        local held = do(base_path)
+            local part = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, steps = extend(base_path.steps), indices = base_path.indices }, info.mutable, info.lifetime, origin_of path)
+            part = data.BorrowInfo { ..part, .origins }
+            compilation.borrows[part.id] = part
+            return data.Reference { type = part_type, borrow = part.id }
+        end
+        local use = tracking.use(path.flow, reference.borrow)
+        return use with
+            derive = held
+            cached = pointer -> held(info.form.path)
+            select = selected -> error("a selected reference must be dispatched before its part is borrowed", 0)
+            fixed = do(pointer)
+                local reached = E.reach(path, reference)
+                local place = E.component_place(path, reached.place, field.type, step)
+                local result = fresh identity.ValueId
+                append(path, data.Address { site = site path, .result, place = place.id })
+                local address = data.Result { value = result, type = types.pointer field.type }
+                local operand = E.compute(path, "reinterpret", part_type, { E.bits(address.type, address) }).operand
+                local stored = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = data.Stored { pointer = operand }, .origins, acquired = origin_of path }
+                compilation.borrows[stored.id] = stored
+                path.flow.borrows[stored.id] = path.flow.borrows[reference.borrow]
+                remember_reference(path, operand, stored.id)
+                return data.Reference { type = part_type, borrow = stored.id }
+            end
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+        end
+    end
+
+    -- the place of a part of memory `place` (a resident place, or storage behind a pointer):
+    -- one per root and path (compiler activities §2.3)
+    E.component_place = do(path, place, part_type, step)
+        local root = #place.path == 0 and place.id or provenance.base_place(place, compilation.places)
+        local steps = provenance.access_path(place.path)
+        steps[#steps + 1] = step
+        return memory.intern(data.Access { place = root, path = steps }, part_type, path.writer)
+    end
+
+    -- where a reference reaches: walking its path's steps from the root's current contents. A
+    -- field of a tracked value stays a part of that value; a field of memory is a component
+    -- place; an element is a raw place derived from its buffer's current header.
+    E.reach_path = do(path, borrow_path, borrow, writing)
+        -- a moved-out part, or a value holding one, is not reached again until it is written
+        if not writing then E.check_vacancy(path, borrow_path.root, borrow_path.steps) end
         if #borrow_path.steps == 0 then return cells.TrackedPlace { place = borrow_path.root } end
         local contents = path.flow.contents[borrow_path.root]
-        local header
+        local position
         if contents and Contents.is(contents, data.Resident) then
-            header = E.load(path, compilation.places[borrow_path.root])
+            position = cells.RawPlace { place = compilation.places[borrow_path.root] }
         elseif contents and Contents.is(contents, data.Tracked) then
-            header = E.deref(path, contents.value)
+            -- a root holding a reference stands for its target: the walk starts there
+            position = E.is_reference contents.value and types.NativeType.is(contents.value.type, types.ReferenceType) and E.reach(path, contents.value) or cells.TrackedPlace { place = borrow_path.root }
         else
             fail(path, "a reference reaches a place that holds no value")
         end
-        local element_type = compilation.places[borrow_path.root].type
-        local place = nil
         local index_position = 0
-        for position = 1, #borrow_path.steps, 2 do
-            if place then header = E.load(path, place) end
-            element_type = header.type.element
-            index_position += 1
-            local data_pointer = E.part(path, header, "data")
-            local index = E.bits(types.U64, borrow_path.indices[index_position])
-            place = data.Place with
-                id = fresh identity.PlaceId
-                type = element_type
-                root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index }).operand, .borrow }
-                path = {}
-                lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
-                origin = origin_of path
+        local position_index = 1
+        local steps = borrow_path.steps
+        while position_index <= #steps do
+            local step = steps[position_index]
+            if data.AccessStep.is(step, data.FieldStep) or data.AccessStep.is(step, data.AlternativeStep) then
+                -- a resident place's fields (and payloads) are memory
+                if cells.Reached.is(position, cells.TrackedPlace) and Contents.is(path.flow.contents[position.place], data.Resident) then
+                    position = cells.RawPlace { place = compilation.places[position.place] }
+                end
+                if cells.is_raw position then
+                    position = cells.RawPlace { place = E.component_place(path, position.place, E.step_type(position.place.type, step), step) }
+                else
+                    local prefix = cells.Reached.is(position, cells.TrackedPart) and position.path or {}
+                    local extended = {}
+                    for at, component in ipairs prefix do extended[at] = component end
+                    extended[#extended + 1] = E.step_component step
+                    position = cells.TrackedPart { place = position.place, path = extended }
+                end
+                position_index += 1
+            else
+                assert(data.AccessStep.is(step, data.ContentsStep), "an element step follows the contents of a buffer")
+                local header = E.reached_value(path, position)
+                if not cells.is_raw position then header = E.deref(path, header) end
+                index_position += 1
+                local data_pointer = E.part(path, header, "data")
+                local index = E.bits(types.U64, borrow_path.indices[index_position])
+                local place = data.Place with
+                    id = fresh identity.PlaceId
+                    type = header.type.element
+                    root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index }).operand, .borrow }
+                    path = {}
+                    lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+                    origin = origin_of path
+                end
+                compilation.places[place.id] = place
+                path.writer.declare place
+                position = cells.RawPlace { .place }
+                position_index += 2
             end
-            compilation.places[place.id] = place
-            path.writer.declare place
         end
-        return cells.RawPlace { .place }
+        return position
     end
-    E.reach = do(path, reference)
+    E.reach = do(path, reference, writing)
         local use = tracking.use(path.flow, reference.borrow)
         return use with
-            derive = p -> E.reach_path(path, p, reference.borrow)
-            cached = pointer -> E.reach_path(path, compilation.borrows[reference.borrow].form.path, reference.borrow)
+            derive = p -> E.reach_path(path, p, reference.borrow, writing)
+            cached = pointer -> E.reach_path(path, compilation.borrows[reference.borrow].form.path, reference.borrow, writing)
             select = selected -> error("a selected reference must be dispatched before reaching its place", 0)
             fixed = do(pointer)
                 local place = data.Place {
@@ -90,6 +214,33 @@ return do(E, core)
             ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
         end
     end
+
+    -- the value at what a reference reached: memory is loaded, a tracked place's contents read,
+    -- a part of one read from them field by field
+    local tracked_contents = do(path, place)
+        local contents = path.flow.contents[place]
+        if contents and Contents.is(contents, data.Resident) then return E.load(path, compilation.places[place]) end
+        if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
+        return contents.value
+    end
+    local ReachedValues = define
+        RawPlace = |reached, recurse, path| -> E.load(path, reached.place)
+        TrackedPlace = |reached, recurse, path| -> tracked_contents(path, reached.place)
+        TrackedPart = do(reached, recurse, path)
+            local value = tracked_contents(path, reached.place)
+            for _, component in ipairs reached.path do value = E.component_value(path, value, component) end
+            return value
+        end
+    end
+    local reached_value = cells.Reached.pass "read what a reference reached" with ..ReachedValues end
+    -- the part of a value one component names: a field, or the payload of the alternative the
+    -- value holds there (a payload is reached only under its tag)
+    E.component_value = do(path, value, component)
+        if data.Component.is(component, data.AlternativeComponent) then return E.payload_of(path, value, component.name) end
+        return E.part(path, value, component.name)
+    end
+    E.reached_value = |path, reached| -> reached_value(reached, path)
+
     E.resident_place = do(path, place)
         local contents = path.flow.contents[place.id]
         if contents and Contents.is(contents, data.Tracked) then
@@ -104,10 +255,18 @@ return do(E, core)
         end
         local reached = E.reach(path, reference)
         local pointer
-        if cells.is_raw(reached) then pointer = reached.place.root.pointer
+        if cells.is_raw(reached) and #reached.place.path == 0 and reached.place.root.pointer then pointer = reached.place.root.pointer
         else
-            local place = compilation.places[reached.place]
-            E.resident_place(path, place)
+            local place
+            if cells.is_raw reached then place = reached.place
+            else
+                place = compilation.places[reached.place]
+                E.resident_place(path, place)
+                -- a part of a tracked place: its root is resident now, the part a component of it
+                if cells.Reached.is(reached, cells.TrackedPart) then
+                    place = memory.intern(data.Access { place = place.id, path = provenance.access_path(reached.path) }, reference.type.target, path.writer)
+                end
+            end
             local result = fresh(identity.ValueId)
             append(path, data.Address { site = site(path), .result, place = place.id })
             pointer = data.Result { value = result, type = types.pointer(place.type) }
@@ -125,13 +284,7 @@ return do(E, core)
         end
         local reached = E.reach(path, value)
         if cells.is_raw(reached) then return E.load(path, reached.place) end
-        local contents = path.flow.contents[reached.place]
-        if contents and Contents.is(contents, data.Resident) then
-            local loaded = E.load(path, compilation.places[reached.place])
-            return loaded
-        end
-        if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
-        return E.deref(path, contents.value)
+        return E.deref(path, E.reached_value(path, reached))
     end
     -- a reference to element `index` of the buffer `reference` reaches (buffers §2.3)
     E.element_reference = do(path, reference, index)
@@ -176,19 +329,234 @@ return do(E, core)
         return data.Reference { type = types.reference element_type, borrow = info.id }
     end
 
-    E.write_reference = do(path, reference, value, name)
+    -- writing what a reference reached: memory is stored to, a tracked place's contents
+    -- replaced, a part of one rebuilt field by field around the written value
+    local Writing = define
+        RawPlace = do(reached, recurse, path, written)
+            append(path, data.Store { site = site path, place = reached.place.id, value = E.materialize(path, written) })
+        end
+        TrackedPlace = do(reached, recurse, path, written)
+            local contents = path.flow.contents[reached.place]
+            local place = compilation.places[reached.place]
+            if contents and Contents.is(contents, data.Resident) then return recurse(cells.RawPlace { .place }, path, written) end
+            -- a place that is not a local of this body (a parameter's target) lives in memory
+            if not data.PlaceRoot.is(place.root, data.LocalRoot) then
+                recurse(cells.RawPlace { .place }, path, written)
+                path.flow.contents[place.id] = data.Resident { info = E.information(path, written) }
+                return
+            end
+            E.check_local_borrow(path, reached.place, written)
+            path.flow.contents[reached.place] = data.Tracked { value = written }
+        end
+        TrackedPart = do(reached, recurse, path, written)
+            local contents = path.flow.contents[reached.place]
+            if contents == nil or not Contents.is(contents, data.Tracked) then fail(path, "a reference reaches a place that holds no value") end
+            local rebuilt
+            rebuilt = do(value, position)
+                local component = reached.path[position]
+                local last = position == #reached.path
+                -- a payload rebuilt is the payload of a value of that alternative (the tag of
+                -- what a payload reference reaches is its alternative)
+                if data.Component.is(component, data.AlternativeComponent) then
+                    local payload = last and E.stored_borrow(path, written) or rebuilt(E.payload_of(path, value, component.name), position + 1)
+                    return data.Tagged { type = value.type, alternative = component.name, .payload }
+                end
+                local exploded = E.explode(path, value)
+                local parts = {}
+                for name, existing in pairs exploded.parts do parts[name] = existing end
+                parts[component.name] = last and E.stored_borrow(path, written) or rebuilt(exploded.parts[component.name], position + 1)
+                return data.Aggregate { type = value.type, packed = nil, .parts }
+            end
+            E.check_local_borrow(path, reached.place, written)
+            local whole = rebuilt(contents.value, 1)
+            path.flow.contents[reached.place] = data.Tracked { value = whole }
+            if types.owns written.type then E.install_payload(path, reached.place, whole) end
+        end
+    end
+    local write_reached = cells.Reached.pass "write what a reference reached" with ..Writing end
+
+    -- writing through a reference: an owner there is replaced, the new header written first,
+    -- then the borrows of the old storage end and it is released, so the storage is valid at
+    -- a trap (syntax §9.2, §9.14); initializing a slot that holds nothing yet only writes
+    local write_through
+    write_through = do(path, reference, value, name, replacing)
         if data.BorrowForm.is(compilation.borrows[reference.borrow].form, data.Selected) then
-            return E.dispatch_reference(path, reference, |arm, selected| -> E.write_reference(arm, selected, value, name))
+            return E.dispatch_reference(path, reference, |arm, selected| -> write_through(arm, selected, value, name, replacing))
         end
-        local reached = E.reach(path, reference)
-        local place = cells.is_raw(reached) and reached.place or compilation.places[reached.place]
-        local written = E.from_host(path, place.type, value, "the value written through '" .. name .. "'")
-        local contents = path.flow.contents[place.id]
-        if cells.is_raw(reached) or (contents and Contents.is(contents, data.Resident)) then
-            append(path, data.Store { site = site path, place = place.id, value = E.materialize(path, written) })
+        local target = reference.type.target
+        -- a place holding a reference is rebound by a reference of its type and written
+        -- through by anything else (syntax §9.4)
+        if types.NativeType.is(target, types.ReferenceType) and not (E.is_reference value and value.type == target) then
+            return write_through(path, E.reached_value(path, E.reach(path, reference)), value, name, replacing)
+        end
+        local reached = E.reach(path, reference, true)
+        local written = E.from_host(path, target, value, "the value written through '" .. name .. "'")
+        if replacing then
+            local place, reached_steps = E.reached_access(reached)
+            E.end_variants(path, place, reached_steps, target, written)
+        end
+        if not (replacing and types.owns target) then return write_reached(reached, path, written) end
+        -- the old owner, unless it was moved out: released after the new one is written,
+        -- skipping its parts that were moved out
+        local root, steps = E.held_access(path, reference)
+        local old = nil
+        if not (root and E.vacated_at(path, root, steps)) then old = E.reached_value(path, reached) end
+        local place, reached_steps = E.reached_access(reached)
+        write_reached(reached, path, written)
+        if old then
+            E.end_storage(path, place, reached_steps, target, "replaced")
+            E.release_value(path, old, root, steps)
+        end
+        if root then tracking.refill(path.flow, root, steps) end
+        if cells.Reached.is(reached, cells.TrackedPlace) then E.install_payload(path, reached.place, written) end
+    end
+    E.write_reference = |path, reference, value, name| -> write_through(path, reference, value, name, true)
+    E.initialize_reference = |path, reference, value, name| -> write_through(path, reference, value, name, false)
+
+    -- the borrows of the storage an owner at `steps` of `place` holds end: a buffer's contents,
+    -- a record's owning fields, a sum's owning alternatives; a borrow of the place itself stays
+    E.end_storage = do(path, place, steps, native_type, reason)
+        local under = do(step)
+            local extended = {}
+            for position, existing in ipairs steps do extended[position] = existing end
+            extended[#extended + 1] = step
+            return extended
+        end
+        if E.is_buffer native_type then
+            append(path, data.Ends { site = site path, target = data.Access { .place, path = under(data.ContentsStep {}) }, .reason })
+        elseif types.NativeType.is(native_type, types.RecordType) then
+            for _, field in ipairs native_type.fields do
+                if types.owns field.type then E.end_storage(path, place, under(data.FieldStep { name = field.name }), field.type, reason) end
+            end
+        elseif E.is_sum native_type then
+            for _, alternative in ipairs native_type.alternatives do
+                if types.owns alternative.payload then E.end_storage(path, place, under(data.AlternativeStep { name = alternative.name }), alternative.payload, reason) end
+            end
+        end
+    end
+    -- a sum given another variant ends the borrows of the payloads it no longer holds (syntax
+    -- §11.2): every alternative but the new one when its tag is known, at every depth
+    local holds_sum
+    local sum_holders = setmetatable({}, { __mode = "k" })
+    holds_sum = do(native_type)
+        if sum_holders[native_type] ~= nil then return sum_holders[native_type] end
+        local found = false
+        if E.is_sum native_type then found = true
+        elseif types.NativeType.is(native_type, types.RecordType) then
+            for _, field in ipairs native_type.fields do if holds_sum(field.type) then found = true end end
+        end
+        sum_holders[native_type] = found
+        return found
+    end
+    E.end_variants = do(path, place, steps, native_type, written)
+        if not holds_sum native_type then return end
+        local under = do(step)
+            local extended = {}
+            for position, existing in ipairs steps do extended[position] = existing end
+            extended[#extended + 1] = step
+            return extended
+        end
+        if E.is_sum native_type then
+            local kept = E.is_tagged written and written.alternative
+            for _, alternative in ipairs native_type.alternatives do
+                local step = data.AlternativeStep { name = alternative.name }
+                if alternative.name ~= kept then
+                    append(path, data.Ends { site = site path, target = data.Access { .place, path = under(step) }, reason = "replaced" })
+                elseif written.payload then
+                    E.end_variants(path, place, under(step), alternative.payload, written.payload)
+                end
+            end
         else
-            path.flow.contents[place.id] = data.Tracked { value = written }
+            for _, field in ipairs native_type.fields do
+                local part = E.is_aggregate written and written.parts[field.name]
+                if holds_sum field.type then E.end_variants(path, place, under(data.FieldStep { name = field.name }), field.type, part) end
+            end
         end
+    end
+
+    -- the place and steps a reached part of storage is named by in the facts
+    E.reached_access = do(reached)
+        if cells.is_raw reached then return reached.place.id, {} end
+        if cells.Reached.is(reached, cells.TrackedPlace) then return reached.place, {} end
+        return reached.place, provenance.access_path(reached.path)
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- moving owners out of parts of places (syntax §9.2): a part whose owner left is vacated in
+    -- the facts; the place keeps the rest, and the vacated part is neither used nor released
+    -- until it is written again
+
+    -- the place and field steps a reference names when it is a held borrow of a place, else nil
+    E.held_access = do(path, reference)
+        local info = compilation.borrows[reference.borrow]
+        if not data.BorrowForm.is(info.form, data.Held) then return nil end
+        return info.form.path.root, info.form.path.steps
+    end
+    -- a vacated part at or above `steps` of `place` (so the value there was moved out)
+    E.vacated_at = do(path, place, steps)
+        for _, part in ipairs(tracking.vacated_under(path.flow, place)) do
+            if borrow_paths.is_prefix(part.path, steps) then return part end
+        end
+        return nil
+    end
+    -- a vacated part strictly below `steps` of `place` (so the value there holds a moved part)
+    E.vacated_below = do(path, place, steps)
+        for _, part in ipairs(tracking.vacated_under(path.flow, place)) do
+            if #part.path > #steps and borrow_paths.is_prefix(steps, part.path) then return part end
+        end
+        return nil
+    end
+    -- the source name of a part of a place: `b.items`
+    E.part_name = do(place, steps)
+        local names = { E.name_of place }
+        for _, step in ipairs steps do
+            if data.AccessStep.is(step, data.FieldStep) or data.AccessStep.is(step, data.AlternativeStep) then names[#names + 1] = step.name end
+        end
+        return table.concat(names, ".")
+    end
+    E.check_vacancy = do(path, place, steps)
+        local part = E.vacated_at(path, place, steps) or E.vacated_below(path, place, steps)
+        if part then fail(path, ("'%s' was moved"):format(E.part_name(place, part.path))) end
+    end
+
+    -- the owner a reference reaches leaves its place: the place's part is vacated. A move
+    -- through a reference whose target is not known while compiling, or out of an element, is
+    -- rejected; an exported word may not move out of its argument (syntax §9.2, §9.13)
+    E.move_through = do(path, reference)
+        local info = compilation.borrows[reference.borrow]
+        if data.BorrowForm.is(info.form, data.Selected) then
+            E.dispatch_reference(path, reference, |arm, selected| -> E.move_through(arm, selected))
+            return
+        end
+        local use = tracking.use(path.flow, reference.borrow)
+        local borrow_path = use with
+            derive = p -> p
+            cached = pointer -> info.form.path
+            select = selected -> error("a selected reference must be dispatched before moving through it", 0)
+            fixed = pointer -> fail(path, "an owner is moved out through a reference whose target is not known while compiling; copy it instead")
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+        end
+        for _, step in ipairs borrow_path.steps do
+            if not (data.AccessStep.is(step, data.FieldStep) or data.AccessStep.is(step, data.AlternativeStep)) then
+                fail(path, "an element that owns storage is moved out only by pop; borrow it with Ref, or copy it")
+            end
+        end
+        local root = compilation.places[borrow_path.root]
+        if data.PlaceRoot.is(root.root, data.ParameterRoot) and definitions.abi_of(root.root.definition) == "c_boundary" then
+            fail(path, "an exported word may not move an owner out of its Ref argument")
+        end
+        append(path, data.Ends { site = site path, target = data.Access { place = borrow_path.root, path = borrow_path.steps }, reason = "moved" })
+    end
+
+    -- release the owner at `steps` of `place` (a part moved on another path, a dropped part):
+    -- it is vacated
+    E.release_part = do(path, place, steps)
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = place, .steps }, true, compilation.places[place].lifetime, origin_of path)
+        local part_type = compilation.places[place].type
+        for _, step in ipairs steps do part_type = E.step_type(part_type, step) end
+        local value = E.reached_value(path, E.reach(path, data.Reference { type = types.reference part_type, borrow = info.id }))
+        E.release_value(path, value, place, steps)
+        append(path, data.Ends { site = site path, target = data.Access { .place, path = steps }, reason = "released" })
     end
 
 end

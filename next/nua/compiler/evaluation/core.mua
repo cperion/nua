@@ -55,13 +55,16 @@ return do(compilation, E, capabilities)
         end
     end
     local forgets = { cleared = true, released = true, replaced = true, moved = true }
+    local vacates = { released = true, moved = true }
     local Appending = define ..graph.Inert
         Moves = do(instruction, recurse, path)
             each_access(instruction, target -> tracking.moves(path.flow, target, instruction.site.origin))
         end
+        -- an owner moved out or released leaves its place (or the part of it the access names)
         Ends = do(instruction, recurse, path)
             each_access(instruction, do(target)
-                tracking.ends(path.flow, target, instruction.reason, instruction.site.origin)
+                if vacates[instruction.reason] then tracking.vacate(path.flow, target, instruction.site.origin)
+                else tracking.ends(path.flow, target, instruction.reason, instruction.site.origin) end
                 if forgets[instruction.reason] then memory.forget(path.flow, target) end
             end)
         end

@@ -27,7 +27,10 @@ return do(E, core)
     -- releasing owners (syntax §9.2): a buffer through its library's release word, a record
     -- through its owning fields; the place is moved, its borrows end
 
-    E.release_value = do(path, value)
+    -- `place` and `steps`, when given, name where the value is held: a part moved out of it is
+    -- not released
+    E.release_value = do(path, value, place, steps)
+        if place and E.vacated_at(path, place, steps) then return end
         if E.is_aggregate value and E.is_buffer value.type then
             local words = library.buffer_words(value.type.element)
             local holder = E.new_place(path, "released", value.type)
@@ -36,10 +39,18 @@ return do(E, core)
             path.flow.contents[holder.id] = data.Moved { at = origin_of path }
             return
         end
-        if is_native value and E.is_sum value.type then return E.release_sum(path, value) end
+        if is_native value and E.is_sum value.type then return E.release_sum(path, value, place, steps) end
         if E.is_aggregate value and types.owns value.type then
             for _, field in ipairs(E.fields_of value.type) do
-                if types.owns field.type then E.release_value(path, E.part(path, value, field.name)) end
+                if types.owns field.type then
+                    local under = nil
+                    if place then
+                        under = {}
+                        for position, step in ipairs steps do under[position] = step end
+                        under[#under + 1] = data.FieldStep { name = field.name }
+                    end
+                    E.release_value(path, E.part(path, value, field.name), place, under)
+                end
             end
         end
     end
@@ -47,9 +58,8 @@ return do(E, core)
         local contents = path.flow.contents[place]
         if not contents or not (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)) then return end
         local value = Contents.is(contents, data.Resident) and E.load(path, compilation.places[place]) or contents.value
-        path.flow.contents[place] = data.Moved { at = origin_of path }
+        E.release_value(path, value, place, {})
         append(path, data.Ends { site = site path, target = data.Access { .place, path = {} }, reason = "released" })
-        E.release_value(path, value)
     end
     -- release the live owners among `places`, from index `first`, newest first
     E.release_live = do(path, places, first)

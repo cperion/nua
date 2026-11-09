@@ -81,18 +81,18 @@ an aliased container slot is overwritten before the effect.
 known overwrite versus wildcard storage, aliasing, recursive/nonreturning groups and independent
 verifier replay after callee mutation. The original clear–store–clear stale-view probe is now
 refused; storing a fresh view after the final clear is accepted. Latest full check:
-**`make test-next`: 136 passed, 0 failed.**
+**`make test-next`: 170 passed, 0 failed.**
 
 ## Design-to-source gap inventory
 
 | Area | Present | Remaining obligation |
 |---|---|---|
 | Hosting/evaluation | Mua host, partial supply, known/residual scalars, records, control, direct calls | Rest supply, hosted callbacks/protected propagation, capture/dependency validation; replace remaining ad-hoc activity outcomes with the specified protocols |
-| Borrow flow | Held/stored selected-path joins, loop-carried references and views, nested-buffer paths, explicit invalidation and real graph replay | Full stored-reference/aggregate transport, including held views through stored header references; lexical `LifetimeStart`/`LifetimeEnd` completion and escape checking |
+| Borrow flow | Held/stored selected-path joins, loop-carried references and views, nested-buffer paths, borrows of part of a place (`Ref s.field`, owner fields grown and replaced in place), explicit invalidation and real graph replay | Full stored-reference/aggregate transport, including held views through stored header references; lexical `LifetimeStart`/`LifetimeEnd` completion and escape checking |
 | Memory provenance | Resident component facts, pointerless provenance, strong/weak stores, load state preservation, resident-local branch/loop agreement | Extend component transport/proofs to the remaining aggregate forms and storage mechanisms; complete alias/provenance validation |
 | Native boundaries | Ordered contracts and substitution, returned-borrow re-rooting, alias requirements, recursive CFG agreement, independent call replay | Complete interface-key/capture/dependency protocols, global/foreign/indirect boundaries, owning ABI/parameter-payload transport and remaining component-path coverage |
-| Owners/buffers | Nua allocator and moving buffer words; nested release and selected conditional moves tested | Complete linear aggregate/partial-move representation, initialized-prefix proofs, pinned storage, complete allocation-ledger and trap-recovery acceptance |
-| Language coverage | Type descriptors include sums and fixed arrays; `Str` descriptor exists | End-to-end sums/matching, fixed arrays, static string literals and Nua Text words; descriptors alone are not implementations |
+| Owners/buffers | Nua allocator and moving buffer words; nested release and selected conditional moves; owner structs; partial moves (fields, payloads) through places, inline `Ref`s and callee contracts, joined and carried across loop rounds; replacement through any place | `finish`, initialized-prefix proofs, pinned storage, complete allocation-ledger and trap-recovery acceptance |
+| Language coverage | Sums and matching end to end, `Ref` handlers borrowing payloads in place; fixed-array and `Str` descriptors | Fixed arrays, static string literals and Nua Text words; descriptors alone are not implementations |
 | Preparation | Graph/type/lifetime checks on emitted C programs | Optimizer, budget insertion, complete effect/alias recomputation, `task_access`, `ready`, revision-matching readiness certificates |
 | Tasks/platform | Storage mapping/copy mechanisms | Native context/stack mechanisms, Nua scheduler/waits, foreign extents, task/channel/slot acceptance |
 | Backends/diagnostics | C for the implemented subset; source-line errors | Shared prepared-IR C/JIT adapters, structured related-location diagnostics and the full independent acceptance set |

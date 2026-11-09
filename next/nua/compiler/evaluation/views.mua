@@ -95,17 +95,8 @@ return do(E, core)
                 local steps = {}
                 for index = 1, #borrow_path.steps - 1 do steps[index] = borrow_path.steps[index] end
                 local reached = E.reach_path(path, data.BorrowPath { root = borrow_path.root, .steps, indices = borrow_path.indices }, view.borrow)
-                local contents = cells.Reached.is(reached, cells.TrackedPlace) and path.flow.contents[reached.place]
-                local header
-                if cells.is_raw(reached) then
-                    header = E.load(path, reached.place)
-                elseif contents and Contents.is(contents, data.Resident) then
-                    header = E.load(path, compilation.places[reached.place])
-                elseif contents and Contents.is(contents, data.Tracked) then
-                    header = E.deref(path, contents.value)
-                else
-                    fail(path, "a view reaches a buffer that holds no value")
-                end
+                local header = E.reached_value(path, reached)
+                if not cells.is_raw(reached) then header = E.deref(path, header) end
                 local first = E.bits(types.U64, borrow_path.range.first)
                 local data_pointer = E.part(path, header, "data")
                 local start = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, first })

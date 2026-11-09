@@ -253,7 +253,34 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         RawRoot = through_pointer
     end
     local root_lvalue = data.PlaceRoot.pass "spell a place in C" with ..Lvalues end
-    local place_text = place -> root_lvalue(place.root, place)
+    -- a component place (a field of a resident record, of storage behind a pointer) is its
+    -- root's lvalue followed by its path; a local one lives in its root place's home
+    local root_places = {}
+    local root_place = do(place)
+        local found = root_places[place.root]
+        if found then return found end
+        for _, candidate in pairs definition.places do
+            if candidate.root == place.root and #candidate.path == 0 then found = candidate end
+        end
+        if found == nil then fail "a component place has no root place" end
+        root_places[place.root] = found
+        return found
+    end
+    local Components = define
+        FieldComponent = |component, recurse| -> "." .. component.name
+        AlternativeComponent = |component, recurse| -> ".as." .. component.name
+        PayloadComponent = |component, recurse| -> fail "a payload component has no C spelling as a place"
+        ElementComponent = |component, recurse| -> fail "an element component has no C spelling as a place"
+        AnyElementComponent = |component, recurse| -> fail "an element component has no C spelling as a place"
+    end
+    local component_text = data.Component.pass "spell a place component in C" with ..Components end
+    local place_text = do(place)
+        if #place.path == 0 then return root_lvalue(place.root, place) end
+        local base = data.PlaceRoot.is(place.root, data.LocalRoot) and root_place place or place
+        local text = "(" .. root_lvalue(place.root, base) .. ")"
+        for _, component in ipairs place.path do text = text .. component_text component end
+        return text
+    end
     local Naming = define
         Constant = |node, recurse| -> constant_text node
         Parameter = |node, recurse| -> "p" .. node.index

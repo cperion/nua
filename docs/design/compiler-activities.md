@@ -286,6 +286,18 @@ at every join; no drop flag exists at runtime. There are no holding identities,
 endpoints, custody records, loan subjects or epochs: SSA values and block arguments
 already say which header went where.
 
+**Partial moves.** An owner moved out of part of a place (a field, a sum's payload) leaves
+the place holding the rest: `FlowFacts.vacated` records the part, for tracked and resident
+places alike. `Ends(moved)` and `Ends(released)` on an access are what vacate it, so an
+in-place move, a move through an inline `Ref`, and a compiled callee's move replayed from
+its contract are one mechanism; an access naming the whole place makes its contents
+`Moved`. A vacated part is neither used nor released until an owner is written there
+again. A part vacated on some incoming edges only is released on the others before the
+join; a part a loop round moves out while the header holds it is moved at the header, the
+entry releasing it. A move through a stored reference, out of an element, or out of an
+exported word's `Ref` argument is rejected; `pop` moves an element out with `take`
+(buffers §4.1).
+
 Releasing is a typed walk generated from the native type (owning contents, then the
 owner's buffers), evaluated as ordinary Nua words.
 
@@ -428,7 +440,9 @@ Proof           = Checked(site: InstructionId) | Taken(edge: EdgeId)
                 | Known(claim: CheckClaim)
 FlowFacts       { contents: Map PlaceId Contents,
                   borrows: Map BorrowId BorrowState,
-                  live_lifetimes: Set LifetimeId }
+                  live_lifetimes: Set LifetimeId,
+                  vacated: Map (PlaceId, AccessPath) Vacated }
+Vacated         { place: PlaceId, path: AccessPath, at: OriginId }
 EdgeFacts       { edge: EdgeId, flow: FlowFacts, arguments: List ValueInfo }
 JoinRelation    { block: BlockId, incoming: List EdgeFacts }
 SiteFacts       { before: FlowFacts, after: FlowFacts, effects: Effects }
@@ -636,7 +650,7 @@ as a loop). No `pcall` and no Lua error carry compiler control.
 | `rewriting` | New output, evolving analysis state | Read-only input and explicit shared capabilities | Return replacement graph/facts; never mutate inspected input |
 | `emitting` | Names, declarations, backend handles | Verified ready program and target | Return backend product; close nonretained resources |
 
-`facts.fork` copies the two `FlowFacts` maps and the live-lifetime set; their entries
+`facts.fork` copies the `FlowFacts` maps and the live-lifetime set; their entries
 are immutable records. A later write replaces an entry rather than changing a
 shared borrow record. Name environments extend by fallback. These are two different operations.
 

@@ -1,0 +1,245 @@
+-- Moving owners (syntax §9.2): out of a local, out of part of a place, through a reference, in
+-- a compiled callee, on some paths only and across loop rounds. A moved part is vacated in the
+-- facts: neither used nor released until written again. The allocation ledger shows that each
+-- owner is released exactly once.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+local prelude = [[
+local Bag = struct { n: U32, xs: Grow U32, ys: Grow U32 }
+local fill = do(xs: Ref (Grow U32), n: U32): Unit
+    for i: U32 = 1, n do
+        xs:push i
+    end
+end
+local length_of = do(xs: Grow U32): U64 = xs.length
+local take = do(r: Ref (Grow U32)): Grow U32 = r
+local take_items = do(b: Ref Bag): Grow U32 = b.xs
+]]
+
+-- each word answers its result and the bytes it left mapped: `result * 2^32 + leaked`
+local measured = do(name, body)
+    return ([[
+local %s_body = do(k: U32): U64
+%s
+end
+local %s = do(k: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local result = %s_body k
+    return result * 4294967296 + (platform.ledger_mapped_bytes() - before)
+end
+export %s
+]]):format(name, body, name, name, name)
+end
+
+local library = nil
+local build = do()
+    if library then return library end
+    library = native("moves", prelude
+        .. measured("field_moved", [[
+    local b = Bag { n = 1 }
+    fill(Ref b.xs, k)
+    fill(Ref b.ys, k)
+    local t = b.xs
+    return length_of t]])
+        .. measured("field_refilled", [[
+    local b = Bag {}
+    fill(Ref b.xs, k)
+    local first = length_of b.xs
+    b.xs = Grow(U32) { 1, 2 }
+    return first + b.xs.length]])
+        .. measured("field_one_arm", [[
+    local b = Bag {}
+    fill(Ref b.xs, k)
+    local n: U64 = 0
+    if k > 3 then n = length_of b.xs end
+    return n]])
+        .. measured("inline_through", [[
+    local xs = Grow(U32) {}
+    fill(Ref xs, k)
+    local ys = take(Ref xs)
+    return ys.length]])
+        .. measured("compiled_through", [[
+    local xs = Grow(U32) {}
+    fill(Ref xs, k)
+    local ys = call take (Ref xs)
+    return ys.length]])
+        .. measured("compiled_field", [[
+    local b = Bag {}
+    fill(Ref b.xs, k)
+    fill(Ref b.ys, 2)
+    local items = call take_items (Ref b)
+    return items.length + b.ys.length]])
+        .. measured("dropped_field", [[
+    local b = Bag {}
+    fill(Ref b.xs, k)
+    drop(Ref b.xs)
+    b.xs = Grow(U32) { 7 }
+    return b.xs.length]])
+        .. measured("loop_refilled", [[
+    local xs = Grow(U32) { 1 }
+    local total: U64 = 0
+    for i: U32 = 1, k do
+        total = total + length_of xs
+        xs = Grow(U32) { 1, 2 }
+    end
+    return total]])
+        .. measured("replaced_through", [[
+    local xs = Grow(U32) {}
+    fill(Ref xs, k)
+    local r = Ref xs
+    r = Grow(U32) { 5 }
+    r:push 6
+    return xs.length]])
+        .. measured("local_replaced", [[
+    local xs = Grow(U32) {}
+    fill(Ref xs, k)
+    local r = Ref xs
+    xs = Grow(U32) { 5 }
+    r:push 6
+    return xs.length]])
+        .. measured("element_replaced", [[
+    local lines = Grow(Grow U32) {}
+    lines:push(Grow(U32) {})
+    fill(lines[0], k)
+    lines[0] = Grow(U32) { 1 }
+    return lines[0].length]])
+        .. measured("popped", [[
+    local lines = Grow(Grow U32) {}
+    lines:push(Grow(U32) {})
+    fill(lines[0], k)
+    local last = lines:pop()
+    return last.length]]))
+    return library
+end
+
+local check = do(name, k, expected)
+    local value = build()[name](k)
+    local result, leaked = tonumber(value / 4294967296ULL), tonumber(value % 4294967296ULL)
+    assert(result == expected, ("%s(%d) answered %d, not %d"):format(name, k, result, expected))
+    assert(leaked == 0, ("%s(%d) left %d bytes mapped"):format(name, k, leaked))
+end
+
+test "a field moved out is released by its new owner, the rest of the record by its own":
+    -- the first run may map the allocator's own pages
+    build().field_moved(1)
+    check("field_moved", 100000, 100000)
+    check("field_refilled", 100000, 100002)
+    check("dropped_field", 100000, 1)
+end
+
+test "a field moved on one path only is released on the other before they join":
+    build().field_one_arm(1)
+    check("field_one_arm", 100000, 100000)
+    check("field_one_arm", 2, 0)
+end
+
+test "moving out through a reference moves the caller's place, inline or across call":
+    build().inline_through(1)
+    check("inline_through", 100000, 100000)
+    check("compiled_through", 100000, 100000)
+    check("compiled_field", 100000, 100002)
+end
+
+test "an owner written through a reference, or into an element, replaces the old one":
+    build().replaced_through(1)
+    check("replaced_through", 100000, 2)
+    -- a reference to the place itself survives its owner's replacement (§9.7)
+    check("local_replaced", 100000, 2)
+    check("element_replaced", 100000, 1)
+    check("popped", 100000, 100000)
+end
+
+test "an owner reassigned in every round may move in each":
+    build().loop_refilled(1)
+    -- the first round reads the first owner (1 element), the others its replacements (2)
+    check("loop_refilled", 5, 1 + 2 * 4)
+end
+
+test "what was moved is not used again":
+    refuses(prelude .. [[
+local f = do(): U64
+    local b = Bag {}
+    local t = b.xs
+    return b.xs.length
+end
+export f
+]], "refused.nua:13: 'b.xs' was moved")
+    refuses(prelude .. [[
+local f = do(): U64
+    local b = Bag {}
+    local t = b.xs
+    local whole = b
+    return t.length
+end
+export f
+]], "'b.xs' was moved")
+    refuses(prelude .. [[
+local f = do(): U64
+    local b = Bag {}
+    local t = b.xs
+    b.xs:push 1
+    return t.length
+end
+export f
+]], "'b.xs' was moved")
+    refuses(prelude .. [[
+local f = do(): U64
+    local xs = Grow(U32) {}
+    local ys = call take (Ref xs)
+    return xs.length + ys.length
+end
+export f
+]], "'xs' was moved")
+    refuses(prelude .. [[
+local f = do(): U64
+    local b = Bag {}
+    local items = call take_items (Ref b)
+    return b.xs.length
+end
+export f
+]], "'b.xs' was moved")
+    refuses(prelude .. [[
+local f = do(n: U32): U64
+    local xs = Grow(U32) { 1 }
+    local t: U64 = 0
+    for i: U32 = 1, n do
+        t = length_of xs
+    end
+    return t
+end
+export f
+]], "'xs' was moved")
+end
+
+test "a move whose source is not known while compiling is rejected":
+    refuses(prelude .. [[
+local Holder = struct { r: Ref (Grow U32) }
+local f = do(): U64
+    local xs = Grow(U32) {}
+    local holder = Holder { r = Ref xs }
+    local ys: Grow U32 = holder.r
+    return ys.length
+end
+export f
+]], "moved out through a reference whose target is not known while compiling")
+    refuses(prelude .. [[
+local f = do(): U64
+    local lines = Grow(Grow U32) {}
+    lines:push(Grow(U32) {})
+    local first: Grow U32 = lines[0]
+    return first.length
+end
+export f
+]], "an element that owns storage is moved out only by pop")
+    refuses(prelude .. [[
+export take
+]], "an exported word may not move an owner out of its Ref argument")
+end

@@ -28,9 +28,16 @@ return do(E, core)
         local type = compilation.places[origin.place].type
         local position = 1
         while position <= #steps do
-            if not E.is_buffer(type) or not data.AccessStep.is(steps[position], data.ContentsStep) or not steps[position + 1] then return nil end
-            type = type.element
-            position += 2
+            local step = steps[position]
+            if data.AccessStep.is(step, data.FieldStep) or data.AccessStep.is(step, data.AlternativeStep) then
+                type = E.step_type(type, step)
+                if not type then return nil end
+                position += 1
+            else
+                if not E.is_buffer(type) or not data.AccessStep.is(step, data.ContentsStep) or not steps[position + 1] then return nil end
+                type = type.element
+                position += 2
+            end
         end
         return type
     end
@@ -66,12 +73,7 @@ return do(E, core)
             local parent_indices = E.incoming_indices(origin, steps, arguments)
             if parent_indices then
                 local reached = E.reach_path(path, data.BorrowPath { root = origin.place, .steps, indices = parent_indices }, reference.borrow)
-                local header
-                if cells.is_raw(reached) then header = E.load(path, reached.place)
-                else
-                    local contents = path.flow.contents[reached.place]
-                    header = contents and Contents.is(contents, data.Tracked) and contents.value or E.load(path, compilation.places[reached.place])
-                end
+                local header = E.reached_value(path, reached)
                 if E.is_buffer(header.type) then
                     local pointer = E.emit_compute(path, "reinterpret", types.pointer(reference.type.target), { info.form.pointer })
                     local distance = E.compute(path, "pointer_difference", types.I64, { pointer, E.part(path, header, "data") })
@@ -100,11 +102,7 @@ return do(E, core)
         if indices == nil then return view end
         local start, count = E.view_parts(path, view)
         local reached = E.reach_path(path, data.BorrowPath { root = origin.place, .steps, .indices }, view.borrow)
-        local header = cells.is_raw(reached) and E.load(path, reached.place) or nil
-        if header == nil then
-            local contents = path.flow.contents[reached.place]
-            header = contents and Contents.is(contents, data.Tracked) and contents.value or E.load(path, compilation.places[reached.place])
-        end
+        local header = E.reached_value(path, reached)
         if not E.is_buffer(header.type) then return view end
         local offset = E.compute(path, "pointer_difference", types.I64, { start, E.part(path, header, "data") })
         local first = E.compute(path, "convert", types.U64, { offset })

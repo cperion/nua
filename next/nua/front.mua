@@ -143,7 +143,7 @@ local generating = do(filename, start_line)
     -- expressions of a typed body: each performs its operation through the evaluation
     -- vocabulary `__E` on the current path
 
-    local expression, statement, statements, block_body, function_text
+    local expression, statement, statements, block_body, function_text, target
 
     -- a name read in a typed body: a cell of the body, a Lua local of a generation-time loop, or
     -- a host value from around the word
@@ -151,9 +151,20 @@ local generating = do(filename, start_line)
         if lookup name == "cell" then return ("__E.get(__path, %s)"):format(name) end
         return name
     end
-    -- the operand of a member or element access: a cell keeps its place, anything else its value
-    local base = do(node)
+    -- whether a node names a place of the body: a local, or a field or element of one
+    local place_chain
+    place_chain = do(node)
+        if node.k == "name" then return lookup(node.name) == "cell" end
+        return (node.k == "field" or node.k == "index") and place_chain(node.obj)
+    end
+    -- `Ref p` of a place: a borrow, never an application of Ref to p's value
+    local place_reference = node -> node.k == "call" and node.fn.k == "name" and node.fn.name == "Ref" and #node.args == 1 and place_chain(node.args[1])
+    -- the operand of a member or element access: a cell keeps its place, a field of a place
+    -- stays a place (its owner is borrowed, never copied out), anything else its value
+    local base
+    base = do(node)
         if node.k == "name" and lookup(node.name) == "cell" then return node.name end
+        if node.k == "field" and place_chain(node.obj) then return ("__E.member(__path, %s, %q)"):format(base node.obj, node.name) end
         return expression node
     end
     -- the callee of an application: a cell's value, else the host value as Lua names it
@@ -187,9 +198,10 @@ local generating = do(filename, start_line)
         field = node -> ("__E.dot(__path, %s, %q)"):format(base node.obj, node.name)
         index = node -> ("__E.element(__path, %s, %s)"):format(base node.obj, expression node.key)
         call = do(node)
-            -- `Ref x` borrows the local itself: its cell, not its value (which would move an owner)
-            if node.fn.k == "name" and node.fn.name == "Ref" and #node.args == 1 and node.args[1].k == "name" and lookup(node.args[1].name) == "cell" then
-                return ("__E.apply(__path, Ref, { %s }, false)"):format(node.args[1].name)
+            -- `Ref x` borrows the local itself: its cell, not its value (which would move an owner);
+            -- `Ref s.field`, `Ref g[i]` borrow part of a place (syntax §9.4)
+            if place_reference node then
+                return ("__E.apply(__path, Ref, { %s }, false)"):format(target node.args[1])
             end
             -- `producer(args) { handlers }`: the evaluator decides whether the table consumes the
             -- producer's returns in place or is an ordinary argument (syntax §11.2)
@@ -198,9 +210,11 @@ local generating = do(filename, start_line)
                 local producer = inner.fn.k == "name" and lookup(inner.fn.name) == "cell" and inner.fn.name or callee_of inner
                 return ("__E.apply_continued(__path, %s, { %s }, %s, %s, %s)"):format(producer, list(inner.args, expression), boundary_flag inner, expression(node.args[1]), boundary_flag node)
             end
-            -- a local applied keeps its cell: a sum matched in place lends its payload to `Ref`
-            -- handlers (syntax §11.2)
-            local callee = node.fn.k == "name" and lookup(node.fn.name) == "cell" and node.fn.name or callee_of node
+            -- a place applied keeps its cell (a local, or a field or element of one): a sum
+            -- matched in place lends its payload to `Ref` handlers (syntax §11.2)
+            local callee = node.fn.k == "name" and lookup(node.fn.name) == "cell" and node.fn.name
+                or node.fn.k ~= "name" and place_chain(node.fn) and target(node.fn)
+                or callee_of node
             return ("__E.apply(__path, %s, { %s }, %s)"):format(callee, list(node.args, expression), boundary_flag node)
         end
         method = node -> ("__E.method(__path, %s, %q, { %s }, %s)"):format(base node.obj, node.name, list(node.args, expression), boundary_flag node)
@@ -225,7 +239,7 @@ local generating = do(filename, start_line)
     expression = dispatching(Expressions, "%s is not available in a typed body yet")
 
     -- the place an assignment writes; a nested target (`o.left.value`) is a chain of cells
-    local target
+    -- (declared with the other mutually recursive emitters above)
     target = do(node)
         if node.k == "name" then
             if lookup(node.name) ~= "cell" then
@@ -350,7 +364,7 @@ local generating = do(filename, start_line)
         local returned = node.exprs[1]
         -- (handlers applied to a producer consume its returns: not a re-entry of the word)
         local continued = returned.k == "call" and returned.fn.k == "call" and #returned.args == 1 and returned.args[1].k == "table"
-        if returned.k == "call" and not returned.boundary and not continued then
+        if returned.k == "call" and not returned.boundary and not continued and not place_reference returned then
             tail_calls = true
             emit(("do return __E.return_tail(__path, %s, { %s }) end;"):format(callee_of returned, list(returned.args, expression)))
             return
@@ -364,8 +378,15 @@ local generating = do(filename, start_line)
         emit " end;"
     end
     statement = dispatching(Statements, "the statement %s is not available in a typed body yet")
+    -- each statement names its line on the path, so a diagnostic or an origin points at it
     statements = do(nodes)
-        for _, node in ipairs nodes do statement node end
+        for _, node in ipairs nodes do
+            if node.line then
+                at node.line
+                emit((" __path.line = %d;"):format(node.line))
+            end
+            statement node
+        end
     end
 
     -- a block as a closure over its own path; a loop variable is a cell it receives

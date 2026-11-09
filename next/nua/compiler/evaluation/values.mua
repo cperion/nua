@@ -41,8 +41,11 @@ return do(E, core)
         end
         local described = not is_native value and types.variant_of value
         if described and types.NativeType.is(type, types.SumType) then return E.from_variant(path, type, described, what) end
+        -- a reference where its target is expected: the target's value; an owner moves out
         if is_native value and NativeValue.is(value, data.Reference) and types.NativeType.is(value.type, types.ReferenceType) and not types.NativeType.is(type, types.ReferenceType) then
-            value = E.deref(path, value)
+            local reference = value
+            value = E.deref(path, reference)
+            if types.owns value.type then E.move_through(path, reference) end
         end
         if is_native value then
             if value.type ~= type then fail(path, ("%s is %s, not %s"):format(what, types.describe value.type, types.describe type)) end

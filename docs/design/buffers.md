@@ -301,9 +301,11 @@ general primitives, which any library word may use:
 
 - **the effect declarations** `moves access` and `ends access reason`, which record the
   effect at the word's site;
-- **the initialized-prefix transitions** `initialize buffer index value` and
-  `finish buffer first limit`, which a buffer's own words use to extend or shrink the
-  checked initialized range.
+- **the initialized-prefix transitions** `initialize buffer index value`,
+  `take buffer index` and `finish buffer first limit`, which a buffer's own words use to
+  extend or shrink the checked initialized range: `initialize` writes a slot that holds
+  nothing yet (releasing nothing), `take` moves out an element the range no longer
+  includes (`pop`). An owning element is otherwise never moved out through a reference.
 
 | Word | Result | Declared effect |
 |---|---|---|

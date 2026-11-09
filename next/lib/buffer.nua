@@ -43,8 +43,7 @@ local words = do(T)
     -- relies on does not depend on what the compiler knows about the capacity (buffers §2.3)
     local push = do(self: Ref B, value: T): Unit
         reserve(self, self.length + 1)
-        local destination = element_of(self, self.length)
-        destination = value
+        initialize(self, self.length, value)
         self.length = self.length + 1
         moves self
     end
@@ -73,7 +72,7 @@ local words = do(T)
 
     local set = do(self: Ref B, index: U64, value: T): Unit
         if index >= self.length then trap "index out of range" end
-        if owning then drop(element_of(self, index)) end
+        -- an owning element is replaced: the old one released after the new one is written
         local destination = element_of(self, index)
         destination = value
     end
@@ -82,7 +81,7 @@ local words = do(T)
         if self.length == 0 then trap "pop of an empty buffer" end
         self.length = self.length - 1
         ends(self, "shrank")
-        return element_of(self, self.length)
+        return take(self, self.length)
     end
 
     local truncate = do(self: Ref B, length: U64): Unit

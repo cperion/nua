@@ -62,12 +62,14 @@ return do(E, core)
 
     -- one round from `path`'s state, built as a child construction: the condition, the body and
     -- the latch. Answers the fragment and the round's outcome.
-    E.run_round = do(path, header_types, assumed, condition, body, latch, memory_schema)
+    E.run_round = do(path, header_types, assumed, condition, body, latch, memory_schema, moved)
         local round = nil
         local outcome = graph.building(nil, supply, do(writer)
             local header = writer.block "loop"
             local flow = facts.fork path.flow
             if memory_schema then memory.seed(memory_schema, flow, writer) end
+            -- owners a round moves out are moved at the header: the entry releases them
+            for _, access in ipairs(moved or {}) do tracking.vacate(flow, access, origin_of path) end
             local header_path = paths_of.continuing(path, writer, header, flow)
             for index, leaf in ipairs assumed do
                 local current = flow.contents[leaf.place].value
@@ -189,6 +191,17 @@ return do(E, core)
         table.sort(places_carried, |a, b| -> a.serial < b.serial)
         local weakened, whole, schemas = {}, {}, {}
         local memory_schema = facts.fork(path.flow)
+        -- owners (or parts of them) a continuing edge has moved out while the header holds
+        -- them: the header assumes them moved (the join rule of §9.2, across rounds)
+        local moved, moved_keys, moved_places = {}, {}, {}
+        local assume_moved = do(place, steps, at)
+            local key = place.serial .. ":" .. borrow_paths.path_key(steps)
+            if moved_keys[key] then return false end
+            moved_keys[key] = true
+            moved[#moved + 1] = data.Access { .place, path = steps }
+            if #steps == 0 then moved_places[place] = true end
+            return true
+        end
 
         -- the leaves the header assumes, as the entry state has them (a place generalized whole
         -- is one leaf), and their types
@@ -197,7 +210,8 @@ return do(E, core)
             for _, place in ipairs places_carried do
                 local value = path.flow.contents[place].value
                 local resident = memory_schema.contents[place] and Contents.is(memory_schema.contents[place], data.Resident)
-                local leaves = resident and {} or whole[place] and { { .place, fields = {}, type = value.type, key = place.serial .. "." } } or E.leaves_of(place, value, {}, {})
+                -- a place the header assumes moved carries nothing
+                local leaves = (moved_places[place] or resident) and {} or whole[place] and { { .place, fields = {}, type = value.type, key = place.serial .. "." } } or E.leaves_of(place, value, {}, {})
                 for _, leaf in ipairs leaves do
                     if weakened[leaf.key] or whole[place] then
                         leaf.schema = schemas[leaf.key]
@@ -244,8 +258,20 @@ return do(E, core)
             local grew = not memory.same(memory_schema, widened_memory)
             memory_schema = widened_memory
             for _, next_state in ipairs round.nexts do
+                for place, contents in pairs header_flow.contents do
+                    local live = Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)
+                    local next_contents = next_state.flow.contents[place]
+                    if live and types.owns(compilation.places[place].type) and next_contents and Contents.is(next_contents, data.Moved) then
+                        if assume_moved(place, {}, next_contents.at) then grew = true end
+                    end
+                end
+                for key, part in pairs next_state.flow.vacated do
+                    if header_flow.vacated[key] == nil and assume_moved(part.place, part.path, part.at) then grew = true end
+                end
+            end
+            for _, next_state in ipairs round.nexts do
                 for _, place in ipairs places_carried do
-                    if not whole[place] and Contents.is(header_flow.contents[place], data.Tracked) then
+                    if not whole[place] and not moved_places[place] and Contents.is(header_flow.contents[place], data.Tracked) then
                         local header_value = header_flow.contents[place].value
                         local next_contents = next_state.flow.contents[place]
                         local next_value = next_contents and next_contents.value
@@ -276,15 +302,26 @@ return do(E, core)
         end
         -- the header holds: adopt the round, enter it from the path, close each continuing
         -- edge back into it, and continue after the paths that leave
+        -- release what the header assumes moved where an edge into it still holds it
+        local release_moved = do(edge_path)
+            for _, access in ipairs moved do
+                local contents = edge_path.flow.contents[access.place]
+                local live = contents and (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident))
+                if live and #access.path == 0 then E.release_place(edge_path, access.place)
+                elseif live and not E.vacated_at(edge_path, access.place, access.path) then E.release_part(edge_path, access.place, access.path) end
+            end
+        end
         local close = do(fragment, round, assumed)
             local residents = E.resident_places(memory_schema)
             for _, place in ipairs residents do E.resident_place(path, compilation.places[place]) end
+            release_moved path
             local entry = path.writer.adopt fragment
             local arguments = leaf_operands(path, path.flow, assumed)
             terminate(path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, .arguments } })
             for _, next_state in ipairs round.nexts do
                 local next_path = paths_of.continuing(path, nil, next_state.block, next_state.flow)
                 for _, place in ipairs residents do E.resident_place(next_path, compilation.places[place]) end
+                release_moved next_path
                 local values = leaf_operands(next_path, next_state.flow, assumed)
                 terminate(next_path, data.Jump { origin = origin_of path, edge = data.Edge { id = fresh identity.EdgeId, target = entry, arguments = values } })
             end
@@ -296,6 +333,7 @@ return do(E, core)
             .widen
             .close
             memory_schema = || -> memory_schema
+            moved = || -> moved
         end
     end
 
@@ -308,7 +346,7 @@ return do(E, core)
         while true do
             local assumed, header_types = header.assumed_leaves()
             local exits_before = #invocation.exits
-            local fragment, round = E.run_round(path, header_types, assumed, condition, body, latch, header.memory_schema())
+            local fragment, round = E.run_round(path, header_types, assumed, condition, body, latch, header.memory_schema(), header.moved())
             if round.request then
                 path.request, path.dead = round.request, true
                 return

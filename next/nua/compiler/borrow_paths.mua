@@ -36,6 +36,15 @@ local covers = do(a, b)
     end
     return true
 end
+-- whether `prefix` is a prefix of `path`, step by step (fields and alternatives by name)
+local is_prefix = do(prefix, path)
+    if #prefix > #path then return false end
+    for position, step in ipairs prefix do
+        local other = path[position]
+        if getmetatable step ~= getmetatable other or step.name ~= other.name or step.index ~= other.index then return false end
+    end
+    return true
+end
 local union = do(left, right)
     local result = {}
     for _, list in ipairs { left, right } do
@@ -140,6 +149,8 @@ local validate = do(info)
     return nil
 end
 return define
+    .path_key
+    .is_prefix
     .validate
     .alternatives
     .key

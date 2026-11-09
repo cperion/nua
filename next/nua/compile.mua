@@ -121,7 +121,7 @@ local hosting_environment = do(compilation, filename)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "drop" } do environment[name] = hosting.primitive name end
+    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop" } do environment[name] = hosting.primitive name end
     environment.owns = types.owns
     return environment, load_nua
 end
@@ -187,6 +187,7 @@ local compiling = do(source, filename)
     definitions_capability.request = registry.request
     definitions_capability.contract_of = registry.contract_of
     definitions_capability.bundle_of = registry.bundle_of
+    definitions_capability.abi_of = registry.abi_of
     local environment, load_nua = hosting_environment(compilation, filename)
     -- the words of buffers of each element type, from the Nua library
     library_capability.buffer_words = element -> environment.import("buffer").words(element)

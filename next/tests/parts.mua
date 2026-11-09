@@ -1,0 +1,278 @@
+-- Borrowing part of a place (syntax §9.4): `Ref s.field` extends the borrow of its record by a
+-- field step. Reached through a tracked value it stays a part of that value; through memory it
+-- is a component place; across a native boundary it is the field's address. A field of an owner
+-- struct is reached by reference, so its owner is grown, read and replaced in place.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "a reference to a field reads and writes that field of the record":
+    local library, text = native("parts_fields", [[
+local Point = struct { x: U32, y: U32 }
+local Outer = struct { left: Point, right: Point }
+local bump = do(r: Ref U32, by: U32): Unit
+    r = r + by
+end
+local fields = do(k: U32): U32
+    local p = Point { x = k, y = 2 }
+    local r = Ref p.x
+    r = r + 10
+    bump(Ref p.y, k)
+    return p.x * 100 + p.y
+end
+export fields
+local nested_fields = do(k: U32): U32
+    local o = Outer { left = Point { x = 1, y = 2 }, right = Point { x = k, y = 4 } }
+    bump(Ref o.right.x, 5)
+    local inner = Ref o.left
+    inner.y = inner.y + k
+    return o.right.x * 100 + o.left.y
+end
+export nested_fields
+]])
+    assert(library.fields(3) == 13 * 100 + 5)
+    assert(library.nested_fields(7) == 12 * 100 + 9)
+    -- the borrows stay parts of tracked values: no field is put in memory
+    assert(not text:find("&", 1, true), text)
+end
+
+test "a reference to a field crosses a native boundary as the field's address":
+    local library, text = native("parts_boundary", [[
+local Point = struct { x: U32, y: U32 }
+local bump = do(r: Ref U32, by: U32): Unit
+    r = r + by
+end
+local field_addresses = do(k: U32): U32
+    local p = Point { x = k, y = 1 }
+    call bump (Ref p.y) k
+    call bump (Ref p.x) 1
+    return p.x * 100 + p.y
+end
+export field_addresses
+-- a compiled word borrowing part of what it received returns a borrow of the caller's place
+local x_of = do(p: Ref Point): Ref U32 = Ref p.x
+local through = do(k: U32): U32
+    local p = Point { x = k, y = 0 }
+    local r = call x_of (Ref p)
+    r = r + 1
+    return p.x
+end
+export through
+-- a field of a Ref parameter is assigned through it
+local set_y = do(p: Ref Point, v: U32): Unit
+    p.y = v
+end
+local assigned = do(k: U32): U32
+    local p = Point { x = 0, y = 0 }
+    call set_y (Ref p) k
+    return p.y
+end
+export assigned
+]])
+    assert(library.field_addresses(4) == 5 * 100 + 5)
+    assert(library.through(41) == 42)
+    assert(library.assigned(9) == 9)
+    assert(text:find("&(home%d+).y") or text:find("&%(home%d+%)%.y"), text)
+end
+
+test "a reference into raw storage borrows nothing the compiler knows (syntax §9.5)":
+    local library = native("parts_raw", [[
+local allocator = import "allocator"
+local bump = do(r: Ref U32): Unit
+    r = r + 1
+end
+local raw_slot = do(k: U32): U32
+    local p = Ptr(U32)(allocator.allocate 16)
+    p[1] = k
+    local r = Ref p[1]
+    r = r * 2
+    call bump (Ref p[1])
+    local value = p[1]
+    allocator.release(Ptr(U8)(p), 16)
+    return value
+end
+export raw_slot
+]])
+    assert(library.raw_slot(20) == 41)
+end
+
+test "a field holding a reference stands for its target":
+    local library = native("parts_holder", [[
+local Point = struct { x: U32, y: U32 }
+local Holder = struct { r: Ref Point, n: U32 }
+local through_holder = do(k: U32): U32
+    local p = Point { x = k, y = 0 }
+    local holder = Holder { r = Ref p, n = 3 }
+    local x = Ref holder.r.x
+    x = x + holder.n
+    holder.r.y = 8
+    return p.x * 100 + p.y
+end
+export through_holder
+]])
+    assert(library.through_holder(5) == 8 * 100 + 8)
+end
+
+test "fields of elements: assigned and borrowed through the element's reference":
+    local library = native("parts_elements", [[
+local Point = struct { x: U32, y: U32 }
+local elements = do(k: U32): U32
+    local points = Grow(Point) { Point { x = 1, y = 2 }, Point { x = 3, y = 4 } }
+    points[1].x = k
+    local y = Ref points[0].y
+    y = y + 10
+    local first = Ref points[0]
+    first.x = first.x + 1
+    return points[1].x * 10000 + points[0].y * 100 + points[0].x
+end
+export elements
+]])
+    assert(library.elements(7) == 7 * 10000 + 12 * 100 + 2)
+end
+
+local bag = [[
+local Bag = struct { n: U32, xs: Grow U32 }
+local fill = do(xs: Ref (Grow U32), n: U32): Unit
+    for i: U32 = 1, n do
+        xs:push i
+    end
+end
+]]
+
+test "an owner field is grown, read and released in place":
+    local library = native("parts_owner", bag .. [[
+local total = do(n: U32): U64
+    local b = Bag { n = 2 }
+    for i: U32 = 1, n do
+        b.xs:push(i * b.n)
+    end
+    fill(Ref b.xs, 3)
+    local sum: U64 = 0
+    local i: U64 = 0
+    while i < b.xs.length do
+        sum = sum + U64(b.xs[i])
+        i = i + 1
+    end
+    return sum
+end
+export total
+local compiled = do(n: U32): U64
+    local b = Bag {}
+    call fill (Ref b.xs) n
+    return b.xs.length
+end
+export compiled
+local ledger = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local length = total n
+    local more = compiled n
+    return platform.ledger_mapped_bytes() - before
+end
+export ledger
+]])
+    assert(library.total(4) == 2 * (1 + 2 + 3 + 4) + 1 + 2 + 3)
+    assert(library.compiled(5) == 5)
+    assert(library.ledger(100000) == 0)
+end
+
+test "assigning an owner field releases the old owner; a reference to the field survives":
+    local library = native("parts_replace", bag .. [[
+local replaced = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local b = Bag {}
+    local r = Ref b.xs
+    fill(r, n)
+    b.xs = Grow(U32) { 1, 2 }
+    r:push 3
+    local length = b.xs.length
+    return length * 1000000000 + (platform.ledger_mapped_bytes() - before)
+end
+export replaced
+]])
+    -- three elements remain; the old 100000-element storage was released at the assignment
+    -- (the first run may map the allocator's own pages)
+    library.replaced(100000)
+    local result = library.replaced(100000)
+    assert(result == 3 * 1000000000ULL, tostring result)
+end
+
+test "borrows of an owner field follow the invalidation rules":
+    -- rule 1: a held view of the field survives its growth
+    local library = native("parts_views", bag .. [[
+local held_field_view = do(): U32
+    local b = Bag {}
+    fill(Ref b.xs, 2)
+    local head = b.xs:all()
+    b.xs:push 3
+    return head[0] + head[1]
+end
+export held_field_view
+]])
+    assert(library.held_field_view() == 3)
+    -- rule 2: clearing or replacing the field ends its views; moving the record ends them all
+    refuses(bag .. [[
+local cleared = do(): U32
+    local b = Bag {}
+    fill(Ref b.xs, 2)
+    local head = b.xs:all()
+    b.xs:clear()
+    return head[0]
+end
+export cleared
+]], "cleared")
+    refuses(bag .. [[
+local replaced = do(): U32
+    local b = Bag {}
+    fill(Ref b.xs, 2)
+    local head = b.xs:all()
+    b.xs = Grow(U32) {}
+    return head[0]
+end
+export replaced
+]], "replaced")
+    refuses(bag .. [[
+local keep = do(b: Bag): U64 = b.xs.length
+local moved = do(): U64
+    local b = Bag {}
+    local r = Ref b.xs
+    local n = keep b
+    r:push 1
+    return n
+end
+export moved
+]], "moved")
+end
+
+test "a reference to a field obeys the lifetime rule":
+    refuses([[
+local Point = struct { x: U32, y: U32 }
+local leak = do(): Ref U32
+    local p = Point { x = 1, y = 2 }
+    return Ref p.x
+end
+local broken = do(): U32
+    local r = leak()
+    return r
+end
+export broken
+]], "a borrow of 'p' cannot be stored in 'r', which outlives it")
+    refuses([[
+local Point = struct { x: U32, y: U32 }
+local Holder = struct { r: Ref U32 }
+local outlived = do(k: U32): U32
+    local holder = Holder { r = Ref k }
+    if k > 0 then
+        local p = Point { x = k, y = 2 }
+        holder.r = Ref p.x
+    end
+    return holder.r
+end
+export outlived
+]], "refused.nua:7: a borrow of 'p' cannot be stored in 'holder', which outlives it")
+end

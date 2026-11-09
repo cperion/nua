@@ -76,19 +76,26 @@ local OwnerMove = oneof {
     uninitialized: Unit,         -- it never held a value
 }
 
-local JoinDecision = struct { flow: data.FlowFacts, differing: Table }
+-- `partly_vacated`: the parts vacated on some incoming paths only, for the activity to release
+-- on the others before they join
+local JoinDecision = struct { flow: data.FlowFacts, differing: Table, partly_vacated: Table }
 
 ------------------------------------------------------------------------------------------------
 
-local empty = || -> data.FlowFacts { contents = {}, borrows = {}, live_lifetimes = {} }
+local empty = || -> data.FlowFacts { contents = {}, borrows = {}, live_lifetimes = {}, vacated = {} }
 
 local fork = do(flow)
-    local contents, borrows, live_lifetimes = {}, {}, {}
+    local contents, borrows, live_lifetimes, vacated = {}, {}, {}, {}
     for place, state in pairs flow.contents do contents[place] = state end
     for borrow, state in pairs flow.borrows do borrows[borrow] = state end
     for lifetime in pairs flow.live_lifetimes do live_lifetimes[lifetime] = true end
-    return data.FlowFacts { .contents, .borrows, .live_lifetimes }
+    for key, part in pairs flow.vacated do vacated[key] = part end
+    return data.FlowFacts { .contents, .borrows, .live_lifetimes, .vacated }
 end
+
+-- the key of a vacated part: its place and path
+local vacated_key = |place, path| -> place.serial .. ":" .. paths.path_key(path)
+local is_prefix = paths.is_prefix
 
 -- two operands denote the same value: one operand, or constants of one type with the same bits.
 -- Each comparison is a pass over its family for two values of one kind; the cases across kinds
@@ -312,6 +319,57 @@ local tracking = do(capabilities)
         return OwnerMove.moved contents.value
     end
 
+    -- a part of a place gives up its owner: the borrows of it end; a whole place is moved, a
+    -- part vacated (the parts under it are no longer separately vacated)
+    local vacate = do(flow, access, at)
+        ends(flow, access, "moved", at)
+        for key, part in pairs flow.vacated do
+            if part.place == access.place and is_prefix(access.path, part.path) then flow.vacated[key] = nil end
+        end
+        if #access.path == 0 then
+            flow.contents[access.place] = data.Moved { .at }
+        else
+            flow.vacated[vacated_key(access.place, access.path)] = data.Vacated { place = access.place, path = access.path, .at }
+        end
+    end
+    -- an owner is written at or above a vacated part: it holds a value again
+    local refill = do(flow, place, path)
+        for key, part in pairs flow.vacated do
+            if part.place == place and is_prefix(path, part.path) then flow.vacated[key] = nil end
+        end
+    end
+    -- the parts vacated under `place`, in a stable order
+    local vacated_under = do(flow, place)
+        local found = {}
+        for key, part in pairs flow.vacated do
+            if part.place == place then found[#found + 1] = { .key, .part } end
+        end
+        table.sort(found, |a, b| -> a.key < b.key)
+        local parts = {}
+        for index, entry in ipairs found do parts[index] = entry.part end
+        return parts
+    end
+    -- parts vacated on every incoming path stay vacated; the others are listed for release
+    local agree_vacated = do(incoming, joined)
+        local keys, partly = {}, {}
+        for _, flow in ipairs incoming do
+            for key in pairs flow.vacated do keys[#keys + 1] = key end
+        end
+        table.sort keys
+        local seen = {}
+        for _, key in ipairs keys do
+            if not seen[key] then
+                seen[key] = true
+                local everywhere, part = true, nil
+                for _, flow in ipairs incoming do
+                    if flow.vacated[key] then part = part or flow.vacated[key] else everywhere = false end
+                end
+                if everywhere then joined.vacated[key] = part else partly[#partly + 1] = part end
+            end
+        end
+        return partly
+    end
+
     -- the contents that agree on every incoming path, and the places whose contents differ
     -- (or exist on some paths only), in identity order
     local agree_contents = do(incoming, joined)
@@ -392,7 +450,8 @@ local tracking = do(capabilities)
         local differing = agree_contents(incoming, joined)
         agree_borrows(incoming, joined)
         agree_lifetimes(incoming, joined)
-        return JoinDecision { flow = joined, .differing }
+        local partly_vacated = agree_vacated(incoming, joined)
+        return JoinDecision { flow = joined, .differing, .partly_vacated }
     end
 
     -- the borrow a block argument carries after a join: the union of the incoming borrows'
@@ -423,6 +482,9 @@ local tracking = do(capabilities)
         .moves
         .ends
         .move_owner
+        .vacate
+        .refill
+        .vacated_under
         .agree
         .join_borrows
         overlap = accesses_overlap

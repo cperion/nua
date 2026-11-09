@@ -210,9 +210,13 @@ local defining = do(compilation, E)
         return id
     end
 
+    -- the ABI a definition is built for (an exported one is "c_boundary")
+    local abi_of = id -> jobs[id] and jobs[id].abi
+
     return define
         .request
         .define_export
+        .abi_of
         .word_id
         .contract_of
         .bundle_of

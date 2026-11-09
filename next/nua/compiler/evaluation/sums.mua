@@ -110,10 +110,18 @@ return do(E, core)
 
     -- releasing a sum: its payload, if the alternative it holds owns storage; on a runtime tag,
     -- a test per alternative
-    E.release_sum = do(path, value)
+    E.release_sum = do(path, value, place, steps)
         local release = do(at, name)
             local alternative = E.alternative(at, value.type, name)
-            if types.owns alternative.payload then E.release_value(at, E.payload_of(at, value, name)) end
+            if types.owns alternative.payload then
+                local under = nil
+                if place then
+                    under = {}
+                    for position, step in ipairs steps do under[position] = step end
+                    under[#under + 1] = data.AlternativeStep { .name }
+                end
+                E.release_value(at, E.payload_of(at, value, name), place, under)
+            end
             return nil
         end
         if E.is_tagged value then return release(path, value.alternative) end
@@ -169,16 +177,38 @@ return do(E, core)
         end
     end
 
-    -- the handler of one alternative applied to its payload (none for a Unit alternative)
-    local handle = do(path, handlers, value, name)
-        local payload = E.payload_of(path, value, name)
-        return E.apply(path, handlers[name], payload and { payload } or {}, false)
+    -- the handler of one alternative applied to its payload (none for a Unit alternative): a
+    -- copy, or, when the handler declares its parameter `Ref`, a borrow of the payload in the
+    -- matched place. A payload that owns storage is matched by reference (syntax §9.13, §11.2).
+    local handle = do(path, handlers, value, name, place)
+        local alternative = E.alternative(path, value.type, name)
+        if alternative.payload == types.Unit then return E.apply(path, handlers[name], {}, false) end
+        local word, supplied = hosting.supplied_of(handlers[name])
+        local requirement = word and word.requirements[#supplied + 1]
+        if requirement and requirement.type and types.NativeType.is(requirement.type, types.ReferenceType) then
+            local reference = E.part_reference(path, place path, data.AlternativeStep { .name })
+            return E.apply(path, handlers[name], { reference }, false)
+        end
+        if types.owns alternative.payload then
+            fail(path, ("the payload of %s.%s owns storage: its handler takes it by reference, do(p: Ref %s)"):format(types.describe value.type, name, types.describe alternative.payload))
+        end
+        return E.apply(path, handlers[name], { E.payload_of(path, value, name) }, false)
+    end
+    -- whether a handler of the match borrows its payload
+    local borrowing = do(handlers)
+        for _, handler in pairs handlers do
+            local word, supplied = hosting.supplied_of(handler)
+            local requirement = word and word.requirements[#supplied + 1]
+            if requirement and requirement.type and types.NativeType.is(requirement.type, types.ReferenceType) then return true end
+        end
+        return false
     end
 
     -- A match: keyed application of a sum value, one handler per alternative. A known tag runs
     -- only its handler, in place. A runtime tag tests each alternative in canonical order (the
     -- last is what remains), each arm built from the same facts with its payload projected
-    -- inside it, and the arms' results meet at one type and join.
+    -- inside it, and the arms' results meet at one type and join. `place`, when the sum is
+    -- held in one, answers a reference to it on a given path, for handlers that borrow the payload.
     E.match = do(path, subject, arguments, place)
         local value = subject
         if not is_native value then
@@ -188,11 +218,20 @@ return do(E, core)
         if #arguments ~= 1 then fail(path, ("matching %s takes one table of handlers"):format(types.describe value.type)) end
         local handlers = arguments[1]
         check_handlers(path, value.type, handlers)
-        -- a payload is received as a copy; an owner cannot be copied, so matching a local
-        -- holding an owning sum moves it, and its payload to the handler
-        if place and types.owns value.type then value = E.get(path, place) end
-        if E.is_tagged value then return handle(path, handlers, value, value.alternative) end
-        return E.dispatch_tag(path, value, |arm, name| -> handle(arm, handlers, value, name), "the handlers of a match of " .. types.describe value.type)
+        -- a sum that is not a place, matched by a handler that borrows: it is held for the
+        -- match in a temporary place, released after it
+        local temporary = nil
+        if place == nil and borrowing handlers then
+            temporary = E.new_place(path, "matched sum", value.type)
+            path.flow.contents[temporary.id] = data.Tracked { .value }
+            local cell = E.place_cell(temporary.id, "the matched sum")
+            place = at -> E.reference_to(at, cell)
+        end
+        local result
+        if E.is_tagged value then result = handle(path, handlers, value, value.alternative, place)
+        else result = E.dispatch_tag(path, value, |arm, name| -> handle(arm, handlers, value, name, place), "the handlers of a match of " .. types.describe value.type) end
+        if temporary and not path.dead then E.release_place(path, temporary.id) end
+        return result
     end
 
     -- On a runtime tag: `run(arm, alternative)` for each alternative, in canonical order, each

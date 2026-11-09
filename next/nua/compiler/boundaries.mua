@@ -408,9 +408,9 @@ local replaying_call = do(bundle, path, arguments, caller, fail, resolve)
     local input_borrows = input_borrows_of(definition, published)
 
     -- storage the call moves or ends must not be what a live received borrow reaches
-    local check_alias = do(access, states, kind)
+    local check_alias = do(access, states, kind, exempt)
         for id in pairs input_borrows do
-            if states[id] and BorrowState.is(states[id], data.Live) then
+            if states[id] and BorrowState.is(states[id], data.Live) and not (exempt and exempt[id]) then
                 for _, origin in ipairs local_registry[id].origins do
                     if access.place == origin.place and facts.affects(access.path, origin.path) then
                         fail(path, kind == "moves" and "the call may move storage it also receives a view of" or "the call ends storage it also receives a view of")
@@ -554,22 +554,44 @@ local replaying_call = do(bundle, path, arguments, caller, fail, resolve)
     -- any other instruction's effects, resolved into the caller's places and applied to both
     -- the caller's facts and the callee's own borrows
     local forgets = { cleared = true, released = true, replaced = true, moved = true }
+    local vacates = { released = true, moved = true }
     local replay_effects = do(state, instruction)
         local site_effects = effects_at(instruction, { effects = contract.effects[instruction.site.id] })
         record_flags site_effects
         local origin = instruction.site.origin
         for _, field in ipairs effect_fields do
             local accesses = {}
-            for _, access in ipairs site_effects[field] do accesses = union_accesses(accesses, resolve_access(access)) end
+            -- a move out through a Ref parameter: that parameter's own reference is what it
+            -- moves through, not a second borrow of the storage
+            local exempt = {}
+            for _, access in ipairs site_effects[field] do
+                local resolved = resolve_access(access)
+                if field == "ends" and vacates[instruction.reason] then
+                    -- moving out of an argument whose target the caller does not know is rejected
+                    if #resolved > 1 then fail(path, "the call moves an owner out of an argument whose target is not known while compiling") end
+                    local place = definition.places[access.place]
+                    if place and PlaceRoot.is(place.root, data.ParameterRoot) then
+                        local parameter_type = definition.signature.parameters[place.root.parameter]
+                        local info = published.values[data.operand_key(data.Parameter { definition = definition.id, index = place.root.parameter, type = parameter_type })]
+                        for _, part in pairs(info and info.components or {}) do
+                            if ComponentInfo.is(part, data.Borrowed) then exempt[part.borrow] = true end
+                        end
+                    end
+                end
+                accesses = union_accesses(accesses, resolved)
+            end
             record_effect(field, accesses)
             for _, access in ipairs accesses do
-                if field == "moves" or field == "ends" or field == "consumes" then check_alias(access, state.local_flow.borrows, field) end
+                if field == "moves" or field == "ends" or field == "consumes" then check_alias(access, state.local_flow.borrows, field, exempt) end
                 if field == "moves" then
                     tracking.moves(state.flow, access, origin)
                     local_tracking.moves(state.local_flow, access, origin)
                 elseif field == "ends" or field == "consumes" then
                     local reason = instruction.reason or "cleared"
-                    tracking.ends(state.flow, access, reason, origin)
+                    -- an owner the callee moved out of (or released from) an argument's place
+                    -- leaves the caller's place: its summary says which part (syntax §9.2)
+                    if vacates[reason] then tracking.vacate(state.flow, access, origin)
+                    else tracking.ends(state.flow, access, reason, origin) end
                     local_tracking.ends(state.local_flow, access, reason, origin)
                     if forgets[reason] then memory.forget(state.flow, access) end
                 end

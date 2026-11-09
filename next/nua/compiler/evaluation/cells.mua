@@ -4,7 +4,8 @@
 --
 -- A cell is what a name of a typed body denotes: a native place, a host binding, a record field or
 -- an element to assign through, or raw storage behind a pointer. A reference reaches a tracked
--- place (its contents in the flow facts) or a raw place derived from a header.
+-- place (its contents in the flow facts), a part of one, or a raw place: memory derived from a
+-- header, or a resident place's field.
 
 local shapes = require "nua.shapes"
 local identity = require "nua.identity"
@@ -21,8 +22,10 @@ Cell { PlaceCell, HostCell, FieldCell, RawCell, ElementCell }
 
 local Reached = family "what a reference reaches"
 local TrackedPlace = struct { place: identity.PlaceId }
+-- a part of a tracked place's value: the fields (and alternatives) `path` names in its contents
+local TrackedPart = struct { place: identity.PlaceId, path: Table }
 local RawPlace = struct { place: Table }
-Reached { TrackedPlace, RawPlace }
+Reached { TrackedPlace, TrackedPart, RawPlace }
 
 return define
     .Cell
@@ -33,6 +36,7 @@ return define
     .ElementCell
     .Reached
     .TrackedPlace
+    .TrackedPart
     .RawPlace
     is_cell = value -> check(Cell, value)
     is_raw = reached -> Reached.is(reached, RawPlace)

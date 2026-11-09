@@ -46,6 +46,18 @@ return do(E, core)
     local Primitives = define
         trap = |path, arguments, boundary| -> E.trap(path, arguments[1])
         element_of = |path, arguments, boundary| -> E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
+        -- `take(b, i)`: element `i`, outside the buffer's initialized prefix now, moved out
+        -- (the reading counterpart of `initialize`, for pop)
+        take = do(path, arguments, boundary)
+            local element = E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
+            return E.reached_value(path, E.reach(path, element))
+        end
+        -- `initialize(b, i, v)`: the initialized-prefix transition (buffers §4.1): element `i`
+        -- holds nothing yet, so writing it releases nothing
+        initialize = do(path, arguments, boundary)
+            local element = E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
+            E.initialize_reference(path, element, arguments[3], "an element")
+        end
         view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3])
         -- `drop(r)`: release what a reference reaches; a local it reaches is moved
         drop = do(path, arguments, boundary)
@@ -54,8 +66,15 @@ return do(E, core)
             local reached = E.reach(path, reference)
             if cells.Reached.is(reached, cells.TrackedPlace) then
                 E.release_place(path, reached.place)
-            else
+            elseif cells.is_raw reached and not E.held_access(path, reference) then
                 E.release_value(path, E.load(path, reached.place))
+            else
+                -- a part of a place (a field): released and vacated
+                local root, steps = E.held_access(path, reference)
+                local element = false
+                for _, step in ipairs steps do if not data.AccessStep.is(step, data.FieldStep) then element = true end end
+                if element then E.release_value(path, E.reached_value(path, reached))
+                else E.release_part(path, root, steps) end
             end
         end
     end
@@ -152,12 +171,22 @@ return do(E, core)
         local place = nil
         if E.is_cell callee then
             place = callee
-            callee = E.peek(path, callee)
+            -- an element is read where it is, through its reference (an owning one is never
+            -- copied out)
+            callee = cells.Cell.is(callee, cells.ElementCell) and E.deref(path, E.reference_to(path, callee)) or E.peek(path, callee)
         end
         -- a constructor applied builds (a Unit one too: `Direction.left()`); a sum value applied
         -- is matched
         if types.is_constructor callee then return E.construct_variant(path, callee, arguments) end
-        if E.is_sum_value callee then return E.match(path, callee, arguments, place) end
+        -- a sum reached through a reference is matched in the place it reaches
+        if E.is_reference callee and types.NativeType.is(callee.type, types.ReferenceType) and E.is_sum(callee.type.target) then
+            local reference = callee
+            return E.match(path, E.deref(path, reference), arguments, at -> reference)
+        end
+        if E.is_sum_value callee then
+            local held = place and not cells.Cell.is(place, cells.HostCell) and (at -> E.reference_to(at, place)) or nil
+            return E.match(path, callee, arguments, held)
+        end
         if callee == types.reference and E.is_cell(arguments[1]) then return E.reference_to(path, arguments[1]) end
         if hosting.is_primitive callee then
             local apply_primitive = Primitives[callee.name]
@@ -171,6 +200,17 @@ return do(E, core)
 
     E.dot = do(path, base, name)
         if path.dead then return nil end
+        -- an owner field of a place used as a value moves out of it (syntax §9.2)
+        if E.is_cell base and not cells.Cell.is(base, cells.HostCell) then
+            local whole = E.deref(path, E.peek(path, base))
+            local field = E.is_aggregate whole and E.field_of(whole.type, name)
+            if field and types.owns field.type then
+                local reference = E.reference_to(path, cells.FieldCell { .base, .name })
+                local value = E.deref(path, reference)
+                E.move_through(path, reference)
+                return value
+            end
+        end
         if E.is_cell base then base = E.peek(path, base) end
         base = E.deref(path, base)
         if E.is_view base and name == "length" then
@@ -232,10 +272,13 @@ return do(E, core)
         if not is_native base and lua_type base == "table" then return base[key] end
         fail(path, "indexing a native value is not available yet")
     end
-    -- the field `name` of the record a cell (or a field cell) holds, as a cell to assign
+    -- the field `name` of the record a cell (or a field cell) holds, as a cell to assign or
+    -- borrow; of what a reference reaches, a reference to the field; of a value, its field
     E.member = do(path, base, name)
-        if not E.is_cell base then fail(path, ("'.%s' is assigned through a local of the body"):format(name)) end
-        return cells.FieldCell { .base, .name }
+        if path.dead then return nil end
+        if E.is_cell base then return cells.FieldCell { .base, .name } end
+        if E.is_reference base and types.NativeType.is(base.type, types.ReferenceType) then return E.part_reference(path, base, data.FieldStep { .name }) end
+        return E.dot(path, base, name)
     end
     E.member_at = do(path, base, key)
         if path.dead then return nil end
