@@ -186,6 +186,9 @@ return do(E, core)
         return value
     end
 
+    -- `same_value(a, b)`: whether two staged values are one value here
+    E.same_value = |a, b| -> facts.same_value(unwrap a, unwrap b)
+
     -- `is_known(v)`: whether a value is known while compiling (a Lua value always is)
     E.is_known = value -> known(lua_type value == "table" and wrapped[value] or value)
 

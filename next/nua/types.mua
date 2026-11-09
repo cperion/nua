@@ -29,9 +29,11 @@ local SumType = struct { name: String, alternatives: list_of(Alternative) }
 -- `fixed`: the owner `Array T` (syntax §9.3): a buffer whose length is set when it is built
 local BufferType = struct { element: NativeType, pinned: Boolean, fixed: Boolean }
 local FunctionType = struct { parameters: list_of(NativeType), result: NativeType, variadic: Boolean }
+-- an opaque C type, usable only behind a `Ptr` (syntax §17.2)
+local OpaqueType = struct { name: String }
 NativeType {
     IntegerType, FloatType, BooleanType, UnitType, PointerType, ReferenceType, ViewType,
-    FixedArrayType, RecordType, SumType, BufferType, FunctionType
+    FixedArrayType, RecordType, SumType, BufferType, FunctionType, OpaqueType
 }
 
 ------------------------------------------------------------------------------------------------
@@ -95,6 +97,13 @@ local Str = ViewType { element = U8, mutable = false, text = true }
 local slice = setmetatable(define
     mut = element -> view(element, true)
 end, { __call = |_, element| -> view element, __tostring = || -> "Slice" })
+local opaques = {}
+local opaque = do(name)
+    if opaques[name] == nil then opaques[name] = OpaqueType { .name } end
+    return opaques[name]
+end
+-- `const char *`: a Lua string where one is expected is known static text (syntax §17.2)
+local CString = pointer(opaque "char")
 local fixed_array = do(element, count)
     need_type(element, "Array")
     if not check(Natural, count) then error("Array(T, n) expects a natural count, got " .. tostring count, 2) end
@@ -223,6 +232,7 @@ local Describing = define
     FixedArrayType = do(node, recurse) return ("Array(%s, %d)"):format(recurse node.element, node.count) end
     RecordType = named
     SumType = named
+    OpaqueType = named
     BufferType = do(node, recurse) return (node.fixed and "Array " or node.pinned and "Buffer.pinned " or "Buffer ") .. recurse node.element end
     FunctionType = do(node, recurse)
         local parameters = {}
@@ -245,6 +255,7 @@ local Owning = define
     ReferenceType = never
     ViewType = never
     FunctionType = never
+    OpaqueType = never
     BufferType = do(node, recurse) return true end
     FixedArrayType = do(node, recurse) return recurse node.element end
     RecordType = do(node, recurse)
@@ -298,6 +309,7 @@ local Laying = define
     PointerType = do(node, recurse, target) return scalar(target.pointer_bits / 8) end
     ReferenceType = do(node, recurse, target) return scalar(target.pointer_bits / 8) end
     FunctionType = do(node, recurse, target) return scalar(target.pointer_bits / 8) end
+    OpaqueType = do(node, recurse, target) error(node.name .. " is opaque: it has no size, only a Ptr to it does", 0) end
     ViewType = do(node, recurse, target)
         return sequence {
             { name = "data", layout = scalar(target.pointer_bits / 8) },
@@ -422,6 +434,7 @@ local Components = define
     RecordType = |node, recurse| -> nil
     SumType = |node, recurse| -> nil
     FunctionType = |node, recurse| -> nil
+    OpaqueType = |node, recurse| -> nil
 end
 local component_of = NativeType.pass "the component a family type is made of" with ..Components end
 
@@ -442,7 +455,7 @@ end
 
 -- host-level reads and assignments of a declared type's members: `function Fixed.__cast(v)`
 -- and `Fixed.__cast` (its descriptor's own fields answer first)
-for _, kind in ipairs { RecordType, ViewType, BufferType, FixedArrayType } do
+for _, kind in ipairs { RecordType, ViewType, BufferType, FixedArrayType, PointerType } do
     kind.__index = |native_type, name| -> member(native_type, name)
     kind.__newindex = |native_type, name, value| -> define_member(native_type, name, value)
 end
@@ -474,6 +487,9 @@ return define
     .SumType
     .BufferType
     .FunctionType
+    .OpaqueType
+    .opaque
+    .CString
     .NativeLayout
     .U8
     .U16

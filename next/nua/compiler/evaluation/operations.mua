@@ -59,7 +59,21 @@ return do(E, core)
         array_element_of = |path, arguments, boundary| -> E.array_element_of(path, reference_argument(path, arguments[1]), arguments[2])
         array_view = |path, arguments, boundary| -> E.array_view(path, reference_argument(path, arguments[1]), arguments[2])
         -- `zero_of(T)`: the zero value of a type, for a word that zeroes storage
-        zero_of = |path, arguments, boundary| -> E.zero_value(arguments[1])
+        -- `hold_structure(r)`, `release_structure(r)`: a buffer's structure is fixed between them
+        hold_structure = do(path, arguments, boundary)
+            E.hold_structure(path, reference_argument(path, arguments[1]), 1)
+        end
+        release_structure = do(path, arguments, boundary)
+            E.hold_structure(path, reference_argument(path, arguments[1]), -1)
+        end
+        -- `null(T)`: the null `Ptr T` (of a pointer type, that type)
+        null = do(path, arguments, boundary)
+            local pointer_type = rules.is_pointer(arguments[1]) and arguments[1] or types.pointer(arguments[1])
+            return E.known(data.Constant { type = pointer_type, bits = data.IntegerBits { bits = 0ULL } })
+        end
+        -- `static_cstring(text)`: a Lua string as a known `CString`
+        static_cstring = |path, arguments, boundary| -> E.known(data.Constant { type = types.CString, bits = data.StaticAddress { bytes = arguments[1], offset = 0 } })
+        zero_of = |path, arguments, boundary| -> E.zero_value(arguments[1], path)
         -- `reinterpret(T, v)`: the bits of a scalar read as another of its size
         reinterpret = |path, arguments, boundary| -> E.compute(path, "reinterpret", arguments[1], { E.deref(path, arguments[2]) })
         view_data = |path, arguments, boundary| -> E.view_data(path, E.deref(path, reference_argument(path, arguments[1])))
@@ -202,6 +216,13 @@ return do(E, core)
             return E.match(path, callee, arguments, held)
         end
         if callee == types.reference and E.is_cell(arguments[1]) then return E.reference_to(path, arguments[1]) end
+        if hosting.is_foreign callee then return E.apply_foreign(path, callee, arguments) end
+        -- `Ptr(place)`: the address of a place, where a lifetime is dropped (syntax §12.1)
+        if callee == types.pointer and E.is_reference(arguments[1]) and types.NativeType.is(arguments[1].type, types.ReferenceType) then
+            local reference = arguments[1]
+            local address = E.pack_reference(path, reference)
+            return E.compute(path, "reinterpret", types.pointer reference.type.target, { E.bits(address.type, address) })
+        end
         if hosting.is_primitive callee then
             local apply_primitive = Primitives[callee.name]
             if apply_primitive == nil then fail(path, "the primitive " .. callee.name .. " is unknown") end
@@ -217,6 +238,10 @@ return do(E, core)
         -- an owner field of a place used as a value moves out of it (syntax §9.2)
         if E.is_cell base and not cells.Cell.is(base, cells.HostCell) then
             local whole = E.deref(path, E.peek(path, base))
+            -- `p.field` of a raw pointer to a record: that field's place (syntax §12.1)
+            if is_native whole and rules.is_pointer whole.type and types.NativeType.is(whole.type.target, types.RecordType) then
+                return E.deref(path, E.reference_to(path, cells.FieldCell { .base, .name }))
+            end
             local field = E.is_aggregate whole and E.field_of(whole.type, name)
             if field and types.owns field.type then
                 local reference = E.reference_to(path, cells.FieldCell { .base, .name })

@@ -54,15 +54,23 @@ return do(compilation, E, capabilities)
             act(data.Access { place = base.place, path = provenance.concat(base.path, instruction.target.path) })
         end
     end
+    -- a buffer whose structure an iteration holds fixed (syntax §15.1)
+    local refuse_held = do(path, target)
+        if facts.structure_held(path.flow, target) then fail(path, "the structure of a map is fixed while it is walked by each: collect the keys first") end
+    end
     local forgets = { cleared = true, released = true, replaced = true, moved = true }
     local vacates = { released = true, moved = true }
     local Appending = define ..graph.Inert
         Moves = do(instruction, recurse, path)
-            each_access(instruction, target -> tracking.moves(path.flow, target, instruction.site.origin))
+            each_access(instruction, do(target)
+                refuse_held(path, target)
+                tracking.moves(path.flow, target, instruction.site.origin)
+            end)
         end
         -- an owner moved out or released leaves its place (or the part of it the access names)
         Ends = do(instruction, recurse, path)
             each_access(instruction, do(target)
+                if instruction.reason == "removed" or instruction.reason == "cleared" or instruction.reason == "shrank" then refuse_held(path, target) end
                 if vacates[instruction.reason] then tracking.vacate(path.flow, target, instruction.site.origin)
                 else tracking.ends(path.flow, target, instruction.reason, instruction.site.origin) end
                 if forgets[instruction.reason] then memory.forget(path.flow, target) end

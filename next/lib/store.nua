@@ -1,0 +1,77 @@
+-- Managed stores and generational IDs (syntax §9.8-9.10): ordinary Nua over a Grow of slots. A
+-- vacant slot holds the zero value of T, so adding and removing are plain replacements, and a
+-- store's release and copy are the walks of its type. An Id names a token, a slot and a
+-- generation; every lookup checks all three and occupancy, so a stale Id never reaches a
+-- recycled slot. Generations start at 1; a slot whose generation would wrap is retired.
+
+local ids, stores, id_types = {}, {}, {}
+
+local Id = do(T)
+    if ids[T] then return ids[T] end
+    local I = struct { token: U64, slot: U32, generation: U32 }
+    function I.__eq(a: I, b: I): Bool
+        return a.token == b.token and a.slot == b.slot and a.generation == b.generation
+    end
+    ids[T] = I
+    id_types[I] = true
+    return I
+end
+
+local Store = do(T)
+    if stores[T] then return stores[T] end
+    local I = Id T
+    local Slot = struct { generation: U32, occupied: Bool, next_free: U32, value: T }
+    local S = struct { slots: Grow Slot, free_head: U32, length: U64, token: U64 }
+
+    local live = do(self: Ref S, id: I): Bool
+        if id.token ~= self.token or U64 id.slot >= self.slots.length then return false end
+        local slot = Ref self.slots[id.slot]
+        return slot.occupied and slot.generation == id.generation
+    end
+
+    function S:has(id: I): Bool
+        return live(self, id)
+    end
+
+    -- insert v: a retired or free slot's next generation, or a new slot; growth moves the slots
+    function S:add(value: T): I
+        if self.token == 0 then self.token = platform.next_store_token() end
+        self.length = self.length + 1
+        if self.free_head ~= 0 then
+            local slot_number = self.free_head - 1
+            local generation = self.slots[slot_number].generation
+            self.free_head = self.slots[slot_number].next_free
+            self.slots[slot_number] = Slot { .generation, occupied = true, next_free = 0, .value }
+            return I { token = self.token, slot = slot_number, .generation }
+        end
+        self.slots:push(Slot { generation = 1, occupied = true, next_free = 0, .value })
+        return I { token = self.token, slot = U32(self.slots.length - 1), generation = 1 }
+    end
+
+    -- remove the object; false if the id is stale or foreign. The borrows of slots end.
+    function S:remove(id: I): Bool
+        if not live(self, id) then return false end
+        local following = id.generation + 1
+        self.slots[id.slot] = Slot { generation = following, occupied = false, next_free = self.free_head, value = zero_of T }
+        -- a slot whose generation wrapped is never used again
+        if following ~= 0 then self.free_head = id.slot + 1 end
+        self.length = self.length - 1
+        ends(Ref self.slots, "removed")
+        return true
+    end
+
+    -- `s[id]`: the object, as a place; every use checks the id
+    function S:__index(id: I): Ref T
+        if not live(self, id) then trap "a stale or foreign store id" end
+        return Ref self.slots[id.slot].value
+    end
+
+    stores[T] = S
+    return S
+end
+
+return define
+    is_id = T -> id_types[T] == true
+    .Id
+    .Store
+end

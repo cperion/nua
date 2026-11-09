@@ -25,6 +25,8 @@ local bindings = define
     storage_context = declare("storage_context", {}, bytes)
     fatal_trap = declare("fatal_trap", { bytes, types.U64 }, types.Unit)
     ledger_mapped_bytes = declare("ledger_mapped_bytes", {}, types.U64)
+    next_store_token = declare("next_store_token", {}, types.U64)
+    hash_seed = declare("hash_seed", { types.U64 }, types.U64)
 end
 
 return define

@@ -1,0 +1,72 @@
+-- Foreign C (syntax §17): opaque effects, never run while compiling; C types behind pointers.
+
+local ffi = require "ffi"
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "calls into C, with a header or a prototype; addresses, null, opaque types":
+    local library, text = native("foreign_calls", [[
+local abs = extern("abs", { I32 }, I32, { header = "<stdlib.h>" })
+local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local labs_proto = extern("labs", { I64 }, I64)
+local FILE = opaque "FILE"
+local fflush = extern("fflush", { Ptr FILE }, I32, { header = "<stdio.h>" })
+local snprintf = extern("snprintf", { Ptr U8, U64, CString }, I32, { header = "<stdio.h>", variadic = true })
+
+local foreign_dist = do(a: I32, b: I32): I32 = abs(a - b)
+export foreign_dist
+local foreign_length = do(): U64 = strlen "hello"
+export foreign_length
+local foreign_proto = do(a: I64): I64 = labs_proto a
+export foreign_proto
+local foreign_flush = do(): I32 = fflush(null FILE)
+export foreign_flush
+local foreign_address = do(k: U32): U32
+    local x = k
+    local p = Ptr(x)
+    p[0] = p[0] + 1
+    return x
+end
+export foreign_address
+local Pair = struct { a: U32, b: U32 }
+local foreign_field = do(k: U32): U32
+    local pair = Pair { a = k, b = 2 }
+    local p = Ptr(pair)
+    p.b = p.a + 1
+    return pair.b
+end
+export foreign_field
+local foreign_format = do(n: U32, x: F64): U64
+    local buffer: Array(U8, 64)
+    local length = snprintf(Ptr(buffer[0]), 64, cformat("n=", n, " x=", x, " 100%"))
+    return strlen(CString(Ptr(buffer[0]))) * 100 + U64 length
+end
+export foreign_format
+]])
+    assert(library.foreign_dist(3, 10) == 7)
+    assert(library.foreign_length() == 5)
+    assert(library.foreign_proto(-4) == 4)
+    assert(library.foreign_flush() == 0)
+    assert(library.foreign_address(1) == 2)
+    assert(library.foreign_field(5) == 6)
+    assert(library.foreign_format(7, 2.5) == #"n=7 x=2.5 100%" * 101)
+    assert(text:find("#include <stdlib.h>", 1, true) and text:find("long labs") == nil and text:find("int64_t labs(int64_t", 1, true), text)
+end
+
+test "a foreign function never runs while compiling":
+    refuses([[
+local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local value = strlen "abc"
+]], "is a foreign function")
+    refuses([[
+local abs = extern("abs", { I32 }, I32)
+local twice = do(x: I32): I32 = abs x
+local known = twice 2
+]], "applied from host code")
+end

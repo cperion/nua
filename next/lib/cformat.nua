@@ -1,0 +1,54 @@
+-- `cformat(...)` (syntax §17.2): a format string and its arguments, decided while specializing,
+-- so a format can never disagree with its values. Lua strings and numbers and known values go
+-- into the format itself.
+
+local as_unsigned = do(value): U64 = U64 value
+local as_signed = do(value): I64 = I64 value
+local as_float = do(value): F64 = F64 value
+local yes_or_no = do(value: Bool): CString
+    if value then return "true" end
+    return "false"
+end
+
+local escaped = text -> (text:gsub("%%", "%%%%"))
+local I32_of = do(value): I32 = I32 value
+
+local cformat = function(...)
+    local format, values = {}, {}
+    local pieces = { n = select("#", ...), ... }
+    for position = 1, pieces.n do
+        local piece = pieces[position]
+        local piece_type = type_of piece
+        if piece_type == nil then
+            format[#format + 1] = escaped(tostring piece)
+        elseif piece_type ~= Str and is_known piece then
+            format[#format + 1] = escaped(tostring(host piece))
+        elseif piece_type == Bool then
+            format[#format + 1] = "%s"
+            values[#values + 1] = yes_or_no piece
+        elseif piece_type == CString then
+            format[#format + 1] = "%s"
+            values[#values + 1] = piece
+        elseif piece_type == Str then
+            format[#format + 1] = "%.*s"
+            values[#values + 1] = I32_of(piece.length)
+            values[#values + 1] = view_data piece
+        elseif piece_type == F64 or piece_type == F32 then
+            format[#format + 1] = "%g"
+            values[#values + 1] = as_float piece
+        elseif piece_type.signed == false then
+            format[#format + 1] = "%llu"
+            values[#values + 1] = as_unsigned piece
+        elseif piece_type.signed == true then
+            format[#format + 1] = "%lld"
+            values[#values + 1] = as_signed piece
+        else
+            error("cformat: a value of " .. tostring piece_type .. " has no C conversion", 0)
+        end
+    end
+    return { cformat = true, format = table.concat format, .values }
+end
+
+return define
+    .cformat
+end

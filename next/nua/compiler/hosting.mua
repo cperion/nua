@@ -89,6 +89,17 @@ local Primitive = getmetatable(primitive_object {})
 local primitive = |name, applier, by_place| -> primitive_object { .name, .applier, .by_place }
 local is_primitive = value -> getmetatable value == Primitive
 
+-- a foreign C function (syntax §17): an opaque effect, applied only in an evaluation
+local foreign_object = meta with
+    tostring = foreign -> "the foreign function " .. foreign.name
+    call = function(foreign, ...)
+        return foreign.applier(foreign, { ... })
+    end
+end
+local Foreign = getmetatable(foreign_object {})
+local foreign = |description, applier| -> foreign_object { ..description, .applier }
+local is_foreign = value -> getmetatable value == Foreign
+
 return define
     .word
     .is_word
@@ -98,5 +109,7 @@ return define
     .saturated
     .primitive
     .is_primitive
+    .foreign
+    .is_foreign
     application = |word_value, arguments| -> supply(setmetatable({ word = word_value, supplied = {} }, Application), arguments)
 end

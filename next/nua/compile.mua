@@ -146,7 +146,7 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret", "hold_structure", "release_structure", "null", "static_cstring" } do environment[name] = hosting.primitive(name, E.host_primitive) end
     environment.copy = hosting.primitive("copy", E.host_primitive, true)
     environment.owns = types.owns
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
@@ -156,6 +156,16 @@ local hosting_environment = do(compilation, filename, E)
     environment.host = E.host_value
     environment.type_of = E.type_of
     environment.is_known = E.is_known
+    environment.same_value = E.same_value
+    -- foreign C (syntax §17): `extern(name, params, result, { header = "<stdio.h>", variadic = true })`
+    environment.extern = do(name, parameters, result, options)
+        options = options or {}
+        return hosting.foreign({ .name, .parameters, .result, header = options.header, variadic = options.variadic == true }, do(foreign, arguments)
+            error(("%s is a foreign function: it is applied inside an evaluation, never while compiling at top level"):format(name), 3)
+        end)
+    end
+    environment.opaque = types.opaque
+    environment.CString = types.CString
     -- `Array(T, n)`: n known while compiling makes the value type (syntax §13)
     -- and, n known only when the program runs, the builder of the owner `Array T` (§9.3);
     -- `Array(T)` is the owner's type
@@ -237,6 +247,10 @@ local compiling_with_members = do(source, filename)
     environment.import "slice"
     environment.import "array"
     environment.Chars = environment.import("chars").Chars
+    environment.Store = environment.import("store").Store
+    environment.Id = environment.import("store").Id
+    environment.Map = environment.import("map").Map
+    environment.cformat = environment.import("cformat").cformat
     environment.import "str"
     load_nua(source, filename)
 

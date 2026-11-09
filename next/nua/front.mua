@@ -176,11 +176,13 @@ local generating = do(filename, start_line)
     -- the arguments of an application, captured one by one in order once the callee is known
     -- (compiler activities §5.1): a local or a field of one is passed as its place, so the
     -- requirement it fills decides whether it is read, moved or lent (syntax §9.2)
-    local supplied = do(nodes)
+    -- (`by_place`: `Ptr` and `copy`, whose element arguments are places too)
+    local supplied = do(nodes, by_place)
         local items = {}
         for index, node in ipairs nodes do
             local place = node.k == "name" and lookup(node.name) == "cell" and node.name
-                or node.k == "field" and place_chain(node.obj) and node.obj.k ~= "index" and target(node)
+                or node.k == "field" and place_chain(node.obj) and (by_place or node.obj.k ~= "index") and target(node)
+                or by_place and node.k == "index" and place_chain(node) and target(node)
             items[index] = ("__capture(%d, %s)"):format(index, place or expression node)
         end
         return ("function(__capture) return { %s } end"):format(table.concat(items, ", "))
@@ -227,7 +229,8 @@ local generating = do(filename, start_line)
             local callee = node.fn.k == "name" and lookup(node.fn.name) == "cell" and node.fn.name
                 or node.fn.k ~= "name" and place_chain(node.fn) and target(node.fn)
                 or callee_of node
-            return ("__E.apply(__path, %s, %s, %s)"):format(callee, supplied(node.args), boundary_flag node)
+            local by_place = node.fn.k == "name" and (node.fn.name == "Ptr" or node.fn.name == "copy")
+            return ("__E.apply(__path, %s, %s, %s)"):format(callee, supplied(node.args, by_place), boundary_flag node)
         end
         method = node -> ("__E.method(__path, %s, %q, %s, %s)"):format(base node.obj, node.name, supplied(node.args), boundary_flag node)
         -- a table of a typed body names each entry once: Lua would keep the last of two, and a

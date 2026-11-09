@@ -140,7 +140,7 @@ return do(E, core)
     end
     E.capture_argument = do(path, callee, position, argument)
         if not E.is_cell argument or cells.Cell.is(argument, cells.HostCell) then return E.is_cell argument and E.get(path, argument) or argument end
-        if hosting.is_primitive callee and callee.by_place then return E.reference_to(path, argument) end
+        if (hosting.is_primitive callee and callee.by_place) or callee == types.pointer then return E.reference_to(path, argument) end
         local requirement = requirement_of(callee, position)
         local wanted = requirement and requirement.type
         if wanted and types.NativeType.is(wanted, types.ViewType) then

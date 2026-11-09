@@ -39,6 +39,47 @@ return do(E, core)
     -- a native call (compiler activities §6.3): the definition of the specification the
     -- arguments give, requested from the compilation; known arguments key it, the others are
     -- passed. `generalized[index]` forces an argument dynamic even when it is known.
+    -- a foreign function applied (syntax §17): an opaque effect, never run while compiling. A
+    -- variadic one takes native scalars, CStrings and pointers past its parameters; a
+    -- `cformat` argument expands to its format and values.
+    E.apply_foreign = do(path, foreign, arguments)
+        local given = {}
+        for _, argument in ipairs arguments do
+            if lua_type argument == "table" and argument.cformat then
+                given[#given + 1] = argument.format
+                for _, value in ipairs argument.values do given[#given + 1] = value end
+            else
+                given[#given + 1] = argument
+            end
+        end
+        local count, parameters = #given, foreign.parameters
+        if count < #parameters or (count > #parameters and not foreign.variadic) then
+            fail(path, ("%s takes %d arguments, %d given"):format(foreign.name, #parameters, count))
+        end
+        local passed = {}
+        for index, argument in ipairs given do
+            local parameter = parameters[index]
+            local value
+            if parameter then
+                value = E.from_host(path, parameter, argument, ("argument %d of %s"):format(index, foreign.name))
+            elseif lua_type argument == "string" then
+                value = E.from_host(path, types.CString, argument, "a variadic argument")
+            else
+                value = E.deref(path, argument)
+                local scalar = is_native value and (rules.is_integer value.type or rules.is_float value.type or rules.is_pointer value.type)
+                if not scalar then fail(path, ("a variadic argument of %s is a native scalar, a CString or a pointer"):format(foreign.name)) end
+            end
+            passed[index] = E.materialize(path, value)
+        end
+        local result_type = foreign.result
+        local result = result_type ~= types.Unit and fresh identity.ValueId or nil
+        local signature = data.Signature { .parameters, result = result_type, abi = "c_boundary", variadic = foreign.variadic == true }
+        local pointer = data.Constant { type = types.function_type(parameters, result_type, foreign.variadic), bits = data.SymbolAddress { name = foreign.name, offset = 0 } }
+        append(path, data.Invoke { site = site path, .result, callee = data.Foreign { .pointer, .signature, contract = data.ForeignEffects { reads = {}, writes = {}, retains = {}, may_reenter = false, noreturn = false }, header = foreign.header }, arguments = passed, boundary = fresh identity.BoundaryId })
+        if result == nil then return nil end
+        return E.value_of_operand(result_type, data.Result { value = result, type = result_type })
+    end
+
     E.call_definition = do(path, word, arguments, generalized)
         if word.result == nil then fail(path, word.name .. " is untyped: it evaluates in place, and has no native boundary") end
         for index, argument in ipairs arguments do

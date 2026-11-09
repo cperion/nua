@@ -583,6 +583,10 @@ local replaying_call = do(bundle, path, arguments, caller, fail, resolve)
             record_effect(field, accesses)
             for _, access in ipairs accesses do
                 if field == "moves" or field == "ends" or field == "consumes" then check_alias(access, state.local_flow.borrows, field, exempt) end
+                -- a compiled word that may change a structure held fixed (syntax §15.1)
+                if (field == "moves" or field == "ends") and (field == "moves" or instruction.reason == "removed" or instruction.reason == "cleared" or instruction.reason == "shrank") and facts.structure_held(state.flow, access) then
+                    fail(path, "the call may change the structure of a map that is being walked by each")
+                end
                 if field == "moves" then
                     tracking.moves(state.flow, access, origin)
                     local_tracking.moves(state.local_flow, access, origin)

@@ -1,0 +1,195 @@
+-- Maps (syntax §15.1): a Grow of entry slots, reused through a free list, and an open-addressed
+-- index of slot numbers, both ordinary Nua over buffers. `Map(Str, V)` owns a copy of each key;
+-- `Map.borrowing(Str, V)` keeps the caller's. An insertion of a new key moves the entries,
+-- a removal ends their borrows; inside `each` the structure is fixed, and the compiler rejects
+-- what would change it.
+
+local key_words = import "key"
+local str = import "str"
+
+local EMPTY, DEAD = 0, 0xffffffff
+local made = {}
+
+local make = do(K, V, borrowing)
+    local family = borrowing and "borrowing" or "owning"
+    made[family] = made[family] or {}
+    made[family][K] = made[family][K] or {}
+    if made[family][K][V] then return made[family][K][V] end
+    if borrowing and K ~= Str then error("Map.borrowing keeps Str keys", 0) end
+    local owned_text = K == Str and not borrowing
+    local Stored = owned_text and Text or K
+    local digest, same = key_words.hash K, key_words.equal K
+    local owning_value = owns V
+
+    local Entry = struct { hashed: U64, next_free: U32, key: Stored, value: V }
+    local Found = oneof { found: V, missing: Unit }
+    local M = struct { entries: Grow Entry, index: Grow U32, free_head: U32, length: U64, dead: U64 }
+
+    local stored_key = do(key: K): Stored
+        if owned_text then return copy key end
+        return key
+    end
+    local entry_is = do(entry: Ref Entry, key: K): Bool
+        if owned_text then return same(entry.key:str(), key) end
+        return same(entry.key, key)
+    end
+
+    -- the index cell holding key, plus 1; 0 when absent
+    local cell_of = do(self: Ref M, key: K, hashed: U64): U64
+        if self.index.length == 0 then return 0 end
+        local mask = self.index.length - 1
+        local at = hashed & mask
+        while true do
+            local cell = self.index[at]
+            if cell == EMPTY then return 0 end
+            if cell ~= DEAD then
+                local entry = Ref self.entries[cell - 1]
+                if entry.hashed == hashed and entry_is(entry, key) then return at + 1 end
+            end
+            at = (at + 1) & mask
+        end
+        return 0
+    end
+
+    -- the first reusable cell of this hash, in an index with room
+    local place_slot = do(self: Ref M, hashed: U64, slot: U32): Unit
+        local mask = self.index.length - 1
+        local at = hashed & mask
+        while self.index[at] ~= EMPTY and self.index[at] ~= DEAD do
+            at = (at + 1) & mask
+        end
+        if self.index[at] == DEAD then self.dead = self.dead - 1 end
+        self.index[at] = slot + 1
+    end
+
+    local rebuild = do(self: Ref M): Unit
+        local capacity: U64 = 8
+        while capacity * 7 < (self.length + 1) * 20 do capacity = capacity * 2 end
+        local fresh = Grow(U32) {}
+        fresh:reserve capacity
+        local i: U64 = 0
+        while i < capacity do
+            fresh:push 0
+            i = i + 1
+        end
+        self.index = fresh
+        self.dead = 0
+        local slot: U64 = 0
+        while slot < self.entries.length do
+            local hashed = self.entries[slot].hashed
+            if hashed ~= 0 then place_slot(self, hashed, U32 slot) end
+            slot = slot + 1
+        end
+    end
+
+    -- a new key, its absence established; a new key moves the entries (§15.1)
+    local insert = do(self: Ref M, key: K, value: V, hashed: U64): Unit
+        if (self.length + self.dead + 1) * 10 > self.index.length * 7 then rebuild self end
+        moves(Ref self.entries)
+        local slot: U32 = 0
+        if self.free_head ~= 0 then
+            slot = self.free_head - 1
+            self.free_head = self.entries[slot].next_free
+            self.entries[slot] = Entry { .hashed, next_free = 0, key = stored_key key, .value }
+        else
+            slot = U32 self.entries.length
+            self.entries:push(Entry { .hashed, next_free = 0, key = stored_key key, .value })
+        end
+        place_slot(self, hashed, slot)
+        self.length = self.length + 1
+    end
+
+    function M:put(key: K, value: V): Unit
+        local hashed = digest key
+        local cell = cell_of(self, key, hashed)
+        if cell ~= 0 then
+            self.entries[self.index[cell - 1] - 1].value = value
+            return
+        end
+        insert(self, key, value, hashed)
+    end
+
+    -- inserted only if absent; both arguments are evaluated
+    function M:ensure(key: K, initial: V): Unit
+        local hashed = digest key
+        if cell_of(self, key, hashed) == 0 then insert(self, key, initial, hashed) end
+    end
+
+    function M:has(key: K): Bool
+        return cell_of(self, key, digest key) ~= 0
+    end
+
+    function M:find(key: K): Found
+        local cell = cell_of(self, key, digest key)
+        if cell == 0 then return Found.missing() end
+        return Found.found(self.entries[self.index[cell - 1] - 1].value)
+    end
+
+    function M:remove(key: K): Bool
+        local cell = cell_of(self, key, digest key)
+        if cell == 0 then return false end
+        local slot = self.index[cell - 1] - 1
+        self.index[cell - 1] = DEAD
+        self.dead = self.dead + 1
+        self.entries[slot] = Entry { hashed = 0, next_free = self.free_head, key = zero_of Stored, value = zero_of V }
+        self.free_head = slot + 1
+        self.length = self.length - 1
+        ends(Ref self.entries, "removed")
+        return true
+    end
+
+    -- `m[k]`: an existing entry's place; a missing key traps
+    function M:__index(key: K): Ref V
+        local cell = cell_of(self, key, digest key)
+        if cell == 0 then trap "map-key: the key is not in the map" end
+        return Ref self.entries[self.index[cell - 1] - 1].value
+    end
+
+    -- `m[k] = v` inserts or replaces; inside `each`, the entry being visited is replaced
+    local replace_at = do(self: Ref M, slot: U64, value: V): Unit
+        self.entries[slot].value = value
+    end
+    local put_entry = do(self: Ref M, key: K, value: V): Unit
+        self:put(key, value)
+    end
+    local visiting = {}
+    function M.__newindex(self, key, value)
+        for depth = #visiting, 1, -1 do
+            if same_value(visiting[depth].key, key) then return replace_at(self, visiting[depth].slot, value) end
+        end
+        return put_entry(self, key, value)
+    end
+    local visit_begin = do(key, slot) visiting[#visiting + 1] = { .key, .slot } end
+    local visit_end = do() visiting[#visiting] = nil end
+
+    -- each entry in slot order; the structure is fixed meanwhile
+    function M:each(body): Unit
+        hold_structure(Ref self.entries)
+        local slot: U64 = 0
+        while slot < self.entries.length do
+            local entry = Ref self.entries[slot]
+            if entry.hashed ~= 0 then
+                -- a text key is lent, a fixed key a snapshot; a value holding owners is lent
+                local visit = do(k)
+                    visit_begin(k, slot)
+                    if owning_value then body(k, Ref entry.value) else body(k, entry.value) end
+                    visit_end()
+                end
+                if owned_text then visit(entry.key:str()) else visit(entry.key) end
+            end
+            slot = slot + 1
+        end
+        release_structure(Ref self.entries)
+    end
+
+    made[family][K][V] = M
+    return M
+end
+
+local Map = setmetatable(define
+    borrowing = |K, V| -> make(K, V, true)
+end, { __call = |_, K, V| -> make(K, V, false) })
+
+return define
+    .Map
+end

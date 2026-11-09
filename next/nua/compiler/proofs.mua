@@ -183,6 +183,11 @@ local agree = do(incoming, joined)
         end
         if low ~= nil or high ~= nil then joined.bounds[key] = Interval { .low, .high } end
     end
+    for key, hold in pairs first.fixed do
+        local everywhere = true
+        for position = 2, #incoming do if incoming[position].fixed[key] == nil then everywhere = false end end
+        if everywhere then joined.fixed[key] = hold end
+    end
     for key, operand in pairs first.available do
         local everywhere = true
         for position = 2, #incoming do if incoming[position].available[key] ~= operand then everywhere = false end end

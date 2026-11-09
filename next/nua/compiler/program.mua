@@ -55,7 +55,8 @@ NuaEntry { DefinitionEntry, RuntimeEntry }
 local Callee = family "callee"
 local DirectNua = struct { definition: DefinitionId }
 local IndirectNua = struct { pointer: Operand, signature: Signature, provenance: NuaEntry }
-local Foreign = struct { pointer: Operand, signature: Signature, contract: ForeignEffects }
+-- `header`: the C header declaring it, as an #include names it; without one a prototype is emitted
+local Foreign = struct { pointer: Operand, signature: Signature, contract: ForeignEffects, header: Optional(String) }
 Callee { DirectNua, IndirectNua, Foreign }
 
 local Site = struct { id: InstructionId, origin: OriginId }

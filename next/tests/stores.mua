@@ -1,0 +1,96 @@
+-- Managed stores (syntax §9.8-9.11): Nua over a Grow of slots, ids checked at every use.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+local node = [[
+local Node = struct { value: U32, weight: U32 }
+local Nodes = Store Node
+]]
+
+test "add, read, write, remove; a stale id never names a recycled slot":
+    local library = native("stores_basic", node .. [[
+local store_flow = do(k: U32): U32
+    local s = Nodes {}
+    local a = s:add(Node { value = k, weight = 1 })
+    local b = s:add(Node { value = 2, weight = 2 })
+    s[a].value = s[a].value + 1
+    local before = U32 s.length
+    local removed = s:remove a
+    local recycled = s:add(Node { value = 50, weight = 5 })
+    local stale: U32 = 0
+    if s:has a then stale = 1 end
+    local again: U32 = 0
+    if s:remove a then again = 1 end
+    local same_slot: U32 = 0
+    if recycled.slot == a.slot and recycled ~= a then same_slot = 1 end
+    return s[b].value * 1000 + s[recycled].value * 10 + before * 100000 + stale + again + same_slot * 100000000
+end
+export store_flow
+local stale_read = do(flag: Bool): U32
+    local s = Nodes {}
+    local a = s:add(Node { value = 1, weight = 1 })
+    if flag then local gone = s:remove a end
+    return s[a].value
+end
+export stale_read
+local foreign_has = do(): Bool
+    local s = Nodes {}
+    local t = Nodes {}
+    local a = s:add(Node { value = 1, weight = 1 })
+    local b = t:add(Node { value = 1, weight = 1 })
+    return s:has b
+end
+export foreign_has
+]])
+    assert(library.store_flow(4) == 100000000 + 200000 + 2000 + 500)
+    assert(library.stale_read(false) == 1)
+    assert(library.foreign_has() == false)
+end
+
+test "a store of owners releases and copies its contents; a removed element's borrow ends":
+    local library = native("stores_owners", [[
+local Texts = Store(Grow U32)
+local owner_store = do(n: U32): U64
+    local s = Texts {}
+    local grown = Grow(U32) {}
+    for i: U32 = 1, n do
+        grown:push i
+    end
+    local a = s:add grown
+    local b = s:add(Grow(U32) { 1 })
+    s[b]:push 2
+    local c = copy s
+    c[b]:push 3
+    local kept = s[b].length * 10 + c[b].length
+    local removed = s:remove a
+    return kept
+end
+export owner_store
+local store_owner_ledger = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local kept = owner_store n
+    return platform.ledger_mapped_bytes() - before
+end
+export store_owner_ledger
+]])
+    assert(library.owner_store(5) == 23)
+    library.store_owner_ledger(1)
+    assert(library.store_owner_ledger(100000) == 0)
+    refuses(node .. [[
+local f = do(): U32
+    local s = Nodes {}
+    local a = s:add(Node { value = 1, weight = 1 })
+    local r = Ref s[a]
+    local gone = s:remove a
+    return r.value
+end
+export f
+]], "a borrow is used after it ended (removed)")
+end

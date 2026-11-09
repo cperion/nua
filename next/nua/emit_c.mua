@@ -46,6 +46,7 @@ local CSpelling = define
     SumType = |node, recurse| -> record_name node
     BufferType = |node, recurse| -> record_name node
     FunctionType = unsupported
+    OpaqueType = |node, recurse| -> node.name
 end
 local c_type = NativeType.pass "spell a native type in C" with ..CSpelling end
 
@@ -73,6 +74,7 @@ local Fields = define
         return fields
     end
     FunctionType = no_fields
+    OpaqueType = no_fields
 end
 local fields_of = NativeType.pass "the fields of a type C spells as a struct" with ..Fields end
 local is_record_like = native_type -> fields_of native_type ~= nil
@@ -405,9 +407,24 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         Address = |node, recurse| -> ("%s = &%s;"):format(value_name(node.result, types.pointer(definition.places[node.place].type)), place_text(definition.places[node.place]))
         Check = |node, recurse| -> fail "check has no C spelling yet"
         Invoke = do(node, recurse)
-            if not data.Callee.is(node.callee, data.DirectNua) then fail "an indirect or foreign call has no C spelling yet" end
             local arguments = {}
             for index, argument in ipairs node.arguments do arguments[index] = operand argument end
+            -- a foreign function by its C name, its result cast (`const char *` becomes our char *)
+            if data.Callee.is(node.callee, data.Foreign) then
+                -- a header's own pointer spelling (`char *`) meets ours through `void *`
+                for index, argument in ipairs node.arguments do
+                    if rules.is_pointer(argument.type) then arguments[index] = "(void *)" .. arguments[index] end
+                    -- a variadic 64-bit integer as cformat's %llu and %lld name it
+                    if index > #node.callee.signature.parameters and rules.is_integer(argument.type) and argument.type.bits == 64 then
+                        arguments[index] = (argument.type.signed and "(long long)" or "(unsigned long long)") .. arguments[index]
+                    end
+                end
+                local call = ("%s(%s);"):format(node.callee.pointer.bits.name, table.concat(arguments, ", "))
+                local result = node.callee.signature.result
+                if node.result then return ("%s = (%s)%s"):format(value_name(node.result, result), c_type result, call) end
+                return call
+            end
+            if not data.Callee.is(node.callee, data.DirectNua) then fail "an indirect call has no C spelling yet" end
             local call = ("%s(%s);"):format(names_of_definitions[node.callee.definition], table.concat(arguments, ", "))
             if node.result then
                 local callee = program.definitions[node.callee.definition]
@@ -596,6 +613,34 @@ local emit = do(program)
     end
     local declarations = record_declarations program
     if #declarations > 0 then parts[#parts + 1] = table.concat(declarations, "\n") .. "\n" end
+    -- foreign functions: a header included, or a prototype
+    local headers, foreign = {}, {}
+    for _, definition in ipairs ordered do
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do
+                if data.Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.Foreign) then
+                    local callee = instruction.callee
+                    if callee.header then
+                        headers[callee.header] = true
+                    elseif not foreign[callee.pointer.bits.name] then
+                        local parameters = {}
+                        for index, parameter in ipairs callee.signature.parameters do parameters[index] = c_type parameter end
+                        if callee.signature.variadic then parameters[#parameters + 1] = "..." end
+                        if #parameters == 0 then parameters[1] = "void" end
+                        foreign[callee.pointer.bits.name] = ("%s %s(%s);"):format(c_type callee.signature.result, callee.pointer.bits.name, table.concat(parameters, ", "))
+                    end
+                end
+            end
+        end
+    end
+    local sorted = {}
+    for header in pairs headers do sorted[#sorted + 1] = "#include " .. header end
+    table.sort sorted
+    if #sorted > 0 then parts[#parts + 1] = table.concat(sorted, "\n") .. "\n" end
+    sorted = {}
+    for _, prototype in pairs foreign do sorted[#sorted + 1] = prototype end
+    table.sort sorted
+    if #sorted > 0 then parts[#parts + 1] = table.concat(sorted, "\n") .. "\n" end
     parts[#parts + 1] = table.concat(prototypes, "\n") .. "\n"
     -- a host declaring the exports needs the records they use first
     local interface = {}

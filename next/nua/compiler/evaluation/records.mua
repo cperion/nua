@@ -165,11 +165,23 @@ return do(E, core)
         return E.value_of_operand(native_type, operand)
     end
 
-    E.zero_value = do(native_type)
+    -- (`path`, when given, lets a borrow be zero: a null borrow of no origins, in a vacant slot)
+    E.zero_value = do(native_type, path)
+        if path and E.is_sum native_type then
+            local first = native_type.alternatives[1]
+            return data.Tagged { type = native_type, alternative = first.name, payload = first.payload ~= types.Unit and E.zero_value(first.payload, path) or nil }
+        end
+        if path and (types.NativeType.is(native_type, types.ReferenceType) or types.NativeType.is(native_type, types.ViewType)) then
+            local info = data.BorrowInfo { id = fresh identity.BorrowId, form = data.Stored { pointer = E.zero_operand native_type }, origins = {}, mutable = false, lifetime = fresh identity.LifetimeId, acquired = origin_of path }
+            compilation.borrows[info.id] = info
+            path.flow.borrows[info.id] = data.Live {}
+            path.writer.borrow info
+            return data.Reference { type = native_type, borrow = info.id }
+        end
         if E.is_array native_type then return data.Aggregate { type = native_type, packed = data.Constant { type = native_type, bits = data.ZeroBits {} }, parts = {} } end
         if E.is_record native_type then
             local parts = {}
-            for _, field in ipairs(E.fields_of native_type) do parts[field.name] = E.zero_value(field.type) end
+            for _, field in ipairs(E.fields_of native_type) do parts[field.name] = E.zero_value(field.type, path) end
             return data.Aggregate { type = native_type, packed = nil, .parts }
         end
         if rules.is_pointer native_type then return E.known(data.Constant { type = native_type, bits = data.IntegerBits { bits = 0ULL } }) end

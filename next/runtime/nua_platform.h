@@ -48,6 +48,27 @@ static inline uint8_t *nua_storage_context(void) {
 
 static inline uint64_t nua_ledger_mapped_bytes(void) { return nua_ledger_bytes; }
 
+/* the process's hash key, read from the system once */
+#include <sys/random.h>
+static inline uint64_t nua_hash_seed(uint64_t which) {
+    static uint64_t seed[2];
+    static _Atomic int ready;
+    if (!ready) {
+        if (getrandom(seed, sizeof seed, 0) != (ssize_t)sizeof seed) {
+            fprintf(stderr, "nua: no random seed for hashing\n");
+            abort();
+        }
+        ready = 1;
+    }
+    return seed[which & 1];
+}
+
+/* a store's token: from one counter, never reused, never 0 (syntax §9.9) */
+static inline uint64_t nua_next_store_token(void) {
+    static _Atomic uint64_t counter;
+    return ++counter;
+}
+
 /* the bits of a float as an integer and back (Nua's reinterpret of floats) */
 #define NUA_REINTERPRET(from, to) \
     static inline to nua_reinterpret_##from##_##to(from value) { to result; memcpy(&result, &value, sizeof result); return result; }

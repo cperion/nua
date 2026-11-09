@@ -1,0 +1,184 @@
+-- Maps (syntax §15.1, §15.2): Nua over buffers, keys encoded by their type.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "the operations of a map":
+    local library = native("maps_ops", [[
+local Counts = Map(U32, U64)
+local map_count = do(n: U32): U64
+    local m = Counts {}
+    for i: U32 = 1, n do
+        local k = i % 17
+        m:ensure(k, 0)
+        m[k] = m[k] + 1
+    end
+    local total: U64 = 0
+    m:each do(k, v) total = total + v end
+    return total * 1000 + m.length
+end
+export map_count
+local map_ops = do(k: U32): U64
+    local m = Counts {}
+    m[k] = 5
+    m:put(k + 1, 6)
+    local present: U64 = 0
+    if m:has k then present = 1 end
+    local got: U64 = 0
+    m:find(k + 1) {
+        found = do(v) got = v end,
+        missing = do() got = 99 end,
+    }
+    local removed: U64 = 0
+    if m:remove k then removed = 1 end
+    local gone: U64 = 0
+    if m:has k then gone = 1 end
+    m[k + 2] = 7
+    return present * 10000 + got * 1000 + removed * 100 + gone * 10 + m.length
+end
+export map_ops
+local map_missing = do(flag: Bool): U64
+    local m = Counts {}
+    m[1] = 2
+    if flag then return m[3] end
+    return m[1]
+end
+export map_missing
+local map_many = do(n: U32): U64
+    local m = Counts {}
+    for i: U32 = 0, n - 1 do
+        m[i] = U64 i * 2
+    end
+    for i: U32 = 0, n - 1 do
+        if i % 2 == 0 then local removed = m:remove i end
+    end
+    for i: U32 = n, n + 100 do
+        m[i] = 1
+    end
+    local sum: U64 = 0
+    for i: U32 = 1, n - 1 do
+        if i % 2 == 1 then sum = sum + m[i] end
+    end
+    return sum * 1000 + m.length
+end
+export map_many
+]])
+    assert(library.map_count(100) == 100000 + 17)
+    assert(library.map_ops(3) == 10000 + 6000 + 100 + 0 + 2)
+    assert(library.map_missing(false) == 2)
+    -- odd i below 1000: 2 * (1 + 3 + ... + 999) = 500000; 500 odd + 101 new
+    assert(library.map_many(1000) == 500000 * 1000 + 601)
+end
+
+test "text keys are copied or borrowed, and compared by contents; struct and sum keys":
+    local library = native("maps_keys", [[
+local Point = struct { x: U32, y: U32 }
+local Shape = oneof { circle: U32, dot: Unit }
+local Names = Map(Str, U32)
+local Borrowing = Map.borrowing(Str, U32)
+local Points = Map(Point, U32)
+local Shapes = Map(Shape, U32)
+local Chars8 = Chars 8
+local ByChars = Map(Chars8, U32)
+local text_keys = do(n: U32): U64
+    local m = Names {}
+    local b = Borrowing {}
+    local scratch = Text {}
+    scratch:write("key", n)
+    m[scratch:str()] = 1
+    m["other"] = 2
+    b["held"] = 3
+    scratch:clear()
+    scratch:write("key", n)
+    local total: U64 = 0
+    m:each do(k, v) total = total + k.length * U64 v end
+    return U64(m[scratch:str()]) * 10000 + U64(b["held"]) * 1000 + total
+end
+export text_keys
+local typed_keys = do(k: U32): U64
+    local p = Points {}
+    p[Point { x = k, y = 1 }] = 4
+    local s = Shapes {}
+    s[Shape.circle k] = 5
+    s[Shape.dot] = 6
+    local c = ByChars {}
+    c[Chars8 "ab"] = 7
+    return U64(p[Point { x = k, y = 1 }]) * 1000 + U64(s[Shape.circle k]) * 100 + U64(s[Shape.dot]) * 10 + U64(c[Chars8 "ab"])
+end
+export typed_keys
+local map_ledger = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local a = text_keys n
+    local b = typed_keys n
+    return platform.ledger_mapped_bytes() - before
+end
+export map_ledger
+]])
+    assert(library.text_keys(1) == 10000 + 3000 + 4 + 10)
+    assert(library.typed_keys(9) == 4000 + 500 + 60 + 7)
+    library.map_ledger(1)
+    assert(library.map_ledger(1) == 0)
+end
+
+test "the structure of a map is fixed inside each; a key type with __eq is refused":
+    local counts = "local Counts = Map(U32, U32)\n"
+    refuses(counts .. [[
+local f = do(): U32
+    local m = Counts {}
+    m[1] = 1
+    m:each do(k, v) m:put(k + 100, 1) end
+    return 0
+end
+export f
+]], "fixed while it is walked by each")
+    refuses(counts .. [[
+local f = do(): U32
+    local m = Counts {}
+    m[1] = 1
+    m:each do(k, v) local gone = m:remove k end
+    return 0
+end
+export f
+]], "fixed while it is walked by each")
+    refuses(counts .. [[
+local add = do(m: Ref Counts, k: U32): Unit
+    m:put(k + 100, 1)
+end
+local f = do(): U32
+    local m = Counts {}
+    m[1] = 1
+    m:each do(k, v) call add (Ref m) k end
+    return 0
+end
+export f
+]], "may change the structure of a map")
+    local library = native("maps_each_values", counts .. [[
+local replaced_in_each = do(): U32
+    local m = Counts {}
+    m[1] = 1
+    m[2] = 2
+    m:each do(k, v) m[k] = v * 10 end
+    return m[1] + m[2]
+end
+export replaced_in_each
+]])
+    assert(library.replaced_in_each() == 30)
+    refuses([[
+local Money = struct { cents: I64 }
+function Money.__eq(a: Money, b: Money): Bool
+    return a.cents == b.cents
+end
+local Prices = Map(Money, U32)
+local f = do(): U32
+    local m = Prices {}
+    return 0
+end
+export f
+]], "which defines __eq")
+end

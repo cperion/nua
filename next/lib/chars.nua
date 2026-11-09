@@ -3,7 +3,7 @@
 -- same loop.
 
 local index = import "index"
-local made = {}
+local made, chars_types = {}, {}
 
 local Chars = do(n)
     if type n ~= "number" or n < 1 or n ~= math.floor n or n > 65536 then
@@ -43,9 +43,11 @@ local Chars = do(n)
     end
 
     made[n] = T
+    chars_types[T] = true
     return T
 end
 
 return define
     .Chars
+    is_chars = T -> chars_types[T] == true
 end

@@ -83,10 +83,10 @@ local JoinDecision = struct { flow: data.FlowFacts, differing: Table, partly_vac
 
 ------------------------------------------------------------------------------------------------
 
-local empty = || -> data.FlowFacts { contents = {}, borrows = {}, live_lifetimes = {}, vacated = {}, proved = {}, bounds = {}, available = {} }
+local empty = || -> data.FlowFacts { contents = {}, borrows = {}, live_lifetimes = {}, vacated = {}, proved = {}, bounds = {}, available = {}, fixed = {} }
 
 local fork = do(flow)
-    local contents, borrows, live_lifetimes, vacated, proved, bounds, available = {}, {}, {}, {}, {}, {}, {}
+    local contents, borrows, live_lifetimes, vacated, proved, bounds, available, fixed = {}, {}, {}, {}, {}, {}, {}, {}
     for place, state in pairs flow.contents do contents[place] = state end
     for borrow, state in pairs flow.borrows do borrows[borrow] = state end
     for lifetime in pairs flow.live_lifetimes do live_lifetimes[lifetime] = true end
@@ -94,12 +94,22 @@ local fork = do(flow)
     for key, value in pairs flow.proved do proved[key] = value end
     for key, interval in pairs flow.bounds do bounds[key] = interval end
     for key, operand in pairs flow.available do available[key] = operand end
-    return data.FlowFacts { .contents, .borrows, .live_lifetimes, .vacated, .proved, .bounds, .available }
+    for key, hold in pairs flow.fixed do fixed[key] = hold end
+    return data.FlowFacts { .contents, .borrows, .live_lifetimes, .vacated, .proved, .bounds, .available, .fixed }
 end
 
 -- the key of a vacated part: its place and path
 local vacated_key = |place, path| -> place.serial .. ":" .. paths.path_key(path)
 local is_prefix = paths.is_prefix
+
+-- what changing the structure at `access` would break: a buffer held fixed by an iteration, or
+-- nil. Growth names the buffer, a removal its contents; a change deeper is not structural.
+local structure_held = do(flow, access)
+    for _, hold in pairs flow.fixed do
+        if hold.access.place == access.place and is_prefix(hold.access.path, access.path) and #access.path <= #hold.access.path + 1 then return hold end
+    end
+    return nil
+end
 
 -- two operands denote the same value: one operand, or constants of one type with the same bits.
 -- Each comparison is a pass over its family for two values of one kind; the cases across kinds
@@ -507,6 +517,7 @@ return define
     .empty
     .fork
     .same_contents
+    .structure_held
     .same_operand
     .same_value
     .paths_overlap

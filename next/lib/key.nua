@@ -1,0 +1,151 @@
+-- Semantic map keys (syntax §15.1, §15.2): the encoding and equality observe typed values, not
+-- object bytes. Walking the type is host code; what it builds are ordinary Nua words.
+
+local hash = import "hash"
+local str = import "str"
+local chars = import "chars"
+local store = import "store"
+
+local keys = {}
+local State = hash.State
+local encoders, equalities, hashers = {}, {}, {}
+
+local is_integer = T -> T.bits ~= nil and T.signed ~= nil
+
+-- a type with its own `==` cannot be a key, however deep (§15.2)
+keys.check = do(T, where)
+    if T == Str or chars.is_chars T or store.is_id T or is_integer T or T == Bool or T == Unit then return end
+    local described = where and (where .. " is " .. tostring T) or ("the map key " .. tostring T)
+    if T.__eq then
+        error(described .. ", which defines __eq: a map compares keys by their semantic encoding, so `a == b` and `m:has(a)` could disagree; key the map by fields that compare structurally", 0)
+    end
+    if T.fields then
+        for _, field in ipairs T.fields do keys.check(field.type, ("field '%s' of %s"):format(field.name, where or tostring T)) end
+    elseif T.alternatives then
+        for _, alternative in ipairs T.alternatives do
+            if alternative.payload ~= Unit then keys.check(alternative.payload, ("alternative '%s' of %s"):format(alternative.name, where or tostring T)) end
+        end
+    else
+        error(described .. ", which cannot be a map key", 0)
+    end
+end
+
+local field_value = |value, name| -> value[name]
+
+keys.encoder = do(T)
+    if encoders[T] then return encoders[T] end
+    local encode
+    if T == Str then
+        encode = do(h: Ref State, key: T): Unit
+            hash.u64(h, key.length)
+            hash.bytes(h, key)
+        end
+    elseif T == Unit then
+        encode = do(h: Ref State, key: T): Unit
+        end
+    elseif T == Bool then
+        encode = do(h: Ref State, key: T): Unit
+            if key then hash.u64(h, 1) else hash.u64(h, 0) end
+        end
+    elseif is_integer T then
+        encode = do(h: Ref State, key: T): Unit
+            hash.u64(h, U64 key)
+        end
+    elseif chars.is_chars T then
+        encode = do(h: Ref State, key: T): Unit
+            local copied = key
+            hash.u64(h, copied.length)
+            hash.bytes(h, copied:str())
+        end
+    elseif T.fields then
+        encode = do(h: Ref State, key: T): Unit
+            for _, field in ipairs T.fields do
+                keys.encoder(field.type)(h, field_value(key, field.name))
+            end
+        end
+    elseif T.alternatives then
+        local handlers_for = do(h)
+            local handlers = {}
+            for index, alternative in ipairs T.alternatives do
+                local tag = index - 1
+                handlers[alternative.name] = function(payload)
+                    hash.u64(h, tag)
+                    if alternative.payload ~= Unit then keys.encoder(alternative.payload)(h, payload) end
+                end
+            end
+            return handlers
+        end
+        encode = do(h: Ref State, key: T): Unit
+            key(handlers_for h)
+        end
+    end
+    encoders[T] = encode
+    return encode
+end
+
+keys.hash = do(T)
+    if hashers[T] then return hashers[T] end
+    keys.check T
+    local encode = keys.encoder T
+    -- never 0: a vacant entry's is
+    local hashed = do(key: T): U64
+        local h = hash.process()
+        encode(Ref h, key)
+        return hash.finish(Ref h) | 1
+    end
+    hashers[T] = hashed
+    return hashed
+end
+
+local agree = do(): Bool = true
+local differ = do(): Bool = false
+
+keys.equal = do(T)
+    if equalities[T] then return equalities[T] end
+    keys.check T
+    local equal
+    if T == Str then
+        equal = str.equals
+    elseif T == Unit then
+        equal = do(a: T, b: T): Bool = true
+    elseif is_integer T or T == Bool then
+        equal = do(a: T, b: T): Bool = a == b
+    elseif chars.is_chars T then
+        equal = do(a: T, b: T): Bool
+            local left, right = a, b
+            return str.equals(left:str(), right:str())
+        end
+    elseif T.fields then
+        equal = do(a: T, b: T): Bool
+            for _, field in ipairs T.fields do
+                if not keys.equal(field.type)(field_value(a, field.name), field_value(b, field.name)) then return false end
+            end
+            return true
+        end
+    elseif T.alternatives then
+        local left_handlers = do(b)
+            local left = {}
+            for _, alternative in ipairs T.alternatives do
+                left[alternative.name] = function(x)
+                    local right = {}
+                    for _, other in ipairs T.alternatives do
+                        right[other.name] = function(y)
+                            if other.name ~= alternative.name then return differ() end
+                            if other.payload == Unit then return agree() end
+                            return keys.equal(other.payload)(x, y)
+                        end
+                    end
+                    return b(right)
+                end
+            end
+            return left
+        end
+        equal = do(a: T, b: T): Bool
+            return a(left_handlers b)
+        end
+    end
+    equalities[T] = equal
+    return equal
+end
+
+return keys

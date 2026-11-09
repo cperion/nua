@@ -90,6 +90,11 @@ return do(E, core)
         local target = reference.type.target
         -- a place holding a reference stands for its target (syntax §9.4)
         if types.NativeType.is(target, types.ReferenceType) then return E.part_reference(path, E.reached_value(path, E.reach(path, reference)), step, index) end
+        -- a place holding a raw pointer: the part of what it points at (syntax §12.1)
+        if rules.is_pointer target then
+            local place = E.raw_place(path, E.reached_value(path, E.reach(path, reference)), 0)
+            return E.part_reference(path, E.reference_to(path, cells.RawCell { .place, name = "a pointer's target" }), step, index)
+        end
         local field = { type = E.step_type(target, step) }
         if not field.type then
             local kind = data.AccessStep.is(step, data.FieldStep) and "field" or "alternative"
@@ -539,6 +544,17 @@ return do(E, core)
     end
     E.write_reference = |path, reference, value, name| -> write_through(path, reference, value, name, true)
     E.initialize_reference = |path, reference, value, name| -> write_through(path, reference, value, name, false)
+
+    -- a buffer's structure held fixed, or no longer, on this path; nesting counts
+    E.hold_structure = do(path, reference, change)
+        local info = compilation.borrows[reference.borrow]
+        for _, origin in ipairs info.origins do
+            local key = origin.place.serial .. ":" .. borrow_paths.path_key(origin.path)
+            local held = path.flow.fixed[key]
+            local count = (held and held.count or 0) + change
+            path.flow.fixed[key] = count > 0 and { access = origin, .count } or nil
+        end
+    end
 
     -- the borrows of the storage an owner at `steps` of `place` holds end: a buffer's contents,
     -- a record's owning fields, a sum's owning alternatives; a borrow of the place itself stays

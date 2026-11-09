@@ -144,6 +144,7 @@ return do(E, core)
         SumType = nothing_symbolic
         BufferType = |native_type, recurse, path, target, component_path, components| -> do components[component_path] = data.Owning {} end
         FunctionType = nothing_symbolic
+        OpaqueType = nothing_symbolic
     end
     E.symbolic_info = do(path, native_type, target, component_path)
         local components = {}

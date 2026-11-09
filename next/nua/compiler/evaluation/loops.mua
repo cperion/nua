@@ -48,7 +48,8 @@ return do(E, core)
         return data.Aggregate { type = value.type, packed = nil, .parts }
     end
     E.leaves_of = do(place, value, fields, out)
-        if E.is_aggregate value and next(value.parts) ~= nil then
+        -- (parts over packed contents, an array partly written, are one leaf)
+        if E.is_aggregate value and next(value.parts) ~= nil and value.packed == nil then
             for _, field in ipairs(E.fields_of value.type) do
                 local extended = {}
                 for index, name in ipairs fields do extended[index] = name end

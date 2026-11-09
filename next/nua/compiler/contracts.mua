@@ -43,7 +43,7 @@ Proof { Checked, Taken, Known }
 local FlowFacts = struct {
     contents: map_of(PlaceId, Contents), borrows: map_of(BorrowId, BorrowState),
     live_lifetimes: set_of(LifetimeId), vacated: map_of(String, places.Vacated),
-    proved: Table, bounds: Table, available: Table
+    proved: Table, bounds: Table, available: Table, fixed: Table
 }
 local EdgeFacts = struct { edge: EdgeId, flow: FlowFacts, arguments: list_of(ValueInfo) }
 local JoinRelation = struct { block: BlockId, incoming: list_of(EdgeFacts) }
