@@ -288,8 +288,8 @@ end
 
 -- decimal text: the grammar is checked here, so strtod only ever sees text it consumes whole; a
 -- known text folds
-local strtod = extern("strtod", { CString, Ptr CString }, F64, { header = "<stdlib.h>" })
-local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local strtod = extern "strtod" { CString, Ptr CString } (F64) { header = "<stdlib.h>" }
+local strlen = extern "strlen" { CString } (U64) { header = "<string.h>" }
 local is_digit = do(c: U8): Bool = c >= 48 and c <= 57
 
 local float_syntax = do(s: Str): Bool
@@ -341,7 +341,7 @@ end
 
 -- `Str.of(x)`: a view of a `Slice U8`, or of a `CString` (`strlen` once)
 local of_cstring = do(c: CString): Str = Slice(Ptr(U8)(c), strlen c, Str)
-local of_bytes = do(bytes: Slice U8): Str = view_as(bytes, Str)
+local of_bytes = do(bytes: Slice U8): Str = view_as bytes Str
 Str.of = do(given)
     if type_of given == CString or type given == "string" then return of_cstring given end
     return of_bytes given

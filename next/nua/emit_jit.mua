@@ -1,7 +1,6 @@
 -- The libgccjit backend (compiler activities §1, §7.5): the prepared program built with gccjit
 -- calls where `emit_c` writes C. It reads the same graph and the same native rules; what it knows
--- of a header it learns from `probe`, and the platform mechanisms are the ones `nua_platform.h`
--- defines, reached by their `jit_symbol`.
+-- of a system header a program names, it learns from `probe`.
 --
 --   emit(prepared, { kind = "shared" | "object", path = ... })  -> { path = ... }
 --   emit(prepared, { kind = "loaded" })                         -> { exports, release }
@@ -779,12 +778,13 @@ local building_definition = do(unit, program, definition)
         Trap = do(node, recurse)
             local message = node.message
             if Operand.is(message, data.Constant) and NativeConstant.is(message.bits, data.StaticBytes) then
-                local bytes = message.bits.bytes
-                local binding = platform.bindings.fatal_trap
+                local bytes = emit_c.trap_line message.bits.bytes
                 local array = J.gcc_jit_lvalue_as_rvalue(unit.static_array bytes)
                 local first = J.gcc_jit_lvalue_get_address(J.gcc_jit_context_new_array_access(context, nil, array, int_constant 0), nil)
-                local arguments = { cast(first, gcc_type binding.parameters[1]), unit.integer_rvalue(gcc_type types.U64, #bytes) }
-                J.gcc_jit_block_add_eval(current, nil, call_of(unit.import_function(binding.jit_symbol, binding.parameters, binding.result, false), arguments))
+                local write_parameters = { types.I32, types.pointer types.U8, types.U64 }
+                local arguments = { int_constant 2, cast(first, gcc_type write_parameters[2]), unit.integer_rvalue(gcc_type types.U64, #bytes) }
+                J.gcc_jit_block_add_eval(current, nil, call_of(unit.import_function("write", write_parameters, types.I64, false), arguments))
+                J.gcc_jit_block_add_eval(current, nil, call_of(unit.import_function("abort", {}, types.Unit, false), {}))
             else
                 J.gcc_jit_block_add_eval(current, nil, unit.call_builtin("__builtin_trap", {}))
             end
@@ -827,7 +827,6 @@ end
 
 local emit = do(prepared, request)
     local program = preparation.certified prepared
-    probe.load_platform()
     local unit = building_unit(program, probe.answers_for program)
     local J, context = unit.J, unit.context
     local built, outcome = pcall(do()

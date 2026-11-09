@@ -385,6 +385,31 @@ local reach_blocks = do(definition)
     return data.Definition { ..definition, .blocks }
 end
 
+-- A global is kept if something kept names its address, or if the outside can see it. Every
+-- library's globals exist from the moment it is imported; only those a program reaches are emitted.
+local reached_globals = do(program, definitions)
+    local named = {}
+    local visit = do(operand)
+        if is_constant operand and NativeConstant.is(operand.bits, data.SymbolAddress) then named[operand.bits.name] = true end
+    end
+    for _, definition in pairs definitions do
+        for _, place in pairs definition.places do
+            if place.root.pointer then visit(place.root.pointer) end
+        end
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do
+                for _, operand in ipairs(verify.operands_of instruction) do visit operand end
+            end
+            for _, operand in ipairs(verify.terminator_operands block.terminator) do visit operand end
+        end
+    end
+    local kept = {}
+    for id, global in pairs program.globals do
+        if named[global.name] or global.exported or global.imported then kept[id] = global end
+    end
+    return kept
+end
+
 -- A definition is kept if an export calls it, directly or through what it calls, or if a global
 -- is initialized by it on first use.
 local reach = do(program)
@@ -401,7 +426,7 @@ local reach = do(program)
             for called in pairs(graph.called_definitions kept[id]) do pending[#pending + 1] = called end
         end
     end
-    return data.Program { ..program, revision = program.revision + 1, definitions = kept }
+    return data.Program { ..program, revision = program.revision + 1, definitions = kept, globals = reached_globals(program, kept) }
 end
 
 ------------------------------------------------------------------------------------------------

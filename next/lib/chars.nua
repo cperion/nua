@@ -10,7 +10,7 @@ local Chars = do(n)
         error("Chars(n) takes a known length from 1 to 65536, got " .. tostring n, 0)
     end
     if made[n] then return made[n] end
-    local T = struct { len: U32, bytes: Array(U8, n) }
+    local T = struct { len: U32, bytes: Array U8 n }
 
     local from = do(text: Str): T
         local too_long = text.length > n
@@ -33,7 +33,7 @@ local Chars = do(n)
 
     -- `c:str()`: the text as a Str borrowing c
     function T:str(): Str
-        return subview_of(array_view(Ref self.bytes, Str), 0, U64 self.len)
+        return subview_of (array_view (Ref self.bytes) Str) 0 (U64 self.len)
     end
 
     local length_of = do(c: Ref T): U64 = U64 c.len

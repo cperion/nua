@@ -16,21 +16,20 @@
 local FILE = opaque "FILE"
 
 local stdio = { header = "<stdio.h>" }
-local fopen = extern("fopen", { CString, CString }, Ptr FILE, stdio)
-local fclose = extern("fclose", { Ptr FILE }, I32, stdio)
-local fputs = extern("fputs", { CString, Ptr FILE }, I32, stdio)
-local fputc = extern("fputc", { I32, Ptr FILE }, I32, stdio)
-local fgetc = extern("fgetc", { Ptr FILE }, I32, stdio)
-local fprintf = extern("fprintf",
-    { Ptr FILE, CString }, I32, { header = "<stdio.h>", variadic = true })
-local printf = extern("printf", { CString }, I32, { header = "<stdio.h>", variadic = true })
+local fopen = extern "fopen" { CString, CString } (Ptr FILE) stdio
+local fclose = extern "fclose" { Ptr FILE } (I32) stdio
+local fputs = extern "fputs" { CString, Ptr FILE } (I32) stdio
+local fputc = extern "fputc" { I32, Ptr FILE } (I32) stdio
+local fgetc = extern "fgetc" { Ptr FILE } (I32) stdio
+local fprintf = extern "fprintf" { Ptr FILE, CString } (I32) { header = "<stdio.h>", variadic = true }
+local printf = extern "printf" { CString } (I32) { header = "<stdio.h>", variadic = true }
 
 local stdlib = { header = "<stdlib.h>" }
-local malloc = extern("malloc", { U64 }, Ptr U8, stdlib)
-local free = extern("free", { Ptr U8 }, Unit, stdlib)
+local malloc = extern "malloc" { U64 } (Ptr U8) stdlib
+local free = extern "free" { Ptr U8 } (Unit) stdlib
 
 local string_h = { header = "<string.h>" }
-local memset = extern("memset", { Ptr U8, I32, U64 }, Ptr U8, string_h)
+local memset = extern "memset" { Ptr U8, I32, U64 } (Ptr U8) string_h
 
 -- formatted output: the format is built from the arguments' types while
 -- specializing, so it always matches them

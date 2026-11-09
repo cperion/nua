@@ -81,16 +81,33 @@ local saturated = application -> #application.supplied == #application.word.requ
 -- declarations, views, element references, drop), named so evaluation can dispatch on it
 -- Applied from Lua (a hook, a host helper), a primitive is applied by its compilation's
 -- `applier`, on the path the host bridge binds.
-local primitive_object = meta with
+-- Primitives are curried like words (syntax §3.5): `ends r "grew"` is `ends(r)("grew")`. A
+-- primitive given fewer arguments than it takes answers one that remembers them; `arity` is a
+-- count, or a function of the first argument for one whose count depends on it.
+local primitive_object
+local completed_primitive = do(primitive, arguments)
+    local whole = {}
+    for index, argument in ipairs primitive.supplied do whole[index] = argument end
+    for _, argument in ipairs arguments do whole[#whole + 1] = argument end
+    local arity = primitive.arity
+    if type arity == "function" and #whole > 0 then arity = arity(whole[1]) end
+    if #whole > 0 and type arity == "number" and #whole < arity then
+        return nil, primitive_object { ..primitive, supplied = whole }
+    end
+    return whole
+end
+primitive_object = meta with
     tostring = primitive -> primitive.name
     call = function(primitive, ...)
+        local whole, partial = completed_primitive(primitive, { ... })
+        if whole == nil then return partial end
         if primitive.applier == nil then error(primitive.name .. " is applied inside an evaluation", 2) end
-        return primitive.applier(primitive, { ... })
+        return primitive.applier(primitive, whole)
     end
 end
 local Primitive = getmetatable(primitive_object {})
 -- `by_place`: its argument is captured as a place, never moved (copy)
-local primitive = |name, applier, by_place| -> primitive_object { .name, .applier, .by_place }
+local primitive = |name, applier, by_place, arity| -> primitive_object { .name, .applier, .by_place, arity = arity or 1, supplied = {} }
 local is_primitive = value -> getmetatable value == Primitive
 
 -- a foreign C function (syntax §17): an opaque effect, applied only in an evaluation
@@ -114,6 +131,7 @@ return define
     .saturated
     .primitive
     .is_primitive
+    .completed_primitive
     .foreign
     .is_foreign
     application = |word_value, arguments| -> supply(setmetatable({ word = word_value, supplied = {} }, Application), arguments)

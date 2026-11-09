@@ -51,6 +51,12 @@ what they mean in practice.
 - **Mua style.** Large tables are `define … end`. Metatabled objects use `meta with … end`.
   Members are `function T:name(...)`. No abbreviated names. Parenthesis-free calls in Nua,
   trailing `do` curried out.
+- **Builtins are curried.** `extern`, `global`, `cconst`, `cread`, `cstruct`, `family`, `Fn`, `Array T n`
+  and the primitives take one argument at a time, with no brackets, as Mua's `checker` does; a
+  bracketed call of the host builtins is refused. Options are required (`{}` for none). Mua's rule
+  that a name followed by a table or string calls it means such a name is grouped:
+  `global (U64) { name = "ledger" }`, `cconst "ENOENT" (I32) "<errno.h>"`,
+  `extern "abs" { I32 } (I32) {}`.
 - **Mua traps that cost time.**
   - `name -> do(a, b) … end` parses as a block-bodied short function.
   - Never write `c and nil or x`.
@@ -110,7 +116,8 @@ the graph only through evaluation, and library code enters the same way as progr
 | `nua/compiler/hosting.mua`, `bridge.mua` | Words, applications, primitives, foreign objects; Lua called from evaluation |
 | `nua/compiler/facts.mua`, `proofs.mua`, `contracts.mua` | `FlowFacts`, borrow tracking, what branches prove |
 | `nua/compiler/rules.mua` | Opcodes: their type rules and folds |
-| `nua/compiler/platform.mua`, `runtime/nua_platform.h` | Platform mechanisms, the only C the design keeps |
+| `lib/platform.nua` | The platform in Nua: pages, ranges, the storage context, ledger, seeds, tokens |
+| `nua/compiler/platform.mua` | Mechanisms that cannot be Nua; empty until the context switch |
 | `tests/`, `tests/support/native.mua` | The suite, and the harness that compiles C and loads it through FFI |
 
 ## What this rewrite added to the design
@@ -205,14 +212,11 @@ test through libgccjit; `NUA_BACKEND=jit` or `options.backend` selects it in the
 
 **How it reaches C:**
 
-- Header knowledge (`ForeignValue`, `cstruct` layouts, `Foreign.reads`) comes from a small C
-  program compiled once and cached by its text under `NUA_CACHE`.
-- The mechanisms of `nua_platform.h` are one process-wide shared library, built from that header
-  with one entry point per binding of `platform.mua` (`jit_symbol`) and cached the same way. No
-  mechanism is written twice. Its state (the ledger, the allocator's context, the store-token
-  counter) is therefore per process under libgccjit and per unit under C.
-- So libgccjit needs a C compiler once per header version, unlike the old C reader in
-  `nua/cjit.lua`, which is not ported.
+- Everything the compiler produces needs no C: there is no runtime header. The platform is
+  `lib/platform.nua`, residualized with the program, its state per unit under both backends.
+- Only what a program names from a system header (`ForeignValue`, `cstruct` layouts,
+  `Foreign.reads`) comes from a small C program, compiled once and cached by its text under
+  `NUA_CACHE`. A program that names none of them starts no C compiler.
 
 **Still open:** `emit` takes a request table rather than `Target` and `BackendProduct` (§7.5). A
 `cstruct` with overlapping fields is refused, since a union's members have no one layout here. A
@@ -237,8 +241,6 @@ not port that part.
 - Components, `ElementComponent` on arrays, sums as tag plus union, `ZeroBits`,
   `StaticAddress`, `SymbolAddress`, `DefinitionAddress`, and `Global` policies including
   `__thread`.
-- Mechanisms in `nua/compiler/platform.mua`, including the new `reserve_range`, `commit_range`,
-  `release_range`, `next_store_token` and `hash_seed`.
 
 **Acceptance:** the old project's bar was byte-identical C with and without the gccjit backend
 present, and every example passing through both. Run the native test suite through both
@@ -258,8 +260,9 @@ against this model.
 
 **Build:**
 
-1. Context and stack mechanisms in `platform.mua` and `runtime/nua_platform.h`: stack
-   reservation with a guard page, and the context switch. C and assembly hold only these.
+1. Stack reservation with a guard page as Nua words in `lib/platform.nua`, and the context
+   switch as the first binding of `platform.mua`. Assembly holds only that; emit it from the
+   backends rather than adding a header.
 2. `nua/compiler/budgets.mua`: `Budget` points on loop and native-call cycles, in the
    preparation order of work package 1.
 3. The scheduler library in Nua, then `Chan`, `Pool`, `Slot`, `spawn`, scopes, `first_of`, and

@@ -116,7 +116,7 @@ end
 
 test "function values: taken, called, compared, null":
     local library = native("opening_functions", [[
-local Op = Fn({ U32 }, U32)
+local Op = Fn { U32 } (U32)
 local double = do(x: U32): U32 = x * 2
 local square = do(x: U32): U32 = x * x
 local scaled = do(by, x: U32): U32 = x * by

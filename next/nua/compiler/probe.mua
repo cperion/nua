@@ -1,12 +1,8 @@
--- What only a C compiler can say (compiler activities §7.5; architecture §11). libgccjit reads no
--- headers and no C, so the libgccjit backend asks one, once, and caches the answer by its text:
---
---   request/run   a program's header knowledge: the values of its `ForeignValue` constants, the
---                 layouts of its `cstruct` records, getters for the C variables it reads
---   platform      the platform mechanisms of nua_platform.h as one process-wide library, its
---                 entry points generated from the same bindings table the C backend spells
---
--- C text is written here only to reach those two; the program itself never goes through it.
+-- What only a system header can say (architecture §11). libgccjit reads no headers, and a program
+-- that names `EPOLLIN` or `struct stat` means whatever this system's headers define, so the
+-- libgccjit backend asks a C compiler, once, and caches the answer by its text: the values of its
+-- `ForeignValue` constants, the layouts of its `cstruct` records, getters for the C variables it
+-- reads. A program that names none of these starts no compiler.
 
 local ffi = require "ffi"
 local bit = require "bit"
@@ -15,24 +11,16 @@ local data = require "nua.compiler.data"
 local graph = require "nua.compiler.graph"
 local rules = require "nua.compiler.rules"
 local verify = require "nua.compiler.verify"
-local platform = require "nua.compiler.platform"
 
 local NativeType = types.NativeType
 local fail = message -> error("libgccjit backend: " .. message, 2)
 
 local root = debug.getinfo(1, "S").source:match("^@(.*)/next/nua/compiler/probe%.mua$") or "."
-local runtime_directory = root .. "/next/runtime"
 
 local exists = do(path)
     local file = io.open path
     if file then file:close() end
     return file ~= nil
-end
-local read_file = do(path)
-    local file = assert(io.open path)
-    local text = file:read "*a"
-    file:close()
-    return text
 end
 local write_file = do(path, text)
     local file = assert(io.open(path, "w"))
@@ -246,53 +234,6 @@ local answers_for = do(program)
     end
 end
 
-------------------------------------------------------------------------------------------------
--- The platform library
-
-local c_scalar
-c_scalar = do(native_type)
-    if native_type == types.Unit then return "void" end
-    if rules.is_pointer native_type then return c_scalar native_type.target .. " *" end
-    return ("%sint%d_t"):format(native_type.signed and "" or "u", native_type.bits)
-end
-
-local platform_loaded = false
-
--- nua_platform.h once more as a library, with an external entry point for each binding
-local platform_source = do()
-    local names = {}
-    for name in pairs platform.bindings do names[#names + 1] = name end
-    table.sort names
-    local lines = { '#include "nua_platform.h"' }
-    for _, name in ipairs names do
-        local binding = platform.bindings[name]
-        local parameters, arguments = {}, {}
-        for index, parameter in ipairs binding.parameters do
-            parameters[index] = ("%s a%d"):format(c_scalar parameter, index)
-            arguments[index] = "a" .. index
-        end
-        local call = ("%s(%s)"):format(binding.c_symbol, table.concat(arguments, ", "))
-        lines[#lines + 1] = ("%s %s(%s) { %s%s; }"):format(c_scalar binding.result, binding.jit_symbol, #parameters > 0 and table.concat(parameters, ", ") or "void", binding.result == types.Unit and "" or "return ", call)
-    end
-    return table.concat(lines, "\n") .. "\n"
-end
-
-local load_platform = do()
-    if platform_loaded then return end
-    local source = platform_source()
-    local header = read_file(runtime_directory .. "/nua_platform.h")
-    local base = ("%s/platform-%s"):format(cache_directory(), text_key(compiler() .. "\n" .. header .. source))
-    local shared = base .. ".so"
-    if not exists shared then
-        write_file(base .. ".c", source)
-        local built, messages = run(("%s -std=gnu11 -O2 -I%s -fPIC -shared -o %s %s.c"):format(compiler(), runtime_directory, shared, base))
-        if not built then fail("the platform library failed:\n" .. messages) end
-    end
-    retained[#retained + 1] = ffi.load(shared, true)
-    platform_loaded = true
-end
-
 return define
     .answers_for
-    .load_platform
 end

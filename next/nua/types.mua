@@ -500,6 +500,11 @@ end
 for _, kind in ipairs { IntegerType, FloatType, BooleanType, PointerType, RecordType } do
     kind.__call = |native_type, value| -> Described { type = native_type, .value }
 end
+-- `Array T n` in host code: the owner type applied to a length is the value type (syntax §13)
+BufferType.__call = do(native_type, length)
+    if native_type.fixed and type length == "number" then return fixed_array(native_type.element, length) end
+    error(describe(native_type) .. " applied in host code takes a known length", 2)
+end
 local constructor_of_sum = SumType.__index
 SumType.__index = do(sum_type, name)
     local found = constructor_of_sum(sum_type, name)

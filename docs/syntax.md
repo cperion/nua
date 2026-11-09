@@ -1103,7 +1103,7 @@ Under dynamic control, a non-tail re-entry with other known arguments generalize
 
 Native types are compile-time Lua values: `U8 U16 U32 U64 I8 I16 I32 I64 F32 F64
 Bool Unit`; the constructors `Ref T`, `Store T`, `Id T`, `Grow T`, `Ptr T`, `Slice T`
-(§12), `Array(T, n)` (§13), `Chars(n)`, `Str` and `Text` (§14), `Atomic T` (§19),
+(§12), `Array T n` (§13), `Chars(n)`, `Str` and `Text` (§14), `Atomic T` (§19),
 `Chan T`, `Pool T` and `Slot T` (§20) and `Fn(params): ret` (§21); the `Map` and
 `Map(Str, V)` of §15; and structs, sums (§11) and library-defined types (§16).
 
@@ -1224,7 +1224,7 @@ Scalars, structs without owner fields, references and IDs are fixed-size. They l
 
 ### 9.3 Variable-size values
 
-`Array(T, n)` with `n` known while compiling is a value (§13). With `n` known only when the program runs, `Array(T, n) {}` builds the owner `Array T`: `n` zeroed elements, a length fixed when built, indexed and borrowed like a `Grow` (`a[i]`, `a.length`, `a:all()`, `a:sub(i, j)`), with no `push` and no `clear`. `copy` of a `Slice T` builds one.
+`Array T n` with `n` known while compiling is a value (§13). With `n` known only when the program runs, `Array T (n) {}` builds the owner `Array T`: `n` zeroed elements, a length fixed when built, indexed and borrowed like a `Grow` (`a[i]`, `a.length`, `a:all()`, `a:sub(i, j)`), with no `push` and no `clear`. `copy` of a `Slice T` builds one.
 
 ### 9.4 Borrows
 
@@ -1394,15 +1394,15 @@ Cycles are ordinary relationships; they create no ownership cycles. Objects are 
 
 ### 9.12 Grow arrays
 
-Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`Slice(p, n)`, `view_of(p, n, body)`, `Array(T, n)`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
+Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`Slice(p, n)`, `view_of(p, n, body)`, `Array T n`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
 
 `Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4), `g:pop()` (the last element, removed; an empty `Grow` traps), `g:truncate(n)` (keep the first `n`; more than `g.length` traps) and `g:clear()`. `pop`, `truncate` and `clear` end the elements above the new end, so borrows of the contents end there.
 
-`Grow.pinned T` and `Text.pinned` reserve address space when created and commit it as they grow, so their storage never moves: even stored borrows survive their growth. A pinned owner has a reserved limit, given when it is built or taken from the runtime default; growing past it traps. A word can require one (`src: Ref Text.pinned`). Pinning costs a system call and at least a page, so it is for a few large, long-lived buffers, not the default. An element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)` may be any type that is not an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots, and owners or values holding them (§9.13).
+`Grow.pinned T` and `Text.pinned` reserve address space when created and commit it as they grow, so their storage never moves: even stored borrows survive their growth. A pinned owner has a reserved limit, given when it is built or taken from the runtime default; growing past it traps. A word can require one (`src: Ref Text.pinned`). Pinning costs a system call and at least a page, so it is for a few large, long-lived buffers, not the default. An element of a `Grow`, an `Array T`, a `Store` or an `Array T n` may be any type that is not an atomic: scalars, records, sums, arrays, references, views, `Id`s, pointers, channels, pools and slots, and owners or values holding them (§9.13).
 
 ### 9.13 Owners inside owners
 
-An owner may sit anywhere a value can: an element of a `Grow`, an `Array T`, a `Store` or an `Array(T, n)`, a field of such an element, a map value, a sum payload, a global.
+An owner may sit anywhere a value can: an element of a `Grow`, an `Array T`, a `Store` or an `Array T n`, a field of such an element, a map value, a sum payload, a global.
 
 ```lua
 local Player = struct { score: U32, name: Text, items: Grow Item }
@@ -1419,7 +1419,7 @@ local Doc = oneof { empty: Unit, text: Text }
 - **Elements one at a time.** A container whose elements hold owners offers no `all` or `sub`: a slice would read their headers as values.
 - **`copy`** of a container is deep: every initialized owning element is built anew. External borrowed fields remain borrows; only declared internal representation links are rebased.
 - **Sums.** A sum whose payload holds owners is an owner. Only its active alternative has live owning fields. Its payload is matched by reference (`d { text = do(t: Ref Text) ... end, ... }`); a handler taking it by value is rejected. Replacement builds the complete new payload, writes the tag and payload, then releases the old active payload. A named payload transfers under §9.2; a constructor can build it directly.
-- **Globals.** A global may be an owner (`global(Grow Text, { name = "journal" })`), with only a name. It is set up at first use by that thread; another thread's later use traps. A task may not use it (`a task cannot use the owner global 'journal'`). After a recovered trap (§9.14) it holds a complete old or new value, never half-built storage; earlier source effects are not rolled back. A first use that trapped leaves the global uninitialized, to be set up again.
+- **Globals.** A global may be an owner (`global (Grow Text) { name = "journal" }`), with only a name. It is set up at first use by that thread; another thread's later use traps. A task may not use it (`a task cannot use the owner global 'journal'`). After a recovered trap (§9.14) it holds a complete old or new value, never half-built storage; earlier source effects are not rolled back. A first use that trapped leaves the global uninitialized, to be set up again.
 - **Maps.** A map's entry slots, index and owned keys are buffers. An insertion of a new key *moves* (held borrows of values survive, `Ref m[k]` included); a removal ends the removed entry's borrows (`a map in 'outer' grew, so a stored view of its entries ended`).
 - **Current implementation limitation.** A sum holding owners as a global is rejected; the buffer model covers it, rather than adopting that exclusion.
 
@@ -2054,7 +2054,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 
 ### 12.2 Slices
 
-`Slice T` is a read-only view: a pointer and a `U64` length. `Slice.mut T` is the same view, writable: `s[i] = v` is checked like a read; its length cannot change. A `Slice.mut` serves where a `Slice` is expected. An owner (a `Grow`, an `Array T`, an `Array(T, n)`) lends its elements to a `Slice.mut` marked at the call, `f(Ref xs)`, and to a `Slice` with no marker. The operations of both:
+`Slice T` is a read-only view: a pointer and a `U64` length. `Slice.mut T` is the same view, writable: `s[i] = v` is checked like a read; its length cannot change. A `Slice.mut` serves where a `Slice` is expected. An owner (a `Grow`, an `Array T`, an `Array T n`) lends its elements to a `Slice.mut` marked at the call, `f(Ref xs)`, and to a `Slice` with no marker. The operations of both:
 
 | Form | Meaning |
 |---|---|
@@ -2069,7 +2069,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 
 A view is read-only: `s[i] = v` is rejected (`not-a-place`); writes go through the storage or a `Ptr`. Slices cannot be compared. Slices are borrows, like `Ref`: a struct field, an element or a payload may hold one, checked by the lifetime rule (§9.4, §9.5).
 
-**Checks and binding times.** Internally a slice is a two-field struct, so the evaluator tracks its length apart from its pointer. The words of every view type are Nua (`lib/slice.nua`, served once per family), over three compiler primitives that check nothing and keep the view's borrow: `view_length s`, `view_element_of(s, i)` (the element's place) and `subview_of(s, first, count)`. A **known index against a known length is checked at compile time** (`index-range`) and costs nothing at run time; anything else is one check when it runs (the `slice.index` word of [lib/slice.nua](../lib/slice.nua), a trap on failure). `s:sub(a, b)` with known bounds produces a slice whose **length is known**, after one range check. So the idiom for formats is to take the whole header once, then read at constant offsets with no further checks.
+**Checks and binding times.** Internally a slice is a two-field struct, so the evaluator tracks its length apart from its pointer. The words of every view type are Nua (`lib/slice.nua`, served once per family), over three compiler primitives that check nothing and keep the view's borrow: `view_length s`, `view_element_of s i` (the element's place) and `subview_of s first count`. A **known index against a known length is checked at compile time** (`index-range`) and costs nothing at run time; anything else is one check when it runs (the `slice.index` word of [lib/slice.nua](../lib/slice.nua), a trap on failure). `s:sub(a, b)` with known bounds produces a slice whose **length is known**, after one range check. So the idiom for formats is to take the whole header once, then read at constant offsets with no further checks.
 
 ### 12.3 Describe, then run: a binary format
 
@@ -2185,12 +2185,12 @@ establish the scoped loan around the user callback and perform invalidating work
 
 ## 13. Fixed-length arrays
 
-`Array(T, n)` holds `n` elements of a fixed-size `T`, with `n` known while compiling. It is a value: a typed local, a struct field, a parameter, a pool's slot type. In C it is a struct wrapping `T e[n]`, so it copies and passes by value as structs do. An `Array(T, n)` whose elements hold owners is an owner instead (§9.13): each element's owners own their own storage, it is indexed like a container (`a[i]`, `a.length`), moved and copied like any owner.
+`Array T n` holds `n` elements of a fixed-size `T`, with `n` known while compiling. It is a value: a typed local, a struct field, a parameter, a pool's slot type. In C it is a struct wrapping `T e[n]`, so it copies and passes by value as structs do. An `Array T n` whose elements hold owners is an owner instead (§9.13): each element's owners own their own storage, it is indexed like a container (`a[i]`, `a.length`), moved and copied like any owner.
 
 ```lua
 local fixed = do(): U32
-    local a = Array(U32, 4) { 10, 20, 30, 40 }
-    local b: Array(U32, 4)
+    local a = Array U32 4 { 10, 20, 30, 40 }
+    local b: Array U32 4
     b[0] = a[3]
     b[1] = a[0] + a[1]
     return b[0] + b[1] + a.length
@@ -2209,7 +2209,7 @@ uint32_t fixed(void) {
 
 * `a[i]` is checked like a slice's element (§12.2): at compile time when the index is known (`index-range: index 4 is outside an array of length 4`), otherwise when it runs.
 * `a.length` is known. `a:slice()` views the elements as a read-only `Slice T`.
-* `Array(T, n)()` is zeroed, `Array(T, n) { ... }` lists every element, and a typed local declared without a value starts zeroed.
+* `(Array T n)()` is zeroed, `Array T (n) { ... }` lists every element, and a typed local declared without a value starts zeroed.
 * Fully known array contents are immutable aggregate values in the evaluator. A typed local keeps its whole pending value; known-index reads and known writes can fold. Copies keep independent snapshots, including nested arrays and structs. Compact zero contents do not require one compiler cell per element.
 * A dynamic write or a read requiring runtime indexing materializes the array conservatively; the implementation does not maintain a partly known element map afterward. Different branch results materialize on their respective paths, and loops widen as other tracked values do. Equal known contents may stay known.
 * `a:slice()` is a live read-only view of the owner, not a snapshot of its contents. It can read known elements without creating an address. Once a raw address or foreign boundary requires memory, pending values are written and affected knowledge is invalidated. Explicit `Ptr(...)` remains the runtime boundary of §12.1; this is not a compile-time heap.
@@ -2679,8 +2679,8 @@ returns a `Ref`.
 ### 17.1 Foreign C interoperability
 
 ```lua
-local puts_u32 = extern("puts_u32", { U32 }, Unit)
-local abs = extern("abs", { I32 }, I32, { header = "<stdlib.h>" })
+local puts_u32 = extern "puts_u32" { U32 } (Unit) {}
+local abs = extern "abs" { I32 } (I32) { header = "<stdlib.h>" }
 
 local dist = do(a: I32, b: I32): I32 = abs(a - b)
 ```
@@ -2705,7 +2705,7 @@ libc is C, and Nua emits C, so wrapping it is a matter of externs. What the lang
 |---|---|
 | `opaque "FILE"` | an opaque C type, usable only behind a `Ptr` (`FILE *`) |
 | `CString` | `const char *`; a Lua string literal is a known `CString` |
-| `extern(name, params, result, { header = "<stdio.h>" })` | a C function from a header (no prototype is emitted) |
+| `extern name params (result) { header = "<stdio.h>" }` | a C function from a header (no prototype is emitted) |
 | `{ variadic = true }` | a variadic C function; extra arguments must be native scalars, `CString`s or pointers |
 | `cformat(...)` | a format string and its arguments, built while specializing |
 | `require "nua.libc"` | load `lib/libc.nua` once per compilation and return its vocabulary table (§2.1) |
@@ -2724,8 +2724,8 @@ void greet(uint32_t times) {
 
 ```lua
 local FILE = opaque "FILE"
-local fopen = extern("fopen", { CString, CString }, Ptr FILE, { header = "<stdio.h>" })
-local fclose = extern("fclose", { Ptr FILE }, I32, { header = "<stdio.h>" })
+local fopen = extern "fopen" { CString, CString } (Ptr FILE) { header = "<stdio.h>" }
+local fclose = extern "fclose" { Ptr FILE } (I32) { header = "<stdio.h>" }
 
 local File = struct { handle: Ptr FILE }
 function File:write(s: CString): Unit
@@ -2844,9 +2844,9 @@ In Unix everything is a file, and in Linux nearly everything is a file descripto
 
 | Form | Meaning |
 |---|---|
-| `cstruct("struct stat", "<sys/stat.h>", { { "size", I64, "st_size" } })` | a struct whose **layout comes from the header**; only the named fields are seen, each optionally mapped to a C member path |
-| `cconst("O_RDONLY", I32, "<fcntl.h>")` | a constant whose **value comes from the header** (a runtime value: platform values are always right) |
-| `cread("errno", I32, "<errno.h>")` | a C variable or macro, read where it is called |
+| `cstruct "struct stat" "<sys/stat.h>" { { "size", I64, "st_size" } }` | a struct whose **layout comes from the header**; only the named fields are seen, each optionally mapped to a C member path |
+| `cconst "O_RDONLY" (I32) "<fcntl.h>"` | a constant whose **value comes from the header** (a runtime value: platform values are always right) |
+| `cread "errno" (I32) "<errno.h>"` | a C variable or macro, read where it is called |
 | `bytes(place)` | the storage of a place as `Ptr U8` (its lifetime dropped, as with `Ptr(place)`) |
 | `size_of(T)` | the C size of a type |
 | `view_of(p, n, body)` | lend a scoped read-only view, with escape and native-boundary checks (§12.6) |
@@ -2857,7 +2857,7 @@ For a recursive foreign layout, the fields argument may be a host function. It
 receives the type being declared and returns the same field list:
 
 ```lua
-local Node = cstruct("struct node", '"node.h"', function(Self)
+local Node = cstruct "struct node" ('"node.h"') (function(Self)
         return { { "next", Ptr Self }, { "value", U32 } }
     end)
 ```
@@ -3348,7 +3348,7 @@ Never `Ref`, `Ptr`, `Slice`, `CString`, `Atomic` or a store `Id`, at any depth. 
 Copying is right for messages and wrong for buffers. A pool moves them instead:
 
 ```lua
-local Block = struct { n: U32, data: Array(U8, 64) }
+local Block = struct { n: U32, data: Array U8 64 }
 
 local pooled = do(count: U32): U64
     local total: U64 = 0
@@ -3441,8 +3441,8 @@ The operations live in a library, `local io = require "nua.io"`, like the libc a
 
 | Operation | Done with | Notes |
 |---|---|---|
-| `io.read(f, buf [, n] [, opts])` | the count read (0 at the end) | `buf` is an `Array(U8, N)` itself: a local, a field, a pool slot's field (`pool[s].bytes`) |
-| `io.write(f, data [, n] [, opts])` | the count written | `data` is an `Array(U8, N)`, a `Slice U8`, or a string known while compiling |
+| `io.read(f, buf [, n] [, opts])` | the count read (0 at the end) | `buf` is an `Array U8 N` itself: a local, a field, a pool slot's field (`pool[s].bytes`) |
+| `io.write(f, data [, n] [, opts])` | the count written | `data` is an `Array U8 N`, a `Slice U8`, or a string known while compiling |
 | `io.open(path, flags [, mode])` | a `File` | flags `io.READ`, `io.WRITE`, `io.READ_WRITE`, `io.CREATE`, `io.TRUNCATE`, `io.APPEND` (from the system's headers) |
 | `io.close(f)` | — | |
 | `io.accept(listener [, opts])` | a `File` | |
@@ -3626,12 +3626,12 @@ Two capabilities that the runtime needed and that any native program may use.
 
 ### 21.1 Globals
 
-`global(T, opts)` is static storage for the whole program. It is the `Ptr T` of a C object, so `g[0]` is its place (and `g.field` a field of a record), read and written as memory in source order, never kept pending:
+`global T opts` is static storage for the whole program. It is the `Ptr T` of a C object, so `g[0]` is its place (and `g.field` a field of a record), read and written as memory in source order, never kept pending:
 
 ```lua
-local hits = global(U32, { name = "hits" })
-local per_thread = global(U32, { name = "per_thread", thread_local = true })
-local seed = global(U32, { name = "seed", init = 100 })
+local hits = global (U32) { name = "hits" }
+local per_thread = global (U32) { name = "per_thread", thread_local = true }
+local seed = global (U32) { name = "seed", init = 100 }
 
 local bump = do(n: U32): U32
     hits[0] = hits[0] + n
@@ -3661,16 +3661,16 @@ uint32_t bump(uint32_t n) {
 
 A global cannot be Unit, opaque, a reference or a view; an owner global is §9.13's. It may be a channel or a pool: handles are generational, so a stale one traps at its next use and never reaches freed memory. Both backends emit it from the same IR (`gccjit` creates an internal, exported or imported global, with the TLS model for `thread_local`). An imported and an exported global of one name are one object.
 
-Tasks cannot write ordinary globals through compiler-visible addresses. The rule follows aliases, aggregate-held pointers, parameters, returns, known function pointers and blocking bodies. Direct reads and calls proved to read only are permitted. Actual atomic operations, thread-local storage and `global(T, { shared = true })` are exceptions. Declaring an Atomic global does not permit non-atomic writes through a cast.
+Tasks cannot write ordinary globals through compiler-visible addresses. The rule follows aliases, aggregate-held pointers, parameters, returns, known function pointers and blocking bodies. Direct reads and calls proved to read only are permitted. Actual atomic operations, thread-local storage and `global (T) { shared = true }` are exceptions. Declaring an Atomic global does not permit non-atomic writes through a cast.
 
 `shared = true` is an unchecked assertion that the program supplies the required synchronization; it changes neither representation nor scheduling. Declarations of the same imported/exported object must agree on `shared` and `thread_local`. The address analysis conservatively merges aggregate fields and array elements. If a possible writable origin is an ordinary global, the compiler rejects the task. Opaque code receiving such an address is considered able to write it, including through reachable pointer fields or callbacks. Raw pointer fabrication and foreign code's hidden state remain unchecked boundaries: this rule is not a whole-program proof of race freedom.
 
 ### 21.2 Function values
 
-`Fn(params): ret` is a C function pointer; `Fn({ U32 }, U32)` takes and returns a `U32`. `fnptr(word)` materializes a native word as a residual function with its declared parameter types and is that function's address. Compile-time parameters are supplied first, by partial application. Calling an `Fn` value calls through it; when the value is a known function the call is direct. `null(Fn(...))` is the null pointer, and `==` and `~=` compare addresses. An `Fn` can be a parameter, result, field, local, global or extern argument (`pthread_create` takes one):
+`Fn(params): ret` is a C function pointer; `Fn { U32 } (U32)` takes and returns a `U32`. `fnptr(word)` materializes a native word as a residual function with its declared parameter types and is that function's address. Compile-time parameters are supplied first, by partial application. Calling an `Fn` value calls through it; when the value is a known function the call is direct. `null(Fn(...))` is the null pointer, and `==` and `~=` compare addresses. An `Fn` can be a parameter, result, field, local, global or extern argument (`pthread_create` takes one):
 
 ```lua
-local Op = Fn({ U32 }, U32)
+local Op = Fn { U32 } (U32)
 local double = do(x: U32): U32 = x * 2
 local square = do(x: U32): U32 = x * x
 

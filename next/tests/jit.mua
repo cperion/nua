@@ -58,6 +58,21 @@ test "the C text does not depend on the libgccjit backend":
     assert(not text:find("jit", 1, true) or text:find("jit_small", 1, true))
 end
 
+test "a unit carries what it reaches of the platform, and needs nothing of ours":
+    local plain = compile.compile_c(small, "jit_plain.nua")
+    assert(not plain:find("nua_platform", 1, true))
+    assert(not plain:find("ledger", 1, true) and not plain:find("mmap", 1, true))
+    local allocating = compile.compile_c([[
+local jit_allocating = do(a: U32): U64
+    local xs = Grow(U32) {}
+    xs:push a
+    return xs.length
+end
+export jit_allocating
+]], "jit_allocating.nua")
+    assert(allocating:find("mmap", 1, true) and not allocating:find("nua_platform", 1, true))
+end
+
 local conversions = [[
 local jit_wrap_add = do(a: U8, b: U8): U8 = a + b
 export jit_wrap_add
@@ -65,7 +80,7 @@ local jit_signed_narrow = do(a: I8): I8 = -a
 export jit_signed_narrow
 local jit_shift_mixed = do(a: U32, count: U8): U32 = a << U32 count
 export jit_shift_mixed
-local jit_float_bits = do(x: F32): U32 = reinterpret(U32, x)
+local jit_float_bits = do(x: F32): U32 = reinterpret U32 x
 export jit_float_bits
 local jit_text_last = do(index: U64): U8
     local text: Str = "a\0b"
@@ -108,7 +123,7 @@ test "atomics reach gcc's builtins by size":
 end
 
 local header_facts = [[
-local Spec = cstruct("struct timespec", "<time.h>", { { "tv_sec", I64 }, { "tv_nsec", I64 } })
+local Spec = cstruct "struct timespec" "<time.h>" { { "tv_sec", I64 }, { "tv_nsec", I64 } }
 local jit_spec_size = do(): U64 = size_of Spec
 export jit_spec_size
 local jit_spec_sum = do(a: I64, b: I64): I64

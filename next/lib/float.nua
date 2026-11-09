@@ -243,7 +243,7 @@ local put = do(out: Ref Digits, byte: U8): Unit
 end
 
 float.text = do(value: F64): Digits
-    local bits = reinterpret(U64, value)
+    local bits = reinterpret U64 value
     local negative = (bits >> 63) == 1
     local biased = I32((bits >> 52) & 0x7ff)
     local significand = bits & ((U64 1 << 52) - 1)
@@ -266,7 +266,7 @@ float.text = do(value: F64): Digits
         exponent = exponent + 1
     end
     -- the digits, most significant first
-    local reversed: Array(U8, 17)
+    local reversed: Array U8 17
     local count: I32 = 0
     while digits > 0 do
         reversed[U32 count] = U8(digits % 10) + 48

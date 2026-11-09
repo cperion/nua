@@ -1,0 +1,90 @@
+-- The platform, in Nua (buffers §3.4): what the storage words need from the operating system, as
+-- ordinary words over its system calls. They specialize and residualize with the program like
+-- any other word, so a compiled unit needs no header or library of ours, and each unit has its
+-- own copy of this state.
+--
+-- The kernel's flags are this target's known values (Linux); nothing here asks a header.
+
+local mman = { header = "<sys/mman.h>" }
+local mmap = extern "mmap" { Ptr U8, U64, I32, I32, I32, I64 } (Ptr U8) mman
+local munmap = extern "munmap" { Ptr U8, U64 } (I32) mman
+local mprotect = extern "mprotect" { Ptr U8, U64, I32 } (I32) mman
+local memmove = extern "memmove" { Ptr U8, Ptr U8, U64 } (Ptr U8) { header = "<string.h>" }
+local getrandom = extern "getrandom" { Ptr U8, U64, U32 } (I64) { header = "<sys/random.h>" }
+
+local protection_none = 0
+local protection_read_write = 3
+local mapping_private_anonymous = 34
+local mapping_no_reserve = 16384
+
+-- an account of mapped bytes kept apart from the allocator, for tests to check it against
+local ledger = global (U64) { name = "ledger" }
+local ledger_mapped_bytes = do(): U64 = ledger[0]
+
+local mapped = do(bytes: U64, protection: I32, flags: I32): Ptr U8
+    local pages = mmap(Ptr(U8)(U64 0), bytes, protection, flags, -1, 0)
+    if I64 pages == -1 then trap "out of memory mapping pages" end
+    ledger[0] = ledger[0] + bytes
+    return pages
+end
+
+local map_pages = do(bytes: U64): Ptr U8 = mapped(bytes, protection_read_write, mapping_private_anonymous)
+
+local unmap_pages = do(pages: Ptr U8, bytes: U64): Unit
+    munmap(pages, bytes)
+    ledger[0] = ledger[0] - bytes
+end
+
+local move_bytes = do(destination: Ptr U8, source: Ptr U8, bytes: U64): Unit
+    memmove(destination, source, bytes)
+end
+
+-- the per-thread region the allocator keeps its state in, zeroed
+local context = global (Array U64 32) { name = "storage_context", thread_local = true }
+local storage_context = do(): Ptr U8 = Ptr(U8)(context)
+
+-- a pinned buffer: its limit reserved as address space, committed from the start as it grows
+local reserve_range = do(bytes: U64): Ptr U8 = mapped(bytes, protection_none, mapping_private_anonymous + mapping_no_reserve)
+
+local commit_range = do(range: Ptr U8, bytes: U64): Unit
+    local rounded = (bytes + 4095) / 4096 * 4096
+    if mprotect(range, rounded, protection_read_write) ~= 0 then trap "cannot commit reserved pages" end
+end
+
+local release_range = unmap_pages
+
+-- the process's hash key, read from the system once
+local seed_first = global (U64) { name = "hash_seed_first" }
+local seed_second = global (U64) { name = "hash_seed_second" }
+local seeded = global (Atomic U32) { name = "hash_seeded", shared = true }
+
+local read_random = do(target: Ptr U64): Unit
+    if getrandom(Ptr(U8)(target), 8, 0) ~= 8 then trap "no random seed for hashing" end
+end
+
+local hash_seed = do(which: U64): U64
+    if seeded[0]:load "acquire" == 0 then
+        read_random seed_first
+        read_random seed_second
+        seeded[0]:store(1, "release")
+    end
+    if which & 1 == 0 then return seed_first[0] end
+    return seed_second[0]
+end
+
+-- a store's token: from one counter, never reused, never 0 (syntax §9.9)
+local token_counter = global (Atomic U64) { name = "store_token_counter", shared = true }
+local next_store_token = do(): U64 = token_counter[0]:add 1 + 1
+
+return define
+    .ledger_mapped_bytes
+    .map_pages
+    .unmap_pages
+    .move_bytes
+    .storage_context
+    .reserve_range
+    .commit_range
+    .release_range
+    .hash_seed
+    .next_store_token
+end

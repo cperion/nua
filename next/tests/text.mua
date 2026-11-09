@@ -137,7 +137,7 @@ end
 
 test "cstring, parse(F64), Str.of, raw and scoped views, UTF-8":
     local library, text = native("text_more", [[
-local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local strlen = extern "strlen" { CString } (U64) { header = "<string.h>" }
 local text_cstring = do(s: Str): U64
     return s:cstring() do(c)
         return strlen c

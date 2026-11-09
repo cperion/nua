@@ -365,7 +365,7 @@ Ownership concerns what has been laid out (§4.2). A vocabulary owns nothing and
 | **vocabulary** | names bound while compiling, with no layout (§4.1) | `define ... end` |
 | **value** | copied freely; owned by whoever holds it | `struct`, `oneof`, `Array`, `Chars n` |
 | **entity** | has identity across operations; independently recyclable entities can live in a store | a scope-owned record, or a struct in a `Store T` named by an `Id` |
-| **owned** | resizable storage, created in place, moved at its last use, duplicated only by `copy`, lent through `Ref` | `Store`, `Grow`, `Text`, `Map`; a struct, sum or `Array(T, n)` holding one; an element holding one (`Store(Player)` with a `name: Text`) |
+| **owned** | resizable storage, created in place, moved at its last use, duplicated only by `copy`, lent through `Ref` | `Store`, `Grow`, `Text`, `Map`; a struct, sum or `Array T n` holding one; an element holding one (`Store(Player)` with a `name: Text`) |
 | **view** | a window on someone else's storage, valid within its owner's lifetime and borrowing rules | `Slice`, `Str` |
 | **handle** | a small name for runtime-owned state; transfer rules depend on its kind | `Chan`, `Pool`, `Slot` |
 | **description** | known while compiling; shapes the code | a vocabulary, a Lua table, a known value |

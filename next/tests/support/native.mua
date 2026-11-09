@@ -49,7 +49,7 @@ return do(name, source, options)
         return declared_library(library, prototypes, name), text
     end
     -- the exit status is captured in the output: this LuaJIT's popen close does not report it
-    local command = ("%s -std=c11 -O1 -I%s -Wall -Werror -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -fPIC -shared -o %s %s 2>&1; printf '\\n__STATUS__%%d' $?"):format(compiler, root .. "/next/runtime", library, c_path)
+    local command = ("%s -std=c11 -O1 -Wall -Werror -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -fPIC -shared -o %s %s 2>&1; printf '\\n__STATUS__%%d' $?"):format(compiler, library, c_path)
     local pipe = io.popen(command)
     local output = pipe:read "*a"
     pipe:close()

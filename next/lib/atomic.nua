@@ -6,17 +6,17 @@ local words = do(T, A)
     local members = {}
     local integer = is_integer T
 
-    local load_word = do(self: Ref A, order): T = atomic_operation("read", self, order)
+    local load_word = do(self: Ref A, order): T = atomic_operation "read" self order
     local store_word = do(self: Ref A, value: T, order): Unit
-        atomic_operation("write", self, order, value)
+        atomic_operation "write" self order value
     end
-    local exchange_word = do(self: Ref A, value: T, order): T = atomic_operation("exchange", self, order, value)
+    local exchange_word = do(self: Ref A, value: T, order): T = atomic_operation "exchange" self order value
     -- true when the value was `expected` and is now `desired`
     local cas_word = do(self: Ref A, expected: T, desired: T, order): Bool
-        return atomic_operation("compare_exchange", self, order, expected, desired) == expected
+        return atomic_operation "compare_exchange" self order expected desired == expected
     end
-    local add_word = do(self: Ref A, value: T, order): T = atomic_operation("fetch_add", self, order, value)
-    local sub_word = do(self: Ref A, value: T, order): T = atomic_operation("fetch_subtract", self, order, value)
+    local add_word = do(self: Ref A, value: T, order): T = atomic_operation "fetch_add" self order value
+    local sub_word = do(self: Ref A, value: T, order): T = atomic_operation "fetch_subtract" self order value
 
     members.load = function(self, order) return load_word(self, order or "seq_cst") end
     members.store = function(self, value, order) return store_word(self, value, order or "seq_cst") end
@@ -29,7 +29,7 @@ local words = do(T, A)
     return members
 end
 
-family(Atomic, |target, atomic_type| -> words(target, atomic_type))
+family Atomic words
 
 -- `Ptr T` viewed as `Ptr (Atomic T)`: memory shared with C or the kernel
 local atomic_ptr = do(pointer): Inferred

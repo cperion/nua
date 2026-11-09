@@ -1,4 +1,4 @@
--- Fixed-length arrays (syntax §13): the words of every `Array(T, n)`, served once per family. An
+-- Fixed-length arrays (syntax §13): the words of every `Array T n`, served once per family. An
 -- array is a value: its elements are its parts, known while they are known; the compiler
 -- supplies only the element's place and a view of the elements in memory, which check nothing.
 
@@ -17,11 +17,11 @@ local words = do(T, A)
         local outside = i >= count
         index.refuse_known(outside, ("index-range: index %s is outside an array of length %d"):format(index.shown i, count))
         if outside then trap "array index out of range" end
-        return array_element_of(self, i)
+        return array_element_of self i
     end
 
     -- `a:slice()`: a read-only view of the elements
-    local slice = do(self: Ref A): Slice T = array_view self
+    local slice = do(self: Ref A): Slice T = array_view self (Slice T)
 
     -- `a.length` is known
     local member = do(self, name)
@@ -38,7 +38,7 @@ local words = do(T, A)
 end
 
 -- the members of every array type (syntax §16.1: served once per family)
-family(FixedArray, |element, array_type| -> words(element, array_type))
+family FixedArray words
 
 return define
     .words

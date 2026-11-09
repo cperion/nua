@@ -38,7 +38,8 @@ no ownership program beside the program graph, and no evaluator fallback.
 An ordinary saturated application enters an invocation; only a requested native
 boundary enters the definition registry. Container and scheduler algorithms are
 Nua words. Compiler Lua/Mua constructs types, evaluates operations and proves
-contracts; C/assembly supplies platform mechanisms.
+contracts; assembly supplies only the context switch and what else cannot be
+written in Nua.
 
 ### 1.1 Modules and their exported vocabularies
 

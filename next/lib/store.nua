@@ -56,7 +56,7 @@ local Store = do(T)
         -- a slot whose generation wrapped is never used again
         if following ~= 0 then self.free_head = id.slot + 1 end
         self.length = self.length - 1
-        ends(Ref self.slots, "removed")
+        ends (Ref self.slots) "removed"
         return true
     end
 

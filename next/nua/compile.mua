@@ -29,6 +29,60 @@ local bridge_module = require "nua.compiler.bridge"
 -- the Nua libraries of the replacement live beside its compiler, in next/lib
 local library_directory = (debug.getinfo(1, "S").source:match("^@(.*)/nua/compile%.mua$") or "next") .. "/lib"
 
+-- Builtins take their arguments one at a time, as Mua's `checker` does: a declaration reads
+-- `global U64 { name = "ledger" }` with no brackets. `body` runs once it has them all.
+local curried = do(name, arity, body)
+    local collecting
+    collecting = do(supplied, count)
+        return function(...)
+            if select("#", ...) ~= 1 then error(("%s takes its arguments one at a time, with no brackets: %s a b"):format(name, name), 2) end
+            local following = {}
+            for index = 1, count do following[index] = supplied[index] end
+            following[count + 1] = (...)
+            if count + 1 == arity then return body(unpack(following, 1, arity)) end
+            return collecting(following, count + 1)
+        end
+    end
+    return collecting({}, 0)
+end
+
+-- how many arguments each primitive takes: `atomic_operation` by its operation
+local atomic_arities = define
+    read = 3
+    compare_exchange = 5
+end
+local primitive_arities = define
+    trap = 1
+    moves = 1
+    ends = 2
+    element_of = 2
+    initialize = 3
+    take = 2
+    drop = 1
+    view_length = 1
+    view_element_of = 2
+    subview_of = 3
+    static_text = 1
+    array_element_of = 2
+    array_view = 2
+    zero_of = 1
+    view_data = 1
+    reinterpret = 2
+    hold_structure = 1
+    release_structure = 1
+    null = 1
+    static_cstring = 1
+    buffer_view = 4
+    loaned_view = 3
+    -- its view type is optional, and only `Slice(p, n)` applies it, with everything at once
+    raw_view = 2
+    view_as = 2
+    end_loan = 1
+    fnptr = 1
+    atomic_operation = operation -> atomic_arities[operation] or 4
+    fence = 1
+end
+
 -- the names a Nua source sees besides Lua's: the native types and their constructors
 local prelude = define
     U8 = types.U8
@@ -150,12 +204,12 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret", "hold_structure", "release_structure", "null", "static_cstring", "buffer_view", "loaned_view", "raw_view", "view_as", "end_loan", "fnptr", "atomic_operation", "fence" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    for name, arity in pairs primitive_arities do environment[name] = hosting.primitive(name, E.host_primitive, false, arity) end
     environment.copy = hosting.primitive("copy", E.host_primitive, true)
     environment.owns = types.owns
     environment.Inferred = hosting.Inferred
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
-    environment.family = types.define_family
+    environment.family = curried("family", 2, types.define_family)
     -- `host(v)`: the Lua value of a known value (syntax §3.7); `type_of(v)`: a staged value's
     -- native type (syntax §2.2)
     environment.host = E.host_value
@@ -163,18 +217,16 @@ local hosting_environment = do(compilation, filename, E)
     environment.is_known = E.is_known
     environment.same_value = E.same_value
     -- foreign C (syntax §17): `extern(name, params, result, { header = "<stdio.h>", variadic = true })`
-    environment.extern = do(name, parameters, result, options)
-        options = options or {}
+    environment.extern = curried("extern", 4, do(name, parameters, result, options)
         return hosting.foreign({ .name, .parameters, .result, header = options.header, variadic = options.variadic == true }, do(foreign, arguments)
             error(("%s is a foreign function: it is applied inside an evaluation, never while compiling at top level"):format(name), 3)
         end)
-    end
+    end)
     -- a Text of its own limit (syntax §9.12)
     types.define_member(types.buffer types.U8, "pinned", types.buffer(types.U8, true))
     -- `global(T, options)` (syntax §21.1): the `Ptr T` of a C object
     local global_count = 0
-    environment.global = do(native_type, options)
-        options = options or {}
+    environment.global = curried("global", 2, do(native_type, options)
         if not check(types.NativeType, native_type) then error("global takes a native type, got " .. tostring native_type, 2) end
         if native_type == types.Unit or types.borrows native_type or types.NativeType.is(native_type, types.OpaqueType) then
             error(("a global cannot be %s"):format(types.describe native_type), 2)
@@ -199,8 +251,8 @@ local hosting_environment = do(compilation, filename, E)
             header = options.header
         end
         return data.Bits { type = types.pointer native_type, operand = data.Constant { type = types.pointer native_type, bits = data.SymbolAddress { name = c_name, offset = 0 } } }
-    end
-    environment.Fn = |parameters, result| -> types.function_type(parameters, result)
+    end)
+    environment.Fn = curried("Fn", 2, |parameters, result| -> types.function_type(parameters, result))
     environment.Atomic = types.atomic
     environment.is_integer = rules.is_integer
     -- what only a header knows (syntax §18): a constant, a variable read where it is called,
@@ -208,16 +260,16 @@ local hosting_environment = do(compilation, filename, E)
     local needs_header = do(header)
         if header then compilation.headers[header] = true end
     end
-    environment.cconst = do(name, native_type, header)
+    environment.cconst = curried("cconst", 3, do(name, native_type, header)
         needs_header header
         return E.known(data.Constant { type = native_type, bits = data.ForeignValue { .name } })
-    end
-    environment.cread = do(name, native_type, header)
+    end)
+    environment.cread = curried("cread", 3, do(name, native_type, header)
         return hosting.foreign({ .name, parameters = {}, result = native_type, header = header, variadic = false, reads = true }, do(foreign, arguments)
             error(("%s is a C variable: it is read inside an evaluation, never while compiling at top level"):format(name), 3)
         end)
-    end
-    environment.cstruct = do(c_name, header, source)
+    end)
+    environment.cstruct = curried("cstruct", 3, do(c_name, header, source)
         needs_header header
         local record = types.RecordType { name = c_name, fields = {}, .c_name }
         local entries = type source == "function" and source(record) or source
@@ -226,7 +278,7 @@ local hosting_environment = do(compilation, filename, E)
             record.fields[#record.fields + 1] = types.Field { name = entry[1], type = entry[2], c_member = entry[3] }
         end
         return record
-    end
+    end)
     environment.size_of = do(native_type)
         if types.NativeType.is(native_type, types.RecordType) and native_type.c_name then
             return E.known(data.Constant { type = types.U64, bits = data.ForeignValue { name = "sizeof(" .. native_type.c_name .. ")" } })
@@ -262,14 +314,10 @@ local hosting_environment = do(compilation, filename, E)
     end
     environment.opaque = types.opaque
     environment.CString = types.CString
-    -- `Array(T, n)`: n known while compiling makes the value type (syntax §13)
-    -- and, n known only when the program runs, the builder of the owner `Array T` (§9.3);
-    -- `Array(T)` is the owner's type
-    environment.Array = do(element, count)
-        if count == nil then return types.buffer(element, false, true) end
-        if E.is_known count then return types.fixed_array(element, E.host_value count) end
-        return environment.import("buffer").words(element, types.buffer(element, false, true)).build(count)
-    end
+    -- `Array T` is the owner's type; applied to a length it is `Array T n` (`E.apply_type`, and
+    -- the type's call in host code): the value type, or the owner built at run time
+    environment.Array = element -> types.buffer(element, false, true)
+    compilation.owner_array_builder = |element, owner_type, length| -> environment.import("buffer").words(element, owner_type).build(length)
     environment.FixedArray = types.fixed_array
     return environment, load_nua
 end
@@ -339,6 +387,8 @@ local compiling_with_members = do(source, filename)
     local environment, load_nua = hosting_environment(compilation, filename, E)
     -- the words of buffers of each element type, from the Nua library
     -- the built-in kinds the Nua library serves register their members (syntax §16.1)
+    environment.import "atomic"
+    environment.platform = environment.import "platform"
     environment.import "buffer"
     environment.import "slice"
     environment.import "array"
@@ -350,7 +400,6 @@ local compiling_with_members = do(source, filename)
     environment.Map = environment.import("map").Map
     environment.cformat = environment.import("cformat").cformat
     environment.import "str"
-    environment.import "atomic"
     environment.atomic_ptr = environment.import("atomic").atomic_ptr
     load_nua(source, filename)
 

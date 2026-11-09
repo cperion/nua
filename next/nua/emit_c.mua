@@ -298,6 +298,9 @@ local c_atomic_builtins = define
     fetch_or = "__atomic_fetch_or"
     fetch_xor = "__atomic_fetch_xor"
 end
+-- what a trap with a message prints, for both backends
+local trap_line = message -> "nua: " .. message .. "\n"
+
 local emit_definition = do(definition, c_name, program, names_of_definitions)
     local names = {}
     local declarations = {}
@@ -428,7 +431,7 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             if is_pointer_like from and is_pointer_like to then return ("(%s)%s;"):format(c_type to, operand a) end
             if NativeType.is(from, types.AtomicType) or NativeType.is(to, types.AtomicType) then return ("(%s)%s;"):format(c_type to, operand a) end
             if rules.is_pointer from or rules.is_pointer to then return ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
-            return ("nua_reinterpret_%s_%s(%s);"):format(c_type from, c_type to, operand a)
+            return ("((union { %s source; %s result; }){ .source = %s }).result;"):format(c_type from, c_type to, operand a)
         end
         negate = do(node, a, b)
             if rules.is_float node.type then return "-" .. operand a .. ";" end
@@ -579,9 +582,8 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         Trap = do(node, recurse)
             local message = node.message
             if data.Operand.is(message, data.Constant) and data.NativeConstant.is(message.bits, data.StaticBytes) then
-                local bytes = message.bits.bytes
-                local escaped = bytes:gsub('[%c"\\]', character -> ("\\%03o"):format(character:byte()))
-                return ('nua_fatal_trap((uint8_t *)"%s", %d); __builtin_unreachable();'):format(escaped, #bytes)
+                local bytes = trap_line message.bits.bytes
+                return ('(void)!write(2, %s, %d); abort();'):format(c_string bytes, #bytes)
             end
             return "__builtin_trap();"
         end
@@ -695,7 +697,7 @@ end
 -- word; every prototype first, so definitions may call one another in any order
 local emit = do(prepared)
     local program = preparation.certified prepared
-    local parts = { "#include \"nua_platform.h\"\n#include <stdint.h>\n#include <stdbool.h>\n#include <math.h>\n" }
+    local parts = { "#define _DEFAULT_SOURCE\n#include <stdint.h>\n#include <stdbool.h>\n#include <stdlib.h>\n#include <unistd.h>\n#include <math.h>\n" }
     local names, exported = {}, {}
     for _, export in ipairs program.exports do
         names[export.definition] = export.name
@@ -785,6 +787,7 @@ end
 return define
     .emit
     .fields_of
+    .trap_line
     .c_type
     .constant_text
 end

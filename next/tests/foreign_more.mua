@@ -78,11 +78,11 @@ end
 
 test "what only a header knows: constants, variables, layouts":
     local library, text = native("more_headers", [[
-local EINVAL = cconst("EINVAL", I32, "<errno.h>")
-local errno = cread("errno", I32, "<errno.h>")
-local Stat = cstruct("struct stat", "<sys/stat.h>", { { "size", I64, "st_size" } })
-local fstat = extern("fstat", { I32, Ptr Stat }, I32, { header = "<sys/stat.h>" })
-local Event = cstruct("struct epoll_event", "<sys/epoll.h>", { { "events", U32 }, { "fd", I32, "data.fd" } })
+local EINVAL = cconst "EINVAL" (I32) "<errno.h>"
+local errno = cread "errno" (I32) "<errno.h>"
+local Stat = cstruct "struct stat" "<sys/stat.h>" { { "size", I64, "st_size" } }
+local fstat = extern "fstat" { I32, Ptr Stat } (I32) { header = "<sys/stat.h>" }
+local Event = cstruct "struct epoll_event" "<sys/epoll.h>" { { "events", U32 }, { "fd", I32, "data.fd" } }
 local header_constant = do(): I32 = EINVAL + 1
 export header_constant
 local header_errno = do(): I32

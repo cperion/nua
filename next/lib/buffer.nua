@@ -64,7 +64,7 @@ local words = do(T, B)
     -- relies on does not depend on what the compiler knows about the capacity (buffers §2.3)
     local push = do(self: Ref B, value: T): Unit
         reserve(self, self.length + 1)
-        initialize(self, self.length, value)
+        initialize self self.length value
         self.length = self.length + 1
         if not B.reserved then moves self end
     end
@@ -75,7 +75,7 @@ local words = do(T, B)
         index.unsigned at
         local i = U64 at
         if i >= self.length then trap "index out of range" end
-        return element_of(self, i)
+        return element_of self i
     end
 
     -- `finish(b, first, limit)` (buffers §4.1): the elements of `[first, limit)` leave the
@@ -84,7 +84,7 @@ local words = do(T, B)
         if owning then
             local index = first
             while index < limit do
-                drop(element_of(self, index))
+                drop(element_of self index)
                 index = index + 1
             end
         end
@@ -93,21 +93,21 @@ local words = do(T, B)
     local pop = do(self: Ref B): T
         if self.length == 0 then trap "pop of an empty buffer" end
         self.length = self.length - 1
-        ends(self, "shrank")
-        return take(self, self.length)
+        ends (self) "shrank"
+        return take self self.length
     end
 
     local truncate = do(self: Ref B, length: U64): Unit
         if length > self.length then trap "truncate past the length" end
         finish(self, length, self.length)
         self.length = length
-        ends(self, "shrank")
+        ends (self) "shrank"
     end
 
     local clear = do(self: Ref B): Unit
         finish(self, 0, self.length)
         self.length = 0
-        ends(self, "cleared")
+        ends (self) "cleared"
     end
 
     local release = do(self: Ref B): Unit
@@ -121,11 +121,11 @@ local words = do(T, B)
     -- views: held borrows of the contents (buffers §2.3); `sub` views `[first, limit)`
     local sub = do(self: Ref B, first: U64, limit: U64): Slice T
         if first > limit or limit > self.length then trap "a view past the length" end
-        return buffer_view(self, first, limit - first)
+        return buffer_view self first (limit - first) (Slice T)
     end
-    local all = do(self: Ref B): Slice T = buffer_view(self, 0, self.length)
+    local all = do(self: Ref B): Slice T = buffer_view self 0 self.length (Slice T)
     -- the elements lent for writing (syntax §12.2: marked at the call, `f(Ref xs)`)
-    local all_mut = do(self: Ref B): Slice.mut T = buffer_view(self, 0, self.length, Slice.mut T)
+    local all_mut = do(self: Ref B): Slice.mut T = buffer_view self 0 self.length (Slice.mut T)
 
     -- `Buffer(T) { … }` (syntax §16, `__cast`): an empty buffer, each entry pushed; the loop is
     -- over the host table, so it runs while specializing
@@ -142,13 +142,13 @@ local words = do(T, B)
         return nil
     end
 
-    -- `Array(T, n) {}` (syntax §9.3): n zeroed elements, a length fixed when built
+    -- `Array T (n) {}` (syntax §9.3): n zeroed elements, a length fixed when built
     local build = do(count: U64, entries): B
         local built: B
         reserve(Ref built, count)
         local i: U64 = 0
         while i < count do
-            initialize(Ref built, i, zero_of T)
+            initialize (Ref built) i (zero_of T)
             i = i + 1
         end
         built.length = count
@@ -161,7 +161,7 @@ local words = do(T, B)
         if self.length > 0 then reserve(Ref built, self.length) end
         local i: U64 = 0
         while i < self.length do
-            initialize(Ref built, i, copy(element_of(self, i)))
+            initialize (Ref built) i (copy(element_of self i))
             i = i + 1
         end
         built.length = self.length
@@ -190,7 +190,7 @@ local words = do(T, B)
     end
     -- a buffer of bytes is text being built (syntax §14.2): it lends a `Str`
     if T == U8 and not B.fixed then
-        members.str = do(self: Ref B): Str = buffer_view(self, 0, self.length, Str)
+        members.str = do(self: Ref B): Str = buffer_view self 0 self.length Str
         local text = import("text").words(B, reserve)
         members.write, members.append = text.write, text.append
     end
@@ -199,7 +199,7 @@ local words = do(T, B)
 end
 
 -- the members of every `Buffer T` and `Array T` (syntax §16.1: served once per family)
-family(Buffer, |element, native_type| -> words(element, native_type))
+family Buffer words
 
 return {
     words = words,

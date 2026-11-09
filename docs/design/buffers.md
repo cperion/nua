@@ -286,10 +286,13 @@ into (several after a join). A borrow whose steps include an unknown element ind
 
 ### 3.4 Platform mechanisms
 
-C supplies only these storage mechanisms: `map_pages`, `unmap_pages`, `remap_pages`
-(optional), `reserve_range`, `commit_range`, `release_range`, `move_bytes`, plus the
-context mechanisms of [tasks §4](tasks.md#4-platform-mechanism-and-resource-lifecycle) (`context_initialize`, `context_switch`,
-`context_finish`) and `fatal_trap` / `recover_jump`. Allocation policy, size classes,
+The storage mechanisms `map_pages`, `unmap_pages`, `remap_pages` (optional),
+`reserve_range`, `commit_range`, `release_range` and `move_bytes` are ordinary Nua words over
+the system's calls, residualized with the program like any other word: a compiled unit needs
+no header or library of ours. Only what cannot be written in Nua stays below it: the context
+mechanisms of [tasks §4](tasks.md#4-platform-mechanism-and-resource-lifecycle)
+(`context_initialize`, `context_switch`, `context_finish`) and `recover_jump`. A trap with a
+message is spelled by each backend as a write and an abort. Allocation policy, size classes,
 free lists and typed walks are Nua.
 
 ## 4. The operations

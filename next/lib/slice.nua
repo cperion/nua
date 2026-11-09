@@ -20,7 +20,7 @@ local words = do(T, V)
         local outside = i >= length
         index.refuse_known(outside, ("index-range: index %s is outside a slice of length %s"):format(index.shown i, index.shown length))
         if outside then trap "slice index out of range" end
-        return view_element_of(self, i)
+        return view_element_of self i
     end
 
     -- `s:sub(a, b)`: the view of `[a, b)`, checked
@@ -36,7 +36,7 @@ local words = do(T, V)
         index.refuse_known(beyond, ("index-range: the range %s..%s is outside a slice of length %s"):format(index.shown a, index.shown b, index.shown length))
         if reversed then trap "slice range out of bounds" end
         if beyond then trap "slice range out of bounds" end
-        return subview_of(self, a, b - a)
+        return subview_of self a (b - a)
     end
 
     -- `s.length`
@@ -68,7 +68,7 @@ local words = do(T, V)
         local built = buffer_words(T, Owned).build(view_length self, {})
         local i: U64 = 0
         while i < view_length self do
-            built[i] = view_element_of(self, i)
+            built[i] = view_element_of self i
             i = i + 1
         end
         return built
@@ -95,13 +95,13 @@ end
 -- it borrows a loan that ends with the body, so it cannot escape it
 local foreign_view = do(pointer, count, body): Inferred
     local loan: U8 = 0
-    local result = body(loaned_view(Ref loan, pointer, count))
+    local result = body(loaned_view (Ref loan) pointer count)
     end_loan(Ref loan)
     return result
 end
 
 -- the members of every view type (syntax §16.1: served once per family)
-family(Slice, |element, view_type| -> words(element, view_type))
+family Slice words
 
 return define
     .words

@@ -147,7 +147,20 @@ return do(E, core)
 
     -- applying a native type: `Grow(T) { … }` builds a buffer, `Record { … }` a record, `U32(x)`
     -- converts (a pointer's bits are reinterpreted, never converted)
+    -- `Array T n`: the owner type `Array T` applied to a length. Known while compiling it makes
+    -- the value type; known only when the program runs, it builds the owner (syntax §9.3, §13).
+    local array_length = do(path, callee, arguments)
+        if not (types.NativeType.is(callee, types.BufferType) and callee.fixed and #arguments == 1) then return nil end
+        local length = arguments[1]
+        if E.is_cell length then length = E.peek(path, length) end
+        if type length == "number" then return types.fixed_array(callee.element, length) end
+        if not (is_native length and rules.is_integer(length.type)) then return nil end
+        if E.is_known length then return types.fixed_array(callee.element, E.host_value length) end
+        return compilation.owner_array_builder(callee.element, callee, length)
+    end
     E.apply_type = do(path, callee, arguments)
+        local sized = array_length(path, callee, arguments)
+        if sized ~= nil then return sized end
         -- `Array(T, n)()` is zeroed (syntax §13)
         if #arguments == 0 and E.is_array callee then return E.zero_value callee end
         if #arguments == 0 and types.NativeType.is(callee, types.RecordType) then return E.construct_record(path, callee, {}) end
@@ -242,7 +255,9 @@ return do(E, core)
         if hosting.is_primitive callee then
             local apply_primitive = Primitives[callee.name]
             if apply_primitive == nil then fail(path, "the primitive " .. callee.name .. " is unknown") end
-            return apply_primitive(path, arguments, boundary)
+            local whole, partial = hosting.completed_primitive(callee, arguments)
+            if whole == nil then return partial end
+            return apply_primitive(path, whole, boundary)
         end
         if check(types.NativeType, callee) then return E.apply_type(path, callee, arguments) end
         if platform.is_mechanism callee then return E.apply_mechanism(path, callee, arguments) end

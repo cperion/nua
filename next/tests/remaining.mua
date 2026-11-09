@@ -52,12 +52,12 @@ end
 
 test "globals are static objects, read and written as memory":
     local library, text = native("remaining_globals", [[
-local hits = global(U32, { name = "hits" })
-local per_thread = global(U32, { name = "per_thread", thread_local = true })
-local seed = global(U32, { name = "seed", init = 100 })
+local hits = global (U32) { name = "hits" }
+local per_thread = global (U32) { name = "per_thread", thread_local = true }
+local seed = global (U32) { name = "seed", init = 100 }
 local Point = struct { x: U32, y: U32 }
-local origin = global(Point, { name = "origin" })
-local journal = global(Grow U32, { name = "journal" })
+local origin = global (Point) { name = "origin" }
+local journal = global (Grow U32) { name = "journal" }
 local global_bump = do(n: U32): U32
     hits[0] = hits[0] + n
     per_thread[0] = hits[0]
@@ -77,7 +77,7 @@ export global_journal
     assert(library.global_journal(1) == 1 and library.global_journal(2) == 2)
     assert(text:find("static __thread uint32_t", 1, true) and text:find("= 100u;", 1, true), text)
     refuses([[
-local g = global(Slice U32, { name = "views" })
+local g = global (Slice U32) { name = "views" }
 ]], "a global cannot be")
 end
 

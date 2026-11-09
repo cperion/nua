@@ -6,7 +6,7 @@ local format = {}
 local Digits = chars.Chars 20
 
 format.u64 = do(value: U64): Digits
-    local reversed: Array(U8, 20)
+    local reversed: Array U8 20
     local n = value
     local count: U32 = 0
     while true do

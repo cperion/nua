@@ -134,7 +134,7 @@ local make = do(K, V, borrowing)
         self.entries[slot] = Entry { hashed = 0, next_free = self.free_head, key = zero_of Stored, value = zero_of V }
         self.free_head = slot + 1
         self.length = self.length - 1
-        ends(Ref self.entries, "removed")
+        ends (Ref self.entries) "removed"
         return true
     end
 

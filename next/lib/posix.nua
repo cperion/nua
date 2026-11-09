@@ -16,40 +16,40 @@ local mman = "<sys/mman.h>"
 local epoll_h = "<sys/epoll.h>"
 
 -- constants: their values come from the headers
-local O_RDONLY = cconst("O_RDONLY", I32, fcntl)
-local O_WRONLY = cconst("O_WRONLY", I32, fcntl)
-local O_RDWR = cconst("O_RDWR", I32, fcntl)
-local O_CREAT = cconst("O_CREAT", I32, fcntl)
-local O_TRUNC = cconst("O_TRUNC", I32, fcntl)
-local ENOENT = cconst("ENOENT", I32, "<errno.h>")
-local PROT_READ = cconst("PROT_READ", I32, mman)
-local MAP_PRIVATE = cconst("MAP_PRIVATE", I32, mman)
-local MAP_FAILED = cconst("MAP_FAILED", Ptr U8, mman)
-local EPOLLIN = cconst("EPOLLIN", U32, epoll_h)
-local EPOLL_CTL_ADD = cconst("EPOLL_CTL_ADD", I32, epoll_h)
+local O_RDONLY = cconst "O_RDONLY" I32 fcntl
+local O_WRONLY = cconst "O_WRONLY" I32 fcntl
+local O_RDWR = cconst "O_RDWR" I32 fcntl
+local O_CREAT = cconst "O_CREAT" I32 fcntl
+local O_TRUNC = cconst "O_TRUNC" I32 fcntl
+local ENOENT = cconst "ENOENT" (I32) "<errno.h>"
+local PROT_READ = cconst "PROT_READ" I32 mman
+local MAP_PRIVATE = cconst "MAP_PRIVATE" I32 mman
+local MAP_FAILED = cconst "MAP_FAILED" (Ptr U8) mman
+local EPOLLIN = cconst "EPOLLIN" U32 epoll_h
+local EPOLL_CTL_ADD = cconst "EPOLL_CTL_ADD" I32 epoll_h
 
-local errno = cread("errno", I32, "<errno.h>")
+local errno = cread "errno" (I32) "<errno.h>"
 
 -- structs: their layouts come from the headers; we name the fields we use
-local Stat = cstruct("struct stat", "<sys/stat.h>", { { "size", I64, "st_size" } })
-local Event = cstruct("struct epoll_event", epoll_h, {
+local Stat = cstruct "struct stat" "<sys/stat.h>" { { "size", I64, "st_size" } }
+local Event = cstruct "struct epoll_event" (epoll_h) {
         { "events", U32 },
         { "fd", I32, "data.fd" },
-    })
+    }
 
 -- the calls
-local c_open = extern("open", { CString, I32 }, I32, { header = fcntl, variadic = true })
-local c_close = extern("close", { I32 }, I32, { header = unistd })
-local c_read = extern("read", { I32, Ptr U8, U64 }, I64, { header = unistd })
-local c_write = extern("write", { I32, Ptr U8, U64 }, I64, { header = unistd })
-local c_write_text = extern("write", { I32, CString, U64 }, I64, { header = unistd })
-local c_fstat = extern("fstat", { I32, Ptr Stat }, I32, { header = "<sys/stat.h>" })
-local c_mmap = extern("mmap", { Ptr U8, U64, I32, I32, I32, I64 }, Ptr U8, { header = mman })
-local c_munmap = extern("munmap", { Ptr U8, U64 }, I32, { header = mman })
-local c_eventfd = extern("eventfd", { U32, I32 }, I32, { header = "<sys/eventfd.h>" })
-local c_epoll_create1 = extern("epoll_create1", { I32 }, I32, { header = epoll_h })
-local c_epoll_ctl = extern("epoll_ctl", { I32, I32, I32, Ptr Event }, I32, { header = epoll_h })
-local c_epoll_wait = extern("epoll_wait", { I32, Ptr Event, I32, I32 }, I32, { header = epoll_h })
+local c_open = extern "open" { CString, I32 } (I32) { header = fcntl, variadic = true }
+local c_close = extern "close" { I32 } (I32) { header = unistd }
+local c_read = extern "read" { I32, Ptr U8, U64 } (I64) { header = unistd }
+local c_write = extern "write" { I32, Ptr U8, U64 } (I64) { header = unistd }
+local c_write_text = extern "write" { I32, CString, U64 } (I64) { header = unistd }
+local c_fstat = extern "fstat" { I32, Ptr Stat } (I32) { header = "<sys/stat.h>" }
+local c_mmap = extern "mmap" { Ptr U8, U64, I32, I32, I32, I64 } (Ptr U8) { header = mman }
+local c_munmap = extern "munmap" { Ptr U8, U64 } (I32) { header = mman }
+local c_eventfd = extern "eventfd" { U32, I32 } (I32) { header = "<sys/eventfd.h>" }
+local c_epoll_create1 = extern "epoll_create1" { I32 } (I32) { header = epoll_h }
+local c_epoll_ctl = extern "epoll_ctl" { I32, I32, I32, Ptr Event } (I32) { header = epoll_h }
+local c_epoll_wait = extern "epoll_wait" { I32, Ptr Event, I32, I32 } (I32) { header = epoll_h }
 
 -- an activity's outcome: done, or the errno it failed with
 local Outcome = oneof { done: Unit, failed: I32 }

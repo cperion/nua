@@ -12,12 +12,12 @@ end
 
 test "calls into C, with a header or a prototype; addresses, null, opaque types":
     local library, text = native("foreign_calls", [[
-local abs = extern("abs", { I32 }, I32, { header = "<stdlib.h>" })
-local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
-local labs_proto = extern("labs", { I64 }, I64)
+local abs = extern "abs" { I32 } (I32) { header = "<stdlib.h>" }
+local strlen = extern "strlen" { CString } (U64) { header = "<string.h>" }
+local labs_proto = extern "labs" { I64 } (I64) {}
 local FILE = opaque "FILE"
-local fflush = extern("fflush", { Ptr FILE }, I32, { header = "<stdio.h>" })
-local snprintf = extern("snprintf", { Ptr U8, U64, CString }, I32, { header = "<stdio.h>", variadic = true })
+local fflush = extern "fflush" { Ptr FILE } (I32) { header = "<stdio.h>" }
+local snprintf = extern "snprintf" { Ptr U8, U64, CString } (I32) { header = "<stdio.h>", variadic = true }
 
 local foreign_dist = do(a: I32, b: I32): I32 = abs(a - b)
 export foreign_dist
@@ -43,7 +43,7 @@ local foreign_field = do(k: U32): U32
 end
 export foreign_field
 local foreign_format = do(n: U32, x: F64): U64
-    local buffer: Array(U8, 64)
+    local buffer: Array U8 64
     local length = snprintf(Ptr(buffer[0]), 64, cformat("n=", n, " x=", x, " 100%"))
     return strlen(CString(Ptr(buffer[0]))) * 100 + U64 length
 end
@@ -61,12 +61,34 @@ end
 
 test "a foreign function never runs while compiling":
     refuses([[
-local strlen = extern("strlen", { CString }, U64, { header = "<string.h>" })
+local strlen = extern "strlen" { CString } (U64) { header = "<string.h>" }
 local value = strlen "abc"
 ]], "is a foreign function")
     refuses([[
-local abs = extern("abs", { I32 }, I32)
+local abs = extern "abs" { I32 } (I32) {}
 local twice = do(x: I32): I32 = abs x
 local known = twice 2
 ]], "applied from host code")
+end
+
+test "a builtin takes its arguments one at a time, and a partial one waits for the rest":
+    local done, problem = pcall(compile.compile, [[
+local hits = global(U32, { name = "bracketed" })
+]], "bracketed.nua")
+    assert(not done and tostring(problem):find("one at a time", 1, true), tostring problem)
+    local library = native("curried_builtins", [[
+local c_labs = extern "labs"
+local curried_labs = c_labs { I64 } (I64) {}
+local curried_counter = global (U32) { name = "curried_counter" }
+local reinterpret_as = reinterpret U32
+local curried_bump = do(x: I64): U64
+    curried_counter[0] = curried_counter[0] + 1
+    return U64 (curried_labs x) + U64 curried_counter[0]
+end
+export curried_bump
+local curried_bits = do(x: F32): U32 = reinterpret_as x
+export curried_bits
+]])
+    assert(library.curried_bump(-5) == 6)
+    assert(library.curried_bits(1.0) == 0x3f800000)
 end
