@@ -168,6 +168,18 @@ local writer_for = do(fragment, supply, parent)
     return GraphWriter
 end
 
+-- whether a fragment leaves no code: no instruction, and no control but the plain jumps
+-- (without arguments) of known control continuing in another block
+local residual_free = do(fragment)
+    for _, id in ipairs fragment.order do
+        local block = fragment.blocks[id]
+        local terminator = block.terminator
+        if #block.instructions > 0 then return false end
+        if terminator ~= nil and not (data.Terminator.is(terminator, data.Jump) and #terminator.edge.arguments == 0) then return false end
+    end
+    return true
+end
+
 -- run `body` with a writer over a new fragment; it answers "adopt" or "discard"
 local BuildResult = oneof { built: GraphFragment, discarded: Unit }
 local building = do(attempt, supply, body, parent)
@@ -425,6 +437,7 @@ local printing = do()
         if data.NativeConstant.is(bits, data.BooleanBit) then return tostring bits.value end
         if data.NativeConstant.is(bits, data.UnitBits) then return "()" end
         if data.NativeConstant.is(bits, data.StaticBytes) then return ("%q"):format(bits.bytes) end
+        if data.NativeConstant.is(bits, data.StaticAddress) then return ("%q+%d"):format(bits.bytes, bits.offset) end
         return types.describe(constant.type) .. " constant"
     end
     local Naming = define
@@ -516,6 +529,7 @@ return define
     .BuildResult
     .GraphIndex
     .building
+    .residual_free
     .seal
     .index
     .walk

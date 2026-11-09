@@ -77,7 +77,9 @@ local BorrowAlternative = struct { form: BorrowForm, origins: list_of(Access) }
 local Selected = struct { selector: Operand, alternatives: list_of(BorrowAlternative) }
 BorrowForm { Held, Stored, Selected }
 
-local BorrowInfo = struct { id: BorrowId, form: BorrowForm, origins: list_of(Access), mutable: Boolean, lifetime: LifetimeId, acquired: OriginId }
+-- `source`: the borrow this one is derived from (an element of a view, a part of a reference):
+-- acquiring it uses the source, whose state it starts with
+local BorrowInfo = struct { id: BorrowId, form: BorrowForm, origins: list_of(Access), mutable: Boolean, lifetime: LifetimeId, acquired: OriginId, source: Optional(BorrowId) }
 
 local BorrowState = family "state of a borrow"
 -- a live held borrow may cache its derived pointer on this path, until a move of its storage

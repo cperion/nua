@@ -131,18 +131,19 @@ return do(E, core)
 
     -- is a round entirely known: no residual code, and every place it changed still known?
     E.known_round = do(fragment, round, start_flow)
-        if #fragment.order ~= 1 then return false end
-        local only = fragment.blocks[fragment.order[1]]
-        if #only.instructions > 0 or only.terminator ~= nil then return false end
+        if not graph.residual_free fragment then return false end
         local states = {}
         for _, state in ipairs round.nexts do states[#states + 1] = state end
         for _, state in ipairs round.leaving do states[#states + 1] = state end
         if #states == 0 then return true, nil, false end
         if #states ~= 1 then return false end
+        -- the places the round carries on (those that existed before it) must stay known; a
+        -- place made inside the round (a local of its body, a parameter of a word it inlined)
+        -- ends with it
         for place, contents in pairs states[1].flow.contents do
             local before = start_flow.contents[place]
-            if not (before and facts.same_contents(before, contents)) then
-                if Contents.is(contents, data.Tracked) and not E.constant_of contents.value then return false end
+            if before and not facts.same_contents(before, contents) then
+                if Contents.is(contents, data.Tracked) and not E.is_known contents.value then return false end
             end
         end
         return true, states[1], #round.nexts == 1

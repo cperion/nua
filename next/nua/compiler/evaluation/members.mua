@@ -73,7 +73,7 @@ return do(E, core)
         local run = || -> E.apply(path, member, supplied, boundary)
         local result
         if hook then result = E.within_hook(value.type, run) else result = run() end
-        if temporary and not path.dead then E.release_place(path, temporary.id) end
+        if temporary and not path.dead and types.owns(temporary.type) then E.release_place(path, temporary.id) end
         return result
     end
 
@@ -92,11 +92,13 @@ return do(E, core)
             return E.dispatch_reference(path, receiver_value, |arm, selected| -> E.method(arm, selected, name, arguments, boundary))
         end
         local value = value_of(path, base)
+        -- a host value's method is Lua's: a table's, a string's (`("%d"):format(n)`)
         if not is_native value then
-            if lua_type value ~= "table" or value[name] == nil then fail(path, ("':%s' of %s is not a method"):format(name, tostring value)) end
+            local found, method = pcall(|| -> value[name])
+            if not found or method == nil then fail(path, ("':%s' of %s is not a method"):format(name, tostring value)) end
             local supplied = { value }
             for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
-            return E.apply(path, value[name], supplied, boundary)
+            return E.apply(path, method, supplied, boundary)
         end
         local found = E.member_hook(path, base, value, name)
         if found ~= nil then return E.apply(path, found, arguments, boundary) end

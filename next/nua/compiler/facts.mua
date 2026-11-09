@@ -108,6 +108,7 @@ local SameConstants = define
     UnitBits = |a, recurse, b| -> true
     StaticBytes = |a, recurse, b| -> a.bytes == b.bytes
     SymbolAddress = |a, recurse, b| -> a.name == b.name and a.offset == b.offset
+    StaticAddress = |a, recurse, b| -> a.bytes == b.bytes and a.offset == b.offset
     DefinitionAddress = |a, recurse, b| -> a.definition == b.definition
     AggregateBits = do(a, recurse, b)
         if #a.parts ~= #b.parts then return false end
@@ -211,7 +212,8 @@ local tracking = do(capabilities)
     end
 
     -- a new held borrow of a path, live on this path of control
-    local borrow = do(flow, path, mutable, lifetime, acquired)
+    -- (derived from `source`, when given: it starts in the source's state)
+    local borrow = do(flow, path, mutable, lifetime, acquired, source)
         local info = data.BorrowInfo with
             id = supply.fresh identity.BorrowId
             form = data.Held { .path }
@@ -219,9 +221,10 @@ local tracking = do(capabilities)
             .mutable
             .lifetime
             .acquired
+            .source
         end
         registry[info.id] = info
-        flow.borrows[info.id] = Live {}
+        flow.borrows[info.id] = source and flow.borrows[source] or Live {}
         return info
     end
 

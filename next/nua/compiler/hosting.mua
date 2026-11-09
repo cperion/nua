@@ -75,9 +75,17 @@ local saturated = application -> #application.supplied == #application.word.requ
 
 -- a primitive: one of the few operations the compiler supplies to the Nua library (trap, effect
 -- declarations, views, element references, drop), named so evaluation can dispatch on it
-local Primitive = {}
-Primitive.__tostring = primitive -> primitive.name
-local primitive = name -> setmetatable({ .name }, Primitive)
+-- Applied from Lua (a hook, a host helper), a primitive is applied by its compilation's
+-- `applier`, on the path the host bridge binds.
+local primitive_object = meta with
+    tostring = primitive -> primitive.name
+    call = function(primitive, ...)
+        if primitive.applier == nil then error(primitive.name .. " is applied inside an evaluation", 2) end
+        return primitive.applier(primitive, { ... })
+    end
+end
+local Primitive = getmetatable(primitive_object {})
+local primitive = |name, applier| -> primitive_object { .name, .applier }
 local is_primitive = value -> getmetatable value == Primitive
 
 return define

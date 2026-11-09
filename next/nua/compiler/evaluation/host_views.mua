@@ -26,11 +26,11 @@ local ffi_exact = |number, bits| -> number ~= nil and math.abs(number) < 2 ^ 53 
 return do(E, core)
     local fail, bridge = core.fail, core.bridge
 
-    local Staged
+    local staged
     local wrapped = setmetatable({}, { __mode = "k" })
     local wrap = do(value)
         if not is_native value then return value end
-        local view = setmetatable({}, Staged)
+        local view = staged {}
         wrapped[view] = value
         return view
     end
@@ -41,6 +41,12 @@ return do(E, core)
         if inner ~= nil then return inner end
         if check(types.Described, value) then return types.Described { type = value.type, value = unwrap(value.value) } end
         if check(types.Variant, value) then return types.Variant { sum = value.sum, alternative = value.alternative, payload = unwrap(value.payload) } end
+        -- an application made inside a hook keeps the values it was supplied, not their wrappers
+        if hosting.is_application value then
+            local supplied = {}
+            for index, argument in ipairs value.supplied do supplied[index] = unwrap argument end
+            return hosting.application(value.word, supplied)
+        end
         if getmetatable value == nil then
             local copy = {}
             for key, item in pairs value do copy[key] = unwrap item end
@@ -67,8 +73,9 @@ return do(E, core)
         end
     end
 
-    Staged = define
-        __index = do(view, key)
+    -- a staged host wrapper: Lua operations on it are evaluation operations
+    staged = meta with
+        index = do(view, key)
             local path = path_now()
             local value = wrapped[view]
             if lua_type key == "string" then
@@ -81,7 +88,7 @@ return do(E, core)
             end
             return wrap(E.element(path, value, unwrap key))
         end
-        __newindex = do(view, key, assigned)
+        newindex = do(view, key, assigned)
             local path = path_now()
             local value = wrapped[view]
             if lua_type key == "string" then
@@ -90,22 +97,22 @@ return do(E, core)
             end
             E.assign_index(path, value, unwrap key, unwrap assigned)
         end
-        __add = operator "add"
-        __sub = operator "subtract"
-        __mul = operator "multiply"
-        __div = operator "divide"
-        __mod = operator "remainder"
-        __unm = a -> wrap(E.operate(path_now(), "negate", unwrap a))
-        __eq = comparison "equal"
-        __lt = comparison "less"
-        __le = comparison "less_equal"
+        add = operator "add"
+        sub = operator "subtract"
+        mul = operator "multiply"
+        div = operator "divide"
+        mod = operator "remainder"
+        unm = a -> wrap(E.operate(path_now(), "negate", unwrap a))
+        eq = comparison "equal"
+        lt = comparison "less"
+        le = comparison "less_equal"
         -- Lua passes a call's arguments as varargs
-        __call = function(view, ...)
+        call = function(view, ...)
             local arguments = { ... }
             for index, argument in ipairs arguments do arguments[index] = unwrap argument end
             return wrap(E.apply(path_now(), wrapped[view], arguments, false))
         end
-        __tostring = view -> "staged " .. types.describe(wrapped[view].type)
+        tostring = view -> "staged " .. types.describe(wrapped[view].type)
     end
 
     -- a Lua function applied by the evaluation: its native arguments wrapped, the bridge bound
@@ -118,6 +125,14 @@ return do(E, core)
         local results = bridge.enter({ .path }, || -> pack(callee(unpack(given, 1, count))))
         for index = 1, results.n do results[index] = unwrap(results[index]) end
         return unpack(results, 1, results.n)
+    end
+
+    -- a primitive applied from Lua: on the path the bridge binds
+    E.host_primitive = do(primitive, arguments)
+        local binding = bridge.active()
+        if binding == nil then error(primitive.name .. " is applied inside an evaluation, not from top-level host code", 3) end
+        for index = 1, #arguments do arguments[index] = unwrap(arguments[index]) end
+        return wrap(E.apply(binding.path, primitive, arguments, false))
     end
 
     -- whether a native value is known while compiling, all of it
@@ -153,19 +168,15 @@ return do(E, core)
             return "adopt"
         end)
         local fragment = outcome { built = f -> f, discarded = || -> nil }
-        -- residual code: an instruction, or control other than the plain jumps of a known
-        -- return joining its continuation
-        for _, id in ipairs fragment.order do
-            local block = fragment.blocks[id]
-            local terminator = block.terminator
-            local plain = terminator == nil or data.Terminator.is(terminator, data.Jump) and #terminator.edge.arguments == 0
-            if #block.instructions > 0 or not plain then residual = true end
-        end
+        residual = not graph.residual_free fragment
         if residual or not known(value) then
             error(("%s:%d: %s is applied from host code with an argument not known while compiling (syntax §3.7)"):format(application.word.source or "?", application.word.line or 0, application.word.name), 0)
         end
         return value
     end
+
+    -- `is_known(v)`: whether a value is known while compiling (a Lua value always is)
+    E.is_known = value -> known(lua_type value == "table" and wrapped[value] or value)
 
     -- `host(v)`: the Lua value of a value known while compiling (syntax §3.7)
     E.host_value = do(value)

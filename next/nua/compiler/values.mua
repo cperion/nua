@@ -64,8 +64,11 @@ local UnitBits = struct {}
 local AggregateBits = struct { parts: list_of(NativeConstant) }
 local StaticBytes = struct { bytes: String }
 local SymbolAddress = struct { name: String, offset: Natural }
+-- a pointer into static bytes (a text literal's data): static data never changes, so a read
+-- of it is known
+local StaticAddress = struct { bytes: String, offset: Natural }
 local DefinitionAddress = struct { definition: DefinitionId }
-NativeConstant { IntegerBits, FloatBits, BooleanBit, UnitBits, AggregateBits, StaticBytes, SymbolAddress, DefinitionAddress }
+NativeConstant { IntegerBits, FloatBits, BooleanBit, UnitBits, AggregateBits, StaticBytes, SymbolAddress, StaticAddress, DefinitionAddress }
 
 local Operand = family "operand"
 local Constant = struct { type: NativeType, bits: NativeConstant }
@@ -148,6 +151,7 @@ return define
     .AggregateBits
     .StaticBytes
     .SymbolAddress
+    .StaticAddress
     .DefinitionAddress
     .Operand
     .Constant

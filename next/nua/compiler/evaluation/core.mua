@@ -91,8 +91,11 @@ return do(compilation, E, capabilities)
         path.writer.terminal_flow(path.block, facts.fork path.flow)
         path.writer.terminate(path.block, terminator)
     end
+    -- (a constant, an address into static data, has no facts of its own: only its borrow is
+    -- recorded)
     local remember_reference = do(path, operand, borrow)
         path.writer.borrow(compilation.borrows[borrow])
+        if Operand.is(operand, data.Constant) then return end
         path.writer.remember(operand, data.ValueInfo { type = operand.type, components = { [{}] = data.Borrowed { .borrow } }, proofs = {} })
     end
 

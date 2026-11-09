@@ -1,0 +1,136 @@
+-- Text views (syntax §14.1): a Lua string where a `Str` is expected is static text, known while
+-- compiling with its bytes and length (`Str.__cast`); the text words are Nua (lib/str.nua),
+-- so over known text they run while compiling and over a known needle they unroll.
+
+local ffi = require "ffi"
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+-- a Str argument from LuaJIT: its C layout is { data, length }
+local view_of_text = do(library_text, text)
+    local name = library_text:match("typedef struct (View_%d+) {")
+    local view = ffi.new(name)
+    view.data = ffi.cast("uint8_t *", text)
+    view.length = #text
+    return view
+end
+
+test "over known text the words run while compiling":
+    local compiled = compile.compile([[
+local count_words = do(s: Str): U32
+    local count: U32 = 0
+    s:split(" ") do(part)
+        if part.length > 0 then count = count + 1 end
+    end
+    return count
+end
+assert(host(count_words("the quick  brown fox")) == 4)
+local first = do(t: Str): U8 = t[0]
+assert(host(first "hello") == 104)
+local found = do(t: Str): U64
+    local result: U64 = 0
+    t:find("lo") {
+        at = do(i) result = i end,
+        missing = do() result = 99 end,
+    }
+    return result
+end
+assert(host(found "hello") == 3)
+local unused = do(): U32 = 0
+export unused
+]], "known_text.nua")
+    assert(compiled.program)
+end
+
+test "a known needle unrolls; the text words run on dynamic text":
+    local library, text = native("text_words", [[
+local text_is_world = do(name: Str): Bool = name:equals "world"
+export text_is_world
+local text_same = do(a: Str, b: Str): Bool = a:equals b
+export text_same
+local text_where = do(s: Str): U64
+    local at: U64 = 1000
+    s:find("ab") {
+        at = do(i) at = i end,
+        missing = do() at = 1000 end,
+    }
+    return at
+end
+export text_where
+local text_order = do(a: Str, b: Str): I32
+    local result: I32 = 0
+    a:compare(b) {
+        less = do() result = -1 end,
+        same = do() result = 0 end,
+        greater = do() result = 1 end,
+    }
+    return result
+end
+export text_order
+local text_trimmed = do(s: Str): U64 = (s:trim()).length
+export text_trimmed
+local text_number = do(s: Str): U32
+    local result: U32 = 7777
+    s:parse(U32) {
+        value = do(v) result = v end,
+        bad = do() result = 7777 end,
+    }
+    return result
+end
+export text_number
+local text_signed_number = do(s: Str): I32
+    local result: I32 = 0
+    s:parse(I32) {
+        value = do(v) result = v end,
+        bad = do() result = 12345 end,
+    }
+    return result
+end
+export text_signed_number
+local text_line_lengths = do(s: Str): U64
+    local total: U64 = 0
+    s:lines() do(line)
+        total = total * 100 + line.length
+    end
+    return total
+end
+export text_line_lengths
+local text_prefixed = do(s: Str): Bool = s:starts_with "nua" and s:ends_with ".c"
+export text_prefixed
+]])
+    local call = |word, ...| -> library[word](...)
+    local v = s -> view_of_text(text, s)
+    assert(call("text_is_world", v "world") == true and call("text_is_world", v "worle") == false and call("text_is_world", v "worlds") == false)
+    -- the known needle is compared byte by byte, with no loop over it
+    local is_world = text:match("bool text_is_world%(.-\n}")
+    assert(is_world:find("119u", 1, true) and is_world:find("100u", 1, true), is_world)
+    assert(call("text_same", v "abc", v "abc") == true and call("text_same", v "abc", v "abd") == false)
+    assert(call("text_where", v "xxab") == 2 and call("text_where", v "xxa") == 1000)
+    assert(call("text_order", v "abc", v "abd") == -1 and call("text_order", v "b", v "a") == 1 and call("text_order", v "ab", v "ab") == 0 and call("text_order", v "a", v "ab") == -1)
+    assert(call("text_trimmed", v "  hi \n") == 2)
+    assert(call("text_number", v "4294967295") == 4294967295 and call("text_number", v "4294967296") == 7777 and call("text_number", v "12a") == 7777)
+    assert(call("text_signed_number", v "-2147483648") == -2147483648 and call("text_signed_number", v "+17") == 17 and call("text_signed_number", v "-") == 12345)
+    assert(call("text_line_lengths", v "ab\ncde\n") == 203)
+    assert(call("text_prefixed", v "nua.c") == true and call("text_prefixed", v "lua.c") == false)
+end
+
+test "a text word's separator is one byte; an export is not named by a C keyword":
+    refuses([[
+local f = do(s: Str): U32
+    local n: U32 = 0
+    s:split(", ") do(part) n = n + 1 end
+    return n
+end
+export f
+]], "split separates at one byte")
+    refuses([[
+local signed = do(): U32 = 1
+export signed
+]], "the C name 'signed' is a C keyword")
+end

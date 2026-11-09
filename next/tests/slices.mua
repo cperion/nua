@@ -1,0 +1,101 @@
+-- Slices (syntax §12.2): the words of every view type are library Nua (lib/slice.nua) over the
+-- compiler's view primitives. Indexes and ranges are checked at run time, or refused while
+-- compiling when known to be outside; a read-only view is not a place to assign.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "a view's elements, length and sub-views, held or stored":
+    local library = native("slices_words", [[
+local total = do(values: Slice U32): U64
+    local sum: U64 = 0
+    local i: U64 = 0
+    while i < values.length do
+        sum = sum + U64(values[i])
+        i = i + 1
+    end
+    return sum
+end
+-- a held view of a Grow, sub-views of it, and a view crossing a native boundary (stored)
+local sums = do(n: U32): U64
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push i
+    end
+    local all = xs:all()
+    local middle = all:sub(1, all.length - 1)
+    local inner = middle:sub(1, 2)
+    return total(all) * 1000000 + (call total middle) * 1000 + U64(inner[0]) + inner.length
+end
+export sums
+-- a held view survives growth: it reads the new storage
+local grown = do(): U32
+    local xs = Grow(U32) { 1, 2 }
+    local head = xs:sub(0, 2)
+    for i: U32 = 1, 100 do
+        xs:push i
+    end
+    return head[0] * 10 + head[1] + U32(head.length) * 100
+end
+export grown
+-- an index of any unsigned type
+local narrow = do(i: U8): U32
+    local xs = Grow(U32) { 5, 6, 7 }
+    local all = xs:all()
+    return all[i]
+end
+export narrow
+]])
+    -- 1..10: all 55; middle [1, 9) is 2..9 = 44; inner [1, 2) of it is the one element 3
+    assert(library.sums(10) == 55 * 1000000 + 44 * 1000 + 3 + 1)
+    assert(library.grown() == 12 + 200)
+    assert(library.narrow(2) == 7)
+end
+
+test "a known index or range outside its view is refused while compiling; the rest checked when run":
+    refuses([[
+local f = do(): U32
+    local xs = Grow(U32) { 1, 2, 3 }
+    local all = xs:all()
+    local head = all:sub(0, 2)
+    return head[2]
+end
+export f
+]], "index-range: index 2 is outside a slice of length 2")
+    refuses([[
+local f = do(): U64
+    local xs = Grow(U32) { 1, 2, 3 }
+    local all = xs:all()
+    return (all:sub(2, 1)).length
+end
+export f
+]], "index-range: the range 2..1 is reversed")
+    refuses([[
+local f = do(i: I32): U32
+    local xs = Grow(U32) { 1 }
+    local all = xs:all()
+    return all[i]
+end
+export f
+]], "an index is an unsigned integer, not I32")
+    local _, text = native("slices_checked", [[
+local at = do(values: Slice U32, i: U64): U32 = values[i]
+export at
+]])
+    assert(text:find("slice index out of range", 1, true), text)
+end
+
+test "a read-only view is not a place to assign":
+    refuses([[
+local f = do(values: Slice U32): Unit
+    values[0] = 1
+end
+export f
+]], "not-a-place: a view is read-only")
+end

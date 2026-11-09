@@ -81,18 +81,18 @@ an aliased container slot is overwritten before the effect.
 known overwrite versus wildcard storage, aliasing, recursive/nonreturning groups and independent
 verifier replay after callee mutation. The original clear–store–clear stale-view probe is now
 refused; storing a fresh view after the final clear is accepted. Latest full check:
-**`make test-next`: 177 passed, 0 failed.**
+**`make test-next`: 183 passed, 0 failed.**
 
 ## Design-to-source gap inventory
 
 | Area | Present | Remaining obligation |
 |---|---|---|
 | Hosting/evaluation | Mua host, partial supply, saturated host application (in place under the host bridge, fully known from top-level code), staged host wrappers, `host`/`type_of`, known/residual scalars, records, control, direct calls; methods and hooks of native types (§8, §16) with library-registered families | Rest supply, hosted callbacks/protected propagation, capture/dependency validation, bridge signals (reconsideration/termination through hooks); replace remaining ad-hoc activity outcomes with the specified protocols |
-| Borrow flow | Held/stored selected-path joins, loop-carried references and views, nested-buffer paths, borrows of part of a place (`Ref s.field`, owner fields grown and replaced in place), explicit invalidation and real graph replay | Full stored-reference/aggregate transport, including held views through stored header references; lexical `LifetimeStart`/`LifetimeEnd` completion and escape checking |
+| Borrow flow | Derived borrows naming their source (inherited in replay), held/stored selected-path joins, loop-carried references and views, nested-buffer paths, borrows of part of a place (`Ref s.field`, owner fields grown and replaced in place), explicit invalidation and real graph replay | Full stored-reference/aggregate transport, including held views through stored header references; lexical `LifetimeStart`/`LifetimeEnd` completion and escape checking |
 | Memory provenance | Resident component facts, pointerless provenance, strong/weak stores, load state preservation, resident-local branch/loop agreement | Extend component transport/proofs to the remaining aggregate forms and storage mechanisms; complete alias/provenance validation |
 | Native boundaries | Ordered contracts and substitution, returned-borrow re-rooting, alias requirements, recursive CFG agreement, independent call replay | Complete interface-key/capture/dependency protocols, global/foreign/indirect boundaries, owning ABI/parameter-payload transport and remaining component-path coverage |
 | Owners/buffers | Nua allocator and moving buffer words; nested release and selected conditional moves; owner structs; partial moves (fields, payloads) through places, inline `Ref`s and callee contracts, joined and carried across loop rounds; replacement through any place | `finish`, initialized-prefix proofs, pinned storage, complete allocation-ledger and trap-recovery acceptance |
-| Language coverage | Sums and matching end to end, `Ref` handlers borrowing payloads in place; fixed-array and `Str` descriptors | Fixed arrays, static string literals and Nua Text words; descriptors alone are not implementations |
+| Language coverage | Sums and matching end to end, `Ref` handlers borrowing payloads in place; `Slice`/`Str` words in Nua (`lib/slice.nua`, `lib/str.nua`), static text literals folding while compiling | Branch proofs dropping proved checks (§12.2), owners lent to `Slice`/`Str` parameters, `Text`, `Chars(n)`, fixed arrays, `Str` words needing foreign calls (`parse(F64)`, `cstring`) and UTF-8 |
 | Preparation | Graph/type/lifetime checks on emitted C programs | Optimizer, budget insertion, complete effect/alias recomputation, `task_access`, `ready`, revision-matching readiness certificates |
 | Tasks/platform | Storage mapping/copy mechanisms | Native context/stack mechanisms, Nua scheduler/waits, foreign extents, task/channel/slot acceptance |
 | Backends/diagnostics | C for the implemented subset; source-line errors | Shared prepared-IR C/JIT adapters, structured related-location diagnostics and the full independent acceptance set |

@@ -159,6 +159,17 @@ local float_text = do(constant)
     if not text:find("[%.eEn]") then text = text .. ".0" end
     return single and text .. "f" or text
 end
+-- bytes as a C string literal: printable ASCII as itself, every other byte in octal (an octal
+-- escape takes at most three digits, so a following digit never joins it)
+local c_string = do(bytes)
+    local parts = {}
+    for index = 1, #bytes do
+        local byte = bytes:byte index
+        if byte >= 32 and byte < 127 and byte ~= 34 and byte ~= 92 and byte ~= 63 then parts[index] = string.char byte
+        else parts[index] = ("\\%03o"):format(byte) end
+    end
+    return '"' .. table.concat parts .. '"'
+end
 local unspelled_constant = do(bits, recurse, constant)
     if is_pointer_like constant.type then fail "a pointer constant other than null has no C spelling" end
     fail("a constant of " .. types.describe constant.type .. " has no C spelling yet")
@@ -178,6 +189,7 @@ local Constants = define
     end
     StaticBytes = unspelled_constant
     SymbolAddress = unspelled_constant
+    StaticAddress = |bits, recurse, constant| -> ("((%s)%s + %d)"):format(c_type constant.type, c_string bits.bytes, bits.offset)
     DefinitionAddress = unspelled_constant
 end
 local constant_bits_text = data.NativeConstant.pass "spell a constant in C" with ..Constants end

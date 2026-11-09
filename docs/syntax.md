@@ -408,7 +408,7 @@ uint32_t use(uint32_t x) {
 local answer = affine(4, 3, 10)
 ```
 
-Applied from host code with every argument known, the body is evaluated entirely at compile time and produces `Known(U32, 43)`. The result remains a typed known value inside the compiler rather than silently losing its native type; `host(answer)` returns the Lua number.
+Applied from host code with every argument known, the body is evaluated entirely at compile time and produces `Known(U32, 43)`. The result remains a typed known value inside the compiler rather than silently losing its native type; `host(answer)` returns the Lua number, and `is_known(v)` says whether a value is known. Applied from a hook or host helper running inside an evaluation, a saturated word is evaluated in place on its caller's path instead, and residualizes with it.
 
 Applying a word from host code with an argument that is not known is an error: there is no native function for the dynamic remainder to live in.
 
@@ -2067,7 +2067,7 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 
 A view is read-only: `s[i] = v` is rejected (`not-a-place`); writes go through the storage or a `Ptr`. Slices cannot be compared. Slices are borrows, like `Ref`: a struct field, an element or a payload may hold one, checked by the lifetime rule (§9.4, §9.5).
 
-**Checks and binding times.** Internally a slice is a two-field struct, so the evaluator tracks its length apart from its pointer. A **known index against a known length is checked at compile time** (`index-range`) and costs nothing at run time; anything else is one check when it runs (the `slice.index` word of [lib/slice.nua](../lib/slice.nua), a trap on failure). `s:sub(a, b)` with known bounds produces a slice whose **length is known**, after one range check. So the idiom for formats is to take the whole header once, then read at constant offsets with no further checks.
+**Checks and binding times.** Internally a slice is a two-field struct, so the evaluator tracks its length apart from its pointer. The words of every view type are Nua (`lib/slice.nua`, served once per family), over three compiler primitives that check nothing and keep the view's borrow: `view_length s`, `view_element_of(s, i)` (the element's place) and `subview_of(s, first, count)`. A **known index against a known length is checked at compile time** (`index-range`) and costs nothing at run time; anything else is one check when it runs (the `slice.index` word of [lib/slice.nua](../lib/slice.nua), a trap on failure). `s:sub(a, b)` with known bounds produces a slice whose **length is known**, after one range check. So the idiom for formats is to take the whole header once, then read at constant offsets with no further checks.
 
 ### 12.3 Describe, then run: a binary format
 
@@ -2225,7 +2225,7 @@ Three types, one per role: views obey their contents lifetimes, resizable storag
 
 ### 14.1 Str
 
-`Str` is to text what `Slice U8` is to bytes: `{ptr, len}` in C, `s.length`, a checked `s[i]` (a `U8`), `s:sub(a, b)`, and the same lifetime rules. A Lua string where a `Str` is expected is a literal, known while compiling, and so are its bytes and its length. Text is compared with words, not operators.
+`Str` is to text what `Slice U8` is to bytes: `{ptr, len}` in C, `s.length`, a checked `s[i]` (a `U8`), `s:sub(a, b)`, and the same lifetime rules. A Lua string where a `Str` is expected is a literal, known while compiling, and so are its bytes and its length: `Str.__cast` makes it static text with the `static_text` primitive, a constant view of static data that borrows nothing that ends (§9.5); a read of static data is known. Text is compared with words, not operators.
 
 | Word | Gives |
 |---|---|

@@ -187,8 +187,19 @@ local replaying = do(program, definition, published, analysis, report)
     -- an inherited borrow must keep the state arriving on the actual CFG edges.
     local acquire = do(state, snapshot)
         if snapshot == nil then return end
-        for id, borrow_state in pairs snapshot.borrows do
-            if not state.observed[id] and (state.previous == nil or state.previous.borrows[id] == nil) then state.flow.borrows[id] = borrow_state end
+        local acquired = {}
+        for id in pairs snapshot.borrows do
+            if not state.observed[id] and (state.previous == nil or state.previous.borrows[id] == nil) then acquired[id] = true end
+        end
+        for id in pairs acquired do
+            local borrow_state = snapshot.borrows[id]
+            -- a borrow derived from one acquired before it is acquired by using that source: it
+            -- starts in the state the source has here, not the one its snapshot recorded (a
+            -- source acquired at this same site has its snapshot's state)
+            local source = registry[id] and registry[id].source
+            local source_state = source and not acquired[source] and state.flow.borrows[source]
+            if source_state and BorrowState.is(source_state, data.Ended) then borrow_state = source_state end
+            state.flow.borrows[id] = borrow_state
         end
         state.previous = snapshot
     end

@@ -11,15 +11,9 @@
 
 local allocator = import "allocator"
 
-local made = {}
+local index = import "index"
 
--- an index is any unsigned integer type (syntax §9.12), or a Lua number known while compiling:
--- checked here, while specializing; a signed index is refused
-local unsigned_index = do(index)
-    local index_type = type_of index
-    if index_type == nil then return end
-    if index_type.signed ~= false then error(("an index is an unsigned integer, not %s"):format(tostring(index_type.name)), 0) end
-end
+local made = {}
 
 local words = do(T)
     if made[T] then return made[T] end
@@ -59,11 +53,11 @@ local words = do(T)
 
     -- `b[i]` is the element's place (syntax §9.12, §16): its index checked at every use; an
     -- element is read as a copy, or, when it owns storage, by reference
-    local element = do(self: Ref B, index): Ref T
-        unsigned_index index
-        local at = U64 index
-        if at >= self.length then trap "index out of range" end
-        return element_of(self, at)
+    local element = do(self: Ref B, at): Ref T
+        index.unsigned at
+        local i = U64 at
+        if i >= self.length then trap "index out of range" end
+        return element_of(self, i)
     end
 
     -- release the elements from `first` up to the length (only for elements that own storage)

@@ -45,9 +45,14 @@ local constant_key_of_bits = data.NativeConstant.pass "a known constant in a def
     FloatBits = |bits, recurse, constant| -> ("%.17g"):format(bits.value)
     BooleanBit = |bits, recurse, constant| -> tostring bits.value
     UnitBits = |bits, recurse, constant| -> "unit"
-    AggregateBits = unkeyed
+    AggregateBits = do(bits, recurse, constant)
+        local parts = {}
+        for index, part in ipairs bits.parts do parts[index] = recurse(part, constant) end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
     StaticBytes = unkeyed
     SymbolAddress = unkeyed
+    StaticAddress = |bits, recurse, constant| -> ("static:%d:%q"):format(bits.offset, bits.bytes)
     DefinitionAddress = unkeyed
 end
 local constant_key = constant -> constant_key_of_bits(constant.bits, constant)

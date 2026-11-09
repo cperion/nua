@@ -50,6 +50,13 @@ local prelude = define
     size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
 end
 
+-- the words C reserves: an export cannot be named by one
+local c_keywords = {}
+for keyword in ([[auto break case char const continue default do double else enum extern float for goto
+if inline int long register restrict return short signed sizeof static struct switch typedef union
+unsigned void volatile while _Bool _Complex _Imaginary _Alignas _Alignof _Atomic _Generic _Noreturn
+_Static_assert _Thread_local bool true false]]):gmatch("%S+") do c_keywords[keyword] = true end
+
 -- the compilation: the data every activity of one compilation shares (compiler activities
 -- §1.1): its identity supply, places, borrows, exports and the origins of source positions
 local new_compilation = do()
@@ -112,6 +119,9 @@ local hosting_environment = do(compilation, filename, E)
             if not (hosting.is_word value or hosting.is_application value) then
                 error(("%s:%d: export needs a word, got %s"):format(filename, line, tostring value), 0)
             end
+            if c_keywords[c_name] then
+                error(("%s:%d: the C name '%s' is a C keyword: export it as another name (export %s as \"...\")"):format(filename, line, c_name, c_name), 0)
+            end
             compilation.exports[#compilation.exports + 1] = { .value, .c_name, .line }
         end
     end
@@ -135,7 +145,7 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop" } do environment[name] = hosting.primitive name end
+    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text" } do environment[name] = hosting.primitive(name, E.host_primitive) end
     environment.owns = types.owns
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
     environment.family = types.define_family
@@ -143,6 +153,7 @@ local hosting_environment = do(compilation, filename, E)
     -- native type (syntax §2.2)
     environment.host = E.host_value
     environment.type_of = E.type_of
+    environment.is_known = E.is_known
     return environment, load_nua
 end
 
@@ -212,6 +223,8 @@ local compiling_with_members = do(source, filename)
     -- the words of buffers of each element type, from the Nua library
     -- the built-in kinds the Nua library serves register their members (syntax §16.1)
     environment.import "buffer"
+    environment.import "slice"
+    environment.import "str"
     load_nua(source, filename)
 
     local exports = {}

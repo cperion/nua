@@ -188,6 +188,8 @@ local nan_bits = do(bits, width)
 end
 local fold_reinterpret = do(result, argument)
     local source = argument.type
+    -- an address into static data is the same address as another pointer or reference
+    if data.NativeConstant.is(argument.bits, data.StaticAddress) then return FoldingDecision.folded(argument.bits) end
     if is_float source and argument.bits.value ~= argument.bits.value then return FoldingDecision.not_foldable() end
     if is_integer source and is_float result and nan_bits(argument.bits.bits, result.bits) then return FoldingDecision.not_foldable() end
     if is_float source and is_integer result then
@@ -353,6 +355,16 @@ local Opcodes = define
             if not is_pointer(arguments[1]) or not is_integer(arguments[2]) then return "pointer_offset takes a pointer and an integer" end
             return result ~= arguments[1] and "pointer_offset yields its pointer's type" or nil
         end
+        -- an address into static data moves within it, by elements of its pointer's target
+        all = do(result, arguments)
+            local base, count = arguments[1], arguments[2]
+            if not data.NativeConstant.is(base.bits, data.StaticAddress) then return FoldingDecision.not_foldable() end
+            local size = types.layout(result.target, { pointer_bits = 64 }).size
+            local elements = count.type.signed and tonumber(ffi.cast("int64_t", count.bits.bits)) or tonumber(count.bits.bits)
+            local offset = base.bits.offset + elements * size
+            if offset < 0 or offset > #base.bits.bytes then return invalid "an address past the static data it points into" end
+            return FoldingDecision.folded(data.StaticAddress { bytes = base.bits.bytes, .offset })
+        end
     end
     pointer_difference = define
         operands = 2
@@ -382,6 +394,7 @@ local fold = do(opcode, result, arguments)
     end
     local entry = Opcodes[opcode]
     if entry and entry.whole then return entry.whole(result, arguments[1]) end
+    if entry and entry.all then return entry.all(result, arguments) end
     local first = arguments[1].type
     if entry == nil or is_pointer first then return FoldingDecision.not_foldable() end
     local value_of = argument -> argument and argument.bits.value

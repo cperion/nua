@@ -99,7 +99,7 @@ return do(E, core)
         local origins = {}
         for _, origin in ipairs info.origins do origins[#origins + 1] = data.Access { place = origin.place, path = extend(origin.path) } end
         local held = do(base_path)
-            local part = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, steps = extend(base_path.steps), indices = base_path.indices }, info.mutable, info.lifetime, origin_of path)
+            local part = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, steps = extend(base_path.steps), indices = base_path.indices }, info.mutable, info.lifetime, origin_of path, reference.borrow)
             part = data.BorrowInfo { ..part, .origins }
             compilation.borrows[part.id] = part
             return data.Reference { type = part_type, borrow = part.id }
@@ -116,7 +116,7 @@ return do(E, core)
                 append(path, data.Address { site = site path, .result, place = place.id })
                 local address = data.Result { value = result, type = types.pointer field.type }
                 local operand = E.compute(path, "reinterpret", part_type, { E.bits(address.type, address) }).operand
-                local stored = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = data.Stored { pointer = operand }, .origins, acquired = origin_of path }
+                local stored = data.BorrowInfo { ..info, id = fresh identity.BorrowId, form = data.Stored { pointer = operand }, .origins, acquired = origin_of path, source = reference.borrow }
                 compilation.borrows[stored.id] = stored
                 path.flow.borrows[stored.id] = path.flow.borrows[reference.borrow]
                 remember_reference(path, operand, stored.id)
@@ -315,7 +315,7 @@ return do(E, core)
         indices[#indices + 1] = index.operand
         local element_type = reference.type.target.element
         local base_info = compilation.borrows[reference.borrow]
-        local info = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, .steps, .indices }, true, base_info.lifetime, origin_of path)
+        local info = tracking.borrow(path.flow, data.BorrowPath { root = base_path.root, .steps, .indices }, true, base_info.lifetime, origin_of path, reference.borrow)
         local origins = {}
         for _, origin in ipairs base_info.origins do
             local extended = {}

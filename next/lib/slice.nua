@@ -1,0 +1,67 @@
+-- Slices (syntax §12.2): the words of every `Slice T`, `Slice.mut T` and `Str`, served once per
+-- family. A view is a pointer and a U64 length; the compiler supplies only the primitives
+-- over its borrow (`view_length`, `view_element_of`, `subview_of`), which check nothing. These
+-- words check every index and range: at run time, or while compiling when the index and the
+-- length are known (`index-range`), so the check costs nothing then.
+
+local index = import "index"
+
+local made = setmetatable({}, { __mode = "k" })
+
+local words = do(T, V)
+    if made[V] then return made[V] end
+
+    -- `s[i]`: the element's place, its index checked
+    local element = do(self: V, at): Ref T
+        index.unsigned at
+        local i = U64 at
+        local length = view_length self
+        local outside = i >= length
+        index.refuse_known(outside, ("index-range: index %s is outside a slice of length %s"):format(index.shown i, index.shown length))
+        if outside then trap "slice index out of range" end
+        return view_element_of(self, i)
+    end
+
+    -- `s:sub(a, b)`: the view of `[a, b)`, checked
+    local sub = do(self: V, first, limit): V
+        index.unsigned first
+        index.unsigned limit
+        local a = U64 first
+        local b = U64 limit
+        local length = view_length self
+        local reversed = a > b
+        local beyond = b > length
+        index.refuse_known(reversed, ("index-range: the range %s..%s is reversed"):format(index.shown a, index.shown b))
+        index.refuse_known(beyond, ("index-range: the range %s..%s is outside a slice of length %s"):format(index.shown a, index.shown b, index.shown length))
+        if reversed then trap "slice range out of bounds" end
+        if beyond then trap "slice range out of bounds" end
+        return subview_of(self, a, b - a)
+    end
+
+    -- `s.length`
+    local member = do(self, name)
+        if name == "length" then return view_length self end
+        return nil
+    end
+
+    local members = define
+        __index = element
+        __member = member
+        .sub
+    end
+    -- a read-only view is not a place to assign (`not-a-place`); a `Slice.mut` is
+    if not V.mutable then
+        members.__newindex = do(self, at, value)
+            error("not-a-place: a view is read-only; write through its storage or a Ptr", 0)
+        end
+    end
+    made[V] = members
+    return members
+end
+
+-- the members of every view type (syntax §16.1: served once per family)
+family(Slice, |element, view_type| -> words(element, view_type))
+
+return define
+    .words
+end

@@ -24,16 +24,12 @@ local lua_type = type
 return do(E, core)
     local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
+    -- `#x`: a Lua value's length; a native value's member `length`
     E.length = do(path, base)
         if path.dead then return nil end
-        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
-        if E.is_view value then
-            local _, count = E.view_parts(path, value)
-            return count
-        end
-        if E.is_aggregate value and E.is_buffer value.type then return E.part(path, value, "length") end
-        if not is_native value and lua_type value == "table" then return #value end
-        fail(path, "'#' of this value is not available yet")
+        local value = E.is_cell base and E.peek(path, base) or base
+        if not is_native value and (lua_type value == "table" or lua_type value == "string") then return #value end
+        return E.dot(path, base, "length")
     end
 
     -- the reference a primitive is given: a cell's value, or the reference itself
@@ -59,6 +55,10 @@ return do(E, core)
             E.initialize_reference(path, element, arguments[3], "an element")
         end
         view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3])
+        static_text = |path, arguments, boundary| -> E.static_text(path, arguments[1])
+        view_length = |path, arguments, boundary| -> E.view_length(path, E.deref(path, reference_argument(path, arguments[1])))
+        view_element_of = |path, arguments, boundary| -> E.view_element_of(path, E.deref(path, reference_argument(path, arguments[1])), arguments[2])
+        subview_of = |path, arguments, boundary| -> E.subview_of(path, E.deref(path, reference_argument(path, arguments[1])), arguments[2], arguments[3])
         -- `drop(r)`: release what a reference reaches; a local it reaches is moved
         drop = do(path, arguments, boundary)
             local reference = reference_argument(path, arguments[1])
@@ -218,10 +218,6 @@ return do(E, core)
         -- syntax §16.3: the `__member` hook, then a field, then a method
         local found = E.member_hook(path, place, base, name)
         if found ~= nil then return found end
-        if E.is_view base and name == "length" then
-            local _, count = E.view_parts(path, base)
-            return count
-        end
         if E.is_aggregate base and E.field_of(base.type, name) then return E.part(path, base, name) end
         local method = E.member_value(path, place, base, name)
         if method ~= nil then return method end
@@ -247,6 +243,12 @@ return do(E, core)
         return place
     end
     E.load = do(path, place)
+        -- a byte of static data is known: static data never changes
+        local pointer = place.root.pointer
+        if pointer and #place.path == 0 and Operand.is(pointer, data.Constant) and data.NativeConstant.is(pointer.bits, data.StaticAddress)
+            and rules.is_integer place.type and place.type.bits == 8 and pointer.bits.offset < #pointer.bits.bytes then
+            return E.known(rules.integer(place.type, pointer.bits.bytes:byte(pointer.bits.offset + 1)))
+        end
         local result = fresh identity.ValueId
         append(path, data.Load { site = site path, .result, place = place.id })
         local operand = data.Result { value = result, type = place.type }
@@ -266,7 +268,6 @@ return do(E, core)
         local place = E.raw_place(path, base, key)
         if place then return E.load(path, place) end
         local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
-        if E.is_view value then return E.view_element(path, value, key) end
         -- the type's `__index` hook (syntax §16)
         if is_native value then
             local found = E.index_member(path, base, value, key)

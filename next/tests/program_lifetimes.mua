@@ -95,10 +95,14 @@ test "the verifier distinguishes stored and held borrows in real program facts":
     for id, facts in pairs compiled.analysis.definitions do
         local borrows = {}
         for borrow, info in pairs facts.borrows do borrows[borrow] = info end
+        -- the borrows indirect places go through, and the borrows they are derived from (a
+        -- view an element is read through): forged stored, growth must end them
         for _, place in pairs compiled.program.definitions[id].places do
             if data.PlaceRoot.is(place.root, data.IndirectRoot) then
                 local info = borrows[place.root.borrow]
                 borrows[info.id] = data.BorrowInfo { ..info, form = data.Stored { pointer = place.root.pointer } }
+                local source = info.source and borrows[info.source]
+                if source then borrows[source.id] = data.BorrowInfo { ..source, form = data.Stored { pointer = place.root.pointer } } end
                 changed = true
             end
         end

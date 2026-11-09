@@ -1,0 +1,25 @@
+-- Indexes and ranges (syntax §9.12, §12.2): what the element words of buffers and views share,
+-- checked while specializing. An index is any unsigned integer type, or a Lua number known
+-- while compiling; what is known to be outside its storage is refused while compiling, and
+-- the words trap at run time for the rest.
+
+-- a signed index is refused
+local unsigned = do(index)
+    local index_type = type_of index
+    if index_type == nil then return end
+    if index_type.signed ~= false then error(("an index is an unsigned integer, not %s"):format(tostring(index_type.name)), 0) end
+end
+
+-- the text of a value known while compiling, for a refusal
+local shown = value -> is_known value and tostring(host value) or "?"
+
+-- `outside`, when known to hold, refuses the access while compiling
+local refuse_known = do(outside, message)
+    if is_known outside and host outside then error(message, 0) end
+end
+
+return define
+    .unsigned
+    .shown
+    .refuse_known
+end

@@ -229,7 +229,8 @@ BorrowPath   { root: PlaceId, steps: AccessPath, indices: List Operand,
                range: Option Range }
 Range        { first: Operand, count: Operand }
 BorrowInfo   { id: BorrowId, form: BorrowForm, origins: List Access,
-               mutable: Bool, lifetime: LifetimeId, acquired: OriginId }
+               mutable: Bool, lifetime: LifetimeId, acquired: OriginId,
+               source: Option BorrowId }
 BorrowForm   = Held(path: BorrowPath)
              | Stored(pointer: Option Operand)
              | Selected(selector: Operand, alternatives: List BorrowAlternative)
@@ -252,6 +253,11 @@ shortest owner lifetime among the origins, checked by the lifetime rule (syntax 
 | owner moved out of, replaced in or released from a place | `Ended(Moved / Replaced / Released)` | same |
 
 Using an `Ended` borrow is a diagnostic naming the event and the use.
+
+A borrow derived from another (an element of a view, a part or element of a reference,
+a sub-view) names it as its `source`. Acquiring it uses the source: it starts in the state
+the source has there, in evaluation and in independent replay alike, so a stale view is
+refused where an element is read through it even when the element's borrow is new.
 
 **Approved selected-path amendment.** A local control join does not turn a held borrow
 into a stored pointer. `Selected` preserves the finite alternatives and a zero-based U64
