@@ -128,7 +128,9 @@ local WordInfo = struct { id: WordId, name: String, requirements: list_of(Requir
 local Program = struct {
     revision: Natural, definitions: map_of(DefinitionId, Definition), words: map_of(WordId, WordInfo),
     globals: map_of(GlobalId, Global), exports: list_of(Export), lifetimes: map_of(LifetimeId, Lifetime),
-    origins: map_of(OriginId, Origin), headers: Optional(Table)
+    origins: map_of(OriginId, Origin), headers: Optional(Table),
+    -- the scheduler's budget word, when the program uses tasks (tasks §1; compiler activities §7.3)
+    budget_service: Optional(DefinitionId)
 }
 
 return define

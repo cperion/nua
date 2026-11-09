@@ -146,6 +146,9 @@ return do(E, core)
             append(path, data.Store { site = site path, place = cell.place.id, value = E.materialize(path, stored) })
         end
         HostCell = do(cell, recurse, path, value)
+            if cell.copied then
+                fail(path, ("'%s' is a copy taken when its block was detached; the block cannot assign it (declare a local to change it)"):format(cell.name))
+            end
             if path.depth > cell.depth and not is_native value and value ~= cell.value then
                 fail(path, ("the host binding '%s' cannot be rebound under dynamic control"):format(cell.name))
             end

@@ -57,7 +57,7 @@ local brand_of = do(value)
     end
     return nil
 end
-local Identity = checker("identity", value -> brand_of value ~= nil)
+local Identity = checker "identity" (value -> brand_of value ~= nil)
 
 -- compilations are numbered in this process only; a compilation's identities never meet
 -- another's

@@ -1,0 +1,111 @@
+-- Budget coverage (compiler activities §7.3 step 3; tasks §1): in a program that uses tasks, every
+-- residual loop charges the running task's budget once a round, so a task that never waits still
+-- lets the others run. A `Budget` point goes at the end of each block with a back edge (an edge to
+-- a block that dominates it) and calls the scheduler's budget word, which returns at once in plain
+-- code. A program that never switches context has no budget points and no budget word.
+--
+--   cover(program, analysis) -> program, analysis   the points placed, facts recomputed
+--   problems(program)                               a back edge without a point, or a stray point
+
+local identity = require "nua.identity"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local verify = require "nua.compiler.verify"
+local analysis_module = require "nua.compiler.analysis"
+local boundaries = require "nua.compiler.boundaries"
+
+local Instruction = data.Instruction
+
+-- whether anything but the budget word switches context: only then is there a task to charge
+local switches = do(program)
+    for id, definition in pairs program.definitions do
+        if id ~= program.budget_service then
+            for _, block in ipairs definition.blocks do
+                for _, instruction in ipairs block.instructions do
+                    if Instruction.is(instruction, data.Mechanism) and instruction.binding == "context_switch" then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- the blocks of a definition that end with a back edge
+local looping_blocks = do(definition)
+    local by_id = {}
+    for _, block in ipairs definition.blocks do by_id[block.id] = block end
+    local dominates = verify.dominators_of(definition, by_id)
+    local looping = {}
+    for _, block in ipairs definition.blocks do
+        for _, edge in ipairs(graph.edges_of block.terminator) do
+            if dominates(edge.target, block.id) then looping[block.id] = true end
+        end
+    end
+    return looping
+end
+
+local has_budget = do(block)
+    for _, instruction in ipairs block.instructions do
+        if Instruction.is(instruction, data.Budget) then return true end
+    end
+    return false
+end
+
+local cover = do(program, analysis)
+    local service = program.budget_service
+    if service == nil then return program, analysis end
+    local definitions = {}
+    for id, definition in pairs program.definitions do definitions[id] = definition end
+    if not switches program then
+        definitions[service] = nil
+        program = data.Program { ..program, revision = program.revision + 1, .definitions, budget_service = nil }
+    else
+        local supply = identity.supply()
+        for id, definition in pairs program.definitions do
+            if id ~= service then
+                local looping = looping_blocks definition
+                if next(looping) then
+                    local blocks = {}
+                    for position, block in ipairs definition.blocks do
+                        blocks[position] = block
+                        if looping[block.id] and not has_budget block then
+                            local instructions = {}
+                            for index, instruction in ipairs block.instructions do instructions[index] = instruction end
+                            instructions[#instructions + 1] = data.Budget { site = data.Site { id = supply.fresh identity.InstructionId, origin = block.terminator.origin }, reason = "loop_edge" }
+                            blocks[position] = data.Block { ..block, .instructions }
+                        end
+                    end
+                    definitions[id] = data.Definition { ..definition, .blocks }
+                end
+            end
+        end
+        program = data.Program { ..program, revision = program.revision + 1, .definitions }
+    end
+    local facts, contracts = {}, {}
+    for id, definition in pairs program.definitions do
+        facts[id] = analysis_module.recompute(definition, analysis.definitions[id], nil)
+        contracts[id] = boundaries.project(definition, facts[id], program.revision)
+    end
+    return program, data.Analysis { revision = program.revision, definitions = facts, .contracts }
+end
+
+local problems = do(program)
+    local found = {}
+    local report = do(definition, message)
+        found[#found + 1] = verify.Problem { verifier = "ready", definition = definition.id, .message, origin = definition.origin }
+    end
+    for id, definition in pairs program.definitions do
+        local looping = program.budget_service and id ~= program.budget_service and looping_blocks definition or {}
+        for _, block in ipairs definition.blocks do
+            local budgeted = has_budget block
+            if looping[block.id] and not budgeted then report(definition, "a loop has no budget point") end
+            if budgeted and not program.budget_service then report(definition, "a budget point has no budget word") end
+        end
+    end
+    return found
+end
+
+return define
+    .cover
+    .problems
+end

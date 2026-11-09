@@ -27,11 +27,11 @@ stays until cutover.
 pushed. The top two changes are the optimizer's and the libgccjit backend's, on top of `pqumypyu`. `master` has
 not moved.
 
-**Mua pin.** `tools/mua.lock` pins commit `50a7a86`, which exists only on branch
-`struct-member-fallback` of `~/dev/mua-member`. The push was blocked in the last session, so a
-fresh `make mua` from GitHub cannot find that commit until you run
-`git -C ~/dev/mua-member push origin struct-member-fallback`. Until then, install with
-`MUA_URL_OVERRIDE=$HOME/dev/mua-member make mua`.
+**Mua pin.** `tools/mua.lock` pins Mua `2eaac12`, pushed to `cperion/mua` `master`: labels and
+descriptions (`label`, `label_of`, `describe`, `description_of`, `mua outline`), the curried
+`checker`, the `test` word and `mua test`, struct `__index`/`__newindex` fallbacks and
+metamethods, the debugging words (`trace`, `inspect`, `trace_through`, `inspect_through`) and the
+labeled vocabularies `testing`, `debugging`, `contracts`. `make mua` installs it from GitHub.
 
 ## How to work in this repository
 
@@ -271,6 +271,63 @@ against this model.
    and `DefinitionKind` has `task_entry_word`).
 5. The `task_access` verifier: parameter, global and callback origins over the reachable call
    graph.
+
+**Built, first stage** (jj change `ruytnxyw`): `lib/tasks.nua` (scheduler, `tasks:`, `spawn`,
+channels with `send`, `recv`, `close`, `each`, deadlock diagnosis), the context mechanisms in
+`nua/compiler/platform.mua` (x86-64 assembly both backends emit beside the program), guarded
+stacks in `lib/platform.nua`, the `spawn do ... end` rewrite in `nua/front.mua`, and
+`tests/tasks.mua`. One executor: tasks run on the thread of the plain code that opened their
+scope, and that code's waits run the scheduler loop.
+
+- **`detach block`** is the general primitive under `spawn` (syntax §20.2). Every untyped lambda
+  binds each outer name it mentions through `E.captured` at its top: in place that is the outer
+  binding, detached it is the captured argument (a copy refuses assignment). Opened contexts
+  are captured like names: by value, opened again inside; one reached by a borrow is
+  unreachable. `tasks:` opens a value (`Tasks`, a handle on the scope), so tasks spawn and make
+  channels in their own scope. Owners move into the task; borrows are refused. `spawn` is a
+  plain word of `lib/tasks.nua`; the task entry moves its captures out of the start record with
+  `take p 0`, which now also takes the value at a raw pointer.
+- **Shared state is raw memory.** Scope, task records, waiters and channel records are reached
+  through pointers, where the evaluator keeps no facts, so nothing read after a switch is folded
+  from before it. Keep it that way for anything another task writes.
+- **Allocator words have no loops** (`class_of` is unrolled while compiling), so the shared
+  per-executor storage context is never entered twice (tasks §1).
+
+- **Budget points** (`nua/compiler/budgets.mua`): in a program that switches context, preparation
+  puts a `Budget` at the end of every block with a back edge, and both backends call the
+  scheduler's loop-free `budget_service` there (`Program.budget_service`). It yields every 1024
+  rounds. A program without tasks gets neither. `tasks` is imported only when a source names it.
+  Known recursive call cycles do not charge on entry yet.
+
+- **`first_of` and timers** follow describe-then-run (Mua's design guide §11): `recv ch do(v) ... end`,
+  `send ch v do ... end` and `after d do ... end` are words returning keyed case data, and one
+  engine attempts them from a rotating start, runs `closed`/`default`, or waits on every case.
+  Waiters are doubly linked; the first counterpart to complete a selection's waiter claims it
+  and withdraws the others (`complete`). Timers are a deadline-ordered queue of the same
+  waiters; the scheduler sleeps until the next one, and reports a deadlock only with none. Channel
+  `send`/`recv` are `try_send`/`poll` plus `offer`/`listen`, so there is one engine. `sleep`, `ns`,
+  `us`, `ms`, `seconds` and `Duration` are words of the same library; `platform.now` reads the
+  monotonic clock.
+
+- **Pools and slots** (syntax §20.6): `pool(T, n)` in the `tasks:` vocabulary, `p:take()`,
+  `p[s]` (a checked `__index`), `p:release(s)`, `take p do(s) ... end` as a `first_of` case, and
+  `Slot T`. Each slot's entry holds its generation and its owner by task id (plain code is 1); a
+  stale, foreign or released slot traps. A slot sent on a channel is given by the sender and
+  adopted by the receiver; a losing offer takes it back. Slots inside records are not moved yet,
+  only a channel of `Slot T` itself. The internal primitive `take` is now `move_out`.
+
+- **Generational handles** (syntax §20.5): a channel or pool is reached through a `Header` from a
+  per-thread registry that never frees one. Its records go when the scope ends and the header's
+  generation moves on; `Chan`, `Pool` and `Slot` carry the generation they were made with, so a
+  handle kept past its scope traps (`a channel used after its tasks scope ended`). Headers are
+  reused. `Chan T` and `Pool T` name the handle types. Slots inside message fields move, and
+  `channel(T, n)` refuses an unsendable `T` naming the field (§20.9); `r[name]` with a name known
+  while compiling is the field `r.name`.
+
+**Still open, in order:** the copied-name and sendable-type
+refusals of §20.9 that need flow (a channel returned from its scope, a slot named after it was
+sent), `blocking`, workers, I/O by completion,
+`task_access`, and `TaskEntry` as the entry's ABI (the entry is a `nua_boundary` definition today).
 
 **Already in place to build on:** `Atomic T` and fences, `Global.policy` (`thread_local`,
 `unchecked_shared`, `thread_affine_owner`), pinned buffers (a stack is a pinned reservation),

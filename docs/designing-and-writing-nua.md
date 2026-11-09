@@ -1466,6 +1466,15 @@ end
 
 ## 20. Spelling forms
 
+**Arguments: the destination first.** A word that moves data names its destination before its
+source, as an assignment and Intel assembly do (syntax §3.4.1): `move_bytes destination source
+n`, `io.read (Ref buffer) file`, `io.write file text`. Calls are juxtaposed (`f a b`). Brackets
+only group: a compound argument (`io.read (Ref buffer) file`, `sleep (ms 5)`); a name before a
+string or table, which would otherwise call it (`io.write (pipe.writer) "abc"`); and a call a
+`with` match follows, which would otherwise match its last argument
+(`io.read(Ref buffer, file) with … end`).
+
+
 | Form | Use |
 |---|---|
 | juxtaposition | the default for safe application, including multiple arguments: `insert 5`, `apply document command`, `hash.init k0 k1`, `Ref draft` |

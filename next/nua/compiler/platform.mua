@@ -1,15 +1,107 @@
--- The platform mechanisms (compiler activities §3.2; buffers §3.4): what cannot be written in Nua,
--- each binding with its native signature and symbols. Applying one in a typed body emits a
--- `Mechanism` instruction. Storage needs none: lib/platform.nua is ordinary Nua over system calls.
--- What remains for this table is the task context switch, which is assembly.
+-- The platform mechanisms (compiler activities §3.2; buffers §3.4; tasks §4): what cannot be
+-- written in Nua, each binding with its native signature, its symbol, and the assembly that
+-- defines it. Applying one in a typed body emits a `Mechanism` instruction; a backend emits the
+-- assembly of the bindings a program reaches, beside the program, so a unit needs nothing of ours.
+-- Storage needs none of this: lib/platform.nua is ordinary Nua over system calls.
+--
+-- The task context (x86-64, System V): `context_initialize(top, entry, argument)` lays out a
+-- saved context on fresh stack storage, so that switching to it calls `entry(argument)`;
+-- `context_switch(save, load)` saves the callee-saved registers, the floating-point control
+-- words and the stack pointer into `save[0]`, and resumes the context `load`.
+
+local types = require "nua.types"
+
+local bytes = types.pointer types.U8
+local entry = types.function_type({ bytes }, types.Unit)
 
 local Mechanism = {}
 Mechanism.__index = Mechanism
 Mechanism.__tostring = mechanism -> "the mechanism " .. mechanism.name
 
-local bindings = {}
+local x86_64_context = [[
+.pushsection .text
+.p2align 4
+.globl nua_context_switch
+.hidden nua_context_switch
+.type nua_context_switch,@function
+nua_context_switch:
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    subq $8, %rsp
+    stmxcsr (%rsp)
+    fnstcw 4(%rsp)
+    movq %rsp, (%rdi)
+    movq %rsi, %rsp
+    ldmxcsr (%rsp)
+    fldcw 4(%rsp)
+    addq $8, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    popq %rbp
+    ret
+.size nua_context_switch, .-nua_context_switch
+.p2align 4
+.globl nua_context_initialize
+.hidden nua_context_initialize
+.type nua_context_initialize,@function
+nua_context_initialize:
+    movq %rdi, %rax
+    andq $-16, %rax
+    leaq nua_context_start(%rip), %rcx
+    movq %rcx, -8(%rax)
+    movq $0, -16(%rax)
+    movq $0, -24(%rax)
+    movq %rdx, -32(%rax)
+    movq %rsi, -40(%rax)
+    movq $0, -48(%rax)
+    movq $0, -56(%rax)
+    stmxcsr -64(%rax)
+    fnstcw -60(%rax)
+    subq $64, %rax
+    ret
+.size nua_context_initialize, .-nua_context_initialize
+.p2align 4
+.type nua_context_start,@function
+nua_context_start:
+    movq %r12, %rdi
+    callq *%r13
+    ud2
+.size nua_context_start, .-nua_context_start
+.popsection
+]]
+
+local declare = |name, parameters, result, assembly| -> setmetatable({ .name, .parameters, .result, c_symbol = "nua_" .. name, .assembly }, Mechanism)
+
+local bindings = define
+    context_initialize = declare("context_initialize", { bytes, entry, bytes }, bytes, x86_64_context)
+    context_switch = declare("context_switch", { types.pointer bytes, bytes }, types.Unit, x86_64_context)
+end
+
+-- the assembly texts of the bindings a program uses, each once, in a stable order
+local assembly_of = do(used)
+    local texts, seen = {}, {}
+    local names = {}
+    for name in pairs used do names[#names + 1] = name end
+    table.sort names
+    for _, name in ipairs names do
+        local text = bindings[name].assembly
+        if text and not seen[text] then
+            seen[text] = true
+            texts[#texts + 1] = text
+        end
+    end
+    return texts
+end
 
 return define
     .bindings
+    .assembly_of
     is_mechanism = value -> getmetatable value == Mechanism
 end

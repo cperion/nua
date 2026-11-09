@@ -16,7 +16,7 @@ local BlockId, EdgeId, InstructionId, ValueId = identity.BlockId, identity.EdgeI
 local PlaceId, BorrowId, LifetimeId, InvocationId = identity.PlaceId, identity.BorrowId, identity.LifetimeId, identity.InvocationId
 local GlobalId, OriginId, HostId, BoundaryId = identity.GlobalId, identity.OriginId, identity.HostId, identity.BoundaryId
 
-local Bits64 = checker("64 bits", value -> ffi.istype("uint64_t", value))
+local Bits64 = checker "64 bits" (value -> ffi.istype("uint64_t", value))
 
 ------------------------------------------------------------------------------------------------
 -- §2.1 Source, words and supply

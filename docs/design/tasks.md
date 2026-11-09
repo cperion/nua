@@ -8,8 +8,11 @@ implementation accompanies it.
 
 ## 1. A task and its stack
 
-A task owns a nonmoving native stack, a storage context ([buffers §3.2](buffers.md#32-allocation))
-and a fixed saved-context/run-state record. Its stack is a pinned reservation of bytes
+A task owns a nonmoving native stack and a fixed saved-context/run-state record. It
+allocates from the storage context ([buffers §3.2](buffers.md#32-allocation)) of its
+executor, which every task of that executor shares: an executor runs one task at a time,
+and an allocator word never contains a switch point (no wait, no budget point), so tasks
+never interleave inside it and no lock is needed. A finished task leaves nothing to merge. Its stack is a pinned reservation of bytes
 with a guard page, committed as it is touched; frames never move. Native words use
 their ordinary call/return ABI on that stack.
 

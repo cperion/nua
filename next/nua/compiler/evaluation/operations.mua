@@ -42,9 +42,14 @@ return do(E, core)
     local Primitives = define
         trap = |path, arguments, boundary| -> E.trap(path, arguments[1])
         element_of = |path, arguments, boundary| -> E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
-        -- `take(b, i)`: element `i`, outside the buffer's initialized prefix now, moved out
+        -- `move_out(b, i)`: element `i`, outside the buffer's initialized prefix now, moved out
         -- (the reading counterpart of `initialize`, for pop)
-        take = do(path, arguments, boundary)
+        -- `move_out(p, i)` of a raw pointer: the value at p[i] moves out under the raw contract, its
+        -- storage left uninitialized (a start record handed to a task)
+        move_out = do(path, arguments, boundary)
+            local first = arguments[1]
+            if E.is_cell first then first = E.peek(path, first) end
+            if is_native first and rules.is_pointer first.type then return E.load(path, E.raw_place(path, first, arguments[2])) end
             local element = E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
             return E.reached_value(path, E.reach(path, element))
         end
@@ -82,6 +87,7 @@ return do(E, core)
         -- `static_cstring(text)`: a Lua string as a known `CString`
         static_cstring = |path, arguments, boundary| -> E.known(data.Constant { type = types.CString, bits = data.StaticAddress { bytes = arguments[1], offset = 0 } })
         fnptr = |path, arguments, boundary| -> E.fnptr(path, arguments[1])
+        detach = |path, arguments, boundary| -> E.detach(path, arguments[1])
         atomic_operation = do(path, arguments, boundary)
             local given = {}
             for index = 4, #arguments do given[#given + 1] = arguments[index] end
@@ -309,6 +315,93 @@ return do(E, core)
         if method ~= nil then return method end
         fail(path, ("%s has no member '%s'"):format(types.describe base.type, name))
     end
+    -- `detach block` (syntax §20.2): the block taken off the code that wrote it. Every outer name
+    -- it mentions is captured now: a value known while compiling stays known, an owner moves, any
+    -- other value is copied into a record; a borrow is refused. Each context opened around it is
+    -- captured the same way and opened again inside, unless it is reached by a borrow: then the
+    -- block cannot reach it. The answer is that record's type, its value, and a word that runs the
+    -- block given the record, sharing nothing with this code.
+    E.unreachable_context = setmetatable({}, { __tostring = || -> "an opened context a detached block cannot reach" })
+    E.captured = do(path, position, outer)
+        local cell = path.invocation and path.invocation.arguments[position]
+        if cell == nil then return outer end
+        if cells.Cell.is(cell, cells.HostCell) then return cells.HostCell { ..cell, copied = true } end
+        return cell
+    end
+    E.captured_context = do(path, position, context)
+        local cell = path.invocation and path.invocation.arguments[position]
+        if cell == nil then return context end
+        if cells.Cell.is(cell, cells.HostCell) and cell.value == false then return E.unreachable_context end
+        if cells.Cell.is(cell, cells.HostCell) then cell = cells.HostCell { ..cell, copied = true } end
+        return E.open_context(path, cell)
+    end
+    E.detach = do(path, block)
+        local word, supplied = hosting.supplied_of block
+        if word == nil or word.captures == nil or #supplied > 0 then fail(path, "detach takes a block written in place: do ... end") end
+        local own = #word.requirements
+        local outer = word.captured()
+        local hosts, fields, natives = {}, { { name = "unused", type = types.U8 } }, { unused = 0 }
+        for index, name in ipairs word.captures do
+            local value = E.capture_argument(path, word, own + index, outer[index])
+            if is_native value and not E.is_known value then
+                if types.borrows value.type then
+                    fail(path, ("a detached block shares no memory: the outside name '%s' is a %s, which points into memory someone else owns; pass values"):format(name, types.describe value.type))
+                end
+                fields[#fields + 1] = { .name, type = value.type }
+                natives[name] = value
+            else
+                hosts[name] = { .value }
+            end
+        end
+        -- the contexts opened around it, captured by value, or unreachable through a borrow
+        local names = {}
+        for index, name in ipairs word.captures do names[index] = name end
+        for index, context in ipairs(word.opened and word.opened() or {}) do
+            local name = "opened_" .. index
+            names[#names + 1] = name
+            local base = context ~= E.unreachable_context and context.base
+            local value = base and (E.is_cell base and E.peek(path, base) or base)
+            if not value or E.is_reference value or (is_native value and types.borrows value.type) then
+                hosts[name] = { value = false }
+            elseif is_native value and not E.is_known value then
+                fields[#fields + 1] = { .name, type = value.type }
+                natives[name] = value
+            else
+                hosts[name] = { .value }
+            end
+        end
+        local Record = types.record("Captured", fields)
+        local values = E.construct_record(path, Record, natives)
+        -- the block with its captures as requirements of its own, and a flag that it is detached
+        local requirements = {}
+        for index, requirement in ipairs word.requirements do requirements[index] = requirement end
+        for _, name in ipairs names do requirements[#requirements + 1] = { .name } end
+        local released = hosting.word({ name = word.name, source = word.source, line = word.line, .requirements, result = word.result, body = word.body, tail_calls = word.tail_calls }, word.applier)
+        local own_requirements = {}
+        for index, requirement in ipairs word.requirements do own_requirements[index] = requirement end
+        own_requirements[#own_requirements + 1] = { name = "captured", type = Record }
+        local detached = hosting.word({ name = word.name .. " (detached)", source = word.source, line = word.line, requirements = own_requirements, result = word.result, body = do(evaluation, at)
+            local arguments = {}
+            for index = 1, own do arguments[index] = evaluation.capture_argument(at, released, index, evaluation.argument(at, index)) end
+            local record = evaluation.argument(at, own + 1)
+            for index, name in ipairs names do
+                local host = hosts[name]
+                if host then
+                    arguments[own + index] = host.value
+                else
+                    arguments[own + index] = evaluation.capture_argument(at, released, own + index, cells.FieldCell { base = record, .name })
+                end
+            end
+            local value = evaluation.invoke(at, released, arguments)
+            if value ~= nil then return evaluation.return_value(at, value) end
+            return evaluation.fall(at)
+        end }, word.applier)
+        return define
+            .Record
+            .values
+            word = detached
+        end
+    end
     -- the place `p[i]` names when `p` is a raw pointer: storage under the raw contract
     E.raw_place = do(path, base, key)
         if E.is_cell base then base = E.peek(path, base) end
@@ -356,6 +449,10 @@ return do(E, core)
         if place and (types.owns place.type or types.contains_atomic place.type) then return E.reference_to(path, cells.RawCell { .place, name = "a pointer's target" }) end
         if place then return E.load(path, place) end
         local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
+        -- `r[name]`, a name known while compiling, is the field `r.name`, as in Lua
+        if is_native value and lua_type key == "string" and types.NativeType.is(value.type, types.RecordType) and E.field_of(value.type, key) then
+            return E.dot(path, base, key)
+        end
         -- the type's `__index` hook (syntax §16)
         if is_native value then
             local found = E.index_member(path, base, value, key)
@@ -379,6 +476,10 @@ return do(E, core)
         if path.dead then return nil end
         local place = E.raw_place(path, base, key)
         if place then return cells.RawCell { .place, name = "an element" } end
+        if lua_type key == "string" then
+            local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
+            if is_native value and types.NativeType.is(value.type, types.RecordType) and E.field_of(value.type, key) then return E.member(path, base, key) end
+        end
         if E.has_element_members(path, base) then return cells.ElementCell { .base, .key, name = "an element" } end
         fail(path, "this has no element places to assign")
     end

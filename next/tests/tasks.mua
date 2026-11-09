@@ -1,0 +1,593 @@
+-- Tasks, scopes and channels (syntax §20; docs/design/tasks.md): each task on its own stack,
+-- every wait a context switch, the scheduler and the channels in Nua.
+
+local compile = require "nua.compile"
+local native = require "tests.support.native"
+
+test "a task runs on its own stack and the scope waits for it":
+    local library = native("tasks_join", [[
+local tasks_join = do(n: U32): U32
+    local total: U32 = 0
+    tasks:
+        local results = channel U32 4
+        spawn do
+            results:send(n * 2)
+        end
+        results:recv() with
+            value = do(v) total = v end
+            closed = do() total = 0 end
+        end
+    end
+    return total
+end
+export tasks_join
+]])
+    assert(library.tasks_join(21) == 42)
+end
+
+test "a pipeline through unbuffered and buffered channels":
+    local library = native("tasks_pipeline", [[
+local tasks_pipeline = do(n: U32): U64
+    local total: U64 = 0
+    tasks:
+        local numbers = channel U32 0
+        local squares = channel U64 2
+        spawn do
+            for i: U32 = 1, n do numbers:send i end
+            numbers:close()
+        end
+        spawn do
+            numbers:each do(v)
+                squares:send(U64 v * U64 v)
+            end
+            squares:close()
+        end
+        squares:each do(s)
+            total = total + s
+        end
+    end
+    return total
+end
+export tasks_pipeline
+]])
+    assert(library.tasks_pipeline(10) == 385)
+    assert(library.tasks_pipeline(1000) == 333833500)
+end
+
+test "a known value a task mentions stays known in it":
+    local library, text = native("tasks_known", [[
+local tasks_known = do(): U32
+    local got: U32 = 0
+    local factor = 7
+    tasks:
+        local out = channel U32 1
+        spawn do
+            out:send(factor * 6)
+            out:close()
+        end
+        out:each do(v) got = v end
+    end
+    return got
+end
+export tasks_known
+]])
+    assert(library.tasks_known() == 42)
+end
+
+-- a trap ends the process, so the deadlock runs in a child of its own
+local in_child = do(name, source, call)
+    native(name, source)
+    local script = ([[
+package.path = '.local/share/lua/5.1/?.lua;.local/share/lua/5.1/?/init.lua'
+local ffi = require 'ffi'
+ffi.cdef 'uint32_t %s(void);'
+ffi.load('build/next/lib%s.so').%s()
+]]):format(call, name, call)
+    local file = assert(io.open("build/next/" .. name .. ".lua", "w"))
+    file:write script
+    file:close()
+    local pipe = io.popen((".local/bin/luajit build/next/%s.lua 2>&1; printf '\\n__STATUS__%%d' $?"):format(name))
+    local output = pipe:read "*a"
+    pipe:close()
+    return output
+end
+
+test "a party no one can wake is a deadlock, diagnosed rather than hung":
+    local output = in_child("tasks_deadlock", [[
+local tasks_deadlock = do(): U32
+    local got: U32 = 0
+    tasks:
+        local never = channel U32 0
+        spawn do
+            never:send 1
+            never:send 2
+        end
+        never:recv() with
+            value = do(v) got = v end
+            closed = do() got = 0 end
+        end
+    end
+    return got
+end
+export tasks_deadlock
+]], "tasks_deadlock")
+    assert(output:find("nua: deadlock: every task is waiting", 1, true), output)
+    assert(not output:find("__STATUS__0", 1, true), output)
+end
+
+test "many tasks, each with its own stack, fan in to one channel":
+    local library = native("tasks_fan_in", [[
+local tasks_fan_in = do(): U64
+    local total: U64 = 0
+    tasks:
+        local results = channel U64 0
+        for worker = 1, 8 do
+            spawn do
+                for i: U32 = 1, 100 do results:send(U64 i * U64 worker) end
+            end
+        end
+        local remaining: U32 = 800
+        while remaining > 0 do
+            results:recv() with
+                value = do(v) total = total + v end
+                closed = do() remaining = 0 end
+            end
+            remaining = remaining - 1
+        end
+    end
+    return total
+end
+export tasks_fan_in
+]])
+    assert(library.tasks_fan_in() == 5050 * 36)
+end
+
+
+test "a task that never waits still lets the others run: every loop has a budget point":
+    local library, text = native("tasks_budget", [[
+local tasks_budget = do(rounds: U32): U32
+    local first: U32 = 0
+    tasks:
+        local results = channel U32 0
+        spawn do
+            local sum: U32 = 0
+            for i: U32 = 1, rounds do sum = sum + i end
+            results:send(1 + sum - sum)
+        end
+        spawn do
+            results:send 2
+        end
+        results:recv() with
+            value = do(v) first = v end
+            closed = do() first = 0 end
+        end
+        results:recv() with
+            value = do(v) first = first * 10 + v end
+            closed = do() first = 0 end
+        end
+    end
+    return first
+end
+export tasks_budget
+]])
+    -- the long task is spawned first and runs first, but its loop yields: the short one's value
+    -- arrives before it
+    assert(library.tasks_budget(10000000) == 21)
+    assert(library.tasks_budget(10) == 12)
+end
+
+test "a program without tasks has no budget points":
+    local _, text = native("tasks_none", [[
+local tasks_none = do(n: U32): U32
+    local sum: U32 = 0
+    for i: U32 = 1, n do sum = sum + i end
+    return sum
+end
+export tasks_none
+]])
+    assert(not text:find("budget", 1, true), text)
+end
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "an owner moves into the task that mentions it, and is released there":
+    local library = native("tasks_owner", [[
+local tasks_owner = do(n: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local total: U64 = 0
+    tasks:
+        local results = channel U64 1
+        local xs = Grow(U32) {}
+        for i: U32 = 1, n do xs:push i end
+        spawn do
+            local sum: U64 = 0
+            local i: U64 = 0
+            while i < xs.length do
+                sum = sum + U64 xs[i]
+                i = i + 1
+            end
+            results:send sum
+        end
+        results:recv() with
+            value = do(v) total = v end
+            closed = do() total = 0 end
+        end
+    end
+    return total * 1000000 + (platform.ledger_mapped_bytes() - before)
+end
+export tasks_owner
+]])
+    -- large enough to map its own pages: released in the task, the ledger returns to where it was
+    library.tasks_owner(40000)
+    local got = library.tasks_owner(40000)
+    assert(got == 800020000ULL * 1000000ULL, tostring(got))
+end
+
+test "a detached block cannot assign a copy, nor capture a borrow":
+    refuses([[
+local copy_assigned = do(n: U32): U32
+    tasks:
+        spawn do
+            n = n + 1
+        end
+    end
+    return n
+end
+export copy_assigned
+]], "'n' is a copy taken when its block was detached")
+    refuses([[
+local borrow_captured = do(xs: Slice U32): U32
+    tasks:
+        spawn do
+            local first = xs[0]
+        end
+    end
+    return 0
+end
+export borrow_captured
+]], "the outside name 'xs' is a Slice U32")
+end
+
+test "a task spawns into its own scope and makes channels there":
+    local library = native("tasks_nested", [[
+local tasks_nested = do(n: U32): U64
+    local total: U64 = 0
+    tasks:
+        local results = channel U64 0
+        spawn do
+            local inner = channel U64 0
+            spawn do
+                for i: U32 = 1, n do inner:send(U64 i) end
+                inner:close()
+            end
+            inner:each do(v)
+                results:send(v * 2)
+            end
+            results:close()
+        end
+        results:each do(v)
+            total = total + v
+        end
+    end
+    return total
+end
+export tasks_nested
+]])
+    assert(library.tasks_nested(100) == 10100)
+end
+
+test "first_of takes the first case ready, runs default when none is, and closed at the end":
+    local library = native("tasks_first_of", [[
+local tasks_first_of = do(): U32
+    local score: U32 = 0
+    tasks:
+        local fast = channel U32 1
+        local slow = channel U32 1
+        first_of {
+            recv fast do(v) score = score + 100 end,
+            default = do() score = score + 1 end,
+        }
+        fast:send 5
+        first_of {
+            recv slow do(v) score = score + 1000 end,
+            recv fast do(v) score = score + v * 10 end,
+            default = do() score = score + 7 end,
+        }
+        fast:close()
+        slow:close()
+        first_of {
+            recv slow do(v) score = score + 1000 end,
+            recv fast do(v) score = score + 1000 end,
+            closed = do() score = score + 2 end,
+        }
+    end
+    return score
+end
+export tasks_first_of
+]])
+    assert(library.tasks_first_of() == 1 + 50 + 2)
+end
+
+test "first_of waits on every case at once, and the losers are withdrawn":
+    local library = native("tasks_select_wait", [[
+local tasks_select_wait = do(): U32
+    local got: U32 = 0
+    tasks:
+        local left = channel U32 0
+        local right = channel U32 0
+        spawn do
+            sleep (ms 5)
+            right:send 2
+        end
+        first_of {
+            recv left do(v) got = v end,
+            recv right do(v) got = v * 10 end,
+            closed = do() got = 0 end,
+        }
+        spawn do
+            left:send 3
+        end
+        first_of {
+            recv left do(v) got = got + v end,
+            recv right do(v) got = got + 1000 end,
+            closed = do() got = 0 end,
+        }
+    end
+    return got
+end
+export tasks_select_wait
+]])
+    assert(library.tasks_select_wait() == 23)
+end
+
+test "a timer fires: sleep, and after as the case that wins":
+    local library = native("tasks_timers", [[
+local tasks_timers = do(): U64
+    local outcome: U64 = 0
+    local before = platform.now()
+    tasks:
+        local never = channel U32 0
+        sleep (ms 20)
+        first_of {
+            recv never do(v) outcome = 1 end,
+            after (ms 10) do() outcome = 2 end,
+            closed = do() outcome = 3 end,
+        }
+    end
+    local elapsed = platform.now() - before
+    if elapsed < 30000000 then return 100 + outcome end
+    return outcome
+end
+export tasks_timers
+]])
+    assert(library.tasks_timers() == 2)
+end
+
+test "a send case waits for a receiver, and a losing send keeps its value":
+    local library = native("tasks_select_send", [[
+local tasks_select_send = do(): U32
+    local got: U32 = 0
+    tasks:
+        local out = channel U32 0
+        local stop = channel U32 0
+        spawn do
+            out:recv() with
+                value = do(v) stop:send v end
+                closed = do() stop:send 0 end
+            end
+        end
+        first_of {
+            send out 7 do() got = 1 end,
+            after (seconds 5) do() got = 999 end,
+        }
+        first_of {
+            send out 8 do() got = 999 end,
+            recv stop do(v) got = got * 10 + v end,
+            closed = do() got = 0 end,
+        }
+    end
+    return got
+end
+export tasks_select_send
+]])
+    assert(library.tasks_select_send() == 17)
+end
+
+test "a pool's slots move between tasks: taken, filled, sent, read and released":
+    local library = native("tasks_pool", [[
+local Block = struct { n: U32, data: Array U8 64 }
+local tasks_pool = do(count: U32): U64
+    local total: U64 = 0
+    tasks:
+        local buffers = pool Block 4
+        local full = channel (Slot Block) 4
+        spawn do
+            local k: U32 = 0
+            while k < count do
+                local s = buffers:take()
+                buffers[s].n = k
+                full:send s
+                k = k + 1
+            end
+            full:close()
+        end
+        full:each do(s)
+            total = total + U64 buffers[s].n
+            buffers:release s
+        end
+    end
+    return total
+end
+export tasks_pool
+]])
+    assert(library.tasks_pool(100) == 4950)
+end
+
+test "take is a case of first_of, and a slot used by another task traps":
+    local library = native("tasks_take_case", [[
+local tasks_take_case = do(): U32
+    local got: U32 = 0
+    tasks:
+        local buffers = pool U32 1
+        local first = buffers:take()
+        buffers[first] = 5
+        first_of {
+            take buffers do(s) got = 999 end,
+            default = do() got = buffers[first] end,
+        }
+        buffers:release first
+        first_of {
+            take buffers do(s)
+                buffers[s] = 7
+                got = got * 10 + buffers[s]
+                buffers:release s
+            end,
+            after (seconds 5) do() got = 999 end,
+        }
+    end
+    return got
+end
+export tasks_take_case
+]])
+    assert(library.tasks_take_case() == 57)
+    local output = in_child("tasks_foreign_slot", [[
+local tasks_foreign_slot = do(): U32
+    local got: U32 = 0
+    tasks:
+        local buffers = pool U32 1
+        local handed = channel (Slot U32) 1
+        local mine = buffers:take()
+        handed:send mine
+        buffers[mine] = 3
+    end
+    return got
+end
+export tasks_foreign_slot
+]], "tasks_foreign_slot")
+    assert(output:find("nua: a slot used by a task that does not own it", 1, true), output)
+end
+
+test "a slot in a message's field moves with it":
+    local library = native("tasks_slot_message", [[
+local Job = struct { id: U32, data: Slot U32 }
+local tasks_slot_message = do(n: U32): U32
+    local total: U32 = 0
+    tasks:
+        local buffers = pool U32 2
+        local jobs = channel Job 1
+        spawn do
+            for i: U32 = 1, n do
+                local s = buffers:take()
+                buffers[s] = i * 10
+                jobs:send(Job { id = i, data = s })
+            end
+            jobs:close()
+        end
+        jobs:each do(job)
+            total = total + job.id + buffers[job.data]
+            buffers:release job.data
+        end
+    end
+    return total
+end
+export tasks_slot_message
+]])
+    assert(library.tasks_slot_message(5) == 15 + 150)
+end
+
+test "values crossing a channel are copies: borrows, pointers, owners and slots in a oneof are refused":
+    refuses([[
+local Message = struct { id: U32, p: Ptr U8 }
+local refused_pointer = do(): Unit
+    tasks:
+        local out = channel Message 1
+    end
+end
+export refused_pointer
+]], "Chan Message: values crossing a channel are copies, and its field 'p' is a Ptr U8")
+    refuses([[
+local refused_owner = do(): Unit
+    tasks:
+        local out = channel (Grow U32) 1
+    end
+end
+export refused_owner
+]], "which owns storage: move it in a pool slot")
+    refuses([[
+local Maybe = oneof { some: Slot U32, none: Unit }
+local refused_choice = do(): Unit
+    tasks:
+        local out = channel Maybe 1
+    end
+end
+export refused_choice
+]], "a Slot inside a oneof cannot move")
+end
+
+test "a channel or pool kept past its scope traps at its next use":
+    local channel_output = in_child("tasks_stale_channel", [[
+local saved = global (Chan U32) { name = "saved_channel" }
+local tasks_stale_channel = do(): U32
+    tasks:
+        saved[0] = channel U32 1
+    end
+    tasks:
+        local other = channel U32 1
+        saved[0]:send 1
+    end
+    return 0
+end
+export tasks_stale_channel
+]], "tasks_stale_channel")
+    assert(channel_output:find("nua: a channel used after its tasks scope ended", 1, true), channel_output)
+    local pool_output = in_child("tasks_stale_pool", [[
+local saved = global (Pool U32) { name = "saved_pool" }
+local tasks_stale_pool = do(): U32
+    tasks:
+        saved[0] = pool U32 1
+    end
+    local taken = saved[0]:take()
+    return 0
+end
+export tasks_stale_pool
+]], "tasks_stale_pool")
+    assert(pool_output:find("nua: a pool used after its tasks scope ended", 1, true), pool_output)
+end
+
+test "I/O by completion: a read waits for a pipe a task writes into":
+    local library = native("tasks_io_pipe", [[
+local io = require "nua.io"
+local tasks_io_pipe = do(): U32
+    local got: U32 = 0
+    io.pipe() with
+        done = do(ends)
+            tasks:
+                spawn do
+                    sleep (ms 5)
+                    io.write (ends.writer) "abc"
+                    io.close ends.writer
+                end
+                local buf: Array U8 8
+                io.read(Ref buf, ends.reader) with
+                    done = do(count) got = count * 100 + U32 buf[0] end
+                    failed = do(code) got = 1 end
+                end
+                io.read(Ref buf, ends.reader) with
+                    done = do(count) got = got + count end
+                    failed = do(code) got = 2 end
+                end
+            end
+            io.close ends.reader
+        end
+        failed = do(code) got = 3 end
+    end
+    return got
+end
+export tasks_io_pipe
+]])
+    assert(library.tasks_io_pipe() == 300 + 97)
+end

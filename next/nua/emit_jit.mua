@@ -352,7 +352,20 @@ local building_unit = do(program, answers)
         end
     end
 
+    -- the assembly of the mechanisms a program reaches, added to the unit once each
+    local used_mechanisms, added_assembly = {}, {}
+    local use_mechanism = do(name)
+        used_mechanisms[name] = true
+        for _, text in ipairs(platform.assembly_of used_mechanisms) do
+            if not added_assembly[text] then
+                added_assembly[text] = true
+                J.gcc_jit_context_add_top_level_asm(context, nil, text)
+            end
+        end
+    end
+
     return define
+        .use_mechanism
         .J
         .context
         .void
@@ -727,13 +740,16 @@ local building_definition = do(unit, program, definition)
         LifetimeEnd = nothing
         Moves = nothing
         Ends = nothing
-        Budget = nothing
+        Budget = do(node, recurse)
+            J.gcc_jit_block_add_eval(current, nil, call_of(unit.function_handles[program.budget_service], {}))
+        end
         Mechanism = do(node, recurse)
             local binding = platform.bindings[node.binding]
             if binding == nil then fail("the mechanism " .. node.binding .. " is not declared") end
             local rvalues = {}
             for index, argument in ipairs node.arguments do rvalues[index] = cast(operand argument, gcc_type binding.parameters[index]) end
-            finish_call(node, call_of(unit.import_function(binding.jit_symbol, binding.parameters, binding.result, false), rvalues), binding.result)
+            unit.use_mechanism node.binding
+            finish_call(node, call_of(unit.import_function(binding.c_symbol, binding.parameters, binding.result, false), rvalues), binding.result)
         end
     end
     local build_instruction = Instruction.pass "build an instruction with gccjit" with ..Building end

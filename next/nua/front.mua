@@ -54,12 +54,13 @@ local generating = do(filename, start_line)
     local fail = do(message, where)
         error(("%s:%s: %s"):format(filename, tostring(where or line), message), 0)
     end
-    local declare = do(name, kind)
+    -- `alias`: a name for a binding another scope owns, which this one does not release
+    local declare = do(name, kind, alias)
         local scope = scopes[#scopes]
         scope.kinds[name] = kind
         sequence += 1
         scope.positions[name] = sequence
-        if kind == "cell" then table.insert(scope.cells, name) end
+        if kind == "cell" and not alias then table.insert(scope.cells, name) end
     end
     local lookup = do(name)
         for depth = #scopes, 1, -1 do
@@ -328,7 +329,7 @@ local generating = do(filename, start_line)
         end
         -- a typed lambda is a word; an untyped one a word evaluated in place, whose result is
         -- what it returns
-        lambda = node -> function_text(node.fn)
+        lambda = node -> function_text(node.fn, nil, nil, true)
     end
     Expressions["nil"], Expressions["true"], Expressions["false"] = keyword, keyword, keyword
     expression = dispatching(Expressions, "%s is not available in a typed body yet")
@@ -519,11 +520,39 @@ local generating = do(filename, start_line)
     -- of its own; whether it makes tail applications is its own.
     -- `receiver`, for a method (syntax §8): the host expression of its receiver's type; the
     -- word's first requirement is then `self: Ref T`
-    function_text = do(fn, name, receiver)
+    -- `capturing`: a block written in place (an untyped lambda), which may be detached
+    function_text = do(fn, name, receiver, capturing)
         local requirements = {}
         local parameters = {}
         if receiver then parameters[1] = { name = "self", receiver = receiver } end
         for _, parameter in ipairs fn.params do parameters[#parameters + 1] = parameter end
+        -- the outer bindings the block mentions, and the contexts opened around it
+        local captures, openings = {}, {}
+        if capturing then
+            local own, seen = {}, {}
+            for _, parameter in ipairs parameters do own[parameter.name] = true end
+            local visit
+            visit = do(item)
+                if type item ~= "table" then return end
+                if item.k == "name" and not seen[item.name] and not own[item.name] then
+                    seen[item.name] = true
+                    local _, kind = openings_of item.name
+                    if kind == "cell" then captures[#captures + 1] = item.name end
+                end
+                for _, child in pairs item do visit child end
+            end
+            visit(fn.body)
+            visit(fn.expr)
+            local opened = {}
+            for _, scope in ipairs scopes do
+                for _, opening in ipairs scope.openings do
+                    if not opened[opening.variable] then
+                        opened[opening.variable] = true
+                        openings[#openings + 1] = opening.variable
+                    end
+                end
+            end
+        end
         for index, parameter in ipairs parameters do
             local annotation = parameter.receiver and ("__nua.receiver(%s)"):format(parameter.receiver)
                 or parameter.type and host_expression parameter.type or "nil"
@@ -539,6 +568,14 @@ local generating = do(filename, start_line)
                 declare(parameter.name, "cell")
             end
             emit(table.concat(bindings, " "))
+            -- a block's outer names: the outer bindings in place, the captured copies detached
+            for index, name in ipairs captures do
+                emit((" local %s = __E.captured(__path, %d, %s);"):format(name, #parameters + index, name))
+                declare(name, "cell", true)
+            end
+            for index, variable in ipairs openings do
+                emit((" local %s = __E.captured_context(__path, %d, %s);"):format(variable, #parameters + #captures + index, variable))
+            end
             for _, parameter in ipairs parameters do
                 if parameter.opened then
                     open_context parameter.name
@@ -558,8 +595,14 @@ local generating = do(filename, start_line)
         end))
         local has_tail_calls = tail_calls
         tail_calls = outer_tail_calls
-        return ("__nua.word { name = %s, source = %q, line = %d, requirements = { %s }, result = %s, tail_calls = %s, rest = %s, body = function(__E, __path) %s return __E.fall(__path) end }"):format(
-            quote(name or fn.name or "a word"), filename, fn.line or line, table.concat(requirements, ", "), result, tostring has_tail_calls, fn.rest and "true" or "false", body)
+        local capture_text = ""
+        if capturing then
+            local quoted = {}
+            for index, captured_name in ipairs captures do quoted[index] = quote captured_name end
+            capture_text = (", captures = { %s }, captured = function() return { %s } end, opened = function() return { %s } end"):format(table.concat(quoted, ", "), table.concat(captures, ", "), table.concat(openings, ", "))
+        end
+        return ("__nua.word { name = %s, source = %q, line = %d, requirements = { %s }, result = %s, tail_calls = %s, rest = %s%s, body = function(__E, __path) %s return __E.fall(__path) end }"):format(
+            quote(name or fn.name or "a word"), filename, fn.line or line, table.concat(requirements, ", "), result, tostring has_tail_calls, fn.rest and "true" or "false", capture_text, body)
     end
 
     return define

@@ -97,14 +97,12 @@ local view = do(element, mutable)
 end
 -- Str is the read-only view of bytes with the text words
 local Str = ViewType { element = U8, mutable = false, text = true }
--- `Slice T`, `Slice.mut T`: the view constructors, as one object (the family's constructor)
--- (`Slice(p, n)`, a raw view at a pointer, is answered by the compilation's evaluation)
-local raw_slice = nil
+-- `Slice T`, `Slice.mut T`: the view constructors, as one object (the family's constructor).
+-- A view at a raw pointer is built by `raw_slice p n`, a word of its own.
 local slice = setmetatable(define
     mut = element -> view(element, true)
-    of_raw = maker -> do raw_slice = maker end
-end, { __call = function(_, element, count, view_type)
-    if count ~= nil then return raw_slice(element, count, view_type) end
+end, { __call = function(_, element, ...)
+    if select("#", ...) > 0 then error("Slice T is a type: a view at a pointer is raw_slice p n", 2) end
     return view element
 end, __tostring = || -> "Slice" })
 local opaques = {}
@@ -261,6 +259,25 @@ local Describing = define
     end
 end
 local describe = NativeType.pass "describe a native type" with ..Describing end
+
+-- the kind of a native type, by name, for host code that inspects types
+local kind_name = name -> |node, recurse| -> name
+local kind_of = NativeType.pass "the kind of a native type" with
+    IntegerType = kind_name "integer"
+    FloatType = kind_name "float"
+    BooleanType = kind_name "boolean"
+    UnitType = kind_name "unit"
+    PointerType = kind_name "pointer"
+    ReferenceType = kind_name "reference"
+    ViewType = kind_name "view"
+    FixedArrayType = kind_name "array"
+    AtomicType = kind_name "atomic"
+    RecordType = kind_name "record"
+    SumType = kind_name "sum"
+    BufferType = kind_name "buffer"
+    FunctionType = kind_name "function"
+    OpaqueType = kind_name "opaque"
+end
 
 -- Does a value of the type own storage? Buffers do, and aggregates holding them. References,
 -- views, pointers and functions never own what they reach.
@@ -566,6 +583,7 @@ return define
     .variant_of
     .describe
     .owns
+    .kind_of
     .borrows
     .layout
     .define_member

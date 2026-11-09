@@ -94,7 +94,7 @@ local words = do(T, B)
         if self.length == 0 then trap "pop of an empty buffer" end
         self.length = self.length - 1
         ends (self) "shrank"
-        return take self self.length
+        return move_out self self.length
     end
 
     local truncate = do(self: Ref B, length: U64): Unit

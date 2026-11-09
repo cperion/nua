@@ -13,7 +13,8 @@ local identity = require "nua.identity"
 local Cell = family "binding cell"
 local PlaceCell = struct { place: identity.PlaceId, name: String }
 -- a host binding's value may be rebound while control stays known; `depth` is where it was made
-local HostCell = struct { name: String, value: Any, depth: shapes.Natural }
+-- `copied`: a name a detached block captured, which it cannot assign
+local HostCell = struct { name: String, value: Any, depth: shapes.Natural, copied: Optional(Boolean) }
 local FieldCell = struct { base: Cell, name: String }
 local RawCell = struct { place: Table, name: String }
 -- `base` is a cell or a reference to the buffer the element belongs to

@@ -57,7 +57,7 @@ local primitive_arities = define
     ends = 2
     element_of = 2
     initialize = 3
-    take = 2
+    move_out = 2
     drop = 1
     view_length = 1
     view_element_of = 2
@@ -74,11 +74,11 @@ local primitive_arities = define
     static_cstring = 1
     buffer_view = 4
     loaned_view = 3
-    -- its view type is optional, and only `Slice(p, n)` applies it, with everything at once
-    raw_view = 2
+    raw_view = 3
     view_as = 2
     end_loan = 1
     fnptr = 1
+    detach = 1
     atomic_operation = operation -> atomic_arities[operation] or 4
     fence = 1
 end
@@ -184,7 +184,32 @@ local hosting_environment = do(compilation, filename, E)
             compilation.exports[#compilation.exports + 1] = { .value, .c_name, .line }
         end
     end
-    local environment = setmetatable({ __nua = runtime, platform = platform.bindings, ..prelude }, { __index = _G })
+    -- the libraries a source names only if it uses them (`tasks`), imported on first mention
+    local lazy_libraries = define
+        tasks = "tasks"
+        first_of = "tasks"
+        recv = "tasks"
+        send = "tasks"
+        after = "tasks"
+        take = "tasks"
+        Slot = "tasks"
+        Chan = "tasks"
+        Pool = "tasks"
+        sleep = "tasks"
+        ns = "tasks"
+        us = "tasks"
+        ms = "tasks"
+        seconds = "tasks"
+        Duration = "tasks"
+    end
+    local environment
+    environment = setmetatable({ __nua = runtime, mechanisms = platform.bindings, ..prelude }, { __index = do(_, name)
+        local library = lazy_libraries[name]
+        if library == nil then return _G[name] end
+        local value = environment.import(library)[name]
+        rawset(environment, name, value)
+        return value
+    end })
     local load_nua = do(text, name)
         local chunk, problem = mua.load(text, "@" .. name, { host = front.host name })
         if not chunk then error(problem, 0) end
@@ -207,6 +232,9 @@ local hosting_environment = do(compilation, filename, E)
     for name, arity in pairs primitive_arities do environment[name] = hosting.primitive(name, E.host_primitive, false, arity) end
     environment.copy = hosting.primitive("copy", E.host_primitive, true)
     environment.owns = types.owns
+    -- host inspection of a native type: its kind, and how it is described in messages
+    environment.native_kind = types.kind_of
+    environment.describe_type = types.describe
     environment.Inferred = hosting.Inferred
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
     environment.family = curried("family", 2, types.define_family)
@@ -316,7 +344,10 @@ local hosting_environment = do(compilation, filename, E)
     environment.CString = types.CString
     -- `Array T` is the owner's type; applied to a length it is `Array T n` (`E.apply_type`, and
     -- the type's call in host code): the value type, or the owner built at run time
-    environment.Array = element -> types.buffer(element, false, true)
+    environment.Array = function(element, ...)
+        if select("#", ...) > 0 then error("Array takes its element, then its length, one at a time: Array T n", 2) end
+        return types.buffer(element, false, true)
+    end
     compilation.owner_array_builder = |element, owner_type, length| -> environment.import("buffer").words(element, owner_type).build(length)
     environment.FixedArray = types.fixed_array
     return environment, load_nua
@@ -393,7 +424,11 @@ local compiling_with_members = do(source, filename)
     environment.import "slice"
     environment.import "array"
     environment.view_of = environment.import("slice").foreign_view
-    types.slice.of_raw(|pointer, count, view_type| -> environment.raw_view(pointer, count, view_type))
+    -- `raw_slice p n` (syntax §12.6): a view of n elements at p, borrowing nothing the compiler
+    -- knows; `view_of p n body` is its scoped partner
+    environment.raw_slice = curried("raw_slice", 2, do(pointer, count)
+        return environment.raw_view(pointer)(count)(types.view(environment.type_of(pointer).target))
+    end)
     environment.Chars = environment.import("chars").Chars
     environment.Store = environment.import("store").Store
     environment.Id = environment.import("store").Id
@@ -409,13 +444,22 @@ local compiling_with_members = do(source, filename)
         local id = registry.define_export(word, specification, filename, export.line)
         exports[#exports + 1] = data.Export { name = export.c_name, definition = id }
     end
-    local definitions = reachable_definitions(registry.definitions(), exports)
+    -- a program that uses tasks gets the scheduler's budget word; preparation places its calls
+    local budget_service = nil
+    if rawget(environment, "tasks") ~= nil or rawget(environment, "first_of") ~= nil or rawget(environment, "sleep") ~= nil then
+        budget_service = registry.request(environment.import("tasks").budget_service, {}, "nua_boundary", filename, 0)
+    end
+    local roots = {}
+    for index, export in ipairs exports do roots[index] = export end
+    if budget_service then roots[#roots + 1] = data.Export { name = "budget_service", definition = budget_service } end
+    local definitions = reachable_definitions(registry.definitions(), roots)
     local program = data.Program with
         revision = 0
         .definitions
         words = registry.words()
         globals = compilation.globals
         headers = compilation.headers
+        .budget_service
         .exports
         lifetimes = {}
         origins = compilation.origins

@@ -53,6 +53,15 @@ end
 
 local release_range = unmap_pages
 
+-- a task's stack: mapped pages whose lowest page is a guard, so an overflow traps
+local guard_bytes = 4096
+local map_stack = do(bytes: U64): Ptr U8
+    local stack = map_pages bytes
+    if mprotect(stack, guard_bytes, protection_none) ~= 0 then trap "cannot guard a task stack" end
+    return stack
+end
+local unmap_stack = unmap_pages
+
 -- the process's hash key, read from the system once
 local seed_first = global (U64) { name = "hash_seed_first" }
 local seed_second = global (U64) { name = "hash_seed_second" }
@@ -72,6 +81,23 @@ local hash_seed = do(which: U64): U64
     return seed_second[0]
 end
 
+-- the monotonic clock, in nanoseconds, and sleeping until a time on it (CLOCK_MONOTONIC is 1,
+-- TIMER_ABSTIME is 1 on Linux)
+local Timespec = struct { seconds: I64, nanoseconds: I64 }
+local time_h = { header = "<time.h>" }
+local clock_gettime = extern "clock_gettime" { I32, Ptr Timespec } (I32) time_h
+local clock_nanosleep = extern "clock_nanosleep" { I32, I32, Ptr Timespec, Ptr Timespec } (I32) time_h
+local clock_reading = global (Timespec) { name = "clock_reading", thread_local = true }
+local now = do(): U64
+    clock_gettime(1, clock_reading)
+    return U64 clock_reading.seconds * 1000000000 + U64 clock_reading.nanoseconds
+end
+local sleep_until = do(deadline: U64): Unit
+    clock_reading.seconds = I64(deadline / 1000000000)
+    clock_reading.nanoseconds = I64(deadline % 1000000000)
+    clock_nanosleep(1, 1, clock_reading, null Timespec)
+end
+
 -- a store's token: from one counter, never reused, never 0 (syntax §9.9)
 local token_counter = global (Atomic U64) { name = "store_token_counter", shared = true }
 local next_store_token = do(): U64 = token_counter[0]:add 1 + 1
@@ -85,6 +111,10 @@ return define
     .reserve_range
     .commit_range
     .release_range
+    .map_stack
+    .now
+    .sleep_until
+    .unmap_stack
     .hash_seed
     .next_store_token
 end

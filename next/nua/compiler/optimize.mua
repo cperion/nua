@@ -415,6 +415,7 @@ end
 local reach = do(program)
     local kept, reached, pending = {}, {}, {}
     for _, export in ipairs program.exports do pending[#pending + 1] = export.definition end
+    if program.budget_service then pending[#pending + 1] = program.budget_service end
     for _, global in pairs program.globals do
         if data.GlobalInitializer.is(global.initializer, data.FirstUse) then pending[#pending + 1] = global.initializer.definition end
     end

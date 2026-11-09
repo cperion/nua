@@ -17,12 +17,15 @@ local limit_slot = 14
 local slots = do(): Ptr (Ptr U8) = Ptr(Ptr U8)(platform.storage_context())
 
 -- the smallest class whose blocks hold `bytes`
+local class_limits = {}
+for shift = 0, 11 do class_limits[shift + 1] = 16 * 2 ^ shift end
+
 local class_of = do(bytes: U64): U64
+    -- the classes below `bytes`, counted by comparisons unrolled while compiling: an allocator
+    -- word has no loop, so no budget point can fall inside it (tasks §1)
     local class: U64 = 0
-    local size: U64 = 16
-    while size < bytes do
-        size = size + size
-        class = class + 1
+    for _, limit in ipairs class_limits do
+        if bytes > limit then class = class + 1 end
     end
     return class
 end

@@ -64,6 +64,10 @@ local word = do(description, applier)
         body = description.body
         tail_calls = description.tail_calls == true
         rest = description.rest
+        -- a block written in place: the outer names it mentions, and their bindings now
+        captures = description.captures
+        captured = description.captured
+        opened = description.opened
         .applier
     end, Word)
 end
@@ -102,7 +106,8 @@ primitive_object = meta with
         local whole, partial = completed_primitive(primitive, { ... })
         if whole == nil then return partial end
         if primitive.applier == nil then error(primitive.name .. " is applied inside an evaluation", 2) end
-        return primitive.applier(primitive, whole)
+        -- the whole argument list goes with the primitive itself, not with its partial form
+        return primitive.applier(primitive_object { ..primitive, supplied = {} }, whole)
     end
 end
 local Primitive = getmetatable(primitive_object {})

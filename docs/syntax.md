@@ -371,6 +371,14 @@ A word's `body` is a Lua closure produced from the typed body. That closure expr
 
 Its identity is stable across aliases and partial applications.
 
+### 3.4.1 Argument order: the destination first
+
+A word that moves data takes its destination first and its source after it, as an assignment
+does (`target = source`) and as Intel assembly writes `mov destination, source`:
+`move_bytes destination source n`, `io.write file text`, `io.read (Ref buffer) file`,
+`channel:send value`, `buffer:push value`. The destination is the subject of the operation, so a
+partial application is a useful word: `local log = io.write standard_error`.
+
 ### 3.5 Autocurrying
 
 ```lua
@@ -463,8 +471,14 @@ end
 
 `test` takes a name known as text and a body callable without arguments. It calls
 the body immediately. A failed assertion or other error stops compilation, with
-the test name and the underlying diagnostic. Nested blocks add their names to the
-failure context. Returning a value, including `false`, does not itself assert
+the test name and the underlying diagnostic. The name is attached to the body through
+Mua's shared label protocol before invocation; `label_of(body)` reads it, including for
+native words. Nested blocks add their names to the failure context. `label "description"
+value` is also available directly: its text must be known while compiling, it returns the
+same value, and it changes neither native symbols nor specialization/dispatch identity.
+Labels are human metadata, not residual data or a test registry. These words require a
+Mua runtime with `label` and `label_of` support.
+Returning a value, including `false`, does not itself assert
 anything; assertions are explicit.
 
 There is no test registry, runner, test mode or residual test entry point. Tests
@@ -533,7 +547,7 @@ A typed body is therefore parsed — a recursive-descent parser with Lua's prece
 | a free name, a bare call or an assignment in an opened region | resolved against the opened contexts (§10.5) |
 | `..e`, `T { ..p, x = 1 }` | `stage.expand`, `stage.keyed` (§10.7, §10.8) |
 | `oneof { ... }`, `s { alt = handler, ... }` | `stage.oneof`, matching (§11) |
-| `p[i]`, `s[i]`, `Ptr(place)`, `Slice(p, n)` | element places and checked reads (§12) |
+| `p[i]`, `s[i]`, `Ptr(place)`, `raw_slice p n` | element places and checked reads (§12) |
 
 Arithmetic, calls, field access and constructors stay ordinary Lua expressions; metamethods handle them.
 
@@ -1290,7 +1304,7 @@ r
 ```
 
 A Lua string literal is a `Str` of static data and borrows nothing that ends.
-`Slice(p, n)` and raw pointers borrow nothing the compiler knows: they are the
+`raw_slice p n` and raw pointers borrow nothing the compiler knows: they are the
 programmer's contract (§12.5).
 
 ### 9.6 Containers, globals and tasks
@@ -1394,7 +1408,7 @@ Cycles are ordinary relationships; they create no ownership cycles. Objects are 
 
 ### 9.12 Grow arrays
 
-Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`Slice(p, n)`, `view_of(p, n, body)`, `Array T n`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
+Every length is a `U64` (`g.length`, `s.length`, `a.length`, `c.length`, `m.length`), and an index may be any unsigned integer type, checked against it. Operations take any unsigned length where they take one from outside (`raw_slice p n`, `view_of p n body`, `Array T n`); the language converts nothing else implicitly, so arithmetic mixing a length with a `U32` converts one side explicitly: `U32 xs.length`.
 
 `Grow T` supports `g:push(v)`, `g[i]` (a place, its index checked at every use), `g.length`, `g:all()` and `g:sub(i, j)` (borrowed slices, §9.4), `g:pop()` (the last element, removed; an empty `Grow` traps), `g:truncate(n)` (keep the first `n`; more than `g.length` traps) and `g:clear()`. `pop`, `truncate` and `clear` end the elements above the new end, so borrows of the contents end there.
 
@@ -2061,9 +2075,9 @@ A pointer into a store slot or a `Grow` dangles after the storage grows. That is
 | `s[i]` | a checked element read (a copy) |
 | `s.length` | the length |
 | `s:sub(a, b)` | the view of `[a, b)`, checked |
-| `Slice(p, n)` | a view of `n` elements at pointer `p`: the boundary where a length is trusted |
+| `raw_slice p n` | a view of `n` elements at pointer `p`: the boundary where a length is trusted |
 | `g:all()`, `g:sub(a, b)` | a view of a `Grow` (§12.4) |
-| `view_of(p, n, body)` | lend a scoped view of foreign elements (§12.6) |
+| `view_of p n body` | lend a scoped view of foreign elements (§12.6) |
 
 **A check that a branch already proved is dropped.** On each arm of a dynamic branch the compiler records what an integer comparison proves (the loop exit `if (i >= n) break;` proves `i < n` on the path that continues), over values that cannot change behind its back: constants, parameters, temporaries, versioned reads of tracked locals, and a view's length. When `i` changes, its version changes and the fact stops matching. `s[i]` and `a[i]` (§13) emit no check when such a fact proves `i < length`.
 
@@ -2135,13 +2149,13 @@ A check stays when no recorded fact proves it: facts are kept per path, over val
 
 ### 12.6 Scoped foreign views
 
-`view_of(p, n, body)` lends a read-only `Slice T` over `n` elements of a `Ptr T`
+`view_of p n body` lends a read-only `Slice T` over `n` elements of a `Ptr T`
 for the body's evaluation. The pointer and length remain trusted: the wrapper
 must ensure the elements stay valid until the body completes. The compiler does
 not prevent a foreign API from freeing or invalidating them during the callback.
 The primitive neither allocates nor frees the memory. It snapshots the supplied
 pointer and length before invoking the body. Use it inside a foreign resource
-activity instead of handing the callback an unscoped `Slice(p, n)`:
+activity instead of handing the callback an unscoped `raw_slice p n`:
 
 ```lua
 local foreign_sum = do(pointer: Ptr U8, length: U32): U32
@@ -2176,7 +2190,7 @@ The scoped view is a borrow of the activity (§9.4) and follows the lifetime rul
   Changing the loan provenance across a residual backedge is rejected rather
   than discarding it.
 
-The raw boundary remains explicit. `Slice(p, n)`, raw pointers and raw
+The raw boundary remains explicit. `raw_slice p n`, raw pointers and raw
 representation access do not gain a loan merely because a length is present.
 Extracting a raw pointer and constructing a new slice deliberately crosses back
 into the programmer's trusted foreign-memory contract. A resource wrapper must
@@ -2796,7 +2810,7 @@ local sum_filled = do(n: U32, byte: U8): U32
     with_buffer n:
         fill byte
         data[0] = 1
-        local bytes = Slice(data, size)
+        local bytes = raw_slice data size
         local i: U32 = 0
         while i < bytes.length do
             total = total + U32 bytes[i]
@@ -2849,7 +2863,7 @@ In Unix everything is a file, and in Linux nearly everything is a file descripto
 | `cread "errno" (I32) "<errno.h>"` | a C variable or macro, read where it is called |
 | `bytes(place)` | the storage of a place as `Ptr U8` (its lifetime dropped, as with `Ptr(place)`) |
 | `size_of(T)` | the C size of a type |
-| `view_of(p, n, body)` | lend a scoped read-only view, with escape and native-boundary checks (§12.6) |
+| `view_of p n body` | lend a scoped read-only view, with escape and native-boundary checks (§12.6) |
 
 Declaring kernel structs by hand risks ABI mismatches (`struct epoll_event` is packed on x86-64; `struct stat` differs between architectures). A `cstruct` emits no definition of its own: the C compiler supplies the real layout, and a field like `{ "fd", I32, "data.fd" }` reaches into nested unions.
 
@@ -3141,7 +3155,8 @@ end
 
 A spawned block may mention:
 
-* **Runtime names from outside, as copies.** Every outer typed local, parameter or introduced name the block mentions (`n` and `jobs` here) is copied into the task when it is spawned. The set is the one the compiler already computes for loop state (§6.4): the names the block mentions. Each copied name must have a *sendable* type (§20.5), and assigning one inside the block is rejected. A copy that looked like shared state would be the one way to misread the model.
+* **Runtime names from outside, as copies.** Every outer typed local, parameter or introduced name the block mentions (`n` and `jobs` here) is captured when it is spawned: a value is copied, and an **owner moves** into the task, which then owns and releases it (the outer name is moved, as by any move, §9.2). A borrow (`Ref`, `Slice`, `Str` at any depth) is refused: it points into memory the task does not own. Assigning a captured name inside the block is rejected. A copy that looked like shared state would be the one way to misread the model.
+* **`detach block`** is what `spawn` is made of, and is available to any library word: it takes a block off the code that wrote it, capturing the outer names it mentions as above, and answers the record type of the runtime captures, their record, and a word that runs the block given that record. A context opened around it (§10.5) is captured like a name: by value, and opened again inside, so a task reaches its `tasks:` vocabulary (a handle on its scope); a context reached through a borrow cannot be reached. `spawn` is an ordinary word of the scheduler library: it detaches its block, puts the record at the top of the new task's stack, and enqueues the task.
 * **Compile-time values, as facts.** Known values, types, words and Lua data are baked into the task's specialization, as in any word (architecture §5). A spawn inside a host loop unrolls.
 * **Its own locals,** which nobody else can reach.
 

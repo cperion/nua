@@ -156,7 +156,7 @@ export parsed_float
 local from_c = do(c: CString): U64 = (Str.of c).length
 export from_c
 local raw_sum = do(p: Ptr U8, n: U32): U32
-    local s = Slice(p, n)
+    local s = raw_slice p n
     return U32 s[0] + U32 s.length
 end
 export raw_sum
@@ -193,3 +193,15 @@ end
 export leak
 ]], "outlives it")
 end
+
+test "Slice T is a type; a view at a pointer is raw_slice":
+    local done, problem = pcall(compile.compile, [[
+local bracketed_view = do(p: Ptr U8, n: U64): U8
+    local s = Slice(p, n)
+    return s[0]
+end
+export bracketed_view
+]], "bracketed_view.nua")
+    assert(not done and tostring(problem):find("raw_slice p n", 1, true), tostring problem)
+end
+

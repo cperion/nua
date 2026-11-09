@@ -1,0 +1,87 @@
+-- I/O by completion (syntax §20.7): `local io = require "nua.io"`. Every operation that moves
+-- data takes its destination first: `io.read (Ref buffer) file`, `io.write file text`. An operation is attempted;
+-- if the descriptor would block, the party waits until it is ready and attempts it again, so a
+-- program sees completion on every system: a task is suspended, plain code blocks. Descriptors
+-- are made nonblocking when opened here. Linux's values are written in.
+
+local tasks = import "tasks"
+
+local unistd = { header = "<unistd.h>" }
+local c_read = extern "read" { I32, Ptr U8, U64 } (I64) unistd
+local c_write = extern "write" { I32, Ptr U8, U64 } (I64) unistd
+local c_close = extern "close" { I32 } (I32) unistd
+local c_pipe = extern "pipe" { Ptr I32 } (I32) unistd
+local fcntl = extern "fcntl" { I32, I32 } (I32) { header = "<fcntl.h>", variadic = true }
+local errno_location = extern "__errno_location" {} (Ptr I32) { header = "<errno.h>" }
+
+local would_block = 11
+local readable = 1
+local writable = 4
+local get_flags = 3
+local set_flags = 4
+local nonblocking = 2048
+
+local File = struct { descriptor: I32 }
+local Pipe = struct { reader: File, writer: File }
+-- the outcomes, matched exhaustively: `failed` carries the system's error code
+local Count = oneof { done: U32, failed: I32 }
+local Made = oneof { done: Pipe, failed: I32 }
+local Closed = oneof { done: Unit, failed: I32 }
+
+local errno = do(): I32 = errno_location()[0]
+
+local make_nonblocking = do(descriptor: I32): Unit
+    fcntl(descriptor, set_flags, fcntl(descriptor, get_flags) | nonblocking)
+end
+
+-- `io.pipe()`: setup that never waits
+local pipe = do(): Made
+    local ends = Ptr(I32)(platform.map_pages 4096)
+    local made = c_pipe ends
+    local reader, writer = ends[0], ends[1]
+    platform.unmap_pages(Ptr(U8)(ends), 4096)
+    if made ~= 0 then return Made.failed(errno()) end
+    make_nonblocking reader
+    make_nonblocking writer
+    return Made.done(Pipe { reader = File { descriptor = reader }, writer = File { descriptor = writer } })
+end
+
+-- one system call, attempted until it does not block: its count, or the error
+local transfer = do(file: File, data: Ptr U8, count: U64, writing: Bool): Count
+    while true do
+        local result: I64 = 0
+        if writing then result = c_write(file.descriptor, data, count) else result = c_read(file.descriptor, data, count) end
+        if result >= 0 then return Count.done(U32 result) end
+        local code = errno()
+        if code ~= would_block then return Count.failed code end
+        local events: U32 = readable
+        if writing then events = writable end
+        tasks.wait_ready(file.descriptor, events)
+    end
+    return Count.failed 0
+end
+
+-- `io.read (Ref buffer) file`: into the buffer, an `Array U8 N`, from the file (the destination
+-- first, as in every operation that moves data); the count read, 0 at the end
+local read = do(buffer, file: File): Count
+    return transfer(file, Ptr(U8)(Ptr buffer), size_of(type_of(buffer).target), false)
+end
+
+-- `io.write file text`: into the file, a `Str` (or a string known while compiling); the count written
+local write = do(file: File, text: Str): Count
+    return transfer(file, view_data text, text.length, true)
+end
+
+local close = do(file: File): Closed
+    if c_close(file.descriptor) ~= 0 then return Closed.failed(errno()) end
+    return Closed.done
+end
+
+return define
+    .File
+    .Pipe
+    .pipe
+    .read
+    .write
+    .close
+end

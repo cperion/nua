@@ -4,8 +4,8 @@
 --   prepare(program, analysis, options) -> Prepared
 --   certified(prepared)                 refuses what `prepare` did not issue for this program
 --
--- Budget coverage and `task_access` belong to this order and are not yet checked: nothing can
--- wait or switch until the scheduler exists (work package 3 of the handoff).
+-- Budget coverage is placed after the optional rounds (budgets.mua); `task_access` is not yet
+-- checked.
 
 local data = require "nua.compiler.data"
 local graph = require "nua.compiler.graph"
@@ -13,6 +13,7 @@ local verify = require "nua.compiler.verify"
 local verify_lifetimes = require "nua.compiler.verify_lifetimes"
 local optimizer = require "nua.compiler.optimize"
 local platform = require "nua.compiler.platform"
+local budgets = require "nua.compiler.budgets"
 
 -- what the verifiers need to know of the target's mechanisms
 local capabilities = do()
@@ -51,6 +52,7 @@ local ready = do(program, analysis)
     local problems = verify.all(program, capabilities())
     for _, problem in ipairs(verify_lifetimes.lifetimes(program, analysis)) do problems[#problems + 1] = problem end
     for _, problem in ipairs(closure_problems(program, analysis)) do problems[#problems + 1] = problem end
+    for _, problem in ipairs(budgets.problems program) do problems[#problems + 1] = problem end
     return problems
 end
 
@@ -70,6 +72,7 @@ local prepare = do(program, analysis, options)
     if not (options and options.optimize == false) then
         program, analysis = optimizer.optimize(program, analysis, options and options.observe)
     end
+    program, analysis = budgets.cover(program, analysis)
     local problems = ready(program, analysis)
     if #problems > 0 then
         local lines = {}

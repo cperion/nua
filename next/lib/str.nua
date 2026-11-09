@@ -340,7 +340,7 @@ parse_words[F64] = do(s: Str): ParsedF64
 end
 
 -- `Str.of(x)`: a view of a `Slice U8`, or of a `CString` (`strlen` once)
-local of_cstring = do(c: CString): Str = Slice(Ptr(U8)(c), strlen c, Str)
+local of_cstring = do(c: CString): Str = raw_view (Ptr(U8)(c)) (strlen c) Str
 local of_bytes = do(bytes: Slice U8): Str = view_as bytes Str
 Str.of = do(given)
     if type_of given == CString or type given == "string" then return of_cstring given end

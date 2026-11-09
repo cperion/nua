@@ -137,7 +137,7 @@ return do(E, core)
     end
     local has_field = |value, name| -> is_native value and types.NativeType.is(value.type, types.RecordType) and E.field_of(value.type, name) ~= nil
     E.opened = do(path, context, name, fallback)
-        if path.dead then return fallback() end
+        if path.dead or context == E.unreachable_context then return fallback() end
         local value = opened_value(path, context)
         if has_field(value, name) then
             if E.is_cell context.base then return cells.FieldCell { base = context.base, .name } end
@@ -149,8 +149,10 @@ return do(E, core)
     E.apply_opened = do(path, contexts, name, fallback, arguments, boundary)
         if path.dead then return nil end
         for _, context in ipairs contexts do
-            local value = opened_value(path, context)
-            if is_native value then
+            local value = context ~= E.unreachable_context and opened_value(path, context)
+            if not value then
+                -- a context a detached block cannot reach answers nothing
+            elseif is_native value then
                 if name:sub(1, 2) ~= "__" and E.member_of(value.type, name) then return E.method(path, context.base, name, arguments, boundary) end
                 if has_field(value, name) then return E.apply(path, cells.FieldCell { base = context.base, .name }, arguments, boundary) end
             elseif lua_type value == "table" and value[name] ~= nil then

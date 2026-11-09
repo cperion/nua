@@ -1,0 +1,1013 @@
+-- Tasks, scopes, channels, `first_of` and timers (docs/design/tasks.md; syntax §20), in Nua
+-- over two mechanisms: `context_initialize` and `context_switch`. Each task runs on its own
+-- guarded stack; every wait is a context switch to the scheduler, which is the loop of the plain
+-- code that waits. This is one executor: tasks run on the thread of the plain code that opened
+-- their scope.
+--
+-- What another task changes lives in raw memory reached through pointers (the scope, the task
+-- records, the waiters, the channels), where the compiler keeps no facts: a value read after a
+-- switch is read again, never folded from before it.
+--
+-- Every wait is a waiter in a queue: a channel's receivers or senders, or the timers. A waiter of
+-- a `first_of` belongs to a selection: the first counterpart to complete one of its waiters claims
+-- the selection and withdraws the others, so exactly one case happens.
+
+local allocator = import "allocator"
+local allocate, release = allocator.allocate, allocator.release
+
+local stack_bytes = 262144
+
+-- `queue_head` and `queue_tail`: the queue a waiter is linked into, null when it is in none
+local Waiter = struct {
+    task: Ptr U8, ready: U32, closed: U32, index: U32, value: Ptr U8, deadline: U64,
+    next: Ptr U8, previous: Ptr U8, queue_head: Ptr U8, queue_tail: Ptr U8, selection: Ptr U8,
+    -- a wait for a descriptor: which, and for what (poll's events)
+    descriptor: I32, events: U32,
+}
+-- `party`: the waiter of the task or plain code that waits on every case at once
+local Selection = struct { claimed: U32, count: U32, waiters: Ptr Waiter, party: Ptr Waiter }
+local Task = struct { saved: Ptr U8, next: Ptr U8, stack: Ptr U8, scope: Ptr U8, finished: U32, id: U64, waiter: Waiter }
+-- `records`: the headers of the scope's channels and pools, retired when it ends
+local Scope = struct { live: U32, waiter: Ptr U8, records: Ptr U8 }
+
+local current = global (Ptr Task) { name = "current_task", thread_local = true }
+local scheduler = global (Ptr U8) { name = "scheduler_context", thread_local = true }
+local ready_head = global (Ptr Task) { name = "ready_head", thread_local = true }
+local ready_tail = global (Ptr Task) { name = "ready_tail", thread_local = true }
+local plain_waiter = global (Waiter) { name = "plain_waiter", thread_local = true }
+-- every task's id, never reused; plain code is party 1, so a slot it takes is its own
+local next_task_id = global (U64) { name = "next_task_id", thread_local = true, init = 2 }
+-- the parties waiting for a descriptor to be ready, and how many
+local io_head = global (Ptr U8) { name = "io_head", thread_local = true }
+local io_tail = global (Ptr U8) { name = "io_tail", thread_local = true }
+local io_count = global (U32) { name = "io_count", thread_local = true }
+local timers_head = global (Ptr U8) { name = "timers_head", thread_local = true }
+local timers_tail = global (Ptr U8) { name = "timers_tail", thread_local = true }
+
+-- the task record and its start record sit at the top of the task's stack, the context below
+local rounded = bytes -> math.floor((bytes + 15) / 16) * 16
+local task_bytes = rounded(size_of Task)
+
+local enqueue = do(task: Ptr Task): Unit
+    task.next = null U8
+    local tail = ready_tail[0]
+    if tail == null Task then ready_head[0] = task else tail.next = Ptr(U8)(task) end
+    ready_tail[0] = task
+end
+
+local dequeue = do(): Ptr Task
+    local task = ready_head[0]
+    if task ~= null Task then
+        local following = Ptr(Task)(task.next)
+        ready_head[0] = following
+        if following == null Task then ready_tail[0] = null Task end
+    end
+    return task
+end
+
+-- a waiter made ready for a new wait of the running party
+local reset = do(waiter: Ptr Waiter, task: Ptr Task): Unit
+    waiter.task = Ptr(U8)(task)
+    waiter.ready = 0
+    waiter.closed = 0
+    waiter.index = 0
+    waiter.value = null U8
+    waiter.deadline = 0
+    waiter.next = null U8
+    waiter.previous = null U8
+    waiter.queue_head = null U8
+    waiter.queue_tail = null U8
+    waiter.selection = null U8
+    waiter.descriptor = -1
+    waiter.events = 0
+end
+
+-- the waiter of the running party: a task's own, or the thread's for plain code
+local current_waiter = do(): Ptr Waiter
+    local task = current[0]
+    local waiter: Ptr Waiter = plain_waiter
+    if task ~= null Task then waiter = Ptr task.waiter end
+    reset(waiter, task)
+    return waiter
+end
+
+-- the party running now: a task's id, or 1 for plain code
+local current_id = do(): U64
+    local task = current[0]
+    if task == null Task then return 1 end
+    return task.id
+end
+
+local wake = do(waiter: Ptr Waiter): Unit
+    waiter.ready = 1
+    if waiter.task ~= null U8 then enqueue(Ptr(Task)(waiter.task)) end
+end
+
+-- Queues of waiters, doubly linked, so a waiter leaves its queue at once wherever it is.
+local link_after = do(head: Ptr (Ptr U8), tail: Ptr (Ptr U8), waiter: Ptr Waiter, before: Ptr Waiter): Unit
+    waiter.queue_head = Ptr(U8)(head)
+    waiter.queue_tail = Ptr(U8)(tail)
+    if before == null Waiter then
+        local last = tail[0]
+        waiter.previous = last
+        waiter.next = null U8
+        if last == null U8 then head[0] = Ptr(U8)(waiter) else Ptr(Waiter)(last).next = Ptr(U8)(waiter) end
+        tail[0] = Ptr(U8)(waiter)
+    else
+        local earlier = before.previous
+        waiter.previous = earlier
+        waiter.next = Ptr(U8)(before)
+        before.previous = Ptr(U8)(waiter)
+        if earlier == null U8 then head[0] = Ptr(U8)(waiter) else Ptr(Waiter)(earlier).next = Ptr(U8)(waiter) end
+    end
+end
+local push_waiter = |head, tail, waiter| -> link_after(head, tail, waiter, null Waiter)
+
+local unlink = do(waiter: Ptr Waiter): Unit
+    if waiter.queue_head == null U8 then return end
+    local head = Ptr(Ptr U8)(waiter.queue_head)
+    local tail = Ptr(Ptr U8)(waiter.queue_tail)
+    local earlier = waiter.previous
+    local later = waiter.next
+    if earlier == null U8 then head[0] = later else Ptr(Waiter)(earlier).next = later end
+    if later == null U8 then tail[0] = earlier else Ptr(Waiter)(later).previous = earlier end
+    waiter.queue_head = null U8
+    waiter.next = null U8
+    waiter.previous = null U8
+end
+
+local pop_waiter = do(head: Ptr (Ptr U8), tail: Ptr (Ptr U8)): Ptr Waiter
+    local first = Ptr(Waiter)(head[0])
+    if first ~= null Waiter then unlink first end
+    return first
+end
+
+-- A counterpart completes a waiter. Of a selection, it claims the selection, withdraws the other
+-- cases from their queues and wakes the selection's party; the waiters left behind are in no
+-- queue, so no one else completes them.
+local complete = do(waiter: Ptr Waiter): Unit
+    if waiter.selection == null U8 then
+        wake waiter
+        return
+    end
+    local selection = Ptr(Selection)(waiter.selection)
+    selection.claimed = waiter.index + 1
+    local index: U32 = 0
+    while index < selection.count do
+        unlink(selection.waiters + index)
+        index = index + 1
+    end
+    wake selection.party
+end
+
+-- Timers: waiters in deadline order. Those whose time has come are completed.
+local add_timer = do(waiter: Ptr Waiter): Unit
+    local later = Ptr(Waiter)(timers_head[0])
+    while later ~= null Waiter and later.deadline <= waiter.deadline do later = Ptr(Waiter)(later.next) end
+    link_after(timers_head, timers_tail, waiter, later)
+end
+
+local fire_timers = do(): Unit
+    local first = Ptr(Waiter)(timers_head[0])
+    if first == null Waiter then return end
+    local time = platform.now()
+    while first ~= null Waiter and first.deadline <= time do
+        unlink first
+        complete first
+        first = Ptr(Waiter)(timers_head[0])
+    end
+end
+
+-- I/O by completion (syntax §20.7) on a readiness backend: a party waits for its descriptor;
+-- the scheduler polls, completes the waiters whose descriptors are ready, and each retries its
+-- system call. `timeout` is poll's, in milliseconds: 0 to look, -1 to wait.
+local Polled = struct { descriptor: I32, events: I16, returned: I16 }
+local poll = extern "poll" { Ptr Polled, U64, I32 } (I32) { header = "<poll.h>" }
+
+local poll_io = do(timeout: I32): Unit
+    local count = io_count[0]
+    if count == 0 then return end
+    local polled = Ptr(Polled)(allocate(U64 count * size_of Polled))
+    local waiter = Ptr(Waiter)(io_head[0])
+    local index: U32 = 0
+    while waiter ~= null Waiter do
+        local entry = polled + index
+        entry.descriptor = waiter.descriptor
+        entry.events = I16 waiter.events
+        entry.returned = 0
+        index = index + 1
+        waiter = Ptr(Waiter)(waiter.next)
+    end
+    if poll(polled, U64 count, timeout) > 0 then
+        waiter = Ptr(Waiter)(io_head[0])
+        index = 0
+        while waiter ~= null Waiter do
+            local following = Ptr(Waiter)(waiter.next)
+            if (polled + index).returned ~= 0 then
+                unlink waiter
+                io_count[0] = io_count[0] - 1
+                complete waiter
+            end
+            index = index + 1
+            waiter = following
+        end
+    end
+    release(Ptr(U8)(polled), U64 count * size_of Polled)
+end
+
+-- plain code waits by running the tasks until its waiter is ready
+-- With nothing ready, it sleeps until the next timer; with no timer either, nothing can ever
+-- wake anyone (syntax §20.8).
+local serve_until = do(waiter: Ptr Waiter): Unit
+    while waiter.ready == 0 do
+        fire_timers()
+        if io_count[0] > 0 then poll_io 0 end
+        local task = dequeue()
+        if task ~= null Task then
+            current[0] = task
+            mechanisms.context_switch(scheduler, task.saved)
+            current[0] = null Task
+            if task.finished ~= 0 then platform.unmap_stack(task.stack, stack_bytes) end
+        elseif waiter.ready == 0 then
+            -- nothing to run: wait for a descriptor or the next timer, whichever comes first
+            local next_timer = Ptr(Waiter)(timers_head[0])
+            if io_count[0] > 0 then
+                local timeout: I32 = -1
+                if next_timer ~= null Waiter then
+                    local time = platform.now()
+                    timeout = 0
+                    if next_timer.deadline > time then timeout = I32((next_timer.deadline - time) / 1000000 + 1) end
+                end
+                poll_io timeout
+            else
+                if next_timer == null Waiter then trap "deadlock: every task is waiting" end
+                platform.sleep_until next_timer.deadline
+            end
+        end
+    end
+end
+
+-- a task waits by switching to the scheduler; it is resumed once woken
+local wait = do(waiter: Ptr Waiter): Unit
+    local task = current[0]
+    if task == null Task then
+        serve_until waiter
+    else
+        mechanisms.context_switch(Ptr task.saved, scheduler[0])
+    end
+end
+
+-- wait until a descriptor is ready for `events` (poll's: 1 to read, 4 to write)
+local wait_ready = do(descriptor: I32, events: U32): Unit
+    local waiter = current_waiter()
+    waiter.descriptor = descriptor
+    waiter.events = events
+    push_waiter(io_head, io_tail, waiter)
+    io_count[0] = io_count[0] + 1
+    wait waiter
+end
+
+local finish = do(task: Ptr Task): Unit
+    local scope = Ptr(Scope)(task.scope)
+    scope.live = scope.live - 1
+    if scope.live == 0 and scope.waiter ~= null U8 then wake(Ptr(Waiter)(scope.waiter)) end
+    task.finished = 1
+    mechanisms.context_switch(Ptr task.saved, scheduler[0])
+end
+
+-- The budget word every residual loop calls in a program with tasks: a task that has run a
+-- quantum of rounds goes back to the ready queue and lets the others run. It has no loop, so it
+-- carries no budget point of its own; plain code returns at once.
+local quantum = 1024
+local rounds = global (U32) { name = "budget_rounds", thread_local = true }
+local budget_service = do(): Unit
+    local task = current[0]
+    if task == null Task then return end
+    rounds[0] = rounds[0] + 1
+    if rounds[0] < quantum then return end
+    rounds[0] = 0
+    enqueue task
+    mechanisms.context_switch(Ptr task.saved, scheduler[0])
+end
+
+------------------------------------------------------------------------------------------------
+-- Spawning: the block is detached, its captures put in a record at the top of the new stack, and
+-- the task's entry runs the detached word on that record.
+
+local entry_for = do(detached_word, Record)
+    local entry = do(argument: Ptr U8): Unit
+        local task = Ptr(Task)(argument)
+        -- the captures move out of the start record into the task
+        detached_word(move_out (Ptr(Record)(argument + task_bytes)) 0)
+        finish task
+    end
+    return entry
+end
+
+-- the vocabulary inside `tasks:`
+local Tasks = struct { scope: Ptr Scope }
+
+function Tasks:spawn(block): Unit
+    local detached = detach block
+    local Record = detached.Record
+    local entry = entry_for(detached.word, Record)
+    local stack = platform.map_stack stack_bytes
+    local top = stack + (stack_bytes - task_bytes - rounded(size_of Record))
+    local task = Ptr(Task)(top)
+    task.saved = null U8
+    task.next = null U8
+    task.stack = stack
+    task.scope = Ptr(U8)(self.scope)
+    task.finished = 0
+    task.id = next_task_id[0]
+    next_task_id[0] = next_task_id[0] + 1
+    local start = Ptr(Record)(top + task_bytes)
+    start[0] = detached.values
+    task.saved = mechanisms.context_initialize(top, fnptr entry, Ptr(U8)(task))
+    self.scope.live = self.scope.live + 1
+    enqueue task
+end
+
+------------------------------------------------------------------------------------------------
+-- Handles (syntax §20.5): a channel or pool is reached through a header that is never freed.
+-- Its records live while its scope does; when the scope ends they go and the header's
+-- generation moves on, so a handle kept past its scope (it carries the generation it was made
+-- with) traps at its next use instead of reaching freed memory. Retired headers are reused.
+
+local Header = struct { generation: U32, data: Ptr U8, bytes: U64, next: Ptr U8 }
+local free_headers = global (Ptr U8) { name = "free_headers", thread_local = true }
+
+local new_header = do(data: Ptr U8, bytes: U64): Ptr Header
+    local header = Ptr(Header)(free_headers[0])
+    if header ~= null Header then
+        free_headers[0] = header.next
+    else
+        header = Ptr(Header)(allocate(size_of Header))
+        header.generation = 0
+    end
+    header.generation = header.generation + 1
+    header.data = data
+    header.bytes = bytes
+    header.next = null U8
+    return header
+end
+
+local retire = do(header: Ptr Header): Unit
+    release(header.data, header.bytes)
+    header.data = null U8
+    header.generation = header.generation + 1
+    header.next = free_headers[0]
+    free_headers[0] = Ptr(U8)(header)
+end
+
+-- the records of a handle, if it is of its header's generation
+local records_of = do(header: Ptr Header, generation: U32, message): Ptr U8
+    if header.generation ~= generation then trap message end
+    return header.data
+end
+
+------------------------------------------------------------------------------------------------
+-- Pools and slots (syntax §20.6): n slots of T reserved once, whose ownership moves between tasks.
+-- A slot's entry records its generation and its owner by task id; using, giving or releasing a
+-- slot the running party does not own traps, and so does a stale slot. A slot in transit (sent,
+-- not yet received, or handed to a waiting taker) is owned by no one (0).
+
+local Entry = struct { generation: U32, next_free: U32, owner: U64 }
+-- `next` and `bytes` first, as every record a scope retires
+local PoolRecord = struct { count: U32, free_head: U32, entries: Ptr Entry, data: Ptr U8, takers: Ptr U8, takers_tail: Ptr U8 }
+
+-- `Slot T`: a handle on one slot of a pool of T; `slot_elements` maps each slot type to its T
+local slot_types, slot_elements = {}, {}
+local Slot = do(T)
+    if slot_types[T] == nil then
+        local S = struct { pool: Ptr U8, pool_generation: U32, index: U32, generation: U32 }
+        slot_types[T] = S
+        slot_elements[S] = T
+    end
+    return slot_types[T]
+end
+local is_slot = native_type -> slot_elements[native_type] ~= nil
+
+-- the entry of a slot, checked to be of its pool's generation and of its own
+local entry_of = do(pool: Ptr U8, pool_generation: U32, index: U32, generation: U32): Ptr Entry
+    local record = Ptr(PoolRecord)(records_of(Ptr(Header)(pool), pool_generation, "a slot used after its pool's tasks scope ended"))
+    if index >= record.count then trap "not a slot of this pool" end
+    local entry = record.entries + index
+    if entry.generation ~= generation then trap "a slot used after it was released" end
+    return entry
+end
+-- ... and owned by the running party
+local owned_entry = do(pool: Ptr U8, pool_generation: U32, index: U32, generation: U32): Ptr Entry
+    local entry = entry_of(pool, pool_generation, index, generation)
+    if entry.owner ~= current_id() then trap "a slot used by a task that does not own it" end
+    return entry
+end
+
+local pool_kinds = {}
+local pool_of = do(T)
+    if pool_kinds[T] then return pool_kinds[T] end
+    local S = Slot T
+    local Taken = oneof { slot: S, empty: Unit }
+    local Pool = struct { header: Ptr Header, generation: U32 }
+    function Pool:records(): Ptr PoolRecord
+        return Ptr(PoolRecord)(records_of(self.header, self.generation, "a pool used after its tasks scope ended"))
+    end
+
+    -- a free slot, now the running party's; empty when all are out
+    function Pool:try_take(): Taken
+        local record = self:records()
+        if record.free_head == 0 then return Taken.empty end
+        local index = record.free_head - 1
+        local entry = record.entries + index
+        record.free_head = entry.next_free
+        entry.owner = current_id()
+        return Taken.slot(S { pool = Ptr(U8)(self.header), pool_generation = self.generation, .index, generation = entry.generation })
+    end
+
+    -- a waiter for a slot: its cell is where a release hands one
+    function Pool:listen(waiter: Ptr Waiter, cell: Ptr S): Unit
+        local record = self:records()
+        waiter.value = Ptr(U8)(cell)
+        push_waiter(Ptr record.takers, Ptr record.takers_tail, waiter)
+    end
+
+    -- a slot handed over is in no one's hands until the party that waited adopts it
+    function Pool:adopt(slot: S): Unit
+        local entry = entry_of(slot.pool, slot.pool_generation, slot.index, slot.generation)
+        entry.owner = current_id()
+    end
+
+    function Pool:take(): S
+        local outcome = S { pool = null U8, pool_generation = 0, index = 0, generation = 0 }
+        local waiting: Bool = false
+        self:try_take() with
+            slot = do(slot) outcome = slot end
+            empty = do() waiting = true end
+        end
+        if not waiting then return outcome end
+        local cell = Ptr(S)(allocate(size_of S))
+        local waiter = current_waiter()
+        self:listen(waiter, cell)
+        wait waiter
+        local slot = cell[0]
+        release(Ptr(U8)(cell), size_of S)
+        self:adopt slot
+        return slot
+    end
+
+    -- the slot goes back: to a party waiting to take one, or to the free list. Its generation
+    -- moves on, so the handle given back is stale.
+    function Pool:release(slot: S): Unit
+        local record = self:records()
+        if slot.pool ~= Ptr(U8)(self.header) then trap "a slot released to a pool it is not from" end
+        local entry = owned_entry(slot.pool, slot.pool_generation, slot.index, slot.generation)
+        entry.generation = entry.generation + 1
+        entry.owner = 0
+        local taker = pop_waiter(Ptr record.takers, Ptr record.takers_tail)
+        if taker ~= null Waiter then
+            Ptr(S)(taker.value)[0] = S { pool = slot.pool, pool_generation = slot.pool_generation, index = slot.index, generation = entry.generation }
+            complete taker
+            return
+        end
+        entry.next_free = record.free_head
+        record.free_head = slot.index + 1
+    end
+
+    -- `p[s]`: the slot's contents as a place, checked at every use
+    function Pool:__index(slot: S): Ref T
+        if slot.pool ~= Ptr(U8)(self.header) then trap "a slot of another pool" end
+        owned_entry(slot.pool, slot.pool_generation, slot.index, slot.generation)
+        local data = Ptr(T)(self:records().data)
+        return Ref data[slot.index]
+    end
+
+    pool_kinds[T] = { .Pool, Slot = S, element = T }
+    pool_kinds[Pool] = pool_kinds[T]
+    return pool_kinds[T]
+end
+
+function Tasks:pool(T, capacity): Inferred
+    local kinds = pool_of T
+    local Pool = kinds.Pool
+    local count = U32 capacity
+    local entries_bytes = U64 count * size_of Entry
+    local bytes = size_of PoolRecord + entries_bytes + U64 count * size_of T
+    local raw = allocate bytes
+    local record = Ptr(PoolRecord)(raw)
+    record.count = count
+    record.entries = Ptr(Entry)(raw + size_of PoolRecord)
+    record.data = raw + size_of PoolRecord + entries_bytes
+    record.takers = null U8
+    record.takers_tail = null U8
+    record.free_head = 0
+    if count > 0 then record.free_head = 1 end
+    local data = Ptr(T)(record.data)
+    local index: U32 = 0
+    while index < count do
+        local entry = record.entries + index
+        entry.generation = 1
+        entry.owner = 0
+        entry.next_free = 0
+        if index + 1 < count then entry.next_free = index + 2 end
+        data[index] = zero_of T
+        index = index + 1
+    end
+    local header = new_header(raw, bytes)
+    header.next = self.scope.records
+    self.scope.records = Ptr(U8)(header)
+    return Pool { .header, generation = header.generation }
+end
+
+------------------------------------------------------------------------------------------------
+-- Channels: a record in the scope's memory, a ring of values and two queues of waiters. A
+-- value crossing a blocked party goes through a cell of its own.
+
+local channel_types, channel_kinds = {}, {}
+
+-- Sendable types (syntax §20.5): scalars, records and sums of sendable types, the handles of
+-- channels and pools, and slots, which move. Never a reference, pointer, view, owner or atomic.
+-- Answers the reason a type is not sendable, or nil; `where` names the part being checked.
+local sendable_problem
+sendable_problem = do(T, where, in_sum)
+    if channel_kinds[T] or pool_kinds[T] then return nil end
+    if is_slot T then
+        if in_sum then return ("a Slot inside a oneof cannot move (its ownership would depend on a choice made when the program runs)") end
+        return nil
+    end
+    local kind = native_kind T
+    if kind == "integer" or kind == "float" or kind == "boolean" or kind == "unit" then return nil end
+    if kind == "record" then
+        for _, field in ipairs T.fields do
+            local problem = sendable_problem(field.type, ("its field '%s'"):format(field.name), in_sum)
+            if problem then return problem end
+        end
+        return nil
+    end
+    if kind == "sum" then
+        for _, alternative in ipairs T.alternatives do
+            local problem = sendable_problem(alternative.payload, ("its alternative '%s'"):format(alternative.name), true)
+            if problem then return problem end
+        end
+        return nil
+    end
+    if kind == "array" then return sendable_problem(T.element, where, in_sum) end
+    if kind == "buffer" then return ("%s is a %s, which owns storage: move it in a pool slot"):format(where, describe_type T) end
+    return ("%s is a %s, which points into memory someone else owns"):format(where, describe_type T)
+end
+
+-- the slot at a path of a message: the message itself, or one of its fields
+local slot_at = do(value, name): Inferred
+    if name == "" then return value end
+    return value[name]
+end
+
+local slot_paths_of_nested
+slot_paths_of_nested = do(T)
+    local found = {}
+    if is_slot T then return { "" } end
+    if native_kind T == "record" then
+        for _, field in ipairs T.fields do
+            if #slot_paths_of_nested(field.type) > 0 then found[#found + 1] = field.name end
+        end
+    end
+    return found
+end
+
+-- where the slots of a message are: the whole value, or its fields (deeper is not moved yet)
+local slot_paths_of = do(T)
+    if is_slot T then return { "" } end
+    local paths = {}
+    if native_kind T == "record" then
+        for _, field in ipairs T.fields do
+            if is_slot field.type then
+                paths[#paths + 1] = field.name
+            elseif native_kind field.type == "record" and #slot_paths_of_nested(field.type) > 0 then
+                error(("Chan %s: a Slot inside the field '%s' is nested too deep to move; make it a field of the message"):format(describe_type T, field.name), 0)
+            end
+        end
+    end
+    return paths
+end
+local channel_of = do(T)
+    if channel_types[T] then return channel_types[T] end
+    local problem = sendable_problem(T, "the element", false)
+    if problem then error(("Chan %s: values crossing a channel are copies, and %s"):format(describe_type T, problem), 0) end
+    local Received = oneof { value: T, closed: Unit }
+    -- what a channel holds for a receiver now: a value, the news that it is closed, or nothing
+    local Polled = oneof { value: T, closed: Unit, empty: Unit }
+    local Record = struct {
+        closed: U32, capacity: U32, head: U32, count: U32, buffer: Ptr T,
+        receivers: Ptr U8, receivers_tail: Ptr U8, senders: Ptr U8, senders_tail: Ptr U8,
+    }
+    local Chan = struct { header: Ptr Header, generation: U32 }
+    function Chan:records(): Ptr Record
+        return Ptr(Record)(records_of(self.header, self.generation, "a channel used after its tasks scope ended"))
+    end
+    -- a slot crossing a channel moves: the sender gives it when it is delivered or offered, the
+    -- receiver adopts it, and a losing offer of a `first_of` takes it back
+    local slot_paths = slot_paths_of T
+
+    function Chan:give(value: T): Unit
+        for _, name in ipairs slot_paths do
+            local slot = slot_at(value, name)
+            local entry = owned_entry(slot.pool, slot.pool_generation, slot.index, slot.generation)
+            entry.owner = 0
+        end
+    end
+    function Chan:adopt(value: T): Unit
+        for _, name in ipairs slot_paths do
+            local slot = slot_at(value, name)
+            local entry = entry_of(slot.pool, slot.pool_generation, slot.index, slot.generation)
+            entry.owner = current_id()
+        end
+    end
+
+    -- a value delivered now, to a waiting receiver or into the ring; false when it would wait
+    function Chan:try_send(value: T): Bool
+        local record = self:records()
+        if record.closed ~= 0 then trap "send on a closed channel" end
+        local receiver = pop_waiter(Ptr record.receivers, Ptr record.receivers_tail)
+        if receiver ~= null Waiter then
+            self:give value
+            Ptr(T)(receiver.value)[0] = value
+            complete receiver
+            return true
+        end
+        if record.count < record.capacity then
+            self:give value
+            local buffer = record.buffer
+            buffer[(record.head + record.count) % record.capacity] = value
+            record.count = record.count + 1
+            return true
+        end
+        return false
+    end
+
+    function Chan:poll(): Polled
+        local record = self:records()
+        if record.count > 0 then
+            local ring = record.buffer
+            local value = ring[record.head]
+            record.head = (record.head + 1) % record.capacity
+            record.count = record.count - 1
+            local sender = pop_waiter(Ptr record.senders, Ptr record.senders_tail)
+            if sender ~= null Waiter then
+                ring[(record.head + record.count) % record.capacity] = Ptr(T)(sender.value)[0]
+                record.count = record.count + 1
+                complete sender
+            end
+            self:adopt value
+            return Polled.value value
+        end
+        local sender = pop_waiter(Ptr record.senders, Ptr record.senders_tail)
+        if sender ~= null Waiter then
+            local value = Ptr(T)(sender.value)[0]
+            complete sender
+            self:adopt value
+            return Polled.value value
+        end
+        if record.closed ~= 0 then return Polled.closed end
+        return Polled.empty
+    end
+
+    -- a waiter for a value: its cell is where a sender puts it
+    function Chan:listen(waiter: Ptr Waiter, cell: Ptr T): Unit
+        local record = self:records()
+        waiter.value = Ptr(U8)(cell)
+        push_waiter(Ptr record.receivers, Ptr record.receivers_tail, waiter)
+    end
+
+    -- a waiter offering the value in its cell
+    function Chan:offer(waiter: Ptr Waiter, cell: Ptr T): Unit
+        local record = self:records()
+        self:give(cell[0])
+        waiter.value = Ptr(U8)(cell)
+        push_waiter(Ptr record.senders, Ptr record.senders_tail, waiter)
+    end
+
+    function Chan:send(value: T): Unit
+        if self:try_send value then return end
+        local cell = Ptr(T)(allocate(size_of T))
+        cell[0] = value
+        local waiter = current_waiter()
+        self:offer(waiter, cell)
+        wait waiter
+        release(Ptr(U8)(cell), size_of T)
+    end
+
+    function Chan:recv(): Received
+        local outcome: Received = Received.closed
+        local waiting: Bool = false
+        self:poll() with
+            value = do(value) outcome = Received.value value end
+            closed = do() outcome = Received.closed end
+            empty = do() waiting = true end
+        end
+        if not waiting then return outcome end
+        local cell = Ptr(T)(allocate(size_of T))
+        local waiter = current_waiter()
+        self:listen(waiter, cell)
+        wait waiter
+        if waiter.closed ~= 0 then
+            release(Ptr(U8)(cell), size_of T)
+            return Received.closed
+        end
+        local value = cell[0]
+        release(Ptr(U8)(cell), size_of T)
+        self:adopt value
+        return Received.value value
+    end
+
+    function Chan:close(): Unit
+        local record = self:records()
+        if record.closed ~= 0 then trap "a channel is closed twice" end
+        record.closed = 1
+        local receiver = pop_waiter(Ptr record.receivers, Ptr record.receivers_tail)
+        while receiver ~= null Waiter do
+            receiver.closed = 1
+            complete receiver
+            receiver = pop_waiter(Ptr record.receivers, Ptr record.receivers_tail)
+        end
+    end
+
+    -- receive until the channel is closed and drained
+    function Chan:each(body): Unit
+        local open: Bool = true
+        while open do
+            self:recv() with
+                value = do(value) body value end
+                closed = do() open = false end
+            end
+        end
+    end
+
+    channel_types[T] = { .Chan, .Record, .Received, .Polled, element = T }
+    channel_kinds[Chan] = channel_types[T]
+    return channel_types[T]
+end
+
+-- `Chan T`, `Pool T`: the handle types, for a place that keeps one (syntax §20.5)
+local Chan = T -> channel_of(T).Chan
+local Pool = T -> pool_of(T).Pool
+
+function Tasks:channel(T, capacity): Inferred
+    local kinds = channel_of T
+    local Chan, Record = kinds.Chan, kinds.Record
+    local count = U32 capacity
+    local bytes = size_of Record + U64 count * size_of T
+    local raw = allocate bytes
+    local record = Ptr(Record)(raw)
+    record.closed = 0
+    record.capacity = count
+    record.head = 0
+    record.count = 0
+    record.buffer = Ptr(T)(raw + size_of Record)
+    record.receivers = null U8
+    record.receivers_tail = null U8
+    record.senders = null U8
+    record.senders_tail = null U8
+    local header = new_header(raw, bytes)
+    header.next = self.scope.records
+    self.scope.records = Ptr(U8)(header)
+    return Chan { .header, generation = header.generation }
+end
+
+------------------------------------------------------------------------------------------------
+-- Time: durations, `sleep`, and `after` as a case of `first_of`
+
+local Duration = struct { nanoseconds: U64 }
+local ns = do(count): Duration = Duration { nanoseconds = U64 count }
+local us = do(count): Duration = Duration { nanoseconds = U64 count * 1000 }
+local ms = do(count): Duration = Duration { nanoseconds = U64 count * 1000000 }
+local seconds = do(count): Duration = Duration { nanoseconds = U64 count * 1000000000 }
+
+local sleep = do(duration: Duration): Unit
+    local waiter = current_waiter()
+    waiter.deadline = platform.now() + duration.nanoseconds
+    add_timer waiter
+    wait waiter
+end
+
+------------------------------------------------------------------------------------------------
+-- `first_of` (syntax §20.4): describe, then run. Each case is keyed data made while compiling;
+-- one engine attempts them from a rotating start, runs `closed` or `default` when they apply, and
+-- otherwise waits on every case at once. A completed receive on a channel that closed meanwhile
+-- is no value: the cases are attempted again.
+
+local recv = do(channel, handler): Inferred
+    return { kind = "recv", .channel, .handler }
+end
+local send = do(channel, value, handler): Inferred
+    return { kind = "send", .channel, .value, .handler }
+end
+local take = do(pool, handler): Inferred
+    return { kind = "take", .pool, .handler }
+end
+local after = do(duration, handler): Inferred
+    return { kind = "after", .duration, .handler }
+end
+
+-- the element type of a case's channel, from the channel's type
+local element_of = do(case)
+    if case.kind == "take" then return pool_kinds[type_of case.pool].Slot end
+    return channel_kinds[type_of case.channel].element
+end
+local case_count = cases -> #cases
+local receives_of = do(cases)
+    local count = 0
+    for _, case in ipairs cases do
+        if case.kind == "recv" then count = count + 1 end
+    end
+    if count > 0 and cases.closed == nil and cases.default == nil then
+        error("first_of: when every channel is closed it runs `closed = do ... end`; give it one (or a default)", 0)
+    end
+    if count == 0 and cases.closed ~= nil then
+        error("first_of: `closed` runs when every received channel is closed, but no case receives", 0)
+    end
+    return count
+end
+local tickets = global (U32) { name = "first_of_tickets", thread_local = true }
+
+local first_of = do(cases): Unit
+    local count = case_count cases
+    local receives = receives_of cases
+    local start_time = platform.now()
+    local selection = Ptr(Selection)(allocate(size_of Selection + U64 count * size_of Waiter))
+    local waiters = Ptr(Waiter)(Ptr(U8)(selection) + size_of Selection)
+    local done: Bool = false
+    while not done do
+        local drained: U32 = 0
+        local start = tickets[0] % count
+        tickets[0] = tickets[0] + 1
+        local step: U32 = 0
+        while step < count and not done do
+            local position = (start + step) % count
+            for index, case in ipairs cases do
+                if position == index - 1 and not done then
+                    if case.kind == "recv" then
+                        case.channel:poll() with
+                            value = do(value)
+                                done = true
+                                case.handler value
+                            end
+                            closed = do() drained = drained + 1 end
+                            empty = do() end
+                        end
+                    elseif case.kind == "send" then
+                        if case.channel:try_send(case.value) then
+                            done = true
+                            case.handler()
+                        end
+                    elseif case.kind == "take" then
+                        case.pool:try_take() with
+                            slot = do(slot)
+                                done = true
+                                case.handler slot
+                            end
+                            empty = do() end
+                        end
+                    else
+                        if platform.now() >= start_time + case.duration.nanoseconds then
+                            done = true
+                            case.handler()
+                        end
+                    end
+                end
+            end
+            step = step + 1
+        end
+        if receives > 0 and cases.closed ~= nil then
+            if not done and drained == receives then
+                done = true
+                cases.closed()
+            end
+        end
+        if cases.default ~= nil then
+            if not done then
+                done = true
+                cases.default()
+            end
+        end
+        if not done then
+            -- wait on every case at once; the first to complete claims the selection
+            local party = current_waiter()
+            selection.claimed = 0
+            selection.count = count
+            selection.waiters = waiters
+            selection.party = party
+            for index, case in ipairs cases do
+                local waiter = waiters + (index - 1)
+                reset(waiter, null Task)
+                waiter.index = index - 1
+                waiter.selection = Ptr(U8)(selection)
+                if case.kind == "recv" then
+                    local T = element_of case
+                    case.channel:listen(waiter, Ptr(T)(allocate(size_of T)))
+                elseif case.kind == "send" then
+                    local T = element_of case
+                    local cell = Ptr(T)(allocate(size_of T))
+                    cell[0] = case.value
+                    case.channel:offer(waiter, cell)
+                elseif case.kind == "take" then
+                    local S = element_of case
+                    case.pool:listen(waiter, Ptr(S)(allocate(size_of S)))
+                else
+                    waiter.deadline = start_time + case.duration.nanoseconds
+                    add_timer waiter
+                end
+            end
+            wait party
+            -- every waiter is out of its queue now; the claimed case runs, every cell goes
+            local claimed = selection.claimed
+            for index, case in ipairs cases do
+                local waiter = waiters + (index - 1)
+                local won = claimed == index
+                if case.kind == "after" then
+                    if won then
+                        done = true
+                        case.handler()
+                    end
+                else
+                    local T = element_of case
+                    local cell = Ptr(T)(waiter.value)
+                    if case.kind == "recv" then
+                        if won and waiter.closed == 0 then
+                            local value = cell[0]
+                            release(Ptr(U8)(cell), size_of T)
+                            case.channel:adopt value
+                            done = true
+                            case.handler value
+                        else
+                            release(Ptr(U8)(cell), size_of T)
+                        end
+                    elseif case.kind == "take" then
+                        if won then
+                            local slot = cell[0]
+                            release(Ptr(U8)(cell), size_of T)
+                            case.pool:adopt slot
+                            done = true
+                            case.handler slot
+                        else
+                            release(Ptr(U8)(cell), size_of T)
+                        end
+                    else
+                        if won then
+                            release(Ptr(U8)(cell), size_of T)
+                            done = true
+                            case.handler()
+                        else
+                            -- a losing offer keeps its value: a slot in it is the sender's again
+                            case.channel:adopt(cell[0])
+                            release(Ptr(U8)(cell), size_of T)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    release(Ptr(U8)(selection), size_of Selection + U64 count * size_of Waiter)
+end
+
+-- `tasks:` (syntax §20.1): the body, then a wait until every task of the scope has ended; then
+-- the channels retire
+local tasks = do(body): Unit
+    local scope = Ptr(Scope)(allocate(size_of Scope))
+    scope.live = 0
+    scope.waiter = null U8
+    scope.records = null U8
+    -- the vocabulary is a value, a handle on the scope: a task that mentions it captures a copy,
+    -- so it can spawn and make channels in the scope it belongs to (syntax §20.1)
+    body(Tasks { .scope })
+    if scope.live > 0 then
+        local waiter = current_waiter()
+        scope.waiter = Ptr(U8)(waiter)
+        wait waiter
+    end
+    local header = Ptr(Header)(scope.records)
+    while header ~= null Header do
+        local following = Ptr(Header)(header.next)
+        retire header
+        header = following
+    end
+    release(Ptr(U8)(scope), size_of Scope)
+end
+
+return define
+    .wait_ready
+    .tasks
+    .budget_service
+    .first_of
+    .recv
+    .send
+    .after
+    .take
+    .Slot
+    .Chan
+    .Pool
+    .sleep
+    .ns
+    .us
+    .ms
+    .seconds
+    .Duration
+end

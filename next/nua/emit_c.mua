@@ -548,12 +548,13 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         LifetimeEnd = |node, recurse| -> nil
         Moves = |node, recurse| -> nil
         Ends = |node, recurse| -> nil
-        Budget = |node, recurse| -> nil
+        Budget = |node, recurse| -> names_of_definitions[program.budget_service] .. "();"
         Mechanism = do(node, recurse)
             local binding = platform.bindings[node.binding]
             if binding == nil then fail("the mechanism " .. node.binding .. " is not declared") end
             local arguments = {}
             for index, argument in ipairs node.arguments do arguments[index] = operand argument end
+            program.mechanisms_used[node.binding] = true
             local call = ("%s(%s);"):format(binding.c_symbol, table.concat(arguments, ", "))
             if node.result then return value_name(node.result, binding.result) .. " = " .. call end
             return call
@@ -713,7 +714,7 @@ local emit = do(prepared)
             names[definition.id] = ("%s_%d"):format(word_name, count)
         end
     end
-    local view = { ..program, .exported }
+    local view = { ..program, .exported, mechanisms_used = {} }
     local bodies, prototypes, exported_prototypes = {}, {}, {}
     for _, definition in ipairs ordered do
         local text, prototype = emit_definition(definition, names[definition.id], view, names)
@@ -774,6 +775,17 @@ local emit = do(prepared)
     table.sort sorted
     if #sorted > 0 then parts[#parts + 1] = table.concat(sorted, "\n") .. "\n" end
     if #global_text > 0 then parts[#parts + 1] = table.concat(global_text, "\n") .. "\n" end
+    -- the mechanisms a program reaches: their prototypes, and the assembly that defines them
+    local mechanism_names = {}
+    for name in pairs view.mechanisms_used do mechanism_names[#mechanism_names + 1] = name end
+    table.sort mechanism_names
+    for _, name in ipairs mechanism_names do
+        local binding = platform.bindings[name]
+        local parameters = {}
+        for index, parameter in ipairs binding.parameters do parameters[index] = c_type parameter end
+        parts[#parts + 1] = ('__attribute__((visibility("hidden"))) %s %s(%s);'):format(c_type binding.result, binding.c_symbol, table.concat(parameters, ", "))
+    end
+    for _, text in ipairs(platform.assembly_of view.mechanisms_used) do parts[#parts + 1] = "__asm__(" .. c_string(text) .. ");" end
     parts[#parts + 1] = table.concat(prototypes, "\n") .. "\n"
     -- a host declaring the exports needs the records they use first
     local interface = {}
