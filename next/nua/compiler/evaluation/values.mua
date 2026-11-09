@@ -28,6 +28,8 @@ return do(E, core)
     -- values
 
     E.constant_of = do(value)
+        -- a header's constant is a run-time value here
+        if is_native value and NativeValue.is(value, data.Bits) and Operand.is(value.operand, data.Constant) and data.NativeConstant.is(value.operand.bits, data.ForeignValue) then return nil end
         if is_native value and NativeValue.is(value, data.Bits) and Operand.is(value.operand, data.Constant) then return value.operand end
         return nil
     end
@@ -37,6 +39,13 @@ return do(E, core)
     -- a host value met by a native type (syntax §7.2): numbers range-checked, booleans as Bool,
     -- a table of fields as a record
     E.from_host = do(path, type, value, what)
+        -- an atomic's initialization is the one plain store (syntax §19.1)
+        if types.NativeType.is(type, types.AtomicType) and not (is_native value and value.type == type) then
+            local plain = E.from_host(path, type.target, value, what)
+            local constant = E.constant_of plain
+            if constant then return E.known(data.Constant { .type, bits = constant.bits }) end
+            return E.compute(path, "reinterpret", type, { plain })
+        end
         -- a value described in host code meets its own type only (syntax §2.2); a Lua number
         -- described as an integer is converted as C converts it, toward zero, and must fit
         if check(types.Described, value) then

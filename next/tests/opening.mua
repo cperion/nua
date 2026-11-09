@@ -1,0 +1,144 @@
+-- Opening, keyed spread and function values (syntax §10.5, §10.7, §21.2).
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "an opened record's fields are live places; bare calls find its methods":
+    local library, text = native("opening_records", [[
+local Vec = struct { x: F64, y: F64 }
+local Terminal = struct { width: U32, drawn: U32 }
+function Terminal:draw(lines: U32): Unit
+    self.drawn = self.drawn + lines
+end
+local status = do(t: Ref Terminal, extra: U32): Unit
+    t.drawn = t.drawn + extra
+end
+local open_squared = do(..: Vec): F64 = x * x + y * y
+local open_vec = do(a: F64): F64 = open_squared(Vec { x = a, y = 2 })
+export open_vec
+local session = do(..: Ref Terminal, lines: U32): U32
+    draw lines
+    (status)(.., 1)
+    return width - drawn
+end
+local open_session = do(lines: U32): U32
+    local t = Terminal { width = 80, drawn = 2 }
+    return session(Ref t, lines)
+end
+export open_session
+local open_local = do(k: U32): U32
+    local t = Terminal { width = k, drawn = 0 }
+    local t..
+    drawn = width + 1
+    local before = drawn
+    drawn = 7
+    return before * 100 + t.drawn
+end
+export open_local
+local open_named = do(ctx..: Terminal): U32 = width + ctx.drawn
+local open_shadow = do(k: U32): U32
+    local t = Terminal { width = k, drawn = 3 }
+    local width: U32 = 1
+    local t..
+    local inner = width
+    local drawn: U32 = 50
+    return inner * 100 + drawn + open_named t
+end
+export open_shadow
+local units = { kilo = 1000, mega = 1000000 }
+local open_table = do(k: U32, m: U32): U32
+    local units..
+    return k * kilo + m * mega
+end
+export open_table
+]])
+    assert(library.open_vec(3) == 13)
+    assert(library.open_session(4) == 80 - 7)
+    assert(library.open_local(9) == 1007)
+    assert(library.open_shadow(5) == 550 + 8)
+    assert(library.open_table(2, 3) == 3002000)
+    refuses([[
+local f = do(): U32
+    local x = (..)
+    return 0
+end
+export f
+]], "context-required")
+end
+
+test "an opened store slot's fields are live places (§10.6)":
+    local library = native("opening_slot", [[
+local Node = struct { value: U32, weight: U32 }
+local Nodes = Store Node
+local double_node = do(s: Ref Nodes, id: Id Node): Unit
+    local node.. = s[id]
+    value = value * 2
+    weight = weight + 1
+end
+local open_slot = do(v: U32): U32
+    local s = Nodes {}
+    local id = s:add(Node { value = v, weight = 1 })
+    double_node(Ref s, id)
+    return s[id].value * 100 + s[id].weight
+end
+export open_slot
+]])
+    assert(library.open_slot(4) == 802)
+end
+
+test "a keyed spread builds a record from a record":
+    local library = native("opening_spread", [[
+local Point = struct { x: I32, y: I32 }
+local spread_moved = do(k: I32): I32
+    local p = Point { x = k, y = 2 }
+    local q = Point { ..p, x = p.x + 1 }
+    return q.x * 100 + q.y
+end
+export spread_moved
+]])
+    assert(library.spread_moved(4) == 502)
+    refuses([[
+local Point = struct { x: I32 }
+local f = do(k: I32): I32
+    local p = Point { x = k }
+    local q = Point { ..p, ..p }
+    return q.x
+end
+export f
+]], "spread-overlap")
+end
+
+test "function values: taken, called, compared, null":
+    local library = native("opening_functions", [[
+local Op = Fn({ U32 }, U32)
+local double = do(x: U32): U32 = x * 2
+local square = do(x: U32): U32 = x * x
+local scaled = do(by, x: U32): U32 = x * by
+local pick_fn = do(which: U32): Op
+    if which == 0 then return fnptr double end
+    if which == 1 then return fnptr square end
+    return null Op
+end
+local fn_apply = do(which: U32, x: U32): U32
+    local f = pick_fn which
+    return f x
+end
+export fn_apply
+local fn_partial = do(x: U32): U32
+    local f = fnptr(scaled 3)
+    return f x
+end
+export fn_partial
+local fn_null = do(which: U32): Bool = pick_fn which == null Op
+export fn_null
+]])
+    assert(library.fn_apply(0, 5) == 10 and library.fn_apply(1, 5) == 25)
+    assert(library.fn_partial(4) == 12)
+    assert(library.fn_null(2) == true and library.fn_null(0) == false)
+end

@@ -56,7 +56,7 @@ local Callee = family "callee"
 local DirectNua = struct { definition: DefinitionId }
 local IndirectNua = struct { pointer: Operand, signature: Signature, provenance: NuaEntry }
 -- `header`: the C header declaring it, as an #include names it; without one a prototype is emitted
-local Foreign = struct { pointer: Operand, signature: Signature, contract: ForeignEffects, header: Optional(String) }
+local Foreign = struct { pointer: Operand, signature: Signature, contract: ForeignEffects, header: Optional(String), reads: Optional(Boolean) }
 Callee { DirectNua, IndirectNua, Foreign }
 
 local Site = struct { id: InstructionId, origin: OriginId }
@@ -128,7 +128,7 @@ local WordInfo = struct { id: WordId, name: String, requirements: list_of(Requir
 local Program = struct {
     revision: Natural, definitions: map_of(DefinitionId, Definition), words: map_of(WordId, WordInfo),
     globals: map_of(GlobalId, Global), exports: list_of(Export), lifetimes: map_of(LifetimeId, Lifetime),
-    origins: map_of(OriginId, Origin)
+    origins: map_of(OriginId, Origin), headers: Optional(Table)
 }
 
 return define

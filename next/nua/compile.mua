@@ -71,6 +71,7 @@ local new_compilation = do()
         borrows = {}
         exports = {}
         globals = {}
+        headers = {}
         .origins
         origin = do(origin_source, line)
             local key = tostring origin_source .. ":" .. tostring line
@@ -148,7 +149,7 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret", "hold_structure", "release_structure", "null", "static_cstring", "buffer_view", "loaned_view", "raw_view", "view_as", "end_loan" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    for _, name in ipairs { "trap", "moves", "ends", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret", "hold_structure", "release_structure", "null", "static_cstring", "buffer_view", "loaned_view", "raw_view", "view_as", "end_loan", "fnptr", "atomic_operation", "fence" } do environment[name] = hosting.primitive(name, E.host_primitive) end
     environment.copy = hosting.primitive("copy", E.host_primitive, true)
     environment.owns = types.owns
     environment.Inferred = hosting.Inferred
@@ -197,6 +198,66 @@ local hosting_environment = do(compilation, filename, E)
             header = options.header
         end
         return data.Bits { type = types.pointer native_type, operand = data.Constant { type = types.pointer native_type, bits = data.SymbolAddress { name = c_name, offset = 0 } } }
+    end
+    environment.Fn = |parameters, result| -> types.function_type(parameters, result)
+    environment.Atomic = types.atomic
+    environment.is_integer = rules.is_integer
+    -- what only a header knows (syntax §18): a constant, a variable read where it is called,
+    -- a layout
+    local needs_header = do(header)
+        if header then compilation.headers[header] = true end
+    end
+    environment.cconst = do(name, native_type, header)
+        needs_header header
+        return E.known(data.Constant { type = native_type, bits = data.ForeignValue { .name } })
+    end
+    environment.cread = do(name, native_type, header)
+        return hosting.foreign({ .name, parameters = {}, result = native_type, header = header, variadic = false, reads = true }, do(foreign, arguments)
+            error(("%s is a C variable: it is read inside an evaluation, never while compiling at top level"):format(name), 3)
+        end)
+    end
+    environment.cstruct = do(c_name, header, source)
+        needs_header header
+        local record = types.RecordType { name = c_name, fields = {}, .c_name }
+        local entries = type source == "function" and source(record) or source
+        for _, entry in ipairs entries do
+            if entry[2] == record then error(("cstruct %s: the type being declared may occur only behind a pointer"):format(c_name), 2) end
+            record.fields[#record.fields + 1] = types.Field { name = entry[1], type = entry[2], c_member = entry[3] }
+        end
+        return record
+    end
+    environment.size_of = do(native_type)
+        if types.NativeType.is(native_type, types.RecordType) and native_type.c_name then
+            return E.known(data.Constant { type = types.U64, bits = data.ForeignValue { name = "sizeof(" .. native_type.c_name .. ")" } })
+        end
+        return prelude.size_of native_type
+    end
+    -- `test "name" do ... end` (syntax §3.10): a computation of program construction, named
+    local test_names = {}
+    environment.test = do(name, body)
+        if type name ~= "string" then error("test: the name must be text known while compiling", 2) end
+        if body == nil then return block -> environment.test(name, block) end
+        test_names[#test_names + 1] = name
+        local done, problem = xpcall(body, |message| -> tostring message)
+        local trail = table.concat(test_names, " > ")
+        test_names[#test_names] = nil
+        if not done then error(("test %q:\n%s"):format(trail, problem), 0) end
+    end
+    -- `assert` also takes a native condition, which must be a known Bool (syntax §3.10)
+    environment.assert = function(...)
+        local condition = (...)
+        local native_type = environment.type_of condition
+        if native_type == nil then return assert(...) end
+        if native_type ~= types.Bool then error("assert: a native condition is a Bool, not " .. types.describe native_type, 2) end
+        if not environment.is_known condition then error("assert: this condition is not known while compiling, and an assertion is never a run-time check", 2) end
+        if environment.host condition == false then error(select(2, ...) or "assertion failed", 2) end
+        return ...
+    end
+    -- `require "nua.x"` is a bundled library; other names are Lua's
+    environment.require = do(name)
+        local bundled = name:match("^nua%.(.+)$")
+        if bundled then return environment.import(bundled) end
+        return require(name)
     end
     environment.opaque = types.opaque
     environment.CString = types.CString
@@ -288,6 +349,8 @@ local compiling_with_members = do(source, filename)
     environment.Map = environment.import("map").Map
     environment.cformat = environment.import("cformat").cformat
     environment.import "str"
+    environment.import "atomic"
+    environment.atomic_ptr = environment.import("atomic").atomic_ptr
     load_nua(source, filename)
 
     local exports = {}
@@ -302,6 +365,7 @@ local compiling_with_members = do(source, filename)
         .definitions
         words = registry.words()
         globals = compilation.globals
+        headers = compilation.headers
         .exports
         lifetimes = {}
         origins = compilation.origins

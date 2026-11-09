@@ -123,6 +123,79 @@ return do(E, core)
         return E.apply_member(path, base, value, hook, { name }, false, true)
     end
 
+    -- Opening (syntax §10.5): a context's names are what the front end resolves through these.
+    -- A field of a record is a live place of the retained receiver; a Lua table offers its
+    -- string keys; methods are not introduced, a bare call finds them.
+    E.open_context = |path, base| -> { .base }
+    E.open_reference = do(path, place)
+        if E.is_cell place then return E.reference_to(path, place) end
+        return place
+    end
+    local opened_value = do(path, context)
+        local value = E.is_cell context.base and E.peek(path, context.base) or context.base
+        return E.deref(path, value)
+    end
+    local has_field = |value, name| -> is_native value and types.NativeType.is(value.type, types.RecordType) and E.field_of(value.type, name) ~= nil
+    E.opened = do(path, context, name, fallback)
+        if path.dead then return fallback() end
+        local value = opened_value(path, context)
+        if has_field(value, name) then
+            if E.is_cell context.base then return cells.FieldCell { base = context.base, .name } end
+            return E.dot(path, context.base, name)
+        end
+        if not is_native value and lua_type value == "table" and value[name] ~= nil then return value[name] end
+        return fallback()
+    end
+    E.apply_opened = do(path, contexts, name, fallback, arguments, boundary)
+        if path.dead then return nil end
+        for _, context in ipairs contexts do
+            local value = opened_value(path, context)
+            if is_native value then
+                if name:sub(1, 2) ~= "__" and E.member_of(value.type, name) then return E.method(path, context.base, name, arguments, boundary) end
+                if has_field(value, name) then return E.apply(path, cells.FieldCell { base = context.base, .name }, arguments, boundary) end
+            elseif lua_type value == "table" and value[name] ~= nil then
+                return E.apply(path, value[name], arguments, boundary)
+            end
+        end
+        return E.apply(path, fallback(), arguments, boundary)
+    end
+
+    -- A keyed spread (syntax §10.7): `{ ..p, x = 1 }`. Explicit fields override spread ones
+    -- wherever they stand; two spreads may not give one field.
+    E.spread_table = do(path, entries)
+        local explicit, contributed, result = {}, {}, {}
+        for _, entry in ipairs entries do
+            if entry.name then explicit[entry.name] = true end
+        end
+        local position = 0
+        for _, entry in ipairs entries do
+            if entry.spread ~= nil then
+                local value = E.deref(path, E.is_cell entry.spread and E.peek(path, entry.spread) or entry.spread)
+                local names = {}
+                if is_native value and types.NativeType.is(value.type, types.RecordType) then
+                    for _, field in ipairs value.type.fields do names[#names + 1] = field.name end
+                elseif not is_native value and lua_type value == "table" then
+                    for key in pairs value do if lua_type key == "string" then names[#names + 1] = key end end
+                else
+                    fail(path, "spread-source: a keyed spread takes a record or a table")
+                end
+                for _, name in ipairs names do
+                    if contributed[name] then fail(path, ("spread-overlap: two spreads give the field '%s'"):format(name)) end
+                    contributed[name] = true
+                    if not explicit[name] then
+                        if is_native value then result[name] = E.dot(path, entry.spread, name) else result[name] = value[name] end
+                    end
+                end
+            elseif entry.name then
+                result[entry.name] = entry.value
+            else
+                position += 1
+                result[position] = entry.value
+            end
+        end
+        return result
+    end
+
     -- Capturing an application's arguments (compiler activities §5.1, syntax §9.2): each in
     -- order, once the callee is known, under the requirement it fills. An argument given as a
     -- place (a local, a field of one) is read for a value requirement (an owner moves) and
@@ -170,6 +243,9 @@ return do(E, core)
         local receiver = takes_reference member and E.receiver(path, base) or value
         if hosting.is_word member then return hosting.application(member, { receiver }) end
         if hosting.is_application member then return hosting.supply(member, { receiver }) end
+        -- a member that is a value (`M.length = U64 n`)
+        if check(types.Described, member) then return E.from_host(path, member.type, member, "a member") end
+        if lua_type member ~= "function" then return member end
         return |...| -> member(receiver, ...)
     end
 

@@ -277,7 +277,7 @@ local yields_bool = |opcode| -> |result, arguments| -> both_same(arguments, opco
 local equality_entry = do(opcode, compare)
     return define
         operands = 2
-        check = operand_rule(type -> is_numeric type or is_boolean type or is_pointer type, "equality", yields_bool opcode)
+        check = operand_rule(type -> is_numeric type or is_boolean type or is_pointer type or NativeType.is(type, types.FunctionType), "equality", yields_bool opcode)
         integer = integer_comparison compare
         float = value_comparison compare
         boolean = boolean_logic compare
@@ -341,7 +341,7 @@ local Opcodes = define
         operands = 1
         check = do(result, arguments)
             local first, target = arguments[1], { pointer_bits = 64 }
-            local scalar = type -> is_numeric type or is_pointer type or NativeType.is(type, types.ReferenceType)
+            local scalar = type -> is_numeric type or is_boolean type or is_pointer type or NativeType.is(type, types.ReferenceType) or NativeType.is(type, types.AtomicType)
             if not scalar first or not scalar result or types.layout(first, target).size ~= types.layout(result, target).size then
                 return ("cannot reinterpret %s as %s"):format(described first, described result)
             end
@@ -387,6 +387,9 @@ end
 -- fold a computation whose operands are all constants; types must already be checked. A
 -- computation with unknown operands is refused when its known ones prove undefined behaviour.
 local fold = do(opcode, result, arguments)
+    for _, argument in ipairs arguments do
+        if data.Operand.is(argument, data.Constant) and data.NativeConstant.is(argument.bits, data.ForeignValue) then return FoldingDecision.not_foldable() end
+    end
     local undefined = proven_undefined(opcode, arguments)
     if undefined then return invalid undefined end
     for _, argument in ipairs arguments do

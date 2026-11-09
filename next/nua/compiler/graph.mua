@@ -227,20 +227,41 @@ local definitions_in_order = do(program)
     return list
 end
 
--- the definitions a definition calls directly, as a set
-local called_definitions = do(definition)
-    local called = {}
-    for _, block in ipairs definition.blocks do
-        for _, instruction in ipairs block.instructions do
-            if Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then called[instruction.callee.definition] = true end
-        end
-    end
-    return called
-end
 local edges_of = do(terminator)
     if Terminator.is(terminator, data.Jump) then return { terminator.edge } end
     if Terminator.is(terminator, data.Branch) then return { terminator.when_true, terminator.when_false } end
     return {}
+end
+
+-- the definitions a definition calls directly, or whose address it takes (`fnptr`, syntax
+-- §21.2) wherever the address travels: an instruction's operand, a block argument, the result
+local called_definitions = do(definition)
+    local called = {}
+    local address_of
+    address_of = do(bits)
+        if data.NativeConstant.is(bits, data.DefinitionAddress) then called[bits.definition] = true end
+        if data.NativeConstant.is(bits, data.AggregateBits) then
+            for _, part in ipairs bits.parts do address_of part end
+        end
+    end
+    local visit = do(operand)
+        if operand and data.Operand.is(operand, data.Constant) then address_of operand.bits end
+    end
+    for _, block in ipairs definition.blocks do
+        for _, instruction in ipairs block.instructions do
+            if Instruction.is(instruction, data.Invoke) and data.Callee.is(instruction.callee, data.DirectNua) then called[instruction.callee.definition] = true end
+            if instruction.value and check(data.Operand, instruction.value) then visit(instruction.value) end
+            for _, list in ipairs { instruction.arguments or {}, instruction.components or {} } do
+                for _, operand in ipairs list do visit operand end
+            end
+        end
+        local terminator = block.terminator
+        if Terminator.is(terminator, data.Return) then visit(terminator.value) end
+        for _, edge in ipairs edges_of(terminator) do
+            for _, operand in ipairs edge.arguments do visit operand end
+        end
+    end
+    return called
 end
 
 local GraphIndex = struct { definitions: Table, blocks: Table, sites: Table, predecessors: Table, edges: Table, definitions_of: Table }

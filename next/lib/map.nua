@@ -186,7 +186,67 @@ local make = do(K, V, borrowing)
     return M
 end
 
+-- `Map.known(K, V, entries)` (syntax §15.3): an immutable description, no native storage. The
+-- entries are host values; a query is a comparison per entry, which a known key folds and a
+-- dynamic key leaves as ordinary branches.
+local known = do(K, V, entries)
+    if type entries ~= "table" then error("Map.known takes a list of { key, value } entries", 2) end
+    local equal, Found = key_words.equal K, oneof { found: V, missing: Unit }
+    local M = struct {}
+    local keys, values = {}, {}
+    local check_key = do(key: K): K = key
+    local check_value = do(value: V): V = value
+    for index, entry in ipairs entries do
+        if type entry ~= "table" or entry[1] == nil or entry[2] == nil then error(("known map entry %d needs a key and a value"):format(index), 2) end
+        if not is_known(entry[1]) or not is_known(entry[2]) then error("known map keys and values must be known", 2) end
+        check_key(entry[1])
+        check_value(entry[2])
+        for earlier = 1, index - 1 do
+            if host(equal(keys[earlier], entry[1])) then error(("duplicate semantic key in known map at entry %d"):format(index), 2) end
+        end
+        keys[index], values[index] = entry[1], entry[2]
+    end
+    local count = #keys
+    local has = do(key: K): Bool
+        for index = 1, count do
+            if equal(key, keys[index]) then return true end
+        end
+        return false
+    end
+    local get = do(key: K): V
+        for index = 1, count do
+            if equal(key, keys[index]) then return values[index] end
+        end
+        trap "map-key: missing key in known map"
+    end
+    function M:find(key: K): Found
+        for index = 1, count do
+            if equal(key, keys[index]) then return Found.found(values[index]) end
+        end
+        return Found.missing()
+    end
+    function M:has(key: K): Bool
+        return has key
+    end
+    function M.__index(self, key)
+        if is_known key and not host(has key) then error("map-key: missing key in known map", 0) end
+        return get key
+    end
+    function M:each(body): Unit
+        for index = 1, count do
+            body(keys[index], values[index])
+        end
+    end
+    function M.__newindex(self, key, value)
+        error("known maps are immutable; indexing yields a value, not a place", 0)
+    end
+    M.length = U64(count)
+    local make_description = do(): M = M {}
+    return make_description()
+end
+
 local Map = setmetatable(define
+    .known
     borrowing = |K, V| -> make(K, V, true)
 end, { __call = |_, K, V| -> make(K, V, false) })
 

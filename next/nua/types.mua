@@ -22,8 +22,12 @@ local PointerType = struct { target: NativeType }
 local ReferenceType = struct { target: NativeType }
 local ViewType = struct { element: NativeType, mutable: Boolean, text: Boolean }
 local FixedArrayType = struct { element: NativeType, count: Natural }
-local Field = struct { name: String, type: NativeType }
-local RecordType = struct { name: String, fields: list_of(Field) }
+-- `Atomic T` (syntax §19): a plain T in memory, reached only by atomic operations
+local AtomicType = struct { target: NativeType }
+-- `c_member`, `c_name`: a record described by a C header (`cstruct`, syntax §18): its layout is
+-- the C compiler's, and a field may reach a nested member ("data.fd")
+local Field = struct { name: String, type: NativeType, c_member: Optional(String) }
+local RecordType = struct { name: String, fields: list_of(Field), c_name: Optional(String) }
 local Alternative = struct { name: String, payload: NativeType }
 local SumType = struct { name: String, alternatives: list_of(Alternative) }
 -- `fixed`: the owner `Array T` (syntax §9.3): a buffer whose length is set when it is built
@@ -33,7 +37,7 @@ local FunctionType = struct { parameters: list_of(NativeType), result: NativeTyp
 local OpaqueType = struct { name: String }
 NativeType {
     IntegerType, FloatType, BooleanType, UnitType, PointerType, ReferenceType, ViewType,
-    FixedArrayType, RecordType, SumType, BufferType, FunctionType, OpaqueType
+    FixedArrayType, RecordType, SumType, BufferType, FunctionType, OpaqueType, AtomicType
 }
 
 ------------------------------------------------------------------------------------------------
@@ -114,6 +118,10 @@ local fixed_array = do(element, count)
     need_type(element, "Array")
     if not check(Natural, count) then error("Array(T, n) expects a natural count, got " .. tostring count, 2) end
     return arrays({ element, count }, || -> FixedArrayType { .element, .count })
+end
+local atomics = interned()
+local atomic = do(target)
+    return atomics({ target }, || -> AtomicType { .target })
 end
 local buffer = do(element, pinned, fixed)
     need_type(element, "Buffer")
@@ -240,6 +248,7 @@ local Describing = define
         return (node.mutable and "Slice.mut " or "Slice ") .. recurse node.element
     end
     FixedArrayType = do(node, recurse) return ("Array(%s, %d)"):format(recurse node.element, node.count) end
+    AtomicType = do(node, recurse) return "Atomic " .. recurse node.target end
     RecordType = named
     SumType = named
     OpaqueType = named
@@ -267,6 +276,7 @@ local Owning = define
     FunctionType = never
     OpaqueType = never
     BufferType = do(node, recurse) return true end
+    AtomicType = never
     FixedArrayType = do(node, recurse) return recurse node.element end
     RecordType = do(node, recurse)
         for _, field in ipairs node.fields do
@@ -335,6 +345,7 @@ local Laying = define
         if node.reserved then parts[#parts + 1] = { name = "limit", layout = recurse(U64, target) } end
         return sequence parts
     end
+    AtomicType = |node, recurse, target| -> recurse(node.target, target)
     FixedArrayType = do(node, recurse, target)
         local element = recurse(node.element, target)
         local stride = align_up(element.size, element.alignment)
@@ -395,6 +406,7 @@ local kinds_of_constructors = define
     [view] = ViewType
     [slice] = ViewType
     [fixed_array] = FixedArrayType
+    [atomic] = AtomicType
     [buffer] = BufferType
     [growable] = BufferType
 end
@@ -437,6 +449,7 @@ local Components = define
     ReferenceType = |node, recurse| -> node.target
     ViewType = |node, recurse| -> node.element
     FixedArrayType = |node, recurse| -> node.element
+    AtomicType = |node, recurse| -> node.target
     BufferType = |node, recurse| -> node.element
     IntegerType = |node, recurse| -> nil
     FloatType = |node, recurse| -> nil
@@ -464,9 +477,22 @@ local member = do(native_type, name)
     return members[name]
 end
 
+-- a type holding an atomic is never read or written whole (syntax §19.1)
+local contains_atomic
+contains_atomic = do(native_type)
+    if NativeType.is(native_type, AtomicType) then return true end
+    if NativeType.is(native_type, FixedArrayType) then return contains_atomic native_type.element end
+    if NativeType.is(native_type, RecordType) then
+        for _, field in ipairs native_type.fields do
+            if contains_atomic field.type then return true end
+        end
+    end
+    return false
+end
+
 -- host-level reads and assignments of a declared type's members: `function Fixed.__cast(v)`
 -- and `Fixed.__cast` (its descriptor's own fields answer first)
-for _, kind in ipairs { RecordType, ViewType, BufferType, FixedArrayType, PointerType } do
+for _, kind in ipairs { RecordType, ViewType, BufferType, FixedArrayType, PointerType, AtomicType } do
     kind.__index = |native_type, name| -> member(native_type, name)
     kind.__newindex = |native_type, name, value| -> define_member(native_type, name, value)
 end
@@ -492,6 +518,9 @@ return define
     .ReferenceType
     .ViewType
     .FixedArrayType
+    .AtomicType
+    .atomic
+    .contains_atomic
     .Field
     .RecordType
     .Alternative

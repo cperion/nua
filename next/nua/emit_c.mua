@@ -26,7 +26,7 @@ local record_name = do(record)
     if found then return found end
     record_count += 1
     local base_name = NativeType.is(record, types.BufferType) and "Buffer" or NativeType.is(record, types.ViewType) and "View"
-        or NativeType.is(record, types.FixedArrayType) and "Array" or (record.name:gsub("[^%w_]", "_"))
+        or NativeType.is(record, types.FixedArrayType) and "Array" or NativeType.is(record, types.FunctionType) and "Fn" or (record.name:gsub("[^%w_]", "_"))
     found = ("%s_%d"):format(base_name, record_count)
     record_names[record] = found
     return found
@@ -42,10 +42,11 @@ local CSpelling = define
     ReferenceType = |node, recurse| -> recurse node.target .. " *"
     ViewType = |node, recurse| -> record_name node
     FixedArrayType = |node, recurse| -> record_name node
-    RecordType = |node, recurse| -> record_name node
+    RecordType = |node, recurse| -> node.c_name or record_name node
+    AtomicType = |node, recurse| -> recurse node.target
     SumType = |node, recurse| -> record_name node
     BufferType = |node, recurse| -> record_name node
-    FunctionType = unsupported
+    FunctionType = |node, recurse| -> record_name node
     OpaqueType = |node, recurse| -> node.name
 end
 local c_type = NativeType.pass "spell a native type in C" with ..CSpelling end
@@ -62,6 +63,7 @@ local Fields = define
     ReferenceType = no_fields
     ViewType = |node, recurse| -> { { name = "data", type = types.pointer node.element }, { name = "length", type = types.U64 } }
     FixedArrayType = no_fields
+    AtomicType = no_fields
     RecordType = |node, recurse| -> node.fields
     SumType = no_fields
     BufferType = do(node, recurse)
@@ -80,6 +82,21 @@ local fields_of = NativeType.pass "the fields of a type C spells as a struct" wi
 local is_record_like = native_type -> fields_of native_type ~= nil
 local is_sum = native_type -> NativeType.is(native_type, types.SumType)
 local is_array = native_type -> NativeType.is(native_type, types.FixedArrayType)
+local field_of = do(record, name)
+    for _, field in ipairs(fields_of(record)) do
+        if field.name == name then return field end
+    end
+    return nil
+end
+-- the C member of a field: a `cstruct` field may name its own, a nested path
+local field_spelling = do(record, name)
+    local field = field_of(record, name)
+    return field and rawget(field, "c_member") or name
+end
+local field_type = do(record, name)
+    local field = field_of(record, name)
+    return field and field.type
+end
 -- the C name of a sum's tag constant for an alternative
 local tag_name = |sum_type, name| -> record_name sum_type .. "_" .. name
 -- a sum in C (syntax §11.1): its tag constants, then a tag and a union of the payloads that are
@@ -107,6 +124,18 @@ local record_declarations = do(program)
             order[#order + 1] = sum_declaration native_type
             return
         end
+        if NativeType.is(native_type, types.FunctionType) and not done[native_type] then
+            done[native_type] = true
+            visit native_type.result
+            local parameters = {}
+            for index, parameter in ipairs native_type.parameters do
+                visit parameter
+                parameters[index] = c_type parameter
+            end
+            if #parameters == 0 then parameters[1] = "void" end
+            order[#order + 1] = ("typedef %s (*%s)(%s);"):format(c_type native_type.result, record_name native_type, table.concat(parameters, ", "))
+            return
+        end
         if is_array native_type and not done[native_type] then
             done[native_type] = true
             if native_type.count == 0 then fail "an array of no elements has no C spelling" end
@@ -129,6 +158,11 @@ local record_declarations = do(program)
             for _, argument in ipairs block.arguments do visit(argument.type) end
             for _, instruction in ipairs block.instructions do
                 if instruction.type then visit(instruction.type) end
+                if instruction.callee and data.Callee.is(instruction.callee, data.IndirectNua) then
+                    visit instruction.callee.signature.result
+                    visit instruction.callee.pointer.type
+                end
+                for _, operand in ipairs(instruction.arguments or {}) do visit operand.type end
                 -- the storage an instruction uses is spelled too (a local's home)
                 if instruction.place then visit(definition.places[instruction.place].type) end
             end
@@ -141,7 +175,7 @@ local narrow = type -> rules.is_integer type and type.bits < 32
 local wide_of = type -> type.signed and "int32_t" or "uint32_t"
 
 -- a constant as a C expression of its exact type: a pass over the kinds of its bits
-local is_pointer_like = native_type -> rules.is_pointer native_type or NativeType.is(native_type, types.ReferenceType)
+local is_pointer_like = native_type -> rules.is_pointer native_type or NativeType.is(native_type, types.ReferenceType) or NativeType.is(native_type, types.FunctionType)
 local integer_text = do(constant)
     local type = constant.type
     if is_pointer_like type then
@@ -187,6 +221,7 @@ end
 -- the initializer of an all-zero value, with the braces its type has
 local zero_initializer
 zero_initializer = do(native_type)
+    if NativeType.is(native_type, types.RecordType) and native_type.c_name then return "{ 0 }" end
     if is_array native_type then return "{ { " .. zero_initializer native_type.element .. " } }" end
     local fields = fields_of native_type
     if fields then
@@ -216,6 +251,7 @@ local Constants = define
     end
     StaticBytes = unspelled_constant
     SymbolAddress = |bits, recurse, constant| -> ("((%s)&%s)"):format(c_type constant.type, bits.name)
+    ForeignValue = |bits, recurse, constant| -> ("((%s)(%s))"):format(c_type constant.type, bits.name)
     ZeroBits = |bits, recurse, constant| -> ("((%s)%s)"):format(c_type constant.type, zero_initializer constant.type)
     StaticAddress = |bits, recurse, constant| -> ("((%s)%s + %d)"):format(c_type constant.type, c_string bits.bytes, bits.offset)
     DefinitionAddress = unspelled_constant
@@ -243,6 +279,24 @@ end
 
 -- one definition's C function (a stateful vocabulary, writing compilers §4.6): the names of
 -- its values, blocks and local homes, and the declarations they need, belong to it
+local c_memory_orders = define
+    relaxed = "__ATOMIC_RELAXED"
+    consume = "__ATOMIC_CONSUME"
+    acquire = "__ATOMIC_ACQUIRE"
+    release = "__ATOMIC_RELEASE"
+    acquire_release = "__ATOMIC_ACQ_REL"
+    sequential = "__ATOMIC_SEQ_CST"
+end
+local c_atomic_builtins = define
+    read = "__atomic_load_n"
+    write = "__atomic_store_n"
+    exchange = "__atomic_exchange_n"
+    fetch_add = "__atomic_fetch_add"
+    fetch_subtract = "__atomic_fetch_sub"
+    fetch_and = "__atomic_fetch_and"
+    fetch_or = "__atomic_fetch_or"
+    fetch_xor = "__atomic_fetch_xor"
+end
 local emit_definition = do(definition, c_name, program, names_of_definitions)
     local names = {}
     local declarations = {}
@@ -314,15 +368,35 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         AnyElementComponent = |component, recurse| -> fail "an element component has no C spelling as a place"
     end
     local component_text = data.Component.pass "spell a place component in C" with ..Components end
+    -- the record a place's path starts from
+    local rooted_type = do(place, base)
+        local root = place.root
+        if data.PlaceRoot.is(root, data.IndirectRoot) or data.PlaceRoot.is(root, data.RawRoot) then return root.pointer.type.target end
+        if data.PlaceRoot.is(root, data.ParameterRoot) then return definition.signature.parameters[root.parameter].target end
+        return data.PlaceRoot.is(root, data.LocalRoot) and base.type or nil
+    end
     local place_text = do(place)
         if #place.path == 0 then return root_lvalue(place.root, place) end
         local base = data.PlaceRoot.is(place.root, data.LocalRoot) and root_place place or place
         local text = "(" .. root_lvalue(place.root, base) .. ")"
-        for _, component in ipairs place.path do text = text .. component_text component end
+        local current = rooted_type(place, base)
+        for _, component in ipairs place.path do
+            if data.Component.is(component, data.FieldComponent) and current and fields_of current then
+                text = text .. "." .. field_spelling(current, component.name)
+                current = field_type(current, component.name)
+            else
+                text = text .. component_text component
+                current = current and data.Component.is(component, data.ElementComponent) and is_array current and current.element or (data.Component.is(component, data.ElementComponent) and nil or current)
+            end
+        end
         return text
     end
     local Naming = define
-        Constant = |node, recurse| -> constant_text node
+        Constant = do(node, recurse)
+            if data.NativeConstant.is(node.bits, data.DefinitionAddress) then return names_of_definitions[node.bits.definition] end
+            if NativeType.is(node.type, types.AtomicType) then return constant_text(data.Constant { type = node.type.target, bits = node.bits }) end
+            return constant_text node
+        end
         Parameter = |node, recurse| -> "p" .. node.index
         BlockArgument = |node, recurse| -> parameters_of[node.block][node.index]
         Result = |node, recurse| -> value_name(node.value, node.type)
@@ -351,6 +425,7 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
         reinterpret = do(node, a, b)
             local from, to = a.type, node.type
             if is_pointer_like from and is_pointer_like to then return ("(%s)%s;"):format(c_type to, operand a) end
+            if NativeType.is(from, types.AtomicType) or NativeType.is(to, types.AtomicType) then return ("(%s)%s;"):format(c_type to, operand a) end
             if rules.is_pointer from or rules.is_pointer to then return ("(%s)(uintptr_t)%s;"):format(c_type to, operand a) end
             return ("nua_reinterpret_%s_%s(%s);"):format(c_type from, c_type to, operand a)
         end
@@ -383,13 +458,20 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             for index, component in ipairs node.components do components[index] = operand component end
             if is_array node.type then return ("%s = (%s){ { %s } };"):format(value_name(node.result, node.type), c_type node.type, table.concat(components, ", ")) end
             if not is_record_like node.type then fail("packing " .. types.describe node.type .. " has no C spelling yet") end
+            -- a `cstruct` names only some members, in no order of the layout's
+            if NativeType.is(node.type, types.RecordType) and node.type.c_name then
+                for index, field in ipairs node.type.fields do components[index] = ("." .. (rawget(field, "c_member") or field.name) .. " = " .. components[index]) end
+            end
             return ("%s = (%s){ %s };"):format(value_name(node.result, node.type), c_type node.type, table.concat(components, ", "))
         end
         Extract = do(node, recurse)
             local text = operand node.aggregate
+            local extracted_type = node.aggregate.type
             for _, component in ipairs node.path do
                 if data.Component.is(component, data.FieldComponent) then
-                    text = text .. "." .. component.name
+                    local record = extracted_type
+                    text = text .. "." .. (record and fields_of record and field_spelling(record, component.name) or component.name)
+                    extracted_type = record and fields_of record and field_type(record, component.name) or nil
                 elseif data.Component.is(component, data.AlternativeComponent) then
                     text = text .. ".as." .. component.name
                 elseif data.Component.is(component, data.ElementComponent) then
@@ -411,6 +493,10 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             local arguments = {}
             for index, argument in ipairs node.arguments do arguments[index] = operand argument end
             -- a foreign function by its C name, its result cast (`const char *` becomes our char *)
+            if data.Callee.is(node.callee, data.Foreign) and node.callee.reads then
+                local result = node.callee.signature.result
+                return ("%s = (%s)(%s);"):format(value_name(node.result, result), c_type result, node.callee.pointer.bits.name)
+            end
             if data.Callee.is(node.callee, data.Foreign) then
                 -- a header's own pointer spelling (`char *`) meets ours through `void *`
                 for index, argument in ipairs node.arguments do
@@ -425,7 +511,12 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
                 if node.result then return ("%s = (%s)%s"):format(value_name(node.result, result), c_type result, call) end
                 return call
             end
-            if not data.Callee.is(node.callee, data.DirectNua) then fail "an indirect call has no C spelling yet" end
+            if data.Callee.is(node.callee, data.IndirectNua) then
+                local call = ("(%s)(%s);"):format(operand node.callee.pointer, table.concat(arguments, ", "))
+                local result = node.callee.signature.result
+                if node.result then return ("%s = %s"):format(value_name(node.result, result), call) end
+                return call
+            end
             local call = ("%s(%s);"):format(names_of_definitions[node.callee.definition], table.concat(arguments, ", "))
             if node.result then
                 local callee = program.definitions[node.callee.definition]
@@ -433,8 +524,22 @@ local emit_definition = do(definition, c_name, program, names_of_definitions)
             end
             return call
         end
-        Atomic = |node, recurse| -> fail "atomic has no C spelling yet"
-        Fence = |node, recurse| -> fail "fence has no C spelling yet"
+        Atomic = do(node, recurse)
+            local address = operand node.address
+            local order = c_memory_orders[node.order]
+            local target = node.address.type.target
+            local assign = node.result and (value_name(node.result, target) .. " = ") or ""
+            local given = {}
+            for index, argument in ipairs node.arguments do given[index] = operand argument end
+            if node.opcode == "compare_exchange" then
+                return ("{ %s expected = %s; __atomic_compare_exchange_n(%s, &expected, %s, 0, %s, %s); %sexpected; }"):format(c_type target, given[1], address, given[2], order, c_memory_orders[node.failure_order], assign)
+            end
+            local parts = { address }
+            for _, text in ipairs given do parts[#parts + 1] = text end
+            parts[#parts + 1] = order
+            return ("%s%s(%s);"):format(assign, c_atomic_builtins[node.opcode], table.concat(parts, ", "))
+        end
+        Fence = |node, recurse| -> ("__atomic_thread_fence(%s);"):format(c_memory_orders[node.order])
         LifetimeStart = |node, recurse| -> nil
         LifetimeEnd = |node, recurse| -> nil
         Moves = |node, recurse| -> nil
@@ -635,6 +740,7 @@ local emit = do(program)
     for _, global in ipairs ordered_globals do
         if global.imported and global.header then headers[global.header] = true end
     end
+    for header in pairs(program.headers or {}) do headers[header] = true end
     for _, definition in ipairs ordered do
         for _, block in ipairs definition.blocks do
             for _, instruction in ipairs block.instructions do
@@ -642,6 +748,8 @@ local emit = do(program)
                     local callee = instruction.callee
                     if callee.header then
                         headers[callee.header] = true
+                    elseif callee.reads then
+                        fail(callee.pointer.bits.name .. ": a C variable is read from its header")
                     elseif not foreign[callee.pointer.bits.name] then
                         local parameters = {}
                         for index, parameter in ipairs callee.signature.parameters do parameters[index] = c_type parameter end

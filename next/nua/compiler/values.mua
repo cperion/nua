@@ -64,13 +64,16 @@ local UnitBits = struct {}
 local AggregateBits = struct { parts: list_of(NativeConstant) }
 local StaticBytes = struct { bytes: String }
 local SymbolAddress = struct { name: String, offset: Natural }
+-- a C expression that is a constant in C, its value the header's (`cconst`, `size_of` of a
+-- `cstruct`): a run-time value to this compiler, never folded (syntax §18)
+local ForeignValue = struct { name: String }
 -- every bit zero: an array's contents without one compiler cell per element (syntax §13)
 local ZeroBits = struct {}
 -- a pointer into static bytes (a text literal's data): static data never changes, so a read
 -- of it is known
 local StaticAddress = struct { bytes: String, offset: Natural }
 local DefinitionAddress = struct { definition: DefinitionId }
-NativeConstant { IntegerBits, FloatBits, BooleanBit, UnitBits, AggregateBits, StaticBytes, SymbolAddress, StaticAddress, ZeroBits, DefinitionAddress }
+NativeConstant { IntegerBits, FloatBits, BooleanBit, UnitBits, AggregateBits, StaticBytes, SymbolAddress, ForeignValue, StaticAddress, ZeroBits, DefinitionAddress }
 
 local Operand = family "operand"
 local Constant = struct { type: NativeType, bits: NativeConstant }
@@ -153,6 +156,7 @@ return define
     .AggregateBits
     .StaticBytes
     .SymbolAddress
+    .ForeignValue
     .StaticAddress
     .ZeroBits
     .DefinitionAddress

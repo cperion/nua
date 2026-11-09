@@ -38,7 +38,10 @@ local generating = do(filename, start_line)
     local line = start_line or 1
     -- innermost last; each maps a name to its kind (`cell`, a binding cell of the body; `host`,
     -- a Lua local of a generation-time loop) and lists its cells in declaration order
-    local scopes = { { kinds = {}, cells = {} } }
+    local scopes = { { kinds = {}, cells = {}, positions = {}, openings = {} } }
+    -- declarations and openings in source order: a later one shadows an earlier one
+    local sequence = 0
+    local opening_count = 0
     local tail_calls = false
 
     local emit = text -> do out[#out + 1] = text end
@@ -54,6 +57,8 @@ local generating = do(filename, start_line)
     local declare = do(name, kind)
         local scope = scopes[#scopes]
         scope.kinds[name] = kind
+        sequence += 1
+        scope.positions[name] = sequence
         if kind == "cell" then table.insert(scope.cells, name) end
     end
     local lookup = do(name)
@@ -64,9 +69,46 @@ local generating = do(filename, start_line)
         return nil
     end
 
+    -- the opened contexts that may answer `name`, innermost and latest first, down to the
+    -- declaration that shadows them (syntax §10.5), and what the name is declared as
+    local openings_of = do(name)
+        local variables = {}
+        for depth = #scopes, 1, -1 do
+            local scope = scopes[depth]
+            local position = scope.positions[name]
+            for index = #scope.openings, 1, -1 do
+                local opening = scope.openings[index]
+                if position == nil or opening.position > position then variables[#variables + 1] = opening.variable end
+            end
+            if scope.kinds[name] then return variables, scope.kinds[name] end
+        end
+        return variables, nil
+    end
+    -- the text of a name that may be a place: through the contexts that may answer it, else
+    -- what it is lexically
+    local name_place = do(name)
+        local text = name
+        local variables = openings_of name
+        for index = #variables, 1, -1 do
+            text = ("__E.opened(__path, %s, %q, function() return %s end)"):format(variables[index], name, text)
+        end
+        return text
+    end
+    local is_place_name = do(name)
+        local variables, kind = openings_of name
+        return kind == "cell" or #variables > 0
+    end
+    -- the anonymous home opened here: the name of its parameter
+    local home_name = do()
+        for depth = #scopes, 1, -1 do
+            if scopes[depth].home then return scopes[depth].home end
+        end
+        return nil
+    end
+
     -- the boundaries of the generation: a scope of names, and an output of its own
     local inner_scope = do(run)
-        scopes[#scopes + 1] = { kinds = {}, cells = {} }
+        scopes[#scopes + 1] = { kinds = {}, cells = {}, positions = {}, openings = {} }
         run()
         local cells = scopes[#scopes].cells
         scopes[#scopes] = nil
@@ -143,18 +185,18 @@ local generating = do(filename, start_line)
     -- expressions of a typed body: each performs its operation through the evaluation
     -- vocabulary `__E` on the current path
 
-    local expression, statement, statements, block_body, function_text, target
+    local expression, statement, statements, block_body, function_text, target, open_context
 
     -- a name read in a typed body: a cell of the body, a Lua local of a generation-time loop, or
     -- a host value from around the word
     local name_value = do(name)
-        if lookup name == "cell" then return ("__E.get(__path, %s)"):format(name) end
+        if is_place_name name then return ("__E.get(__path, %s)"):format(name_place name) end
         return name
     end
     -- whether a node names a place of the body: a local, or a field or element of one
     local place_chain
     place_chain = do(node)
-        if node.k == "name" then return lookup(node.name) == "cell" end
+        if node.k == "name" then return is_place_name node.name end
         return (node.k == "field" or node.k == "index") and place_chain(node.obj)
     end
     -- `Ref p` of a place: a borrow, never an application of Ref to p's value
@@ -163,7 +205,7 @@ local generating = do(filename, start_line)
     -- stays a place (its owner is borrowed, never copied out), anything else its value
     local base
     base = do(node)
-        if node.k == "name" and lookup(node.name) == "cell" then return node.name end
+        if node.k == "name" and is_place_name node.name then return name_place node.name end
         if node.k == "field" and place_chain(node.obj) then return ("__E.member(__path, %s, %q)"):format(base node.obj, node.name) end
         return expression node
     end
@@ -171,6 +213,11 @@ local generating = do(filename, start_line)
     local host_or_value = do(node)
         if node.k == "name" then return name_value node.name end
         return expression node
+    end
+    local home_text = do(node)
+        local home = home_name()
+        if home == nil then fail("context-required: `..` reads a home, and none is opened here", node.line) end
+        return home
     end
     local callee_of = node -> node.fn.k == "call" and expression node.fn or host_or_value(node.fn)
     -- the arguments of an application, captured one by one in order once the callee is known
@@ -180,7 +227,8 @@ local generating = do(filename, start_line)
     local supplied = do(nodes, by_place)
         local items, spreads = {}, false
         for index, node in ipairs nodes do
-            local place = node.k == "name" and lookup(node.name) == "cell" and node.name
+            local place = node.k == "name" and is_place_name node.name and name_place node.name
+                or node.k == "home" and home_text(node)
                 or node.k == "field" and place_chain(node.obj) and (by_place or node.obj.k ~= "index") and target(node)
                 or by_place and node.k == "index" and place_chain(node) and target(node)
             if node.k == "spread" then
@@ -207,6 +255,7 @@ local generating = do(filename, start_line)
         num = literal
         str = literal
         paren = node -> "(" .. expression node.e .. ")"
+        home = node -> ("__E.get(__path, %s)"):format(home_text node)
         binop = do(node)
             if node.op == "and" then return ("__E.both(__path, %s, %s)"):format(expression node.a, lambda_arm node.b) end
             if node.op == "or" then return ("__E.either(__path, %s, %s)"):format(expression node.a, lambda_arm node.b) end
@@ -233,12 +282,20 @@ local generating = do(filename, start_line)
             -- producer's returns in place or is an ordinary argument (syntax §11.2)
             if node.fn.k == "call" and #node.args == 1 and node.args[1].k == "table" then
                 local inner = node.fn
-                local producer = inner.fn.k == "name" and lookup(inner.fn.name) == "cell" and inner.fn.name or callee_of inner
+                local producer = inner.fn.k == "name" and is_place_name inner.fn.name and name_place inner.fn.name or callee_of inner
                 return ("__E.apply_continued(__path, %s, %s, %s, %s, %s)"):format(producer, supplied(inner.args), boundary_flag inner, expression(node.args[1]), boundary_flag node)
             end
             -- a place applied keeps its cell (a local, or a field or element of one): a sum
             -- matched in place lends its payload to `Ref` handlers (syntax §11.2)
-            local callee = node.fn.k == "name" and lookup(node.fn.name) == "cell" and node.fn.name
+            -- a bare call in an opened region goes to the innermost receiver with that member,
+            -- unless a local binding names it (syntax §10.5)
+            if node.fn.k == "name" then
+                local variables, kind = openings_of node.fn.name
+                if #variables > 0 and kind ~= "cell" and kind ~= "host" then
+                    return ("__E.apply_opened(__path, { %s }, %q, function() return %s end, %s, %s)"):format(table.concat(variables, ", "), node.fn.name, node.fn.name, supplied(node.args), boundary_flag node)
+                end
+            end
+            local callee = node.fn.k == "name" and is_place_name node.fn.name and name_place node.fn.name
                 or node.fn.k ~= "name" and place_chain(node.fn) and target(node.fn)
                 or callee_of node
             local by_place = node.fn.k == "name" and (node.fn.name == "Ptr" or node.fn.name == "copy")
@@ -256,7 +313,18 @@ local generating = do(filename, start_line)
                     named[item.name] = true
                 end
             end
-            return table_text(node, expression, "a spread is not available in a typed body yet")
+            local has_spread = false
+            for _, item in ipairs node.items do has_spread = has_spread or item.kind == "spread" end
+            if not has_spread then return table_text(node, expression, "a spread is not available in a typed body yet") end
+            -- a keyed spread (syntax §10.7): entries in source order, resolved by the evaluation
+            local entries = {}
+            for index, item in ipairs node.items do
+                if item.kind == "spread" then entries[index] = ("{ spread = %s }"):format(base item.e)
+                elseif item.kind == "named" then entries[index] = ("{ name = %q, value = %s }"):format(item.name, expression item.e)
+                elseif item.kind == "pos" then entries[index] = ("{ value = %s }"):format(expression item.e)
+                else fail("a keyed entry is not available beside a spread", node.line) end
+            end
+            return ("__E.spread_table(__path, { %s })"):format(table.concat(entries, ", "))
         end
         -- a typed lambda is a word; an untyped one a word evaluated in place, whose result is
         -- what it returns
@@ -269,10 +337,10 @@ local generating = do(filename, start_line)
     -- (declared with the other mutually recursive emitters above)
     target = do(node)
         if node.k == "name" then
-            if lookup(node.name) ~= "cell" then
+            if not is_place_name node.name then
                 fail(("cannot assign '%s': a typed body assigns only the locals it declares"):format(node.name), node.line)
             end
-            return node.name
+            return name_place node.name
         end
         local target_base = inner -> (inner.k == "field" or inner.k == "index") and target(inner) or base(inner)
         if node.k == "field" then return ("__E.member(__path, %s, %q)"):format(target_base node.obj, node.name) end
@@ -301,7 +369,27 @@ local generating = do(filename, start_line)
         emit(" end;" .. dead_check)
     end
 
+    -- opening a binding (syntax §10.5): a context the names after it may resolve through
+    open_context = do(text)
+        opening_count += 1
+        local variable = "__open" .. opening_count
+        emit((" local %s = __E.open_context(__path, %s);"):format(variable, text))
+        sequence += 1
+        local scope = scopes[#scopes]
+        scope.openings[#scope.openings + 1] = { .variable, position = sequence }
+    end
+
     local Statements = define
+        open = do(node)
+            if node.init and (node.init.k == "index" or node.init.k == "field") and place_chain(node.init.k == "index" and node.init.obj or node.init) then
+                -- a slot or a field: opened where it is, its fields live places (syntax §10.6)
+                emit((" local %s = __E.bind(__path, %q, nil, __E.open_reference(__path, %s));"):format(node.name, node.name, target node.init))
+                declare(node.name, "cell")
+            elseif node.init then
+                statement { k = "local", names = { { name = node.name, line = node.line } }, exprs = { node.init }, line = node.line }
+            end
+            open_context(is_place_name node.name and name_place node.name or node.name)
+        end
         assign = do(node)
             local values = {}
             for index, value in ipairs node.exprs do values[index] = expression value end
@@ -391,7 +479,8 @@ local generating = do(filename, start_line)
         local returned = node.exprs[1]
         -- (handlers applied to a producer consume its returns: not a re-entry of the word)
         local continued = returned.k == "call" and returned.fn.k == "call" and #returned.args == 1 and returned.args[1].k == "table"
-        if returned.k == "call" and not returned.boundary and not continued and not place_reference returned then
+        local opened_call = returned.k == "call" and returned.fn.k == "name" and #openings_of(returned.fn.name) > 0
+        if returned.k == "call" and not returned.boundary and not continued and not place_reference returned and not opened_call then
             tail_calls = true
             emit(("do return __E.return_tail(__path, %s, %s) end;"):format(callee_of returned, supplied(returned.args)))
             return
@@ -450,6 +539,12 @@ local generating = do(filename, start_line)
                 declare(parameter.name, "cell")
             end
             emit(table.concat(bindings, " "))
+            for _, parameter in ipairs parameters do
+                if parameter.opened then
+                    open_context parameter.name
+                    if parameter.unnamed then scopes[#scopes].home = parameter.name end
+                end
+            end
             -- `..args`: a pack, second-class: a host value of the body (syntax §10.8)
             if fn.rest then
                 emit((" local %s = __E.rest_argument(__path);"):format(fn.rest))

@@ -185,6 +185,8 @@ A type applied in host code describes a value of it, converted where it meets th
 host code chooses with it, as a library word checks that an index is unsigned (§9.12).
 
 
+Host code inspecting staged values has, besides `host`, `type_of` and `is_known`: `same_value(a, b)` (two staged values are the same operand) and `is_integer(T)`. A result annotated `Inferred` makes a word answer whatever its body answers, for library words such as `s:cstring() do(c) ... end` whose result is the callback's.
+
 ### 2.3 Generic types are ordinary Lua functions
 
 ```lua
@@ -2524,6 +2526,7 @@ caller. No runtime dispatch, inheritance or object model is involved (§22).
 | `__cast(v, T)` | a host value or other-typed value where a `T` is expected, and `T(v)` | a `T`, or `nil` to refuse |
 | `__add` `__sub` `__mul` `__div` `__mod` `__unm` | arithmetic | a `T`; the other operand is first converted through `__cast` |
 | `__eq` `__lt` `__le` | comparisons; `~=`, `>` and `>=` derive from them | a `Bool` |
+| `__copy(v)` | `copy v`, for a type whose copy is not a bitwise one (`Str` copies to a `Text`) | the copy |
 | `__release(r)` | the end of an owner's life, for a type owning allocations of its own (a buffer) | nothing; it releases the owning contents first |
 
 `__eq` is the one hook with a restriction outside its own type: a type that

@@ -135,6 +135,7 @@ return do(E, core)
         ReferenceType = symbolic_borrow
         ViewType = symbolic_borrow
         FixedArrayType = nothing_symbolic
+        AtomicType = nothing_symbolic
         RecordType = do(native_type, recurse, path, target, component_path, components)
             for _, field in ipairs native_type.fields do
                 local field_target = data.Access { place = target.place, path = provenance.concat(target.path, { data.FieldStep { name = field.name } }) }

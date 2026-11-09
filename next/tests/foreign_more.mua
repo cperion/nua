@@ -1,0 +1,229 @@
+-- Atomics, header knowledge, compile-time tests, known maps, libc and POSIX (syntax §19, §18, §3.10, §15.3, §17.3).
+
+local ffi = require "ffi"
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "atomics are effects in source order, spelled with the __atomic builtins":
+    local library, text = native("more_atomics", [[
+local SpinLock = struct { held: Atomic Bool }
+local Shared = struct { lock: SpinLock, total: U64, count: Atomic U32 }
+local with_lock = do(lock: Ref SpinLock, body): Unit
+    while not lock.held:cas(false, true, "acquire") do
+    end
+    body()
+    lock.held:store(false, "release")
+end
+local atomic_locked = do(times: U32): U64
+    local s = Shared { lock = SpinLock { held = false }, total = 0, count = 5 }
+    local i: U32 = 0
+    while i < times do
+        with_lock(Ref s.lock) do
+            s.total = s.total + 1
+        end
+        s.count:add 2
+        i = i + 1
+    end
+    return s.total * 1000 + U64 s.count:load()
+end
+export atomic_locked
+local atomic_local = do(k: U32): U32
+    local a: Atomic U32 = 1
+    local before = a:exchange k
+    a:sub(1, "relaxed")
+    fence "seq_cst"
+    return before * 100 + a:load "acquire"
+end
+export atomic_local
+local atomic_shared = do(p: Ptr U32): U32
+    local shared = atomic_ptr p
+    shared[0]:add 3
+    return shared[0]:load()
+end
+export atomic_shared
+]])
+    assert(library.atomic_locked(3) == 3000 + 11)
+    assert(library.atomic_local(9) == 108)
+    local cell = ffi.new("uint32_t[1]", { 4 })
+    assert(library.atomic_shared(cell) == 7 and cell[0] == 7)
+    assert(text:find("__atomic_compare_exchange_n", 1, true) and text:find("__ATOMIC_RELEASE", 1, true), text)
+    refuses([[
+local f = do(): U32
+    local a: Atomic U32 = 0
+    return a:load "release"
+end
+export f
+]], "atomic-order")
+    refuses([[
+local f = do(): U32
+    local a: Atomic U32 = 0
+    return a
+end
+export f
+]], "atomic-use")
+    refuses([[
+local f = do(): Unit
+    local a: Atomic U32 = 0
+    a = 1
+end
+export f
+]], "atomic-use")
+end
+
+test "what only a header knows: constants, variables, layouts":
+    local library, text = native("more_headers", [[
+local EINVAL = cconst("EINVAL", I32, "<errno.h>")
+local errno = cread("errno", I32, "<errno.h>")
+local Stat = cstruct("struct stat", "<sys/stat.h>", { { "size", I64, "st_size" } })
+local fstat = extern("fstat", { I32, Ptr Stat }, I32, { header = "<sys/stat.h>" })
+local Event = cstruct("struct epoll_event", "<sys/epoll.h>", { { "events", U32 }, { "fd", I32, "data.fd" } })
+local header_constant = do(): I32 = EINVAL + 1
+export header_constant
+local header_errno = do(): I32
+    local st = Stat { size = I64 0 }
+    local failed = fstat(-1, Ptr st)
+    return errno()
+end
+export header_errno
+local header_size = do(): I64
+    local st = Stat { size = I64 0 }
+    if fstat(0, Ptr st) ~= 0 then return -1 end
+    return st.size
+end
+export header_size
+local header_nested = do(k: I32): I32
+    local event = Event { events = 1, fd = k }
+    local through = Ptr event
+    return through.fd + I32 (size_of Event)
+end
+export header_nested
+]])
+    assert(library.header_constant() == 23)
+    assert(library.header_errno() == 9)  -- EBADF
+    library.header_size()
+    assert(library.header_nested(4) == 4 + 12)
+    assert(text:find("st_size", 1, true) and text:find("data.fd", 1, true), text)
+end
+
+test "compile-time tests and assertions (§3.10)":
+    local compiled = compile.compile([[
+local add = do(a: U32, b: U32): U32 = a + b
+test "addition" do(): Unit
+    assert(add 2 2 == 4)
+    assert(add 40 2 == 42)
+end
+local unused = do(): U32 = 0
+export unused
+]], "named_tests.nua")
+    assert(compiled.program)
+    refuses([[
+local add = do(a: U32, b: U32): U32 = a + b
+test "wrong" do(): Unit
+    assert(add 2 2 == 5, "two and two")
+end
+]], [[test "wrong"]])
+    refuses([[
+local add = do(a: U32, b: U32): U32 = a + b
+test "wrong" do(): Unit
+    assert(add 2 2 == 5, "two and two")
+end
+]], "two and two")
+    refuses([[
+local f = do(k: U32): U32
+    assert(k == 1)
+    return k
+end
+export f
+]], "not known while compiling")
+end
+
+test "known map descriptions fold on known keys and branch on dynamic ones (§15.3)":
+    local library, text = native("more_known", [[
+local numbers = Map.known(U32, U32, { { 1, 10 }, { 2, 20 } })
+local keywords = Map.known(Str, U32, { { "if", 1 }, { "while", 2 } })
+local known_fold = do(): U32
+    local total: U32 = 0
+    numbers:each do(k, v)
+        total = total + k * v
+    end
+    return numbers[2] + total + U32 numbers.length
+end
+export known_fold
+local known_classify = do(s: Str): U32
+    return keywords:find(s) with
+        found = do(v: U32): U32 = v
+        missing = do(): U32 = 0
+    end
+end
+export known_classify
+local known_dynamic = do(k: U32): U32 = numbers[k]
+export known_dynamic
+]])
+    assert(library.known_fold() == 20 + 50 + 2)
+    assert(text:match("uint32_t known_fold%(void%) {.-\n}"):find("return 72u", 1, true), text)
+    assert(library.known_dynamic(2) == 20)
+    local name = text:match("typedef struct (View_%d+) {")
+    local view = ffi.new(name)
+    view.data = ffi.cast("uint8_t *", "while")
+    view.length = 5
+    assert(library.known_classify(view) == 2)
+    refuses([[
+local m = Map.known(U32, U32, { { 1, 1 }, { 1, 2 } })
+]], "duplicate semantic key")
+    refuses([[
+local m = Map.known(U32, U32, { { 1, 1 } })
+local f = do(): U32 = m[9]
+export f
+]], "map-key")
+end
+
+test "libc and POSIX are activities (§17.3, §18.2)":
+    local path = "build/next/posix_activity.txt"
+    local library = native("more_posix", ([[
+local px = require "nua.posix"
+local c = require "nua.libc"
+local posix_write = do(): I32
+    local outcome = px.with_fd("%s", px.O_WRONLY | px.O_CREAT | px.O_TRUNC) do(writing..)
+        write_text "hello posix"
+    end
+    return outcome with
+        done = do(): I32 = 0
+        failed = do(e: I32): I32 = e
+    end
+end
+export posix_write
+local posix_size = do(): I64
+    local measured: I64 = -1
+    px.with_fd("%s", px.O_RDONLY) do(reading..)
+        measured = size()
+    end
+    return measured
+end
+export posix_size
+local posix_missing = do(): I32
+    local outcome = px.with_fd("/nonexistent/path", px.O_RDONLY) do(reading..)
+    end
+    return outcome with
+        done = do(): I32 = 0
+        failed = do(e: I32): I32 = e
+    end
+end
+export posix_missing
+local libc_buffer = do(): Bool
+    return c.with_buffer(16) do(b..)
+        fill 7
+    end
+end
+export libc_buffer
+]]):format(path, path))
+    assert(library.posix_write() == 0)
+    assert(library.posix_size() == 11)
+    assert(library.posix_missing() == 2)
+    assert(library.libc_buffer() == true)
+end

@@ -80,8 +80,7 @@ an aliased container slot is overwritten before the effect.
 `tests/boundaries.mua` covers native execution, record-component forwarding, addressed locals,
 known overwrite versus wildcard storage, aliasing, recursive/nonreturning groups and independent
 verifier replay after callee mutation. The original clear–store–clear stale-view probe is now
-refused; storing a fresh view after the final clear is accepted. Latest full check:
-**`make test-next`: 194 passed, 0 failed.**
+refused; storing a fresh view after the final clear is accepted. Latest full check: see the end of this file.
 
 ## Design-to-source gap inventory
 
@@ -92,12 +91,12 @@ refused; storing a fresh view after the final clear is accepted. Latest full che
 | Memory provenance | Resident component facts, pointerless provenance, strong/weak stores, load state preservation, resident-local branch/loop agreement | Extend component transport/proofs to the remaining aggregate forms and storage mechanisms; complete alias/provenance validation |
 | Native boundaries | Ordered contracts and substitution, returned-borrow re-rooting, alias requirements, recursive CFG agreement, independent call replay | Complete interface-key/capture/dependency protocols, global/foreign/indirect boundaries, owning ABI/parameter-payload transport and remaining component-path coverage |
 | Owners/buffers | Nua allocator and moving buffer words; nested release and selected conditional moves; owner structs; partial moves (fields, payloads) through places, inline `Ref`s and callee contracts, joined and carried across loop rounds; replacement through any place | `finish`, initialized-prefix proofs, pinned storage, complete allocation-ledger and trap-recovery acceptance |
-| Language coverage | Sums and matching end to end, `Ref` handlers borrowing payloads in place; `Slice`/`Str` words in Nua (`lib/slice.nua`, `lib/str.nua`), static text literals folding while compiling; branch proofs dropping proved checks (§12.2); owners lent to `Slice`/`Slice.mut`/`Str` requirements; `Array(T, n)` values and the owner `Array T` (`lib/array.nua`); `copy`, `Text`, integer/Bool/float formatting in Nua, `Chars(n)` | `Store`/`Id`, `Map`, foreign calls (`extern`, §17), `Str` words needing them or decimal parsing (`parse(F64)`, `cstring`), UTF-8, pinned buffers, `finish`, globals |
+| Language coverage | Everything of `syntax.md` outside §20: sums and matching, `Ref` handlers, `Slice`/`Str`/UTF-8, static text, branch proofs, lending, `Array(T, n)` and owner `Array T`, `copy`, `Text` and formatting in Nua (Schubfach floats), `Chars(n)`, `Store`/`Id`, `Map` and `Map.known`, foreign calls (`extern`, `opaque`, `CString`, `cformat`, curried), `cconst`/`cread`/`cstruct`, `global`, pinned buffers, `finish`, rest requirements and packs, opening (records, tables, store slots, anonymous homes), keyed spread, `fnptr`/`Fn`, `Atomic T`/`fence`/`atomic_ptr`, compile-time `test`/`assert`, `lib/libc.nua`, `lib/posix.nua` | Tasks, channels, pools and I/O (§20); see [the handoff](HANDOFF.md) |
 | Preparation | Graph/type/lifetime checks on emitted C programs | Optimizer, budget insertion, complete effect/alias recomputation, `task_access`, `ready`, revision-matching readiness certificates |
 | Tasks/platform | Storage mapping/copy mechanisms | Native context/stack mechanisms, Nua scheduler/waits, foreign extents, task/channel/slot acceptance |
 | Backends/diagnostics | C for the implemented subset; source-line errors | Shared prepared-IR C/JIT adapters, structured related-location diagnostics and the full independent acceptance set |
 
-The next end-to-end work is **remaining reference/aggregate transport and lifetime completion**,
-not an optimizer over incomplete facts. Then finish `Store`, `Map` and foreign calls, the remaining boundary
-protocols, preparation, scheduling and both backends. Cutover requires the documented acceptance obligations;
+The next end-to-end work is the **optimizer/preparation, the libgccjit backend and the scheduler** (§20), described in [the handoff](HANDOFF.md). Cutover requires the documented acceptance obligations;
 passing the current subset does not establish them.
+
+Latest full check: **`make test-next`: 216 passed, 0 failed.**

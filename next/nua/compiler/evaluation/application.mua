@@ -52,7 +52,19 @@ return do(E, core)
                 given[#given + 1] = argument
             end
         end
+        if foreign.bound then
+            local all = {}
+            for _, argument in ipairs foreign.bound do all[#all + 1] = argument end
+            for _, argument in ipairs given do all[#all + 1] = argument end
+            given = all
+        end
         local count, parameters = #given, foreign.parameters
+        -- fewer arguments than parameters: a C function curries like a word (syntax §3.5)
+        if count < #parameters and count > 0 then
+            return hosting.foreign({ name = foreign.name, .parameters, result = foreign.result, header = foreign.header, variadic = foreign.variadic, reads = foreign.reads, bound = given }, do(partial, arguments)
+                error(("%s is a foreign function: it is applied inside an evaluation, never while compiling at top level"):format(foreign.name), 3)
+            end)
+        end
         if count < #parameters or (count > #parameters and not foreign.variadic) then
             fail(path, ("%s takes %d arguments, %d given"):format(foreign.name, #parameters, count))
         end
@@ -75,7 +87,8 @@ return do(E, core)
         local result = result_type ~= types.Unit and fresh identity.ValueId or nil
         local signature = data.Signature { .parameters, result = result_type, abi = "c_boundary", variadic = foreign.variadic == true }
         local pointer = data.Constant { type = types.function_type(parameters, result_type, foreign.variadic), bits = data.SymbolAddress { name = foreign.name, offset = 0 } }
-        append(path, data.Invoke { site = site path, .result, callee = data.Foreign { .pointer, .signature, contract = data.ForeignEffects { reads = {}, writes = {}, retains = {}, may_reenter = false, noreturn = false }, header = foreign.header }, arguments = passed, boundary = fresh identity.BoundaryId })
+        local reads = foreign.reads == true
+        append(path, data.Invoke { site = site path, .result, callee = data.Foreign { .pointer, .signature, .reads, contract = data.ForeignEffects { reads = {}, writes = {}, retains = {}, may_reenter = false, noreturn = false }, header = foreign.header }, arguments = passed, boundary = fresh identity.BoundaryId })
         if result == nil then return nil end
         return E.value_of_operand(result_type, data.Result { value = result, type = result_type })
     end
@@ -95,6 +108,100 @@ return do(E, core)
     E.pack_items = do(path, value)
         if not E.is_pack value then fail(path, "spread-source: `..` expands a pack") end
         return rawget(value, "items")
+    end
+
+    -- Atomic operations (syntax §19): effects in source order, never folded nor tracked. The
+    -- operations themselves are Nua words (lib/atomic.nua) over this one primitive.
+    local memory_orders = define
+        relaxed = "relaxed"
+        acquire = "acquire"
+        release = "release"
+        acq_rel = "acquire_release"
+        seq_cst = "sequential"
+    end
+    local undefined_orders = define
+        read = define release = true; acquire_release = true end
+        write = define acquire = true; acquire_release = true end
+    end
+    -- the failure order of a compare-and-swap: its success order without the release
+    local failure_orders = define
+        release = "relaxed"
+        acquire_release = "acquire"
+    end
+    local memory_order = do(path, opcode, order)
+        local found = memory_orders[order]
+        if found == nil then fail(path, ("atomic-order: %s is not a memory order"):format(tostring order)) end
+        local refused = undefined_orders[opcode]
+        if refused and refused[found] then fail(path, ("atomic-order: C leaves an atomic %s with order %s undefined"):format(opcode, order)) end
+        return found
+    end
+    E.atomic = do(path, opcode, reference, order, given)
+        local atomic_type = reference.type.target
+        if not types.NativeType.is(atomic_type, types.AtomicType) then fail(path, "an atomic operation takes a reference to an Atomic") end
+        local target = atomic_type.target
+        local resolved = memory_order(path, opcode, order)
+        local address = E.compute(path, "reinterpret", types.pointer target, { E.bits(reference.type, E.pack_reference(path, reference)) })
+        local operands = {}
+        for index, value in ipairs given do operands[index] = E.materialize(path, E.from_host(path, target, value, "an atomic operand")) end
+        local result = opcode ~= "write" and fresh identity.ValueId or nil
+        local failure = opcode == "compare_exchange" and (failure_orders[resolved] or resolved) or nil
+        append(path, data.Atomic { site = site path, .result, opcode = opcode, address = E.materialize(path, address), arguments = operands, order = resolved, failure_order = failure })
+        if result == nil then return nil end
+        return E.value_of_operand(target, data.Result { value = result, type = target })
+    end
+    E.fence = do(path, order)
+        append(path, data.Fence { site = site path, order = memory_order(path, "fence", order) })
+    end
+
+    -- `fnptr(word)` (syntax §21.2): a native word materialized with its declared parameters; the
+    -- arguments already supplied are compile-time parameters
+    E.fnptr = do(path, callee)
+        local word, supplied = hosting.supplied_of callee
+        if word == nil then fail(path, "fnptr takes a native word") end
+        if word.result == nil or word.rest then fail(path, word.name .. " has no fixed native signature") end
+        local specification, parameters = {}, {}
+        for index, requirement in ipairs word.requirements do
+            if index <= #supplied then
+                local argument = supplied[index]
+                specification[index] = requirement.type == nil and specifications.KnownHost { value = argument } or specifications.KnownNative { value = E.from_host(path, requirement.type, argument, "a supplied argument") }
+            else
+                if requirement.type == nil then fail(path, ("fnptr: the parameter '%s' of %s needs a native type"):format(requirement.name, word.name)) end
+                specification[index] = specifications.Dynamic { type = requirement.type }
+                parameters[#parameters + 1] = requirement.type
+            end
+        end
+        local definition = definitions.request(word, specification, "nua_boundary", path.source, path.line)
+        path.writer.require_definition definition
+        return E.known(data.Constant { type = types.function_type(parameters, word.result), bits = data.DefinitionAddress { .definition } })
+    end
+    -- calling through an `Fn` value: nothing describes the callee's effects, so an owner passed
+    -- by reference may have grown
+    E.call_indirect = do(path, callee, arguments)
+        local function_type = callee.type
+        if #arguments ~= #function_type.parameters then fail(path, ("this function takes %d arguments, %d given"):format(#function_type.parameters, #arguments)) end
+        local passed = {}
+        for index, parameter in ipairs function_type.parameters do
+            local value = E.from_host(path, parameter, arguments[index], ("argument %d of a function value"):format(index))
+            passed[index] = E.materialize(path, value)
+            if E.is_reference value and types.NativeType.is(value.type, types.ReferenceType) and types.owns value.type.target then
+                for _, origin in ipairs compilation.borrows[value.borrow].origins do
+                    append(path, data.Moves { site = site path, target = data.Access { place = origin.place, path = provenance.concat(origin.path, { data.ContentsStep {} }) } })
+                end
+            end
+        end
+        local result = function_type.result ~= types.Unit and fresh identity.ValueId or nil
+        local signature = data.Signature { parameters = function_type.parameters, result = function_type.result, abi = "nua_boundary", variadic = false }
+        -- a known function is called directly (syntax §21.2)
+        local constant = E.constant_of callee
+        local target
+        if constant and data.NativeConstant.is(constant.bits, data.DefinitionAddress) then
+            target = data.DirectNua { definition = constant.bits.definition }
+        else
+            target = data.IndirectNua { pointer = E.materialize(path, callee), .signature, provenance = data.RuntimeEntry { name = "a function value" } }
+        end
+        append(path, data.Invoke { site = site path, .result, callee = target, arguments = passed, boundary = fresh identity.BoundaryId })
+        if result == nil then return nil end
+        return E.value_of_operand(function_type.result, data.Result { value = result, type = function_type.result })
     end
 
     E.call_definition = do(path, word, arguments, generalized)

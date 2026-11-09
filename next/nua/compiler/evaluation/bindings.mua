@@ -84,7 +84,9 @@ return do(E, core)
 
     E.get = do(path, cell)
         if path.dead then return nil end
+        if not E.is_cell cell then return cell end
         local value = E.peek(path, cell)
+        if is_native value and types.contains_atomic(value.type) then fail(path, "atomic-use: an atomic is reached only by its operations; it is never read or copied whole") end
         -- using an owner as a value moves it (syntax §9.2); one with a part moved out is not
         -- whole
         if cells.Cell.is(cell, cells.PlaceCell) and types.owns(compilation.places[cell.place].type) then
@@ -182,9 +184,25 @@ return do(E, core)
         end
     end
     local set_cell = cells.Cell.pass "write a binding cell" with ..Setting end
+    -- the declared type of a cell, without reading it (an element has none to give here)
+    local declared_type
+    declared_type = do(cell)
+        if cells.Cell.is(cell, cells.PlaceCell) then return compilation.places[cell.place].type end
+        if cells.Cell.is(cell, cells.RawCell) then return cell.place.type end
+        if cells.Cell.is(cell, cells.FieldCell) then
+            local record = declared_type(cell.base)
+            if record and types.NativeType.is(record, types.RecordType) then
+                local field = E.field_of(record, cell.name)
+                return field and field.type
+            end
+        end
+        return nil
+    end
     E.set = do(path, cell, value)
         if path.dead then return nil end
         if not E.is_cell cell then fail(path, "this is not something a typed body can assign") end
+        local stored_type = declared_type(cell)
+        if stored_type and types.contains_atomic stored_type then fail(path, "atomic-use: an atomic is written only by its operations") end
         set_cell(cell, path, value)
     end
 

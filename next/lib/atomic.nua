@@ -1,0 +1,39 @@
+-- Atomics (syntax §19): `Atomic T` is a plain T in memory reached only by these operations.
+-- The compiler supplies one primitive, `atomic_operation`; memory orders are compile-time
+-- arguments, and each operation is an effect in source order.
+
+local words = do(T, A)
+    local members = {}
+    local integer = is_integer T
+
+    local load_word = do(self: Ref A, order): T = atomic_operation("read", self, order)
+    local store_word = do(self: Ref A, value: T, order): Unit
+        atomic_operation("write", self, order, value)
+    end
+    local exchange_word = do(self: Ref A, value: T, order): T = atomic_operation("exchange", self, order, value)
+    -- true when the value was `expected` and is now `desired`
+    local cas_word = do(self: Ref A, expected: T, desired: T, order): Bool
+        return atomic_operation("compare_exchange", self, order, expected, desired) == expected
+    end
+    local add_word = do(self: Ref A, value: T, order): T = atomic_operation("fetch_add", self, order, value)
+    local sub_word = do(self: Ref A, value: T, order): T = atomic_operation("fetch_subtract", self, order, value)
+
+    members.load = function(self, order) return load_word(self, order or "seq_cst") end
+    members.store = function(self, value, order) return store_word(self, value, order or "seq_cst") end
+    members.exchange = function(self, value, order) return exchange_word(self, value, order or "seq_cst") end
+    members.cas = function(self, expected, desired, order) return cas_word(self, expected, desired, order or "seq_cst") end
+    if integer then
+        members.add = function(self, value, order) return add_word(self, value, order or "seq_cst") end
+        members.sub = function(self, value, order) return sub_word(self, value, order or "seq_cst") end
+    end
+    return members
+end
+
+family(Atomic, |target, atomic_type| -> words(target, atomic_type))
+
+-- `Ptr T` viewed as `Ptr (Atomic T)`: memory shared with C or the kernel
+local atomic_ptr = do(pointer): Inferred
+    return Ptr(Atomic(type_of(pointer).target))(pointer)
+end
+
+return { .atomic_ptr }
