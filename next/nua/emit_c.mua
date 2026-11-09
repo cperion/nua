@@ -181,6 +181,19 @@ local c_string = do(bytes)
     end
     return '"' .. table.concat parts .. '"'
 end
+-- the initializer of an all-zero value, with the braces its type has
+local zero_initializer
+zero_initializer = do(native_type)
+    if is_array native_type then return "{ { " .. zero_initializer native_type.element .. " } }" end
+    local fields = fields_of native_type
+    if fields then
+        local parts = {}
+        for index, field in ipairs fields do parts[index] = zero_initializer field.type end
+        return "{ " .. table.concat(parts, ", ") .. " }"
+    end
+    if is_sum native_type then return "{ 0 }" end
+    return "0"
+end
 local unspelled_constant = do(bits, recurse, constant)
     if is_pointer_like constant.type then fail "a pointer constant other than null has no C spelling" end
     fail("a constant of " .. types.describe constant.type .. " has no C spelling yet")
@@ -200,7 +213,7 @@ local Constants = define
     end
     StaticBytes = unspelled_constant
     SymbolAddress = unspelled_constant
-    ZeroBits = |bits, recurse, constant| -> ("((%s){ 0 })"):format(c_type constant.type)
+    ZeroBits = |bits, recurse, constant| -> ("((%s)%s)"):format(c_type constant.type, zero_initializer constant.type)
     StaticAddress = |bits, recurse, constant| -> ("((%s)%s + %d)"):format(c_type constant.type, c_string bits.bytes, bits.offset)
     DefinitionAddress = unspelled_constant
 end

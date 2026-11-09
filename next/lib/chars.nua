@@ -1,0 +1,51 @@
+-- Chars(n) (syntax §14.3): short text as a value, a length and n bytes inline. The type is a
+-- struct; its words are Nua, so a known construction folds and a dynamic one residualizes the
+-- same loop.
+
+local index = import "index"
+local made = {}
+
+local Chars = do(n)
+    if type n ~= "number" or n < 1 or n ~= math.floor n or n > 65536 then
+        error("Chars(n) takes a known length from 1 to 65536, got " .. tostring n, 0)
+    end
+    if made[n] then return made[n] end
+    local T = struct { len: U32, bytes: Array(U8, n) }
+
+    local from = do(text: Str): T
+        local too_long = text.length > n
+        index.refuse_known(too_long, ("Chars(%d) holds %d bytes; this text has %s"):format(n, n, index.shown text.length))
+        if too_long then trap "text longer than its Chars(n)" end
+        local out = T()
+        out.len = U32 text.length
+        local i: U64 = 0
+        while i < text.length do
+            out.bytes[i] = text[i]
+            i = i + 1
+        end
+        return out
+    end
+
+    function T.__cast(value)
+        if type value == "string" or type_of value == Str then return from value end
+        return nil
+    end
+
+    -- `c:str()`: the text as a Str borrowing c
+    function T:str(): Str
+        return subview_of(array_view(Ref self.bytes, Str), 0, U64 self.len)
+    end
+
+    local length_of = do(c: Ref T): U64 = U64 c.len
+    function T.__member(c, name)
+        if name == "length" then return length_of c end
+        return nil
+    end
+
+    made[n] = T
+    return T
+end
+
+return define
+    .Chars
+end

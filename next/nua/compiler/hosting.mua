@@ -85,7 +85,8 @@ local primitive_object = meta with
     end
 end
 local Primitive = getmetatable(primitive_object {})
-local primitive = |name, applier| -> primitive_object { .name, .applier }
+-- `by_place`: its argument is captured as a place, never moved (copy)
+local primitive = |name, applier, by_place| -> primitive_object { .name, .applier, .by_place }
 local is_primitive = value -> getmetatable value == Primitive
 
 return define

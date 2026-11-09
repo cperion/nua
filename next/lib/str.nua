@@ -17,6 +17,13 @@ function Str.__cast(value)
     return nil
 end
 
+-- `copy s` of text builds a Text (syntax §9.2)
+Str.__copy = do(s: Str): Buffer U8
+    local out: Buffer U8
+    out:append s
+    return out
+end
+
 -- equal bytes; the loop runs over b, so a known b unrolls
 str.equals = do(a: Str, b: Str): Bool
     if a.length ~= b.length then

@@ -1,0 +1,133 @@
+-- copy, Text and Chars(n) (syntax §9.2, §14.2, §14.3): duplicates built by Nua words and the
+-- walk the type gives; text built in place; short text as a value.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "copy duplicates an owner deeply; a value is itself; a view builds an owner":
+    local library = native("owned_copy", [[
+local Bag = struct { n: U32, xs: Grow U32 }
+local Doc = oneof { empty: Unit, text: Grow U32 }
+local copied_grow = do(k: U32): U32
+    local xs = Grow(U32) { k, 2 }
+    local ys = copy xs
+    ys[0] = 9
+    ys:push 3
+    return xs[0] * 100 + ys[0] * 10 + U32 ys.length
+end
+export copied_grow
+local copied_struct = do(k: U32): U32
+    local a = Bag { n = k, xs = Grow(U32) { 1 } }
+    local b = copy a
+    b.xs:push 2
+    b.n = 8
+    return a.n * 1000 + U32 a.xs.length * 100 + b.n * 10 + U32 b.xs.length
+end
+export copied_struct
+local copied_nested = do(): U32
+    local lines = Grow(Grow U32) {}
+    lines:push(Grow(U32) { 1 })
+    local other = copy lines
+    other[0]:push 2
+    return U32 lines[0].length * 10 + U32 other[0].length
+end
+export copied_nested
+local copied_view = do(k: U32): U32
+    local xs = Grow(U32) { k, 5 }
+    local a = copy(xs:all())
+    a[0] = 7
+    return xs[0] * 10 + a[0]
+end
+export copied_view
+local copied_sum = do(flag: Bool): U64
+    local d = Doc.empty
+    if flag then d = Doc.text(Grow(U32) { 1, 2 }) end
+    local e = copy d
+    return e with
+        empty = do(): U64 = 0
+        text = do(t: Ref (Grow U32)): U64 = t.length
+    end
+end
+export copied_sum
+local copied_ledger = do(k: U32): U64
+    local before = platform.ledger_mapped_bytes()
+    local result = copied_struct k + copied_nested() + copied_view k + U32(copied_sum true)
+    return platform.ledger_mapped_bytes() - before
+end
+export copied_ledger
+]])
+    assert(library.copied_grow(4) == 400 + 90 + 3)
+    assert(library.copied_struct(6) == 6000 + 100 + 80 + 2)
+    assert(library.copied_nested() == 12)
+    assert(library.copied_view(3) == 37)
+    assert(library.copied_sum(true) == 2 and library.copied_sum(false) == 0)
+    library.copied_ledger(1)
+    assert(library.copied_ledger(1) == 0)
+end
+
+test "Text is built in place; known pieces join; each run-time value by its type":
+    local library, text = native("owned_text", [[
+local text_length = do(n: U32, m: I32, flag: Bool, name: Str): U64
+    local out = Text {}
+    out:write("n=", n, " m=", m, " ", flag, " ", name, " ", 1, "/", 2)
+    return out.length
+end
+export text_length
+local text_byte = do(n: U32, at: U64): U8
+    local out = Text {}
+    out:write("[", n, "]")
+    return out[at]
+end
+export text_byte
+local self_append = do(): U64
+    local out = Text {}
+    out:write "abc"
+    out:write(out:str())
+    return out.length
+end
+export self_append
+local text_copy = do(s: Str): U64
+    local kept = copy s
+    kept:write "!"
+    return kept.length
+end
+export text_copy
+]])
+    assert(library.text_byte(42, 0) == 91 and library.text_byte(42, 1) == 52 and library.text_byte(42, 3) == 93)
+    assert(library.self_append() == 6)
+    -- the known " 1/2" is one piece
+    assert(text:find(' 1/2"', 1, true), text)
+end
+
+test "Chars(n) is short text as a value":
+    local library, text = native("owned_chars", [[
+local Name = Chars 8
+local chars_known = do(): U64
+    local c = Name "abc"
+    return c.length * 10 + U64((c:str())[1])
+end
+export chars_known
+local chars_copy = do(s: Str): U64
+    local a = Name s
+    local b = a
+    b.len = 1
+    return a.length * 10 + b.length
+end
+export chars_copy
+]])
+    assert(library.chars_known() == 30 + 98)
+    assert(text:match("uint64_t chars_known%(void%) {.-\n}"):find("128", 1, true), text:match("uint64_t chars_known%(void%) {.-\n}"))
+    refuses([[
+local f = do(): U64
+    local c = Chars(2) "abc"
+    return c.length
+end
+export f
+]], "Chars(2) holds 2 bytes; this text has 3")
+end

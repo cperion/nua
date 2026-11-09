@@ -133,7 +133,21 @@ local words = do(T, B)
         return built
     end
 
+    -- `copy b` (syntax §9.2): a new allocation, every initialized element copied
+    local copied = do(self: Ref B): B
+        local built: B
+        if self.length > 0 then reserve(Ref built, self.length) end
+        local i: U64 = 0
+        while i < self.length do
+            initialize(Ref built, i, copy(element_of(self, i)))
+            i = i + 1
+        end
+        built.length = self.length
+        return built
+    end
+
     local shared = define
+        __copy = copied
         .sub
         .all
         .all_mut
@@ -153,8 +167,10 @@ local words = do(T, B)
         __cast = cast
     end
     -- a buffer of bytes is text being built (syntax §14.2): it lends a `Str`
-    if T == U8 then
+    if T == U8 and not B.fixed then
         members.str = do(self: Ref B): Str = view_of(self, 0, self.length, Str)
+        local text = import("text").words(B, reserve)
+        members.write, members.append = text.write, text.append
     end
     made[B] = members
     return members

@@ -169,12 +169,35 @@ return do(E, core)
     end
 
     -- `array_view(a)`: the elements of an array in memory as a read-only view
-    E.array_view = do(path, reference)
+    E.array_view = do(path, reference, wanted)
         local array_type = reference.type.target
+        local reference_info = compilation.borrows[reference.borrow]
+        if data.BorrowForm.is(reference_info.form, data.Selected) then
+            return E.dispatch_reference(path, reference, |arm, selected| -> E.array_view(arm, selected, wanted))
+        end
+        -- a view of a held array is a held path through it: its known elements are read
+        -- without an address (syntax §13); only asking for its pointer materializes it
+        if data.BorrowForm.is(reference_info.form, data.Held) then
+            local base = reference_info.form.path
+            local steps, origins = {}, {}
+            for position, step in ipairs base.steps do steps[position] = step end
+            steps[#steps + 1] = data.ContentsStep {}
+            for _, origin in ipairs reference_info.origins do
+                local extended = {}
+                for position, step in ipairs origin.path do extended[position] = step end
+                extended[#extended + 1] = data.ContentsStep {}
+                origins[#origins + 1] = data.Access { place = origin.place, path = extended }
+            end
+            local held = data.BorrowPath { root = base.root, .steps, indices = base.indices, range = data.Range { first = rules.integer(types.U64, 0), count = rules.integer(types.U64, array_type.count) } }
+            local made = tracking.borrow(path.flow, held, false, reference_info.lifetime, origin_of path, reference.borrow)
+            made = data.BorrowInfo { ..made, .origins }
+            compilation.borrows[made.id] = made
+            return data.Reference { type = wanted or types.view array_type.element, borrow = made.id }
+        end
         local pointer = E.pack_reference(path, reference)
         local element_pointer = types.pointer array_type.element
         local data_pointer = E.compute(path, "reinterpret", element_pointer, { E.bits(pointer.type, pointer) })
-        local view_type = types.view array_type.element
+        local view_type = wanted or types.view array_type.element
         local result = fresh identity.ValueId
         append(path, data.Pack { site = site path, .result, type = view_type, components = { data_pointer.operand, rules.integer(types.U64, array_type.count) } })
         local operand = data.Result { value = result, type = view_type }
@@ -257,23 +280,31 @@ return do(E, core)
                 position_index += 1
             else
                 assert(data.AccessStep.is(step, data.ContentsStep), "an element step follows the contents of a buffer")
-                local header = E.reached_value(path, position)
-                if not cells.is_raw position then header = E.deref(path, header) end
-                index_position += 1
-                local data_pointer = E.part(path, header, "data")
-                local index = E.bits(types.U64, borrow_path.indices[index_position])
-                local place = data.Place with
-                    id = fresh identity.PlaceId
-                    type = header.type.element
-                    root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index }).operand, .borrow }
-                    path = {}
-                    lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
-                    origin = origin_of path
+                local header = nil
+                if not (cells.is_raw position and E.is_array position.place.type) then
+                    header = E.reached_value(path, position)
+                    if not cells.is_raw position then header = E.deref(path, header) end
                 end
-                compilation.places[place.id] = place
-                path.writer.declare place
-                position = cells.RawPlace { .place }
-                position_index += 2
+                -- the elements of an array are inline: the element step that follows reads them
+                if header == nil or E.is_array header.type then
+                    position_index += 1
+                else
+                    index_position += 1
+                    local data_pointer = E.part(path, header, "data")
+                    local index = E.bits(types.U64, borrow_path.indices[index_position])
+                    local place = data.Place with
+                        id = fresh identity.PlaceId
+                        type = header.type.element
+                        root = data.IndirectRoot { pointer = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, index }).operand, .borrow }
+                        path = {}
+                        lifetime = path.invocation and path.invocation.lifetime or fresh identity.LifetimeId
+                        origin = origin_of path
+                    end
+                    compilation.places[place.id] = place
+                    path.writer.declare place
+                    position = cells.RawPlace { .place }
+                    position_index += 2
+                end
             end
         end
         return position

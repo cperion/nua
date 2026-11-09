@@ -5,6 +5,7 @@
 -- length are known (`index-range`), so the check costs nothing then.
 
 local index = import "index"
+local buffer_words = import("buffer").words
 
 local made = setmetatable({}, { __mode = "k" })
 
@@ -61,7 +62,20 @@ local words = do(T, V)
         return nil
     end
 
+    -- `copy s`: the owner of a copy of the elements (syntax §9.2)
+    local Owned = Buffer(T, false, true)
+    local copied = do(self: V): Owned
+        local built = buffer_words(T, Owned).build(view_length self, {})
+        local i: U64 = 0
+        while i < view_length self do
+            built[i] = view_element_of(self, i)
+            i = i + 1
+        end
+        return built
+    end
+
     local members = define
+        __copy = copied
         __index = element
         __member = member
         __cast = cast

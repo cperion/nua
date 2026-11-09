@@ -1,0 +1,73 @@
+-- Text (syntax §14.2): `Text` is `Grow U8` with text words. `write` appends each value as text:
+-- known pieces are joined while compiling into one literal, each run-time value converted by
+-- the words of its type.
+
+local format = import "format"
+
+-- the words of text buffers, over the buffer's `reserve`
+local words = do(B, reserve)
+    -- the bytes of `text` at the end; a held `text` of this same buffer is derived again after
+    -- the growth, so a Text can append its own bytes
+    local append = do(self: Ref B, text: Str): Unit
+        local count = text.length
+        if count == 0 then return end
+        reserve(self, self.length + count)
+        platform.move_bytes(self.data + self.length, view_data text, count)
+        self.length = self.length + count
+        moves self
+    end
+
+    local as_f64 = do(value): F64 = F64 value
+    local as_u64 = do(value): U64 = U64 value
+    local as_i64 = do(value): I64 = I64 value
+    -- what a piece known while compiling reads as, or nil
+    local known_text = do(piece)
+        local piece_type = type_of piece
+        if piece_type == nil then return tostring piece end
+        if piece_type == Str or not is_known piece then return nil end
+        -- a float's text is the float words', known here
+        if piece_type == F64 or piece_type == F32 then
+            local digits = host(format.f64(as_f64 piece))
+            local bytes = {}
+            for at = 1, digits.len do bytes[at] = string.char(digits.bytes[tostring(at - 1)]) end
+            return table.concat bytes
+        end
+        return tostring(host piece)
+    end
+
+    local write_dynamic = do(self, piece)
+        local piece_type = type_of piece
+        if piece_type == Str then return append(self, piece) end
+        if piece_type == Bool then return append(self, format.boolean piece) end
+        if piece_type.signed == false then return append(self, format.u64(as_u64 piece):str()) end
+        if piece_type.signed == true then return append(self, format.i64(as_i64 piece):str()) end
+        if piece_type == F64 or piece_type == F32 then return append(self, format.f64(as_f64 piece):str()) end
+        return append(self, piece:str())
+    end
+
+    local write = function(self, ...)
+        local pending = nil
+        local pieces = { n = select("#", ...), ... }
+        for position = 1, pieces.n do
+            local piece = pieces[position]
+            local known = known_text piece
+            if known then
+                pending = (pending or "") .. known
+            else
+                if pending then append(self, pending) end
+                pending = nil
+                write_dynamic(self, piece)
+            end
+        end
+        if pending then append(self, pending) end
+    end
+
+    return define
+        .append
+        .write
+    end
+end
+
+return define
+    .words
+end

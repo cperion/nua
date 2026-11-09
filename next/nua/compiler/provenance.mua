@@ -160,7 +160,7 @@ value_info = do(value, lookup)
     if data.NativeValue.is(value, data.Reference) then return data.ValueInfo { type = value.type, components = { [{}] = data.Borrowed { borrow = value.borrow } }, proofs = {} } end
     if data.NativeValue.is(value, data.Aggregate) then
         local components = types.NativeType.is(value.type, types.BufferType) and { [{}] = data.Owning {} } or {}
-        local packed = value.packed and lookup and lookup(value.packed)
+        local packed = value.packed and not data.Operand.is(value.packed, data.Constant) and lookup and lookup(value.packed)
         if packed then for key, part in pairs packed.components do components[key] = part end end
         for name, part in pairs value.parts do
             for key in pairs components do if key[1] and data.Component.is(key[1], data.FieldComponent) and key[1].name == name then components[key] = nil end end

@@ -2281,11 +2281,11 @@ uint32_t format_known_length(void) {
 }
 ```
 
-Decimal formatting is [format.nua](../lib/format.nua): the precision search, the
-special values, the `Chars(32)` buffer and the `snprintf`/`strtod` calls are ordinary
-Nua words, and libc is an explicit external dependency rather than an irreducible
-primitive. The compiler keeps only the fold of a value known while compiling
-(`float_is_known` and `float_text` in `nua/strings.lua`).
+Float text is ordinary Nua words with no libc dependency (`next/lib/float.nua`, the
+Schubfach algorithm): the shortest decimal that reads back as the same value, in the
+layout of C's `%.{p}g`, `p` being its number of digits. A known float folds while
+compiling; a dynamic one residualizes integer code. Its table of powers of ten is made
+by host code while compiling, only when a float word is used, and is static data.
 that algorithm is separate work, not a property claimed for the current prototype.
 
 ### 14.3 Chars(n)

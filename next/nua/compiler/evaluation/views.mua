@@ -109,6 +109,14 @@ return do(E, core)
                 local header = E.reached_value(path, reached)
                 if not cells.is_raw(reached) then header = E.deref(path, header) end
                 local first = E.bits(types.U64, borrow_path.range.first)
+                -- a view of an array: its address, which puts the array in memory (syntax §13)
+                if E.is_array header.type then
+                    local base = tracking.borrow(path.flow, data.BorrowPath { root = borrow_path.root, .steps, indices = borrow_path.indices }, false, compilation.borrows[view.borrow].lifetime, origin_of path, view.borrow)
+                    local address = E.pack_reference(path, data.Reference { type = types.reference header.type, borrow = base.id })
+                    local element_pointer = types.pointer view.type.element
+                    local start = E.compute(path, "reinterpret", element_pointer, { E.bits(address.type, address) })
+                    return E.compute(path, "pointer_offset", element_pointer, { start, first }), E.bits(types.U64, borrow_path.range.count)
+                end
                 local data_pointer = E.part(path, header, "data")
                 local start = E.compute(path, "pointer_offset", data_pointer.type, { data_pointer, first })
                 return start, E.bits(types.U64, borrow_path.range.count)
@@ -155,9 +163,26 @@ return do(E, core)
         return data.Reference { type = types.Str, borrow = info.id }
     end
 
+    -- `view_data(s)`: the raw pointer to a view's first element (for the bytes of a mechanism)
+    E.view_data = do(path, view)
+        if not E.is_view view then fail(path, "view_data takes a view") end
+        local start = E.view_parts(path, view)
+        return start
+    end
+
     -- `view_length(s)`: a view's count, from its current coordinates
     E.view_length = do(path, view)
         if not E.is_view view then fail(path, "view_length takes a view") end
+        -- a held view's count is in its range: no pointer is derived for it
+        local use = tracking.use(path.flow, view.borrow)
+        local held = use with
+            ended = state -> fail(path, ("a borrow is used after it ended (%s)"):format(state.reason))
+            derive = borrow_path -> E.bits(types.U64, borrow_path.range.count)
+            cached = pointer -> nil
+            fixed = pointer -> nil
+            select = selected -> nil
+        end
+        if held then return held end
         local _, count = E.view_parts(path, view)
         return count
     end

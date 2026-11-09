@@ -56,6 +56,38 @@ return do(E, core)
             end
         end
     end
+    -- `copy x` (syntax §9.2): a type's `__copy` hook (a buffer, a view), else the walk the
+    -- type gives: owner fields copied, value fields as values, a sum's active payload
+    E.copy_of = do(path, given)
+        local value = E.deref(path, given)
+        if not is_native value then return given end
+        local hook = E.member_of(value.type, "__copy")
+        if hook then
+            local word = hosting.supplied_of hook
+            local by_reference = word and word.requirements[1].type and types.NativeType.is(word.requirements[1].type, types.ReferenceType)
+            if not by_reference then return E.apply(path, hook, { value }, false) end
+            if E.is_reference given and types.NativeType.is(given.type, types.ReferenceType) then return E.apply(path, hook, { given }, false) end
+            -- a header held only as a value: lent from a place that does not own it
+            local holder = E.new_place(path, "copied", value.type)
+            path.flow.contents[holder.id] = data.Tracked { .value }
+            local result = E.apply(path, hook, { E.reference_to(path, E.place_cell(holder.id, "copied")) }, false)
+            path.flow.contents[holder.id] = data.Moved { at = origin_of path }
+            return result
+        end
+        if not types.owns value.type then return value end
+        if E.is_aggregate value then
+            local parts = {}
+            for _, field in ipairs(E.fields_of value.type) do parts[field.name] = E.copy_of(path, E.part(path, value, field.name)) end
+            return data.Aggregate { type = value.type, packed = nil, .parts }
+        end
+        local copied = do(at, name)
+            local payload = E.payload_of(at, value, name)
+            return data.Tagged { type = value.type, alternative = name, payload = payload and E.copy_of(at, payload) }
+        end
+        if E.is_tagged value then return copied(path, value.alternative) end
+        return E.dispatch_tag(path, value, copied, "the copy of " .. types.describe value.type)
+    end
+
     E.release_place = do(path, place)
         local contents = path.flow.contents[place]
         if not contents or not (Contents.is(contents, data.Tracked) or Contents.is(contents, data.Resident)) then return end

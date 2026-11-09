@@ -151,7 +151,8 @@ return do(E, core)
         if not is_native value then return true end
         if NativeValue.is(value, data.Bits) then return data.Operand.is(value.operand, data.Constant) end
         if NativeValue.is(value, data.Aggregate) then
-            if value.packed then return false end
+            -- (contents packed as a constant are known: an array's zeroed elements)
+            if value.packed and not data.Operand.is(value.packed, data.Constant) then return false end
             for _, part in pairs value.parts do if not known(part) then return false end end
             return true
         end
@@ -206,6 +207,9 @@ return do(E, core)
         end
         if NativeValue.is(value, data.Aggregate) then
             local fields = {}
+            if value.packed then
+                for _, field in ipairs(E.fields_of value.type) do fields[field.name] = E.host_value(E.zero_value field.type) end
+            end
             for name, part in pairs value.parts do fields[name] = E.host_value(part) end
             return fields
         end

@@ -47,6 +47,7 @@ local prelude = define
     Buffer = types.buffer
     Grow = types.buffer
     Slice = types.slice
+    Text = types.buffer types.U8
     size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
 end
 
@@ -145,7 +146,8 @@ local hosting_environment = do(compilation, filename, E)
         end
         return imported[name].value
     end
-    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop", "view_length", "view_element_of", "subview_of", "static_text", "array_element_of", "array_view", "zero_of", "view_data", "reinterpret" } do environment[name] = hosting.primitive(name, E.host_primitive) end
+    environment.copy = hosting.primitive("copy", E.host_primitive, true)
     environment.owns = types.owns
     -- `family(Buffer, provider)`: a library serves the members of every type of a kind
     environment.family = types.define_family
@@ -234,6 +236,7 @@ local compiling_with_members = do(source, filename)
     environment.import "buffer"
     environment.import "slice"
     environment.import "array"
+    environment.Chars = environment.import("chars").Chars
     environment.import "str"
     load_nua(source, filename)
 

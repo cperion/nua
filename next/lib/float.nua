@@ -1,0 +1,328 @@
+-- Floats as text (syntax §14.2): the shortest decimal that reads back as the same F64, closest
+-- to it (Schubfach, R. Giulietti). Ordinary Nua words: a known float folds while compiling, a
+-- dynamic one residualizes integer code. The powers of ten are made here while compiling, the
+-- first time a word needs them, and live in the program as static bytes.
+
+local chars = import "chars"
+local float = {}
+
+float.Digits = chars.Chars 32
+
+------------------------------------------------------------------------------------------------
+-- The table, by host arithmetic: for k in -292..324, 10^k scaled to 128 bits with its top bit
+-- set, rounded up. Numbers are little-endian lists of 24-bit limbs.
+
+local LIMB = 16777216
+
+local multiply_small = do(number, factor)
+    local carry = 0
+    for at = 1, #number do
+        local product = number[at] * factor + carry
+        number[at] = product % LIMB
+        carry = math.floor(product / LIMB)
+    end
+    if carry > 0 then number[#number + 1] = carry end
+end
+local bit_length = do(number)
+    local top = number[#number]
+    local bits = (#number - 1) * 24
+    while top > 0 do
+        bits += 1
+        top = math.floor(top / 2)
+    end
+    return bits
+end
+local bit_of = |number, position| -> math.floor(number[math.floor(position / 24) + 1] / 2 ^ (position % 24)) % 2
+local at_least = do(a, b)
+    if #a ~= #b then return #a > #b end
+    for at = #a, 1, -1 do
+        if a[at] ~= b[at] then return a[at] > b[at] end
+    end
+    return true
+end
+local subtract = do(a, b)
+    local borrow = 0
+    for at = 1, #a do
+        local difference = a[at] - (b[at] or 0) - borrow
+        borrow = difference < 0 and 1 or 0
+        a[at] = difference + borrow * LIMB
+    end
+    while #a > 1 and a[#a] == 0 do a[#a] = nil end
+end
+
+-- 128 bits, most significant first, as 16 bytes rounded up by `inexact`
+local bytes_of_bits = do(bits, inexact)
+    local bytes = {}
+    for byte = 1, 16 do
+        local value = 0
+        for at = 1, 8 do value = value * 2 + bits[(byte - 1) * 8 + at] end
+        bytes[byte] = value
+    end
+    if inexact then
+        for byte = 16, 1, -1 do
+            bytes[byte] += 1
+            if bytes[byte] < 256 then break end
+            bytes[byte] = 0
+        end
+    end
+    return bytes
+end
+
+local positive_power = do(number)
+    local length = bit_length number
+    local bits, inexact = {}, false
+    for at = 1, 128 do
+        local position = length - at
+        bits[at] = position >= 0 and bit_of(number, position) or 0
+    end
+    for position = 0, length - 129 do
+        if bit_of(number, position) == 1 then inexact = true end
+    end
+    return bytes_of_bits(bits, inexact)
+end
+
+-- 1 / divisor, by binary long division from its first set bit
+local negative_power = do(divisor)
+    local remainder = { 1 }
+    while not at_least(remainder, divisor) do multiply_small(remainder, 2) end
+    local bits = {}
+    for at = 1, 128 do
+        if at_least(remainder, divisor) then
+            bits[at] = 1
+            subtract(remainder, divisor)
+        else
+            bits[at] = 0
+        end
+        multiply_small(remainder, 2)
+    end
+    return bytes_of_bits(bits, not (#remainder == 1 and remainder[1] == 0))
+end
+
+-- two little-endian U64s per power: its high half, then its low half
+local little_endian = do(bytes)
+    return string.char(bytes[8], bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1])
+        .. string.char(bytes[16], bytes[15], bytes[14], bytes[13], bytes[12], bytes[11], bytes[10], bytes[9])
+end
+
+local made_table = nil
+local power_table = do()
+    if made_table then return made_table end
+    local powers = {}
+    local number = { 1 }
+    for k = 0, 324 do
+        powers[k + 293] = little_endian(positive_power number)
+        multiply_small(number, 10)
+    end
+    number = { 10 }
+    for k = 1, 292 do
+        powers[293 - k] = little_endian(negative_power number)
+        multiply_small(number, 10)
+    end
+    made_table = table.concat powers
+    return made_table
+end
+
+------------------------------------------------------------------------------------------------
+-- 128-bit products, from 32-bit halves
+
+local U128 = struct { hi: U64, lo: U64 }
+local LOW = 0xffffffff
+
+local multiply = do(a: U64, b: U64): U128
+    local a0 = a & LOW
+    local a1 = a >> 32
+    local b0 = b & LOW
+    local b1 = b >> 32
+    local p00 = a0 * b0
+    local p01 = a0 * b1
+    local p10 = a1 * b0
+    local p11 = a1 * b1
+    local middle = p10 + (p00 >> 32)
+    local carried = (middle & LOW) + p01
+    return U128 { hi = p11 + (middle >> 32) + (carried >> 32), lo = (carried << 32) | (p00 & LOW) }
+end
+
+-- 10^k as 128 bits, read from the table a byte at a time (a known read folds)
+local power_of_ten = do(k: I32): U128
+    local bytes: Str = power_table()
+    local start = view_data bytes
+    local read = do(at: U64): U64
+        local value: U64 = 0
+        for offset = 7, 0, -1 do
+            value = (value << 8) | U64(start[at + offset])
+        end
+        return value
+    end
+    local at = U64(k + 292) * 16
+    return U128 { hi = read at, lo = read(at + 8) }
+end
+
+local round_to_odd = do(g: U128, cp: U64): U64
+    local x = multiply(g.lo, cp)
+    local y = multiply(g.hi, cp)
+    local y0 = y.lo + x.hi
+    local y1 = y.hi
+    if y0 < x.hi then y1 = y1 + 1 end
+    if y0 > 1 then return y1 | 1 end
+    return y1
+end
+
+local Decimal = struct { digits: U64, exponent: I32 }
+
+-- the shortest decimal of the finite, nonzero float of this significand and biased exponent
+local shortest = do(significand: U64, biased: I32): Decimal
+    local c: U64 = significand
+    local q: I32 = -1074
+    if biased ~= 0 then
+        c = significand | (U64 1 << 52)
+        q = biased - 1075
+        -- an integer in range: exactly its own digits
+        if q <= 0 and q > -53 then
+            local shift = U32(0 - q)
+            if (c & ((U64 1 << shift) - 1)) == 0 then
+                return Decimal { digits = c >> shift, exponent = 0 }
+            end
+        end
+    end
+    local even = (c & 1) == 0
+    local closer = significand == 0 and biased > 1
+    local lower_step: U64 = 2
+    local adjust: I32 = 0
+    if closer then
+        lower_step = 1
+        adjust = 524031
+    end
+    local cbl = 4 * c - lower_step
+    local cb = 4 * c
+    local cbr = 4 * c + 2
+    local k: I32 = (q * 1262611 - adjust) >> 22
+    local h: I32 = q + (((0 - k) * 1741647) >> 19) + 1
+    local g = power_of_ten(0 - k)
+    local shift = U32 h
+    local vbl = round_to_odd(g, cbl << shift)
+    local vb = round_to_odd(g, cb << shift)
+    local vbr = round_to_odd(g, cbr << shift)
+    local lower = vbl
+    local upper = vbr
+    if not even then
+        lower = lower + 1
+        upper = upper - 1
+    end
+    local s = vb / 4
+    if s >= 10 then
+        local sp = s / 10
+        local up_inside = lower <= 40 * sp
+        local wp_inside = 40 * sp + 40 <= upper
+        if up_inside ~= wp_inside then
+            local chosen = sp
+            if wp_inside then chosen = chosen + 1 end
+            return Decimal { digits = chosen, exponent = k + 1 }
+        end
+    end
+    local u_inside = lower <= 4 * s
+    local w_inside = 4 * s + 4 <= upper
+    if u_inside ~= w_inside then
+        local chosen = s
+        if w_inside then chosen = chosen + 1 end
+        return Decimal { digits = chosen, exponent = k }
+    end
+    local mid = 4 * s + 2
+    local chosen = s
+    if vb > mid or (vb == mid and (s & 1) ~= 0) then chosen = chosen + 1 end
+    return Decimal { digits = chosen, exponent = k }
+end
+
+------------------------------------------------------------------------------------------------
+-- the text: the layout of C's %.{p}g, p the number of shortest digits
+
+local Digits = float.Digits
+
+local put = do(out: Ref Digits, byte: U8): Unit
+    out.bytes[out.len] = byte
+    out.len = out.len + 1
+end
+
+float.text = do(value: F64): Digits
+    local bits = reinterpret(U64, value)
+    local negative = (bits >> 63) == 1
+    local biased = I32((bits >> 52) & 0x7ff)
+    local significand = bits & ((U64 1 << 52) - 1)
+    local out = Digits()
+    if biased == 0x7ff then
+        if significand ~= 0 then return Digits "nan" end
+        if negative then return Digits "-inf" end
+        return Digits "inf"
+    end
+    if negative then put(Ref out, 45) end
+    if biased == 0 and significand == 0 then
+        put(Ref out, 48)
+        return out
+    end
+    local decimal = shortest(significand, biased)
+    local digits = decimal.digits
+    local exponent = decimal.exponent
+    while digits % 10 == 0 do
+        digits = digits / 10
+        exponent = exponent + 1
+    end
+    -- the digits, most significant first
+    local reversed: Array(U8, 17)
+    local count: I32 = 0
+    while digits > 0 do
+        reversed[U32 count] = U8(digits % 10) + 48
+        count = count + 1
+        digits = digits / 10
+    end
+    local digit_at = do(position: I32): U8 = reversed[U32(count - 1 - position)]
+    local x = exponent + count - 1
+    if x < -4 or x >= count then
+        put(Ref out, digit_at 0)
+        if count > 1 then
+            put(Ref out, 46)
+            local i: I32 = 1
+            while i < count do
+                put(Ref out, digit_at i)
+                i = i + 1
+            end
+        end
+        put(Ref out, 101)
+        local magnitude = x
+        if x < 0 then
+            put(Ref out, 45)
+            magnitude = 0 - x
+        else
+            put(Ref out, 43)
+        end
+        if magnitude >= 100 then
+            put(Ref out, U8(magnitude / 100) + 48)
+            magnitude = magnitude % 100
+        end
+        put(Ref out, U8(magnitude / 10) + 48)
+        put(Ref out, U8(magnitude % 10) + 48)
+        return out
+    end
+    if x >= 0 then
+        local i: I32 = 0
+        while i < count do
+            if i == x + 1 then put(Ref out, 46) end
+            put(Ref out, digit_at i)
+            i = i + 1
+        end
+        return out
+    end
+    put(Ref out, 48)
+    put(Ref out, 46)
+    local zeros: I32 = -1
+    while zeros > x do
+        put(Ref out, 48)
+        zeros = zeros - 1
+    end
+    local i: I32 = 0
+    while i < count do
+        put(Ref out, digit_at i)
+        i = i + 1
+    end
+    return out
+end
+
+return float
