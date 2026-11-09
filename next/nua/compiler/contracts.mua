@@ -16,6 +16,7 @@ local PlaceId, BorrowId, LifetimeId, InvocationId = identity.PlaceId, identity.B
 local GlobalId, OriginId, HostId, BoundaryId = identity.GlobalId, identity.OriginId, identity.HostId, identity.BoundaryId
 
 local places = require "nua.compiler.places"
+local program_data = require "nua.compiler.program"
 local AccessPath, Access, ValueInfo, Contents = places.AccessPath, places.Access, places.ValueInfo, places.Contents
 local BorrowInfo, BorrowState = places.BorrowInfo, places.BorrowState
 local program = require "nua.compiler.program"
@@ -53,7 +54,9 @@ local JoinRelation = struct { block: BlockId, incoming: list_of(EdgeFacts) }
 
 local Effects = struct {
     reads: list_of(Access), writes: list_of(Access), moves: list_of(Access), ends: list_of(Access), consumes: list_of(Access),
-    may_trap: Boolean, may_wait: Boolean, may_switch: Boolean, foreign_extent: Boolean, nonreturning: Boolean
+    may_trap: Boolean, may_wait: Boolean, may_switch: Boolean, foreign_extent: Boolean, nonreturning: Boolean,
+    -- orders memory it names no access for: an atomic operation, a fence, opaque code
+    synchronizes: Boolean
 }
 local SiteFacts = struct { before: FlowFacts, after: FlowFacts, effects: Effects }
 local DefinitionFacts = struct {
@@ -82,6 +85,10 @@ local BoundaryContract = struct {
 }
 local Analysis = struct { revision: Natural, definitions: map_of(DefinitionId, DefinitionFacts), contracts: map_of(DefinitionId, BoundaryContract) }
 
+-- §7.3: readiness of exactly one revision. No backend accepts a program without one.
+local ReadyCertificate = struct { revision: Natural, definitions: set_of(DefinitionId) }
+local Prepared = struct { program: program_data.Program, analysis: Analysis, certificate: ReadyCertificate }
+
 return define
     .ComponentInfo
     .Plain
@@ -109,4 +116,6 @@ return define
     .AliasRequirement
     .BoundaryContract
     .Analysis
+    .ReadyCertificate
+    .Prepared
 end

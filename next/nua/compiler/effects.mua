@@ -1,19 +1,23 @@
 -- Ordered site effects for the graph currently emitted by the replacement. Native-call
 -- effects remain conservative until boundary contracts close; this is not a readiness proof.
 local data = require "nua.compiler.data"
+local rules = require "nua.compiler.rules"
 
 local empty = || -> data.Effects {
     reads = {}, writes = {}, moves = {}, ends = {}, consumes = {},
     may_trap = false, may_wait = false, may_switch = false,
-    foreign_extent = false, nonreturning = false,
+    foreign_extent = false, nonreturning = false, synchronizes = false,
 }
 local ending = node -> data.Effects { ..empty(), may_trap = data.Terminator.is(node, data.Trap), nonreturning = data.Terminator.is(node, data.Trap) }
 local access = place -> data.Access { .place, path = {} }
 local of = data.Instruction.pass "site effects" with
     Compute = do(node, recurse)
-        local result = empty()
-        -- Invalid arithmetic may trap; folding can prove particular computations safe.
-        return data.Effects { ..result, may_trap = node.opcode == "divide" or node.opcode == "remainder" }
+        -- Integer division may trap unless its divisor is known to be neither zero nor -1.
+        local divisor = node.arguments[2]
+        local dividing = (node.opcode == "divide" or node.opcode == "remainder") and rules.is_integer(divisor.type)
+        local safe = dividing and data.Operand.is(divisor, data.Constant) and data.NativeConstant.is(divisor.bits, data.IntegerBits)
+            and rules.integer_value(divisor) ~= 0 and rules.integer_value(divisor) ~= -1
+        return data.Effects { ..empty(), may_trap = dividing and not safe }
     end
     Pack = |node, recurse| -> empty()
     Extract = |node, recurse| -> empty()
@@ -23,16 +27,18 @@ local of = data.Instruction.pass "site effects" with
     Check = |node, recurse| -> data.Effects { ..empty(), may_trap = true }
     Invoke = |node, recurse| -> data.Effects {
         ..empty(), may_trap = true, may_wait = true, may_switch = true,
-        foreign_extent = data.Callee.is(node.callee, data.Foreign),
+        foreign_extent = data.Callee.is(node.callee, data.Foreign), synchronizes = true,
     }
-    Atomic = |node, recurse| -> empty()
-    Fence = |node, recurse| -> empty()
+    -- an atomic's address is a pointer, so what it touches is not a named access; the flag
+    -- is what stops a pass from moving memory operations across it
+    Atomic = |node, recurse| -> data.Effects { ..empty(), synchronizes = true }
+    Fence = |node, recurse| -> data.Effects { ..empty(), synchronizes = true }
     LifetimeStart = |node, recurse| -> empty()
     LifetimeEnd = |node, recurse| -> empty()
     Moves = |node, recurse| -> data.Effects { ..empty(), moves = { node.target } }
     Ends = |node, recurse| -> data.Effects { ..empty(), ends = { node.target } }
-    Budget = |node, recurse| -> data.Effects { ..empty(), may_switch = true }
-    Mechanism = |node, recurse| -> data.Effects { ..empty(), may_trap = true }
+    Budget = |node, recurse| -> data.Effects { ..empty(), may_switch = true, synchronizes = true }
+    Mechanism = |node, recurse| -> data.Effects { ..empty(), may_trap = true, synchronizes = true }
 end
 return define
     .empty

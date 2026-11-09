@@ -1,7 +1,7 @@
 -- Compile Nua source with the replacement compiler, build the C into a shared library under
 -- build/next/, and load it: `native(name, source)` answers the loaded library, with each
--- export's prototype declared, and the C text. Dead block parameters are tolerated until the
--- optimizer sweeps them (compiler activities §7.3).
+-- export's prototype declared, and the C text. `options` go to `compile_c`; `optimize = false`
+-- builds the program as evaluation left it, whose dead block parameters C must tolerate.
 
 local ffi = require "ffi"
 local compile = require "nua.compile"
@@ -14,8 +14,8 @@ local compiler = os.getenv("CC") or (root .. "/.local/bin/gcc")
 local declared = {}
 local declared_names = {}
 
-return do(name, source)
-    local text, prototypes = compile.compile_c(source, name .. ".nua")
+return do(name, source, options)
+    local text, prototypes = compile.compile_c(source, name .. ".nua", options)
     os.execute("mkdir -p " .. build)
     local c_path = ("%s/%s.c"):format(build, name)
     local library = ("%s/lib%s.so"):format(build, name)

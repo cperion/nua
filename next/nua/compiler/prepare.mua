@@ -1,0 +1,102 @@
+-- Preparation (compiler activities §7.3): the verified program, optionally optimized, checked
+-- for readiness and certified for exactly its revision. No backend accepts anything else.
+--
+--   prepare(program, analysis, options) -> Prepared
+--   certified(prepared)                 refuses what `prepare` did not issue for this program
+--
+-- Budget coverage and `task_access` belong to this order and are not yet checked: nothing can
+-- wait or switch until the scheduler exists (work package 3 of the handoff).
+
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local verify = require "nua.compiler.verify"
+local verify_lifetimes = require "nua.compiler.verify_lifetimes"
+local optimizer = require "nua.compiler.optimize"
+local platform = require "nua.compiler.platform"
+
+-- what the verifiers need to know of the target's mechanisms
+local capabilities = do()
+    local mechanisms = {}
+    for name, binding in pairs platform.bindings do
+        mechanisms[name] = { signature = { result = binding.result } }
+    end
+    return define
+        .mechanisms
+    end
+end
+
+-- the definition graph is closed, and each definition has facts and a contract of this revision
+local closure_problems = do(program, analysis)
+    local problems = {}
+    local report = do(definition, message)
+        problems[#problems + 1] = verify.Problem { verifier = "ready", definition = definition and definition.id, .message, origin = definition and definition.origin }
+    end
+    if analysis.revision ~= program.revision then report(nil, "the analysis is of another revision") end
+    for _, export in ipairs program.exports do
+        if program.definitions[export.definition] == nil then report(nil, "the export " .. export.name .. " has no definition") end
+    end
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        for called in pairs(graph.called_definitions definition) do
+            if program.definitions[called] == nil then report(definition, "a definition reaches one outside the program") end
+        end
+        local contract = analysis.contracts[definition.id]
+        if analysis.definitions[definition.id] == nil then report(definition, "a definition has no facts") end
+        if contract == nil or contract.revision ~= program.revision then report(definition, "a definition has no contract of this revision") end
+    end
+    return problems
+end
+
+-- every check readiness requires, in the order of §7.3
+local ready = do(program, analysis)
+    local problems = verify.all(program, capabilities())
+    for _, problem in ipairs(verify_lifetimes.lifetimes(program, analysis)) do problems[#problems + 1] = problem end
+    for _, problem in ipairs(closure_problems(program, analysis)) do problems[#problems + 1] = problem end
+    return problems
+end
+
+-- certificates this module issued, each with the one program it is for
+local issued = setmetatable({}, { __mode = "k" })
+
+local certify = do(program)
+    local definitions = {}
+    for id in pairs program.definitions do definitions[id] = true end
+    local certificate = data.ReadyCertificate { revision = program.revision, .definitions }
+    issued[certificate] = program
+    return certificate
+end
+
+-- `options.optimize = false` skips the optional rounds; readiness is never skipped
+local prepare = do(program, analysis, options)
+    if not (options and options.optimize == false) then
+        program, analysis = optimizer.optimize(program, analysis, options and options.observe)
+    end
+    local problems = ready(program, analysis)
+    if #problems > 0 then
+        local lines = {}
+        for _, problem in ipairs problems do lines[#lines + 1] = ("%s: %s"):format(problem.verifier, problem.message) end
+        error("the prepared program is not ready:\n" .. table.concat(lines, "\n"), 0)
+    end
+    return data.Prepared { .program, .analysis, certificate = certify program }
+end
+
+local certified = do(prepared)
+    if not check(data.Prepared, prepared) then error("a backend takes a prepared program, not " .. tostring(prepared), 2) end
+    local program, certificate = prepared.program, prepared.certificate
+    if issued[certificate] ~= program then error("this certificate was not issued for this program", 2) end
+    if certificate.revision ~= program.revision or prepared.analysis.revision ~= program.revision then
+        error("the certificate is for another revision of the program", 2)
+    end
+    for id in pairs program.definitions do
+        if not certificate.definitions[id] then error("the certificate does not cover every definition", 2) end
+    end
+    for id in pairs certificate.definitions do
+        if program.definitions[id] == nil then error("the certificate covers a definition the program does not have", 2) end
+    end
+    return program
+end
+
+return define
+    .prepare
+    .ready
+    .certified
+end

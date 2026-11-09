@@ -21,7 +21,7 @@ local paths = require "nua.compiler.borrow_paths"
 local Instruction, Operand, PlaceRoot, ComponentInfo, BorrowState = data.Instruction, data.Operand, data.PlaceRoot, data.ComponentInfo, data.BorrowState
 
 local effect_fields = { "reads", "writes", "moves", "ends", "consumes" }
-local effect_flags = { "may_trap", "may_wait", "may_switch", "foreign_extent" }
+local effect_flags = { "may_trap", "may_wait", "may_switch", "foreign_extent", "synchronizes" }
 local union_accesses = paths.union
 local access_key = access -> access.place.serial .. ":" .. provenance.key(provenance.components(access.path))
 
@@ -224,7 +224,7 @@ local fingerprint = do(bundle)
         for _, field in ipairs effect_fields do
             for _, access in ipairs site[field] do found[at .. field .. access_name(access)] = true end
         end
-        for _, flag in ipairs { "may_trap", "may_wait", "may_switch", "foreign_extent", "nonreturning" } do
+        for _, flag in ipairs { "may_trap", "may_wait", "may_switch", "foreign_extent", "nonreturning", "synchronizes" } do
             if site[flag] then found[at .. flag] = true end
         end
     end
@@ -770,7 +770,7 @@ local effect_key = do(info)
     for _, field in ipairs effect_fields do
         for _, access in ipairs info[field] do parts[#parts + 1] = field .. access_key(access) end
     end
-    for _, field in ipairs { "may_trap", "may_wait", "may_switch", "foreign_extent", "nonreturning" } do
+    for _, field in ipairs { "may_trap", "may_wait", "may_switch", "foreign_extent", "nonreturning", "synchronizes" } do
         if info[field] then parts[#parts + 1] = field end
     end
     table.sort(parts)
@@ -781,7 +781,23 @@ local apply = do(bundle, path, arguments, caller, fail)
     local registry, memory = caller.borrows, caller.memory
     local tracking = facts.tracking { borrows = registry, supply = caller.supply }
     local contexts, order, probes = {}, {}, {}
-    local changed = false
+    -- Contexts waiting for a replay, last marked first: a context requested for the first time
+    -- is answered before the one that asked, so a chain of calls takes a walk down and back
+    -- rather than one pass over all the contexts per level.
+    local pending = {}
+    local replaying_context = nil
+    local mark = do(context)
+        if context.waiting then return end
+        context.waiting = true
+        pending[#pending + 1] = context
+    end
+    local mark_with_callees
+    mark_with_callees = do(context, visited)
+        if visited[context] then return end
+        visited[context] = true
+        mark context
+        for callee in pairs context.callees do mark_with_callees(callee, visited) end
+    end
     local original = {}
     for id in pairs path.flow.borrows do original[id] = true end
 
@@ -808,7 +824,7 @@ local apply = do(bundle, path, arguments, caller, fail)
     end
     -- A probe stands for a pre-existing caller borrow of one shape, so a nested frame's end of
     -- it can be told apart from its own acquisitions.
-    local probe_for = do(info)
+    local probe_for = do(info, target)
         local parts = { data.BorrowForm.is(info.form, data.Stored) and "stored" or "held" }
         for _, origin in ipairs info.origins do parts[#parts + 1] = access_key(origin) end
         if data.BorrowForm.is(info.form, data.Selected) then
@@ -821,14 +837,17 @@ local apply = do(bundle, path, arguments, caller, fail)
         local id = probes[key]
         if id == nil then
             id = caller.supply.fresh(identity.BorrowId)
-            probes[key], registry[id], changed = id, data.BorrowInfo { ..info, .id }, true
+            probes[key], registry[id] = id, data.BorrowInfo { ..info, .id }
+            -- only the callee this probe is passed to, and what it calls, can end it
+            local context = contexts[key_of(target.target, target.supplied)]
+            if context then mark_with_callees(context, {}) end
         end
         return id
     end
     -- the context for a callee and what it is supplied: made on first request, its input joined
     -- with each later one
     local open_context = do(target, incoming, supplied)
-        local context = { bundle = target, input = facts.fork(incoming.flow), arguments = {}, result = provenance.plain(target.definition.signature.result), effects = effects.empty(), normal = false }
+        local context = { bundle = target, input = facts.fork(incoming.flow), arguments = {}, result = provenance.plain(target.definition.signature.result), effects = effects.empty(), normal = false, callees = {}, dependents = {}, waiting = false }
         for index, info in ipairs supplied do
             local components = {}
             for component_path, part in pairs info.components do
@@ -847,7 +866,8 @@ local apply = do(bundle, path, arguments, caller, fail)
         local context = contexts[key]
         if context == nil then
             context = open_context(target, incoming, supplied)
-            contexts[key], order[#order + 1], changed = context, context, true
+            contexts[key], order[#order + 1] = context, context
+            mark context
             return context
         end
         local next_flow = facts.fork(incoming.flow)
@@ -860,15 +880,20 @@ local apply = do(bundle, path, arguments, caller, fail)
         memory.agree({ context.input, next_flow }, joined)
         if not same_flow(context.input, joined) then
             context.input = joined
-            changed = true
+            mark context
         end
         return context
     end
     -- a nested call: its context's current answer, with the caller borrows it ended
     local resolve = do(target, at, supplied, local_registry, local_states)
         local requested = {}
-        for id in pairs local_states do requested[id] = probe_for(local_registry[id]) end
+        local probing = { .target, .supplied }
+        for id in pairs local_states do requested[id] = probe_for(local_registry[id], probing) end
         local context = request(target, at, supplied)
+        if replaying_context then
+            replaying_context.callees[context] = true
+            context.dependents[replaying_context] = true
+        end
         if context.normal then
             for id, probe in pairs requested do
                 local state = context.output.borrows[probe]
@@ -884,20 +909,23 @@ local apply = do(bundle, path, arguments, caller, fail)
     end
 
     local root = request(bundle, path, arguments)
-    while changed do
-        changed = false
-        for _, context in ipairs order do
-            local at = { ..path, flow = facts.fork(context.input) }
-            -- Probes describe transfer of an arbitrary pre-existing borrow. Acquisitions
-            -- inside a recursive frame never reset a caller frame's borrow.
-            for _, id in pairs probes do at.flow.borrows[id] = data.Live {} end
-            local result, observed, normal = replaying_call(context.bundle, at, context.arguments, caller, fail, resolve).run()
-            local different = normal ~= context.normal or effect_key(observed) ~= effect_key(context.effects)
-            if normal and context.normal then
-                if not same_flow(context.output, at.flow) or not provenance.same_info(context.result, context.output, result, at.flow, registry) then different = true end
-            end
-            context.output, context.result, context.effects, context.normal = at.flow, result, observed, normal
-            if different then changed = true end
+    while #pending > 0 do
+        local context = table.remove pending
+        context.waiting = false
+        local at = { ..path, flow = facts.fork(context.input) }
+        -- Probes describe transfer of an arbitrary pre-existing borrow. Acquisitions
+        -- inside a recursive frame never reset a caller frame's borrow.
+        for _, id in pairs probes do at.flow.borrows[id] = data.Live {} end
+        replaying_context = context
+        local result, observed, normal = replaying_call(context.bundle, at, context.arguments, caller, fail, resolve).run()
+        replaying_context = nil
+        local different = normal ~= context.normal or effect_key(observed) ~= effect_key(context.effects)
+        if normal and context.normal then
+            if not same_flow(context.output, at.flow) or not provenance.same_info(context.result, context.output, result, at.flow, registry) then different = true end
+        end
+        context.output, context.result, context.effects, context.normal = at.flow, result, observed, normal
+        if different then
+            for dependent in pairs context.dependents do mark dependent end
         end
     end
     if root.normal then

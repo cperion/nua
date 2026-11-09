@@ -511,7 +511,8 @@ All these facts are owned and published with the accepted construction.
 Effects          { reads: List Access, writes: List Access,
                    moves: List Access, ends: List Access, consumes: List Access,
                    may_trap: Bool, may_wait: Bool, may_switch: Bool,
-                   foreign_extent: Bool, nonreturning: Bool }
+                   foreign_extent: Bool, nonreturning: Bool,
+                   synchronizes: Bool }
 ForeignEffects   { reads: List Access, writes: List Access, retains: List Access,
                    may_reenter: Bool, noreturn: Bool }
 InterfaceOrigin  = Incoming(parameter: Positive, path: AccessPath)
@@ -528,6 +529,10 @@ BoundaryContract { definition: DefinitionId, inputs: List InterfaceInfo,
                    requires_disjoint: List AliasRequirement,
                    normal_exits: Set BlockId, revision: U64 }
 ```
+
+`synchronizes` marks a site that orders memory without naming an access: an atomic
+operation, whose address is a pointer rather than a place, a fence, a budget point, a
+mechanism or a call. No pass moves a memory operation across such a site.
 
 `Effects` describes **one execution site**. The boundary contract retains the
 instruction/terminator maps and the definition's actual CFG, including nonreturning

@@ -407,11 +407,49 @@ local fold = do(opcode, result, arguments)
     return FoldingDecision.not_foldable()
 end
 
+-- the value of an integer constant, as its type reads it
+local integer_value = constant -> constant.type.signed and signed_value(constant.bits.bits, constant.type.bits)
+    or unsigned_value(constant.bits.bits, constant.type.bits)
+
+-- the operand a computation is equal to whatever its unknown operand holds, or nil: a zero
+-- offset, a conversion to its own type, an integer's neutral element. Never a float's: x + 0
+-- is not x for a negative zero.
+local is_constant_integer = do(operand, value)
+    return data.Operand.is(operand, data.Constant) and is_integer(operand.type)
+        and data.NativeConstant.is(operand.bits, data.IntegerBits) and integer_value(operand) == value
+end
+local neutral_right = define
+    add = 0
+    subtract = 0
+    multiply = 1
+    bit_or = 0
+    bit_xor = 0
+    shift_left = 0
+    shift_right_signed = 0
+    shift_right_unsigned = 0
+    divide = 1
+end
+local neutral_left = define
+    add = 0
+    multiply = 1
+    bit_or = 0
+    bit_xor = 0
+end
+local identity_of = do(opcode, result, arguments)
+    local first, second = arguments[1], arguments[2]
+    if opcode == "convert" or opcode == "reinterpret" then return first.type == result and first or nil end
+    if opcode == "pointer_offset" then return is_constant_integer(second, 0) and first or nil end
+    if not is_integer(result) or first.type ~= result then return nil end
+    if neutral_right[opcode] and is_constant_integer(second, neutral_right[opcode]) then return first end
+    if neutral_left[opcode] and second.type == result and is_constant_integer(first, neutral_left[opcode]) then return second end
+    return nil
+end
+
 -- a computation has no effect of its own: its validity is its types and, for a known one,
 -- its fold
 local pure = || -> data.Effects {
     reads = {}, writes = {}, moves = {}, ends = {}, consumes = {},
-    may_trap = false, may_wait = false, may_switch = false, foreign_extent = false, nonreturning = false,
+    may_trap = false, may_wait = false, may_switch = false, foreign_extent = false, nonreturning = false, synchronizes = false,
 }
 
 -- integer constants made from Lua numbers or 64-bit cdata, wrapped to the type's width
@@ -419,14 +457,11 @@ local integer = |type, value| -> data.Constant { .type, bits = data.IntegerBits 
 local float = |type, value| -> data.Constant { .type, bits = data.FloatBits { value = round(value, type) } }
 local boolean = value -> data.Constant { type = types.Bool, bits = data.BooleanBit { .value } }
 
--- the value of an integer constant, as its type reads it
-local integer_value = constant -> constant.type.signed and signed_value(constant.bits.bits, constant.type.bits)
-    or unsigned_value(constant.bits.bits, constant.type.bits)
-
 return define
     .FoldingDecision
     .check_types
     .fold
+    .identity_of
     .pure
     .integer
     .float

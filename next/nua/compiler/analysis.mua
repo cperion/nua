@@ -90,6 +90,47 @@ local publish = do(definition, fragment)
         .edges, .joins, sites = fragment.sites, .terminators,
     }
 end
+-- The facts of a definition a rewrite changed, rebuilt from those of the definition it came
+-- from. `renaming` maps the key of an operand that moved to its new operand, or `false` if it is
+-- gone. Snapshots survive with their sites and blocks; what depends on the graph (edge rows,
+-- joins, terminator effects, the facts of new results) is derived again by `publish`. A snapshot
+-- is provenance at its own point: no consumer reads an operand out of it after evaluation.
+local recompute = do(definition, previous, renaming)
+    local values, defined = {}, {}
+    for index, native_type in ipairs definition.signature.parameters do
+        defined[data.operand_key(data.Parameter { definition = definition.id, .index, type = native_type })] = true
+    end
+    local entries, sites, terminal_flows = {}, {}, {}
+    for _, block in ipairs definition.blocks do
+        entries[block.id] = previous.entries[block.id]
+        for index, argument in ipairs block.arguments do
+            defined[data.operand_key(data.BlockArgument { block = block.id, .index, type = argument.type })] = true
+        end
+        for _, instruction in ipairs block.instructions do
+            sites[instruction.site.id] = previous.sites[instruction.site.id]
+            if instruction.result then defined[instruction.result] = true end
+        end
+        local first_edge = graph.edges_of(block.terminator)[1]
+        if first_edge then terminal_flows[block.id] = previous.edges[first_edge.id].flow end
+    end
+    for key, info in pairs previous.values do
+        local moved = renaming and renaming[key]
+        if moved then
+            values[data.operand_key moved] = info
+        elseif moved == nil and defined[key] then
+            values[key] = info
+        end
+    end
+    return publish(definition, define
+        .values
+        borrows = previous.borrows
+        .entries
+        .sites
+        .terminal_flows
+    end)
+end
+
 return define
     .publish
+    .recompute
 end

@@ -299,20 +299,50 @@ local walk = do(pass, program, state)
     end
 end
 
+-- a definition's blocks with a block before those it dominates: reverse postorder of what the
+-- entry reaches, then the unreachable blocks in the order they were made
+local reverse_postorder = do(definition)
+    local by_id, visited, postorder = {}, {}, {}
+    for _, block in ipairs definition.blocks do by_id[block.id] = block end
+    local visit
+    visit = do(id)
+        if visited[id] then return end
+        visited[id] = true
+        for _, edge in ipairs(edges_of by_id[id].terminator) do visit(edge.target) end
+        postorder[#postorder + 1] = by_id[id]
+    end
+    visit(definition.entry)
+    local ordered = {}
+    for position = #postorder, 1, -1 do ordered[#ordered + 1] = postorder[position] end
+    for _, block in ipairs definition.blocks do
+        if not visited[block.id] then ordered[#ordered + 1] = block end
+    end
+    return ordered
+end
+
 -- a rewrite answers each instruction with its replacements; it owns the lists it writes, so
--- its handlers see them only through the work table it makes for each block
-local rewrite = do(pass, program, state)
+-- its handlers see them only through the work table it makes for each block. Blocks are visited
+-- with definitions before their uses, and keep their order in the output. `hooks` are optional:
+-- `entering(block, work)` before a block's instructions, where `work.arguments` may replace its
+-- parameters, and `ending(terminator, work)`, answering its terminator
+local rewrite = do(pass, program, state, hooks)
+    local entering, ending = hooks and hooks.entering, hooks and hooks.ending
     local definitions = {}
     for _, definition in ipairs(definitions_in_order program) do
-        local blocks = {}
-        for _, block in ipairs definition.blocks do
+        local rewritten = {}
+        for _, block in ipairs(reverse_postorder definition) do
             local written = {}
             local work = { ..(state or {}), .written, .block, .definition }
+            if entering then entering(block, work) end
             for _, instruction in ipairs block.instructions do
                 for _, replacement in ipairs(pass(instruction, work)) do written[#written + 1] = replacement end
             end
-            blocks[#blocks + 1] = data.Block { id = block.id, arguments = block.arguments, instructions = written, terminator = block.terminator }
+            local terminator = block.terminator
+            if ending then terminator = ending(terminator, work) end
+            rewritten[block.id] = data.Block { id = block.id, arguments = work.arguments or block.arguments, instructions = written, .terminator }
         end
+        local blocks = {}
+        for position, block in ipairs definition.blocks do blocks[position] = rewritten[block.id] end
         definitions[definition.id] = data.Definition { ..definition, .blocks }
     end
     return data.Program { ..program, revision = program.revision + 1, .definitions }
@@ -558,6 +588,7 @@ return define
     .Unchanged
     .Inert
     .edges_of
+    .reverse_postorder
     .definitions_in_order
     .called_definitions
     same = same_program

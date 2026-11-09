@@ -1,0 +1,503 @@
+-- The optimizer and preparation (compiler activities §7.3, §7.4). What a round may do is checked
+-- on programs built by hand, where nothing has been folded yet; what it must not change is
+-- checked by running the same source optimized and not, against values worked out here rather
+-- than against either build.
+
+local ffi = require "ffi"
+local identity = require "nua.identity"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local rules = require "nua.compiler.rules"
+local effects = require "nua.compiler.effects"
+local verify = require "nua.compiler.verify"
+local verify_lifetimes = require "nua.compiler.verify_lifetimes"
+local optimizer = require "nua.compiler.optimize"
+local preparation = require "nua.compiler.prepare"
+local compile = require "nua.compile"
+local emit_c = require "nua.emit_c"
+local native = require "tests.support.native"
+
+local refuses = do(test_body, expected)
+    local done, problem = pcall test_body
+    assert(not done, "expected a refusal")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+local count_of = do(program, kind)
+    local count = 0
+    for _, definition in pairs program.definitions do
+        for _, block in ipairs definition.blocks do
+            for _, instruction in ipairs block.instructions do
+                if data.Instruction.is(instruction, kind) then count += 1 end
+            end
+        end
+    end
+    return count
+end
+local block_count = do(program)
+    local count = 0
+    for _, definition in pairs program.definitions do count += #definition.blocks end
+    return count
+end
+
+------------------------------------------------------------------------------------------------
+-- Programs built by hand: one definition whose blocks `body` writes.
+
+local u32 = value -> rules.integer(types.U32, value)
+
+local building = do(parameters, result, body)
+    local supply = identity.supply()
+    local fresh = supply.fresh
+    local origin = fresh identity.OriginId
+    local definition = fresh identity.DefinitionId
+    local kit = define
+        .origin
+        .definition
+        parameter = |index, native_type| -> data.Parameter { .definition, .index, type = native_type }
+        site = || -> data.Site { id = fresh identity.InstructionId, .origin }
+        value = || -> fresh identity.ValueId
+        edge = |target, arguments| -> data.Edge { id = fresh identity.EdgeId, .target, .arguments }
+    end
+    local outcome = graph.building(nil, supply, do(writer)
+        body(writer, kit)
+        return "adopt"
+    end)
+    local fragment = outcome { built = f -> f, discarded = || -> error "discarded" }
+    local blocks = graph.seal fragment
+    local built = data.Definition with
+        id = definition
+        word = fresh identity.WordId
+        kind = "native_word"
+        signature = data.Signature { .parameters, .result, abi = "nua_boundary", variadic = false }
+        entry = blocks[1].id
+        .blocks
+        places = fragment.places
+        .origin
+    end
+    return data.Program with
+        revision = 0
+        definitions = { [definition] = built }
+        words = {}
+        globals = {}
+        exports = { data.Export { name = "built", .definition } }
+        lifetimes = {}
+        origins = {}
+    end
+end
+local only_definition = program -> graph.definitions_in_order(program)[1]
+local valid = do(program)
+    local problems = verify.all program
+    assert(#problems == 0, problems[1] and problems[1].message)
+    return program
+end
+local compute = do(writer, kit, block, native_type, opcode, arguments)
+    local result = kit.value()
+    writer.append(block, data.Compute { site = kit.site(), .result, type = native_type, .opcode, .arguments })
+    return data.Result { value = result, type = native_type }
+end
+-- fold, reach and sweep once
+local one_round = program -> valid(optimizer.sweep(optimizer.reach(valid(optimizer.fold program))))
+
+test "a parameter every edge agrees on decides the branch it feeds, and the rest goes":
+    local program = building({}, types.U32, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local join = writer.block("join", { types.Bool })
+        local yes = writer.block("yes", {})
+        local no = writer.block("no", {})
+        writer.terminate(entry, data.Jump { origin = kit.origin, edge = kit.edge(join, { rules.boolean(true) }) })
+        writer.terminate(join, data.Branch { origin = kit.origin, condition = writer.parameter(join, 1), when_true = kit.edge(yes, {}), when_false = kit.edge(no, {}) })
+        writer.terminate(yes, data.Return { origin = kit.origin, value = u32 1 })
+        writer.terminate(no, data.Return { origin = kit.origin, value = u32 2 })
+    end)
+    local before = graph.print program
+    local after = one_round program
+    assert(graph.print program == before, "a round changed the program it was given")
+    local definition = only_definition after
+    assert(#definition.blocks == 3)
+    for _, block in ipairs definition.blocks do assert(#block.arguments == 0) end
+    assert(data.Terminator.is(definition.blocks[2].terminator, data.Jump))
+    assert(after.revision > program.revision)
+end
+
+test "a loop parameter passed back to itself is the value it entered with":
+    local program = building({ types.U32 }, types.U32, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local head = writer.block("head", { types.U32 })
+        local done = writer.block("done", {})
+        local carried = writer.parameter(head, 1)
+        writer.terminate(entry, data.Jump { origin = kit.origin, edge = kit.edge(head, { kit.parameter(1, types.U32) }) })
+        local again = compute(writer, kit, head, types.Bool, "less", { carried, u32 3 })
+        writer.terminate(head, data.Branch { origin = kit.origin, condition = again, when_true = kit.edge(head, { carried }), when_false = kit.edge(done, {}) })
+        writer.terminate(done, data.Return { origin = kit.origin, value = carried })
+    end)
+    local definition = only_definition(one_round program)
+    assert(#definition.blocks[2].arguments == 0, "the parameter stayed")
+    local returned = definition.blocks[3].terminator.value
+    assert(data.Operand.is(returned, data.Parameter) and returned.index == 1)
+end
+
+test "parameters that disagree stay, and later ones shift down when an earlier one goes":
+    local program = building({ types.U32, types.Bool }, types.U32, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local left = writer.block("left", {})
+        local right = writer.block("right", {})
+        local join = writer.block("join", { types.U32, types.U32 })
+        local parameter = kit.parameter(1, types.U32)
+        writer.terminate(entry, data.Branch { origin = kit.origin, condition = kit.parameter(2, types.Bool), when_true = kit.edge(left, {}), when_false = kit.edge(right, {}) })
+        writer.terminate(left, data.Jump { origin = kit.origin, edge = kit.edge(join, { u32 1, parameter }) })
+        writer.terminate(right, data.Jump { origin = kit.origin, edge = kit.edge(join, { u32 2, u32 9 }) })
+        writer.terminate(join, data.Return { origin = kit.origin, value = writer.parameter(join, 2) })
+    end)
+    local definition = only_definition(one_round program)
+    local join = definition.blocks[4]
+    assert(#join.arguments == 1, "the unread parameter stayed")
+    assert(join.terminator.value.index == 1, "the read parameter did not shift")
+    assert(data.Terminator.is(definition.blocks[2].terminator, data.Jump) and #definition.blocks[2].terminator.edge.arguments == 1)
+end
+
+test "chains of dead pure results go in one sweep, and effects stay":
+    local program = building({ types.U32 }, types.U32, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local parameter = kit.parameter(1, types.U32)
+        local first = compute(writer, kit, entry, types.U32, "add", { parameter, u32 7 })
+        local second = compute(writer, kit, entry, types.U32, "multiply", { first, u32 3 })
+        compute(writer, kit, entry, types.U32, "subtract", { second, parameter })
+        -- a division by an unknown divisor may trap: nobody reads it, and it stays
+        compute(writer, kit, entry, types.U32, "divide", { parameter, parameter })
+        -- by a known divisor it cannot
+        compute(writer, kit, entry, types.U32, "divide", { parameter, u32 4 })
+        writer.append(entry, data.Fence { site = kit.site(), order = "sequential" })
+        writer.terminate(entry, data.Return { origin = kit.origin, value = parameter })
+    end)
+    local swept = optimizer.sweep program
+    local instructions = only_definition(swept).blocks[1].instructions
+    assert(#instructions == 2, "kept " .. #instructions)
+    assert(data.Instruction.is(instructions[1], data.Compute) and instructions[1].opcode == "divide" and data.Operand.is(instructions[1].arguments[2], data.Parameter))
+    assert(data.Instruction.is(instructions[2], data.Fence))
+end
+
+test "known computations, neutral operations and checks that hold fold away":
+    local program = building({ types.U32 }, types.U32, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local parameter = kit.parameter(1, types.U32)
+        local six = compute(writer, kit, entry, types.U32, "multiply", { u32 2, u32 3 })
+        local same = compute(writer, kit, entry, types.U32, "add", { parameter, u32 0 })
+        local holds = compute(writer, kit, entry, types.Bool, "less", { u32 1, u32 2 })
+        writer.append(entry, data.Check { site = kit.site(), condition = holds, message = u32 0, claim = data.Condition { value = holds } })
+        local sum = compute(writer, kit, entry, types.U32, "add", { same, six })
+        writer.terminate(entry, data.Return { origin = kit.origin, value = sum })
+    end)
+    local folded = valid(optimizer.fold program)
+    local instructions = only_definition(folded).blocks[1].instructions
+    assert(#instructions == 1 and instructions[1].opcode == "add")
+    assert(data.Operand.is(instructions[1].arguments[1], data.Parameter))
+    assert(rules.integer_value(instructions[1].arguments[2]) == 6)
+end
+
+test "a float's neutral element is not folded, nor undefined arithmetic":
+    local program = building({ types.F64, types.U32 }, types.F64, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local zero = rules.float(types.F64, 0)
+        local sum = compute(writer, kit, entry, types.F64, "add", { kit.parameter(1, types.F64), zero })
+        local undefined = compute(writer, kit, entry, types.U32, "divide", { kit.parameter(2, types.U32), u32 0 })
+        writer.terminate(entry, data.Return { origin = kit.origin, value = sum })
+        assert(undefined)
+    end)
+    local instructions = only_definition(optimizer.fold program).blocks[1].instructions
+    assert(#instructions == 2)
+end
+
+test "a part of a value just packed is the operand it was packed from":
+    local Point = types.record("Point", { { name = "x", type = types.U32 }, { name = "y", type = types.U32 } })
+    local program = building({ types.U32 }, types.U32, do(writer, kit)
+        local entry = writer.block("entry", {})
+        local result = kit.value()
+        writer.append(entry, data.Pack { site = kit.site(), .result, type = Point, components = { u32 5, kit.parameter(1, types.U32) } })
+        local field = kit.value()
+        writer.append(entry, data.Extract { site = kit.site(), result = field, type = types.U32, aggregate = data.Result { value = result, type = Point }, path = { data.FieldComponent { name = "y" } } })
+        writer.terminate(entry, data.Return { origin = kit.origin, value = data.Result { value = field, type = types.U32 } })
+    end)
+    local after = one_round program
+    assert(count_of(after, data.Pack) == 0 and count_of(after, data.Extract) == 0)
+    assert(data.Operand.is(only_definition(after).blocks[1].terminator.value, data.Parameter))
+end
+
+test "places that share a root still share it when its pointer is replaced":
+    local supply_kit = nil
+    local program = building({ types.pointer types.U32 }, types.U32, do(writer, kit)
+        supply_kit = kit
+        local entry = writer.block("entry", {})
+        local pointer_type = types.pointer types.U32
+        local offset = compute(writer, kit, entry, pointer_type, "pointer_offset", { kit.parameter(1, pointer_type), u32 0 })
+        local root = data.RawRoot { pointer = offset }
+        local make_place = do(path)
+            local place = data.Place { id = identity.supply().fresh identity.PlaceId, type = types.U32, .root, .path, lifetime = identity.supply().fresh identity.LifetimeId, origin = kit.origin }
+            writer.declare place
+            return place
+        end
+        local first = make_place {}
+        local second = make_place {}
+        local loaded = kit.value()
+        writer.append(entry, data.Load { site = kit.site(), result = loaded, place = first.id })
+        writer.append(entry, data.Store { site = kit.site(), place = second.id, value = u32 1 })
+        writer.terminate(entry, data.Return { origin = kit.origin, value = data.Result { value = loaded, type = types.U32 } })
+    end)
+    assert(supply_kit)
+    local definition = only_definition(optimizer.fold program)
+    local roots = {}
+    for _, place in pairs definition.places do roots[#roots + 1] = place.root end
+    assert(#roots == 2 and roots[1] == roots[2], "the root was rebuilt per place")
+    assert(data.Operand.is(roots[1].pointer, data.Parameter))
+end
+
+test "atomics and fences are effects a pass can see":
+    local supply = identity.supply()
+    local site = data.Site { id = supply.fresh identity.InstructionId, origin = supply.fresh identity.OriginId }
+    local fence = data.Fence { .site, order = "sequential" }
+    local atomic = data.Atomic { .site, result = supply.fresh identity.ValueId, opcode = "read", address = data.Constant { type = types.pointer types.U32, bits = data.ZeroBits {} }, arguments = {}, order = "acquire" }
+    assert(effects.of(fence).synchronizes and effects.of(atomic).synchronizes)
+    local pure = data.Compute { .site, result = supply.fresh identity.ValueId, type = types.U32, opcode = "add", arguments = { u32 1, u32 2 } }
+    assert(not effects.of(pure).synchronizes)
+end
+
+------------------------------------------------------------------------------------------------
+-- Compiled programs: the same answers either way
+
+local corpus = {
+    {
+        name = "opt_arithmetic",
+        source = [[
+local clamp = do(x: U32, low: U32): U32
+    if x < low then return low end
+    return x
+end
+local opt_clamped = do(a: U32): U32 = clamp(a, 3) + clamp(10, a)
+export opt_clamped
+]],
+        check = do(library)
+            assert(library.opt_clamped(1) == 13)
+            assert(library.opt_clamped(20) == 40)
+        end,
+    },
+    {
+        name = "opt_buffers",
+        source = [[
+local opt_summed = do(a: U32): U32
+    local t = Grow(U32) {}
+    t:push(a)
+    t:push(a * 2)
+    local sum: U32 = 0
+    local i: U64 = 0
+    while i < t.length do
+        sum = sum + t[i]
+        i = i + 1
+    end
+    return sum + t[0]
+end
+export opt_summed
+]],
+        check = do(library)
+            assert(library.opt_summed(5) == 20)
+        end,
+    },
+    {
+        name = "opt_parts",
+        source = [[
+local Point = struct { x: U32, y: U32 }
+local bump = do(r: Ref U32, by: U32): Unit
+    r = r + by
+end
+local opt_fields = do(k: U32): U32
+    local p = Point { x = k, y = 2 }
+    bump(Ref p.y, k)
+    return p.x * 100 + p.y
+end
+export opt_fields
+]],
+        check = do(library)
+            assert(library.opt_fields(7) == 709)
+        end,
+    },
+    {
+        name = "opt_sums",
+        source = [[
+local Rect = struct { width: U32, height: U32 }
+local Shape = oneof { rect: Rect, dot: Unit }
+local area = do(s: Shape): U32 = s with
+    rect = do(r) = r.width * r.height
+    dot = do() = 0
+end
+local opt_areas = do(w: U32): U32
+    local shape = Shape.dot()
+    if w > 1 then shape = Shape.rect(Rect { width = w, height = 3 }) end
+    return area shape + area(Shape.rect(Rect { width = 2, height = w }))
+end
+export opt_areas
+]],
+        check = do(library)
+            assert(library.opt_areas(4) == 12 + 8)
+            assert(library.opt_areas(1) == 0 + 2)
+        end,
+    },
+    {
+        name = "opt_crossing",
+        source = [[
+local fill
+fill = do(xs: Ref(Grow U32), n: U32): Unit
+    if n == 0 then return end
+    xs:push(n)
+    call fill(xs, n - 1)
+end
+local opt_filled = do(n: U32): U64
+    local xs = Grow(U32) {}
+    call fill(Ref xs, n)
+    return xs.length
+end
+export opt_filled
+]],
+        check = do(library)
+            assert(library.opt_filled(6) == 6)
+        end,
+    },
+    {
+        name = "opt_known_chain",
+        source = [[
+local fill_known
+fill_known = do(k, xs: Ref(Grow U32)): Unit
+    if k == 0 then return end
+    xs:push (U32 k)
+    call fill_known(k - 1, xs)
+end
+local opt_known_chain = do(): U32
+    local xs = Grow(U32) {}
+    call fill_known(5, Ref xs)
+    return xs[0] * 10 + xs[4] + U32 xs.length * 100
+end
+export opt_known_chain
+]],
+        check = do(library)
+            assert(library.opt_known_chain() == 551)
+        end,
+    },
+    {
+        name = "opt_atomics",
+        source = [[
+local opt_unused_atomics = do(k: U32): U32
+    local a: Atomic U32 = k
+    a:add 2
+    fence "seq_cst"
+    return a:load "acquire"
+end
+export opt_unused_atomics
+]],
+        check = do(library)
+            assert(library.opt_unused_atomics(9) == 11)
+        end,
+    },
+}
+
+test "optimized and unoptimized programs both give the expected answers":
+    for _, program in ipairs corpus do
+        program.check(native(program.name .. "_optimized", program.source))
+        program.check(native(program.name .. "_plain", program.source, { optimize = false }))
+    end
+end
+
+test "every round of every program verifies, and the last one is a fixed point":
+    for _, item in ipairs corpus do
+        local compiled = compile.compile(item.source, item.name .. ".nua")
+        local rounds = 0
+        local prepared = preparation.prepare(compiled.program, compiled.analysis, define
+            observe = do(program, analysis, number)
+                rounds = number
+                local problems = verify.all program
+                for _, problem in ipairs(verify_lifetimes.lifetimes(program, analysis)) do problems[#problems + 1] = problem end
+                assert(#problems == 0, item.name .. " round " .. number .. ": " .. (problems[1] and problems[1].message or ""))
+            end
+        end)
+        assert(rounds >= 1 and rounds <= optimizer.maximum_rounds)
+        local again = optimizer.optimize(prepared.program, prepared.analysis)
+        assert(graph.same(again, prepared.program), item.name .. " was not a fixed point")
+        assert(block_count(prepared.program) <= block_count(compiled.program))
+    end
+end
+
+test "an atomic nobody reads stays, and a definition nobody reaches goes":
+    local source = [[
+local unused = do(x: U32): U32 = x + 1
+local opt_keep_atomic = do(k: U32): U32
+    local a: Atomic U32 = k
+    a:load "acquire"
+    if false then return call unused(k) end
+    return k
+end
+export opt_keep_atomic
+]]
+    local compiled = compile.compile(source, "keep.nua")
+    local prepared = preparation.prepare(compiled.program, compiled.analysis)
+    assert(count_of(prepared.program, data.Atomic) >= 1)
+    local count = 0
+    for _ in pairs prepared.program.definitions do count += 1 end
+    assert(count == 1)
+end
+
+------------------------------------------------------------------------------------------------
+-- The certificate
+
+local small = [[
+local opt_certified = do(a: U32): U32 = a + 1
+export opt_certified
+]]
+local prepared_small = do()
+    local compiled = compile.compile(small, "certified.nua")
+    return preparation.prepare(compiled.program, compiled.analysis)
+end
+
+test "a backend refuses a bare program":
+    local compiled = compile.compile(small, "bare.nua")
+    refuses(|| -> emit_c.emit compiled.program, "takes a prepared program")
+end
+
+test "a prepared program is emitted, optimized or not":
+    local compiled = compile.compile(small, "either.nua")
+    local unoptimized = preparation.prepare(compiled.program, compiled.analysis, { optimize = false })
+    assert(unoptimized.program == compiled.program)
+    assert(emit_c.emit(unoptimized):find("opt_certified", 1, true))
+    assert(emit_c.emit(prepared_small()):find("opt_certified", 1, true))
+end
+
+test "a certificate is for exactly the program it was issued with":
+    local prepared = prepared_small()
+    local other = prepared_small()
+    local swapped = data.Prepared { program = other.program, analysis = other.analysis, certificate = prepared.certificate }
+    refuses(|| -> emit_c.emit swapped, "was not issued for this program")
+    local forged = data.ReadyCertificate { revision = prepared.program.revision, definitions = prepared.certificate.definitions }
+    refuses(|| -> emit_c.emit(data.Prepared { program = prepared.program, analysis = prepared.analysis, certificate = forged }), "was not issued")
+end
+
+test "a structural change after preparation invalidates the certificate":
+    local prepared = prepared_small()
+    local changed = graph.rewrite(data.Instruction.pass "the same" with ..graph.Unchanged end, prepared.program)
+    local stale = data.Prepared { program = changed, analysis = prepared.analysis, certificate = prepared.certificate }
+    refuses(|| -> emit_c.emit stale, "was not issued for this program")
+end
+
+test "preparation refuses a program whose facts are of another revision":
+    local compiled = compile.compile(small, "stale.nua")
+    local changed = data.Program { ..compiled.program, revision = compiled.program.revision + 1 }
+    refuses(|| -> preparation.prepare(changed, compiled.analysis, { optimize = false }), "another revision")
+end
+
+test "readiness refuses a mechanism the target does not have":
+    local program = building({}, types.Unit, do(writer, kit)
+        local entry = writer.block("entry", {})
+        writer.append(entry, data.Mechanism { site = kit.site(), binding = "no_such_mechanism", arguments = {} })
+        writer.terminate(entry, data.Return { origin = kit.origin })
+    end)
+    local found = false
+    for _, problem in ipairs(preparation.ready(program, data.Analysis { revision = 0, definitions = {}, contracts = {} })) do
+        if problem.message:find("no_such_mechanism", 1, true) then found = true end
+    end
+    assert(found)
+end

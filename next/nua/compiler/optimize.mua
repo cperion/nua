@@ -1,0 +1,602 @@
+-- The optional optimizer (compiler activities §7.3, §7.4; Mua's writing-compilers §10). A round
+-- is three passes, each answering a valid program and never changing the one it was given:
+--
+--   fold    what is known: constants, neutral operations, parts of a value just packed, branches
+--           on a constant, checks that hold, block parameters every edge agrees on
+--   reach   what can run: blocks over the actual control-flow graph, definitions from the exports
+--   sweep   what nobody reads: pure results and the block parameters they feed
+--
+-- Up to eight rounds run, stopping when a round leaves the graph as it found it. Facts are
+-- recomputed each round, so every round leaves a program and analysis of one revision.
+--
+-- Two limits are deliberate. Only plain block parameters are replaced or removed, and only plain
+-- parts are read back out of a pack: a value carrying a borrow or an owner has identity in the
+-- facts that a substitution would lose. And instructions are never moved, so no pass here
+-- depends on memory order.
+
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local rules = require "nua.compiler.rules"
+local verify = require "nua.compiler.verify"
+local effects = require "nua.compiler.effects"
+local analysis_module = require "nua.compiler.analysis"
+local boundaries = require "nua.compiler.boundaries"
+
+local Instruction, Terminator, Operand, NativeConstant = data.Instruction, data.Terminator, data.Operand, data.NativeConstant
+local NativeType, PlaceRoot, Component, CheckClaim = types.NativeType, data.PlaceRoot, data.Component, data.CheckClaim
+
+local is_constant = operand -> Operand.is(operand, data.Constant)
+local is_plain = native_type -> not types.borrows(native_type) and not types.owns(native_type)
+
+------------------------------------------------------------------------------------------------
+-- Substitution: every operand a program holds, wherever it is held. `replaced` maps operand keys
+-- to operands. A list, a path and a place are rebuilt only when something in them changed, so a
+-- round that changes nothing answers the records it was given.
+
+local resolve = do(operand, replaced)
+    if is_constant operand then return operand end
+    return replaced[data.operand_key operand] or operand
+end
+
+local resolve_list = do(list, replaced)
+    local result = list
+    for index, operand in ipairs list do
+        local changed = resolve(operand, replaced)
+        if changed ~= operand then
+            if result == list then
+                result = {}
+                for position, item in ipairs list do result[position] = item end
+            end
+            result[index] = changed
+        end
+    end
+    return result
+end
+
+-- an element step holds its index as an operand
+local resolve_path = do(path, replaced)
+    local result = path
+    for index, component in ipairs path do
+        if Component.is(component, data.ElementComponent) then
+            local changed = resolve(component.index, replaced)
+            if changed ~= component.index then
+                if result == path then
+                    result = {}
+                    for position, item in ipairs path do result[position] = item end
+                end
+                result[index] = data.ElementComponent { index = changed }
+            end
+        end
+    end
+    return result
+end
+
+local pointer_kept = |root, recurse, replaced| -> root
+local pointer_resolved = do(kind)
+    return do(root, recurse, replaced)
+        local pointer = resolve(root.pointer, replaced)
+        if pointer == root.pointer then return root end
+        return kind { ..root, .pointer }
+    end
+end
+local Rooting = define
+    LocalRoot = pointer_kept
+    GlobalRoot = pointer_kept
+    ParameterRoot = pointer_kept
+    IndirectRoot = pointer_resolved(data.IndirectRoot)
+    ForeignRoot = pointer_resolved(data.ForeignRoot)
+    RawRoot = pointer_resolved(data.RawRoot)
+end
+local resolve_root = PlaceRoot.pass "a place's root under replaced operands" with ..Rooting end
+
+-- A place and its components share one root record, and provenance finds a component's base by
+-- that identity, so each root is rebuilt once.
+local resolve_places = do(definition, replaced)
+    local places = nil
+    local roots = {}
+    for id, place in pairs definition.places do
+        local root = roots[place.root]
+        if root == nil then
+            root = resolve_root(place.root, replaced)
+            roots[place.root] = root
+        end
+        local path = resolve_path(place.path, replaced)
+        if root ~= place.root or path ~= place.path then
+            if places == nil then
+                places = {}
+                for key, item in pairs definition.places do places[key] = item end
+            end
+            places[id] = data.Place { ..place, .root, .path }
+        end
+    end
+    if places == nil then return definition end
+    return data.Definition { ..definition, .places }
+end
+
+local resolve_all_places = do(program, replaced)
+    local definitions = {}
+    for id, definition in pairs program.definitions do definitions[id] = resolve_places(definition, replaced) end
+    return data.Program { ..program, .definitions }
+end
+
+local resolve_claim = CheckClaim.pass "a check's claim under replaced operands" with
+    Bounds = do(claim, recurse, replaced)
+        return data.Bounds { ..claim, index = resolve(claim.index, replaced), length = resolve(claim.length, replaced) }
+    end
+    ActiveAlternative = |claim, recurse, replaced| -> data.ActiveAlternative { ..claim, value = resolve(claim.value, replaced) }
+    Condition = |claim, recurse, replaced| -> data.Condition { value = resolve(claim.value, replaced) }
+end
+
+local resolve_callee = do(callee, replaced)
+    if data.Callee.is(callee, data.DirectNua) then return callee end
+    local pointer = resolve(callee.pointer, replaced)
+    if pointer == callee.pointer then return callee end
+    if data.Callee.is(callee, data.IndirectNua) then return data.IndirectNua { ..callee, .pointer } end
+    return data.Foreign { ..callee, .pointer }
+end
+
+-- each kind with its operands replaced, and nothing else about it changed
+local Substituting = define ..graph.Unchanged
+    Compute = do(node, recurse, work)
+        local arguments = resolve_list(node.arguments, work.replaced)
+        if arguments == node.arguments then return { node } end
+        return { data.Compute { ..node, .arguments } }
+    end
+    Pack = do(node, recurse, work)
+        local components = resolve_list(node.components, work.replaced)
+        if components == node.components then return { node } end
+        return { data.Pack { ..node, .components } }
+    end
+    Extract = do(node, recurse, work)
+        local aggregate, path = resolve(node.aggregate, work.replaced), resolve_path(node.path, work.replaced)
+        if aggregate == node.aggregate and path == node.path then return { node } end
+        return { data.Extract { ..node, .aggregate, .path } }
+    end
+    Store = do(node, recurse, work)
+        local value = resolve(node.value, work.replaced)
+        if value == node.value then return { node } end
+        return { data.Store { ..node, .value } }
+    end
+    Check = do(node, recurse, work)
+        return { data.Check { ..node, condition = resolve(node.condition, work.replaced), message = resolve(node.message, work.replaced), claim = resolve_claim(node.claim, work.replaced) } }
+    end
+    Invoke = do(node, recurse, work)
+        return { data.Invoke { ..node, callee = resolve_callee(node.callee, work.replaced), arguments = resolve_list(node.arguments, work.replaced) } }
+    end
+    Atomic = do(node, recurse, work)
+        return { data.Atomic { ..node, address = resolve(node.address, work.replaced), arguments = resolve_list(node.arguments, work.replaced) } }
+    end
+    Mechanism = do(node, recurse, work)
+        local arguments = resolve_list(node.arguments, work.replaced)
+        if arguments == node.arguments then return { node } end
+        return { data.Mechanism { ..node, .arguments } }
+    end
+end
+
+-- an edge's arguments replaced; `dropped` names the target's parameters that are gone
+local resolve_edge = do(edge, replaced, dropped)
+    local arguments = resolve_list(edge.arguments, replaced)
+    local gone = dropped and dropped[edge.target]
+    if gone then
+        local kept = {}
+        for index, operand in ipairs arguments do
+            if not gone[index] then kept[#kept + 1] = operand end
+        end
+        arguments = kept
+    end
+    if arguments == edge.arguments then return edge end
+    return data.Edge { ..edge, .arguments }
+end
+
+local Ending = define
+    Jump = do(node, recurse, work)
+        return data.Jump { ..node, edge = resolve_edge(node.edge, work.replaced, work.dropped) }
+    end
+    Branch = do(node, recurse, work)
+        return data.Branch {
+            ..node, condition = resolve(node.condition, work.replaced),
+            when_true = resolve_edge(node.when_true, work.replaced, work.dropped),
+            when_false = resolve_edge(node.when_false, work.replaced, work.dropped),
+        }
+    end
+    Return = do(node, recurse, work)
+        if node.value == nil then return node end
+        return data.Return { ..node, value = resolve(node.value, work.replaced) }
+    end
+    Trap = |node, recurse, work| -> data.Trap { ..node, message = resolve(node.message, work.replaced) }
+end
+
+------------------------------------------------------------------------------------------------
+-- fold
+
+-- whether two operands are one value: one identity, or constants of the same bits. A float is
+-- compared only when it is not zero or NaN, whose equality is not their identity.
+local same_constant = NativeConstant.pass "whether two constants are the same bits" with
+    IntegerBits = |left, recurse, right| -> NativeConstant.is(right, data.IntegerBits) and left.bits == right.bits
+    FloatBits = |left, recurse, right| -> NativeConstant.is(right, data.FloatBits) and left.value == right.value and left.value ~= 0
+    BooleanBit = |left, recurse, right| -> NativeConstant.is(right, data.BooleanBit) and left.value == right.value
+    UnitBits = |left, recurse, right| -> NativeConstant.is(right, data.UnitBits)
+    AggregateBits = |left, recurse, right| -> false
+    StaticBytes = |left, recurse, right| -> false
+    SymbolAddress = |left, recurse, right| -> false
+    ForeignValue = |left, recurse, right| -> false
+    StaticAddress = |left, recurse, right| -> NativeConstant.is(right, data.StaticAddress) and left.offset == right.offset and left.bytes == right.bytes
+    ZeroBits = |left, recurse, right| -> false
+    DefinitionAddress = |left, recurse, right| -> false
+end
+local same_operand = do(left, right)
+    if is_constant left or is_constant right then
+        return is_constant left and is_constant right and left.type == right.type and same_constant(left.bits, right.bits)
+    end
+    return data.operand_key left == data.operand_key right
+end
+
+-- the value every edge into a parameter passes, leaving out an edge that passes the parameter
+-- back to itself. An operand on every incoming edge dominates each predecessor, so it dominates
+-- the block.
+local agreed_argument = do(block, index, parameter, work)
+    local own = data.BlockArgument { block = block.id, .index, type = parameter.type }
+    local own_key = data.operand_key own
+    local agreed = nil
+    for _, edge_id in ipairs work.graph_index.predecessors[block.id] do
+        local argument = resolve(work.graph_index.edges[edge_id].arguments[index], work.replaced)
+        if is_constant argument or data.operand_key argument ~= own_key then
+            if agreed == nil then
+                agreed = argument
+            elseif not same_operand(agreed, argument) then
+                return nil
+            end
+        end
+    end
+    return agreed
+end
+
+-- a parameter every edge agrees on is that value for the block and all it dominates
+local entering_fold = do(block, work)
+    for index, parameter in ipairs block.arguments do
+        if is_plain parameter.type then
+            local agreed = agreed_argument(block, index, parameter, work)
+            if agreed then work.replaced[data.operand_key(data.BlockArgument { block = block.id, .index, type = parameter.type })] = agreed end
+        end
+    end
+end
+
+-- the part of a pack a component names, by the order `verify.parts_of` packs them
+local part_position = do(native_type, component)
+    if Component.is(component, data.FieldComponent) then
+        if NativeType.is(native_type, types.RecordType) then
+            for index, field in ipairs native_type.fields do
+                if field.name == component.name then return index end
+            end
+        elseif NativeType.is(native_type, types.ViewType) or NativeType.is(native_type, types.BufferType) then
+            return ({ data = 1, length = 2, capacity = 3, limit = 4 })[component.name]
+        end
+    elseif Component.is(component, data.ElementComponent) and NativeType.is(native_type, types.FixedArrayType) then
+        if is_constant component.index and NativeConstant.is(component.index.bits, data.IntegerBits) then
+            return tonumber(rules.integer_value(component.index)) + 1
+        end
+    end
+    return nil
+end
+
+-- walk a path through packs known here: answers the operand reached and the steps left
+local through_packs = do(aggregate, path, packs)
+    local current, consumed = aggregate, 0
+    for position, component in ipairs path do
+        local pack = Operand.is(current, data.Result) and packs[current.value]
+        local index = pack and part_position(pack.type, component)
+        local part = index and pack.components[index]
+        if not part then break end
+        current, consumed = part, position
+    end
+    return current, consumed
+end
+
+local Folding = define ..Substituting
+    Compute = do(node, recurse, work)
+        local arguments = resolve_list(node.arguments, work.replaced)
+        local decision = rules.fold(node.opcode, node.type, arguments)
+        local constant = decision {
+            folded = bits -> data.Constant { type = node.type, .bits },
+            not_foldable = || -> nil,
+            -- undefined only if this runs, which is not known: it stays a residual operation
+            invalid = reason -> nil,
+        }
+        if constant then
+            work.replaced[node.result] = constant
+            return {}
+        end
+        local same = is_plain(node.type) and rules.identity_of(node.opcode, node.type, arguments)
+        if same then
+            work.replaced[node.result] = same
+            return {}
+        end
+        if arguments == node.arguments then return { node } end
+        return { data.Compute { ..node, .arguments } }
+    end
+    Pack = do(node, recurse, work)
+        local kept = Substituting.Pack(node, recurse, work)[1]
+        work.packs[node.result] = kept
+        return { kept }
+    end
+    Extract = do(node, recurse, work)
+        local aggregate, path = resolve(node.aggregate, work.replaced), resolve_path(node.path, work.replaced)
+        local reached, consumed = through_packs(aggregate, path, work.packs)
+        if consumed == #path and consumed > 0 and is_plain(node.type) then
+            work.replaced[node.result] = reached
+            return {}
+        end
+        if aggregate == node.aggregate and path == node.path then return { node } end
+        return { data.Extract { ..node, .aggregate, .path } }
+    end
+    Check = do(node, recurse, work)
+        local condition = resolve(node.condition, work.replaced)
+        if is_constant condition and NativeConstant.is(condition.bits, data.BooleanBit) and condition.bits.value then return {} end
+        return Substituting.Check(node, recurse, work)
+    end
+end
+local fold_instruction = Instruction.pass "fold what is known" with ..Folding end
+
+local FoldingEnds = define ..Ending
+    Branch = do(node, recurse, work)
+        local condition = resolve(node.condition, work.replaced)
+        if is_constant condition and NativeConstant.is(condition.bits, data.BooleanBit) then
+            local taken = condition.bits.value and node.when_true or node.when_false
+            return data.Jump { origin = node.origin, edge = resolve_edge(taken, work.replaced) }
+        end
+        return Ending.Branch(node, recurse, work)
+    end
+end
+local fold_terminator = Terminator.pass "fold a terminator" with ..FoldingEnds end
+
+local fold = do(program)
+    local replaced = {}
+    local state = define
+        .replaced
+        packs = {}
+        graph_index = graph.index program
+    end
+    local folded = graph.rewrite(fold_instruction, program, state, define
+        entering = entering_fold
+        ending = fold_terminator
+    end)
+    return resolve_all_places(folded, replaced)
+end
+
+------------------------------------------------------------------------------------------------
+-- reach
+
+local reach_blocks = do(definition)
+    local by_id, reached, pending = {}, {}, { definition.entry }
+    for _, block in ipairs definition.blocks do by_id[block.id] = block end
+    while #pending > 0 do
+        local id = table.remove pending
+        if not reached[id] then
+            reached[id] = true
+            for _, edge in ipairs(graph.edges_of by_id[id].terminator) do pending[#pending + 1] = edge.target end
+        end
+    end
+    local blocks = {}
+    for _, block in ipairs definition.blocks do
+        if reached[block.id] then blocks[#blocks + 1] = block end
+    end
+    if #blocks == #definition.blocks then return definition end
+    return data.Definition { ..definition, .blocks }
+end
+
+-- A definition is kept if an export calls it, directly or through what it calls, or if a global
+-- is initialized by it on first use.
+local reach = do(program)
+    local kept, reached, pending = {}, {}, {}
+    for _, export in ipairs program.exports do pending[#pending + 1] = export.definition end
+    for _, global in pairs program.globals do
+        if data.GlobalInitializer.is(global.initializer, data.FirstUse) then pending[#pending + 1] = global.initializer.definition end
+    end
+    while #pending > 0 do
+        local id = table.remove pending
+        if not reached[id] then
+            reached[id] = true
+            kept[id] = reach_blocks(program.definitions[id])
+            for called in pairs(graph.called_definitions kept[id]) do pending[#pending + 1] = called end
+        end
+    end
+    return data.Program { ..program, revision = program.revision + 1, definitions = kept }
+end
+
+------------------------------------------------------------------------------------------------
+-- sweep
+
+-- A result can go when nothing reads it and producing it does nothing else. A read of foreign or
+-- raw memory, or of an atomic, is not known to be free of consequences, so it stays.
+local unremovable = |node, recurse, definition| -> false
+local Removing = define
+    Compute = |node, recurse, definition| -> not effects.of(node).may_trap
+    Pack = |node, recurse, definition| -> true
+    Extract = |node, recurse, definition| -> true
+    Address = |node, recurse, definition| -> true
+    Load = do(node, recurse, definition)
+        local place = definition.places[node.place]
+        local root = place.root
+        if PlaceRoot.is(root, data.ForeignRoot) or PlaceRoot.is(root, data.RawRoot) then return false end
+        return not NativeType.is(place.type, types.AtomicType)
+    end
+    Store = unremovable
+    Check = unremovable
+    Invoke = unremovable
+    Atomic = unremovable
+    Fence = unremovable
+    LifetimeStart = unremovable
+    LifetimeEnd = unremovable
+    Moves = unremovable
+    Ends = unremovable
+    Budget = unremovable
+    Mechanism = unremovable
+end
+local removable = Instruction.pass "whether an instruction exists only for its result" with ..Removing end
+
+-- every operand an instruction needs: those of its kind, those its claim names, an element step's
+-- index, and whatever the place it names is reached through
+local mark_place = do(place, mark)
+    if place == nil then return end
+    if place.root.pointer then mark(place.root.pointer) end
+    for _, component in ipairs place.path do
+        if Component.is(component, data.ElementComponent) then mark(component.index) end
+    end
+end
+local claim_operands = CheckClaim.pass "the operands a claim names" with
+    Bounds = do(claim, recurse, mark)
+        mark(claim.index)
+        mark(claim.length)
+    end
+    ActiveAlternative = |claim, recurse, mark| -> mark(claim.value)
+    Condition = |claim, recurse, mark| -> mark(claim.value)
+end
+local mark_uses = do(instruction, definition, mark)
+    for _, operand in ipairs(verify.operands_of instruction) do mark operand end
+    if instruction.claim then claim_operands(instruction.claim, mark) end
+    if Instruction.is(instruction, data.Extract) then
+        for _, component in ipairs instruction.path do
+            if Component.is(component, data.ElementComponent) then mark(component.index) end
+        end
+    end
+    mark_place(definition.places[instruction.place], mark)
+    if instruction.target then mark_place(definition.places[instruction.target.place], mark) end
+end
+
+-- the values something with an effect needs, and all they need in turn
+local live_values = do(definition)
+    local defining, incoming, live, pending = {}, {}, {}, {}
+    for _, block in ipairs definition.blocks do
+        for _, instruction in ipairs block.instructions do
+            if instruction.result then defining[instruction.result] = instruction end
+        end
+        for _, edge in ipairs(graph.edges_of block.terminator) do
+            incoming[edge.target] = incoming[edge.target] or {}
+            table.insert(incoming[edge.target], edge)
+        end
+    end
+    local mark = do(operand)
+        if is_constant operand then return end
+        local key = data.operand_key operand
+        if not live[key] then
+            live[key] = true
+            pending[#pending + 1] = operand
+        end
+    end
+    for _, block in ipairs definition.blocks do
+        for index, parameter in ipairs block.arguments do
+            if not is_plain parameter.type then mark(data.BlockArgument { block = block.id, .index, type = parameter.type }) end
+        end
+        for _, instruction in ipairs block.instructions do
+            if not (instruction.result and removable(instruction, definition)) then mark_uses(instruction, definition, mark) end
+        end
+        local terminator = block.terminator
+        if Terminator.is(terminator, data.Branch) then mark(terminator.condition) end
+        if Terminator.is(terminator, data.Return) and terminator.value then mark(terminator.value) end
+        if Terminator.is(terminator, data.Trap) then mark(terminator.message) end
+    end
+    while #pending > 0 do
+        local operand = table.remove pending
+        if Operand.is(operand, data.Result) then
+            local instruction = defining[operand.value]
+            if instruction then mark_uses(instruction, definition, mark) end
+        elseif Operand.is(operand, data.BlockArgument) then
+            for _, edge in ipairs(incoming[operand.block] or {}) do mark(edge.arguments[operand.index]) end
+        end
+    end
+    return live
+end
+
+local Sweeping = {}
+for kind, handler in pairs Substituting do
+    Sweeping[kind] = do(node, recurse, work)
+        if node.result and not work.live[work.definition.id][node.result] and removable(node, work.definition) then return {} end
+        return handler(node, recurse, work)
+    end
+end
+local sweep_instruction = Instruction.pass "sweep what nobody reads" with ..Sweeping end
+local sweep_terminator = Terminator.pass "a terminator after a sweep" with ..Ending end
+
+-- The block parameters nobody reads are dropped, along with the arguments passed to them.
+-- Later parameters shift down: `replaced` says where each went, `renaming` tells the facts.
+local sweep = do(program)
+    local live, dropped, replaced, renaming = {}, {}, {}, {}
+    local arguments_of = {}
+    for id, definition in pairs program.definitions do
+        live[id] = live_values definition
+        for _, block in ipairs definition.blocks do
+            local kept, gone = {}, nil
+            for index, parameter in ipairs block.arguments do
+                local operand = data.BlockArgument { block = block.id, .index, type = parameter.type }
+                local key = data.operand_key operand
+                if live[id][key] then
+                    kept[#kept + 1] = parameter
+                    if #kept ~= index then
+                        local moved = data.BlockArgument { block = block.id, index = #kept, type = parameter.type }
+                        replaced[key] = moved
+                        renaming[key] = moved
+                    end
+                else
+                    gone = gone or {}
+                    gone[index] = true
+                    renaming[key] = false
+                end
+            end
+            if gone then
+                dropped[block.id] = gone
+                arguments_of[block.id] = kept
+            end
+        end
+    end
+    local state = define
+        .live
+        .dropped
+        .replaced
+    end
+    local swept = graph.rewrite(sweep_instruction, program, state, define
+        entering = do(block, work) work.arguments = arguments_of[block.id] end
+        ending = sweep_terminator
+    end)
+    return resolve_all_places(swept, replaced), renaming
+end
+
+------------------------------------------------------------------------------------------------
+-- The driver
+
+-- the analysis of a rewritten program: unchanged definitions keep their facts' records, and
+-- every contract is stamped with the new revision by projecting it again
+local recomputed = do(program, analysis, renaming)
+    local definitions, contracts = {}, {}
+    for id, definition in pairs program.definitions do
+        definitions[id] = analysis_module.recompute(definition, analysis.definitions[id], renaming)
+        contracts[id] = boundaries.project(definition, definitions[id], program.revision)
+    end
+    return data.Analysis { revision = program.revision, .definitions, .contracts }
+end
+
+local round = do(program, analysis)
+    local swept, renaming = sweep(reach(fold program))
+    return swept, recomputed(swept, analysis, renaming)
+end
+
+local maximum_rounds = 8
+
+-- `observe(program, analysis, number)`, if given, sees the result of each round
+local optimize = do(program, analysis, observe)
+    for number = 1, maximum_rounds do
+        local before = program
+        program, analysis = round(program, analysis)
+        if observe then observe(program, analysis, number) end
+        if graph.same(program, before) then break end
+    end
+    return program, analysis
+end
+
+return define
+    .fold
+    .reach
+    .sweep
+    .optimize
+    .maximum_rounds
+end

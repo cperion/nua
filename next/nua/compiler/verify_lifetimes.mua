@@ -139,7 +139,7 @@ end
 --   reporting  inherited: whether this pass reports (only the pass over the fixed point does)
 --   replay     the callee-replay context of this block
 -- Problems accumulate through `report`.
-local replaying = do(program, definition, published, analysis, report)
+local replaying = do(program, definition, published, analysis, report, shared)
     local values, registry = published.values, published.borrows
     local supply = identity.supply()
     local places = definition.places
@@ -154,18 +154,19 @@ local replaying = do(program, definition, published, analysis, report)
 
     -- the context a native call's contract is replayed in, for one block
     local replay_context = do()
-        local replay_registry, replay_places = {}, {}
+        local replay_registry = {}
         for id, info in pairs registry do replay_registry[id] = info end
-        for _, item in pairs program.definitions do
-            for id, place in pairs item.places do replay_places[id] = place end
-        end
-        local replay = { borrows = replay_registry, places = replay_places, .supply }
+        local replay = { borrows = replay_registry, places = shared.places, .supply }
         replay.memory = provenance.working(replay, tracking, facts_module.paths_overlap)
         replay.check_store = |path, targets, info| -> nil
         replay.bundle_of = do(id)
+            local found = shared.bundles[id]
+            if found then return found end
             local target, target_facts = program.definitions[id], analysis.definitions[id]
             if not target or not target_facts then return nil end
-            return { definition = target, facts = target_facts, contract = boundaries.project(target, target_facts, program.revision) }
+            found = { definition = target, facts = target_facts, contract = boundaries.project(target, target_facts, program.revision) }
+            shared.bundles[id] = found
+            return found
         end
         return replay
     end
@@ -489,9 +490,9 @@ local replaying = do(program, definition, published, analysis, report)
     end
 end
 
-local verify_definition = do(program, definition, published, analysis, report)
+local verify_definition = do(program, definition, published, analysis, report, shared)
     if check_published(definition, published, report) then
-        replaying(program, definition, published, analysis, report).run()
+        replaying(program, definition, published, analysis, report, shared).run()
     end
 end
 
@@ -509,6 +510,11 @@ local lifetimes = do(program, analysis)
         problems[#problems + 1] = verify.Problem { verifier = "lifetimes", message = "analysis revision does not match the program" }
         return problems
     end
+    -- what every definition's replay reads alike: all places, and each callee's projection
+    local shared = { places = {}, bundles = {} }
+    for _, item in pairs program.definitions do
+        for id, place in pairs item.places do shared.places[id] = place end
+    end
     for _, definition in ipairs(graph.definitions_in_order program) do
         local published = analysis.definitions[definition.id]
         local contract = analysis.contracts[definition.id]
@@ -516,7 +522,7 @@ local lifetimes = do(program, analysis)
         if published == nil then
             report(definition, "a definition has no published lifetime facts", definition.origin)
         else
-            verify_definition(program, definition, published, analysis, report)
+            verify_definition(program, definition, published, analysis, report, shared)
         end
     end
     return problems

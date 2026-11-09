@@ -15,12 +15,14 @@ requirements and packs, opening (records, tables, store slots, anonymous homes),
 `cconst`/`cread`/`cstruct`/`cformat`, compile-time `test`/`assert`, and `lib/libc.nua` and
 `lib/posix.nua`.
 
-**Not started, and the subject of this handoff:** the optimizer and preparation passes, the
-libgccjit backend, and the scheduler with the rest of §20. The old compiler in `nua/` still
-runs and stays until cutover.
+**Done since this handoff was written:** work package 1, except what its section below lists
+as still open.
+
+**Not started:** the libgccjit backend, and the scheduler with the rest of §20. The old compiler
+in `nua/` still runs and stays until cutover.
 
 **Version control.** All work is in the jj stack below `@` on top of `master`; nothing is
-pushed. The top change is `pqumypyu`, and the working copy holds it, described. `master` has
+pushed. The top change is the optimizer's, described, on top of `pqumypyu`. `master` has
 not moved.
 
 **Mua pin.** `tools/mua.lock` pins commit `50a7a86`, which exists only on branch
@@ -133,6 +135,34 @@ These are not in the old compiler. New work should build on them rather than aro
 then optional folding and reachability, then budget coverage with facts recomputed, then
 readiness and a `ReadyCertificate`.
 
+**Built:** `nua/compiler/optimize.mua` (`fold`, `reach`, `sweep`, `optimize`),
+`analysis.recompute`, `nua/compiler/prepare.mua` (`prepare`, `ready`, `certified`), and `emit_c`
+refusing anything but a `Prepared` that `prepare` issued. `compile_c` optimizes by default;
+`{ optimize = false }` still prepares. `tests/optimize.mua` covers it. Each round leaves a program
+and analysis of one revision.
+
+**What a new pass must know:**
+
+- `Place` holds real uses that `verify.operands_of` does not list: a root's `pointer` and an
+  element step's `index`. So do `Extract` paths and `Check` claims. `optimize.mua` handles all of
+  them; a pass that substitutes or sweeps needs the same.
+- Only plain values are substituted or removed as block parameters or pack parts, because a value
+  carrying a borrow or an owner has identity in the facts.
+- A root record is shared by a place and its components, and provenance compares it by identity.
+  Rebuild a root once per definition.
+- `Effects` has `synchronizes` (compiler activities §3.5), for what orders memory without naming
+  an access.
+
+**Still open:**
+
+- Budget coverage and `task_access` are not checked by `ready`: they wait for work package 3.
+- `LifetimeStart`/`LifetimeEnd` stay unemitted, by decision: `fold`, `reach` and `sweep` need
+  nothing from them, and `Ends … released` already carries what the lifetimes verifier replays.
+  Emit them when a pass has a use for them. Compiler activities §7.3 still lists them.
+- Store slot lookups still check at every use (below).
+
+The list that follows is the original plan.
+
 **Build, in this order:**
 
 1. `nua/compiler/optimize.mua` with `fold`, `reach`, `sweep`, `optimize`: at most eight rounds,
@@ -154,10 +184,11 @@ readiness and a `ReadyCertificate`.
   and `views.mua`, but nothing sets `state.pointer`, so that path is dead code awaiting this
   work.
 - Dead pure results from inlined words.
-- Known-round compile cost: a recursive word called with a known count re-evaluates
-  quadratically in depth. Depth 16 took 106 seconds. The boundary rebuild loop in
-  `definitions.mua` `close` is the place to look, and this needs fixing regardless of the
-  optimizer.
+- Known-round compile cost: `call` chains over known counts. The cost was not `close` but
+  `boundaries.apply`, which replayed every calling context on every pass; it is now a worklist
+  driven by dependencies. What remains is quadratic in chain depth (each definition replays its
+  whole chain) with a flat profile: depth 16 takes about 30 seconds to compile and as long
+  again to prepare. A cross-call summary would be the next step.
 
 ## Work package 2: libgccjit backend
 

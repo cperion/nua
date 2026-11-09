@@ -12,6 +12,7 @@ local graph = require "nua.compiler.graph"
 local rules = require "nua.compiler.rules"
 local platform = require "nua.compiler.platform"
 local verify = require "nua.compiler.verify"
+local preparation = require "nua.compiler.prepare"
 
 local NativeType, Instruction, Terminator, Operand = types.NativeType, data.Instruction, data.Terminator, data.Operand
 
@@ -692,7 +693,8 @@ end
 
 -- the whole program: exported definitions under their C names, the others named after their
 -- word; every prototype first, so definitions may call one another in any order
-local emit = do(program)
+local emit = do(prepared)
+    local program = preparation.certified prepared
     local parts = { "#include \"nua_platform.h\"\n#include <stdint.h>\n#include <stdbool.h>\n#include <math.h>\n" }
     local names, exported = {}, {}
     for _, export in ipairs program.exports do

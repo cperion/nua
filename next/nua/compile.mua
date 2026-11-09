@@ -1,11 +1,11 @@
 -- The compilation root (compiler activities §7.5): it creates the compilation's identities,
 -- origins and place registry, makes the evaluation vocabulary, loads the source through Mua with
 -- the Nua host, and closes each export into a definition. The program it answers has passed
--- the implemented graph/type/lifetime checks; this is not yet a backend readiness certificate.
+-- the implemented graph/type/lifetime checks; `compile_c` prepares it for the backend.
 -- A refusal is an error naming the source line.
 --
 --   compile(source, filename) -> { program, analysis, exports }
---   compile_c(source, filename) -> C text, prototypes, program
+--   compile_c(source, filename, options) -> C text, prototypes, the prepared program
 
 local specifications = require "nua.compiler.specifications"
 local mua = require "mua"
@@ -22,6 +22,7 @@ local verify = require "nua.compiler.verify"
 local verify_lifetimes = require "nua.compiler.verify_lifetimes"
 local front = require "nua.front"
 local emit_c = require "nua.emit_c"
+local preparation = require "nua.compiler.prepare"
 local platform = require "nua.compiler.platform"
 local bridge_module = require "nua.compiler.bridge"
 
@@ -395,10 +396,12 @@ local compiling = do(source, filename)
     return results[2]
 end
 
-local compile_c = do(source, filename)
+-- `options.optimize = false` emits the program as evaluation left it, still prepared
+local compile_c = do(source, filename, options)
     local compiled = compiling(source, filename)
-    local text, prototypes = emit_c.emit compiled.program
-    return text, prototypes, compiled.program
+    local prepared = preparation.prepare(compiled.program, compiled.analysis, options)
+    local text, prototypes = emit_c.emit prepared
+    return text, prototypes, prepared.program
 end
 
 return define
