@@ -1,0 +1,218 @@
+-- The evaluation vocabulary, part: Members (syntax §8, §16): a type's methods and hooks, found
+-- in the order of §16.3 and applied while specializing, so whatever they build folds and
+-- residualizes with the caller. The members themselves are library code (types.member): the
+-- compiler only finds and applies them. While a type's hook runs, that type's hooks are not
+-- consulted again, so a hook reads its own representation naively; `rawmember(x, name)` does
+-- the same outside a hook.
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local cells = require "nua.compiler.evaluation.cells"
+local hosting = require "nua.compiler.hosting"
+local NativeValue = data.NativeValue
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+
+return do(E, core)
+    local fail = core.fail
+    local compilation = core.compilation
+
+    -- the types whose hooks are running, with how deeply
+    local suspended = {}
+    -- an element read is a copy that knows the place it was read from: where a `Ref` to that
+    -- place is expected (a word returning `Ref E` returns `self.items[i]`), it is the place
+    E.places_of_reads = setmetatable({}, { __mode = "k" })
+
+    -- a member of a type, unless its hooks are suspended (a hook's own name: `__`)
+    E.member_of = do(native_type, name)
+        if name:sub(1, 2) == "__" and (suspended[native_type] or 0) > 0 then return nil end
+        return types.member(native_type, name)
+    end
+    E.hook_of = |native_type, name| -> E.member_of(native_type, name)
+
+    -- run `body` with the hooks of `native_type` suspended
+    E.within_hook = do(native_type, body)
+        suspended[native_type] = (suspended[native_type] or 0) + 1
+        local results = { pcall(body) }
+        suspended[native_type] = suspended[native_type] - 1
+        if not results[1] then error(results[2], 0) end
+        return results[2]
+    end
+
+    -- whether a member takes its receiver by reference: its first requirement is a `Ref`
+    local takes_reference = do(member)
+        -- a Lua hook receives its receiver's place, so it can write through it
+        if lua_type member == "function" then return true end
+        local word, supplied = hosting.supplied_of member
+        if word == nil then return false end
+        local requirement = word.requirements[#supplied + 1]
+        return requirement ~= nil and requirement.type ~= nil and types.NativeType.is(requirement.type, types.ReferenceType)
+    end
+
+    -- the receiver a method or hook is given (syntax §8): a reference to the place `base`
+    -- names, or, for a value, to a temporary place holding it. Answers the receiver and the
+    -- temporary, released after the application when it owns storage.
+    E.receiver = do(path, base)
+        if E.is_cell base and not cells.Cell.is(base, cells.HostCell) then return E.reference_to(path, base), nil end
+        if E.is_reference base and types.NativeType.is(base.type, types.ReferenceType) then return base, nil end
+        local value = E.is_cell base and E.peek(path, base) or base
+        local temporary = E.new_place(path, "receiver", value.type)
+        path.flow.contents[temporary.id] = data.Tracked { .value }
+        return E.reference_to(path, E.place_cell(temporary.id, "the receiver")), temporary
+    end
+
+    -- apply a member of `value`'s type to its receiver and `arguments`; a member taking a
+    -- `Ref` receives the place `base` names, any other its value
+    E.apply_member = do(path, base, value, member, arguments, boundary, hook)
+        local supplied, temporary = {}, nil
+        if takes_reference member then supplied[1], temporary = E.receiver(path, base)
+        else supplied[1] = value end
+        for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
+        local run = || -> E.apply(path, member, supplied, boundary)
+        local result
+        if hook then result = E.within_hook(value.type, run) else result = run() end
+        if temporary and not path.dead then E.release_place(path, temporary.id) end
+        return result
+    end
+
+    -- the value a base stands for, through cells and references
+    local value_of = do(path, base)
+        local value = E.is_cell base and E.peek(path, base) or base
+        return E.deref(path, value)
+    end
+
+    -- `x:name(arguments)`: the `__member` hook first, then a method (syntax §16.3); a Lua
+    -- table's method receives the table
+    E.method = do(path, base, name, arguments, boundary)
+        if path.dead then return nil end
+        local receiver_value = E.is_cell base and E.peek(path, base) or base
+        if E.is_reference receiver_value and data.BorrowForm.is(compilation.borrows[receiver_value.borrow].form, data.Selected) then
+            return E.dispatch_reference(path, receiver_value, |arm, selected| -> E.method(arm, selected, name, arguments, boundary))
+        end
+        local value = value_of(path, base)
+        if not is_native value then
+            if lua_type value ~= "table" or value[name] == nil then fail(path, ("':%s' of %s is not a method"):format(name, tostring value)) end
+            local supplied = { value }
+            for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
+            return E.apply(path, value[name], supplied, boundary)
+        end
+        local found = E.member_hook(path, base, value, name)
+        if found ~= nil then return E.apply(path, found, arguments, boundary) end
+        local member = E.member_of(value.type, name)
+        if member == nil or name:sub(1, 2) == "__" then fail(path, ("%s has no method '%s'"):format(types.describe value.type, name)) end
+        return E.apply_member(path, base, value, member, arguments, boundary, false)
+    end
+
+    -- the `__member` hook's answer for `x.name`, or nil
+    E.member_hook = do(path, base, value, name)
+        local hook = E.hook_of(value.type, "__member")
+        if hook == nil then return nil end
+        return E.apply_member(path, base, value, hook, { name }, false, true)
+    end
+
+    -- `x.name` of a native value by its members: the `__member` hook, else a method bound to
+    -- its receiver; nil when neither answers (fields are the caller's default)
+    E.member_value = do(path, base, value, name)
+        local found = E.member_hook(path, base, value, name)
+        if found ~= nil then return found end
+        local member = name:sub(1, 2) ~= "__" and E.member_of(value.type, name)
+        if not member then return nil end
+        local receiver = takes_reference member and E.receiver(path, base) or value
+        if hosting.is_word member then return hosting.application(member, { receiver }) end
+        if hosting.is_application member then return hosting.supply(member, { receiver }) end
+        return |...| -> member(receiver, ...)
+    end
+
+    -- `x[key]` by the type's `__index` hook: a value, or a place (a `Ref`), which reads as a
+    -- copy unless what it holds owns storage (then it stays a reference to the place)
+    E.index_member = do(path, base, value, key)
+        local hook = E.hook_of(value.type, "__index")
+        if hook == nil then return nil end
+        local result = E.apply_member(path, base, value, hook, { key }, false, true)
+        if E.is_reference result and types.NativeType.is(result.type, types.ReferenceType) and not types.owns(result.type.target) then
+            local read = E.deref(path, result)
+            if lua_type read == "table" then E.places_of_reads[read] = result end
+            return read
+        end
+        return result
+    end
+    -- the place `x[key]` names, as a reference, by `__index`
+    E.index_place = do(path, base, key)
+        local value = value_of(path, base)
+        local hook = is_native value and E.hook_of(value.type, "__index")
+        if not hook then fail(path, ("%s has no element places"):format(is_native value and types.describe value.type or tostring value)) end
+        local result = E.apply_member(path, base, value, hook, { key }, false, true)
+        if not (E.is_reference result and types.NativeType.is(result.type, types.ReferenceType)) then
+            fail(path, ("the __index of %s answers a value, not a place"):format(types.describe value.type))
+        end
+        return result
+    end
+    -- `x[key] = v`: the `__newindex` hook, else a write through the place `__index` answers
+    E.assign_index = do(path, base, key, assigned)
+        local value = value_of(path, base)
+        local hook = is_native value and E.hook_of(value.type, "__newindex")
+        if hook then return E.apply_member(path, base, value, hook, { key, assigned }, false, true) end
+        E.write_reference(path, E.index_place(path, base, key), assigned, "an element")
+    end
+    -- whether `x[key]` is served by the members of the value's type
+    E.has_element_members = do(path, base)
+        local value = value_of(path, base)
+        return is_native value and (E.hook_of(value.type, "__index") ~= nil or E.hook_of(value.type, "__newindex") ~= nil)
+    end
+
+    -- `__cast(v, T)`: a value that is not yet a T converted by T's hook; nil when it has none
+    -- or it refuses
+    E.cast = do(path, native_type, value)
+        local hook = E.hook_of(native_type, "__cast")
+        if hook == nil then return nil end
+        -- a Lua hook receives the value and the type; a word, the value
+        local arguments = lua_type hook == "function" and { value, native_type } or { value }
+        return E.within_hook(native_type, do()
+            local result = E.apply(path, hook, arguments, false)
+            if result == nil then return nil end
+            return E.from_host(path, native_type, result, "the cast to " .. types.describe native_type)
+        end)
+    end
+
+    -- operators of a type with hooks (syntax §16): the other operand converted through
+    -- `__cast`; `~=`, `>` and `>=` derive from `__eq`, `__lt` and `__le`
+    local hooks_of_operators = define
+        add = "__add"
+        subtract = "__sub"
+        multiply = "__mul"
+        divide = "__div"
+        remainder = "__mod"
+        negate = "__unm"
+        equal = "__eq"
+        less = "__lt"
+        less_equal = "__le"
+    end
+    local derived = define
+        not_equal = define hook = "__eq"; swap = false; negate = true end
+        greater = define hook = "__lt"; swap = true; negate = false end
+        greater_equal = define hook = "__le"; swap = true; negate = false end
+    end
+    -- the hooked type of an operation, if one operand's type has the operator's hook
+    E.operator_hook = do(operator, left, right)
+        local rule = derived[operator]
+        local name = rule and rule.hook or hooks_of_operators[operator]
+        if name == nil then return nil end
+        for _, operand in ipairs { left, right } do
+            if is_native operand and E.hook_of(operand.type, name) then return operand.type, name, rule end
+        end
+        return nil
+    end
+    E.operate_by_hook = do(path, operator, left, right)
+        local native_type, name, rule = E.operator_hook(operator, left, right)
+        if native_type == nil then return nil end
+        local hook = E.hook_of(native_type, name)
+        local operands = { E.from_host(path, native_type, left, "the left operand") }
+        if right ~= nil then operands[2] = E.from_host(path, native_type, right, "the right operand") end
+        if rule and rule.swap then operands[1], operands[2] = operands[2], operands[1] end
+        local result = E.within_hook(native_type, || -> E.apply(path, hook, operands, false))
+        if rule and rule.negate then result = E.operate(path, "not", E.from_host(path, types.Bool, result, "the result of " .. name)) end
+        return result
+    end
+end

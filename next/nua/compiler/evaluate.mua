@@ -15,7 +15,7 @@
 
 -- The vocabulary is assembled from its parts under nua/compiler/evaluation/, each adding its
 -- verbs to the one table E; `compile` supplies the capabilities the evaluation does not own
--- (the definitions, the library) and wires them explicitly (§1.1); primitives are a kind of
+-- (the definitions) and wires them explicitly (§1.1); primitives are a kind of
 -- host value (hosting.primitive), recognized by the operations part.
 
 local core = require "nua.compiler.evaluation.core"
@@ -36,6 +36,8 @@ local parts = {
     require "nua.compiler.evaluation.lifetimes",
     require "nua.compiler.evaluation.crossings",
     require "nua.compiler.evaluation.operations",
+    require "nua.compiler.evaluation.members",
+    require "nua.compiler.evaluation.host_views",
 }
 
 local evaluating = do(compilation, capabilities)

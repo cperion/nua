@@ -401,11 +401,17 @@ local generating = do(filename, start_line)
 
     -- a typed lambda or typed function: `__nua.word { … }`. Its body is an output and a scope
     -- of its own; whether it makes tail applications is its own.
-    function_text = do(fn, name)
+    -- `receiver`, for a method (syntax §8): the host expression of its receiver's type; the
+    -- word's first requirement is then `self: Ref T`
+    function_text = do(fn, name, receiver)
         local requirements = {}
-        for index, parameter in ipairs fn.params do
+        local parameters = {}
+        if receiver then parameters[1] = { name = "self", receiver = receiver } end
+        for _, parameter in ipairs fn.params do parameters[#parameters + 1] = parameter end
+        for index, parameter in ipairs parameters do
             if parameter.rest then fail("a rest requirement is not available yet", parameter.line) end
-            local annotation = parameter.type and host_expression parameter.type or "nil"
+            local annotation = parameter.receiver and ("__nua.receiver(%s)"):format(parameter.receiver)
+                or parameter.type and host_expression parameter.type or "nil"
             requirements[index] = ("{ name = %q, type = %s }"):format(parameter.name, annotation)
         end
         local result = fn.result and host_expression fn.result or "nil"
@@ -413,7 +419,7 @@ local generating = do(filename, start_line)
         tail_calls = false
         local body = captured(|| -> inner_scope(do()
             local bindings = {}
-            for index, parameter in ipairs fn.params do
+            for index, parameter in ipairs parameters do
                 bindings[#bindings + 1] = ("local %s = __E.argument(__path, %d);"):format(parameter.name, index)
                 declare(parameter.name, "cell")
             end
@@ -439,12 +445,18 @@ end
 -- the host: what Mua's parser and emitter consult
 local host = do(filename)
     local statements, prefixes, emit_statements = {}, {}, {}
-    -- `export name`, `export name as "c_name"`
+    -- `export name`, `export name as "c_name"`, `export Counter.add as "counter_add"` (a
+    -- method, syntax §8; its C name defaults to the dotted path joined by `_`)
     statements.export = do(parser, token)
         local reader = parser.r
         reader:next()
-        local name = reader:name("after export").v
-        local c_name = name
+        local parts = { reader:name("after export").v }
+        while reader:peek(1).t == "." and reader:peek(2).t == "name" and reader:peek(1).ws == "" do
+            reader:next()
+            parts[#parts + 1] = reader:next().v
+        end
+        local name = table.concat(parts, ".")
+        local c_name = table.concat(parts, "_")
         local next_token = reader:peek(1)
         if next_token.t == "name" and next_token.v == "as" and not next_token.nl then
             reader:next()
@@ -465,7 +477,7 @@ local host = do(filename)
         applied.boundary = true
         return applied
     end
-    local typed = |fn, line, name| -> generating(filename, line).function_text(fn, name)
+    local typed = |fn, line, name, receiver| -> generating(filename, line).function_text(fn, name, receiver)
     return define
         id = "nua-next-front-1"
         .statements
@@ -494,8 +506,17 @@ local host = do(filename)
             if node.k == "localfunction" then
                 return ("local %s; %s = %s"):format(node.name, node.name, typed(node.fn, node.line, node.name))
             end
-            if node.method then error(("%s:%d: a typed method is not available yet"):format(filename, node.line), 0) end
+            -- `function T:name(...)`: a method of T (syntax §8); `function T.name(...)`: a
+            -- member of T, a hook when its name is one (§16); on a Lua table, a field
             local path = table.concat(node.path, ".")
+            if node.method then
+                local full = path .. ":" .. node.method
+                return ("__nua.member(%s, %q, %s, %d)"):format(path, node.method, typed(node.fn, node.line, full, path), node.line)
+            end
+            if #node.path > 1 then
+                local owner = table.concat(node.path, ".", 1, #node.path - 1)
+                return ("__nua.member(%s, %q, %s, %d)"):format(owner, node.path[#node.path], typed(node.fn, node.line, path), node.line)
+            end
             return ("%s = %s"):format(path, typed(node.fn, node.line, path))
         end
     end

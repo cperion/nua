@@ -22,7 +22,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
     --------------------------------------------------------------------------------------------
     -- loops

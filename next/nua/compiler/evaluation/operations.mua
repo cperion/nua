@@ -22,7 +22,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
     E.length = do(path, base)
         if path.dead then return nil end
@@ -112,15 +112,12 @@ return do(E, core)
     -- converts (a pointer's bits are reinterpreted, never converted)
     E.apply_type = do(path, callee, arguments)
         if #arguments ~= 1 then fail(path, types.describe callee .. " takes one argument") end
-        -- `Grow(T) { … }`: an empty buffer, then each entry pushed
-        if E.is_buffer callee then
-            local entries = arguments[1]
-            if lua_type entries ~= "table" or is_native entries then fail(path, types.describe callee .. " is built from a table of its elements") end
-            local holder = E.new_place(path, "built", callee)
-            path.flow.contents[holder.id] = data.Tracked { value = E.zero_value callee }
-            local cell = E.place_cell(holder.id, "built")
-            for _, entry in ipairs entries do E.method(path, cell, "push", { entry }, false) end
-            return E.get(path, cell)
+        -- `T(v)`: T's `__cast` hook first (syntax §16), then the default conversions
+        local given = arguments[1]
+        if E.is_cell given then given = E.peek(path, given) end
+        if not (is_native given and given.type == callee) then
+            local cast = E.cast(path, callee, given)
+            if cast ~= nil then return cast end
         end
         if E.is_record callee then return E.construct_record(path, callee, arguments[1]) end
         local value = arguments[1]
@@ -152,7 +149,7 @@ return do(E, core)
     E.apply_word = do(path, callee, arguments, boundary)
     local word, supplied = hosting.supplied_of callee
     if word == nil then
-        if lua_type callee == "function" then return callee(unpack(arguments)) end
+        if lua_type callee == "function" then return E.call_host(path, callee, arguments) end
         fail(path, tostring callee .. " is not something to apply")
     end
     local application = hosting.supply(hosting.application(word, supplied), arguments)
@@ -211,15 +208,24 @@ return do(E, core)
                 return value
             end
         end
+        local place = base
         if E.is_cell base then base = E.peek(path, base) end
         base = E.deref(path, base)
+        if not is_native base then
+            if lua_type base == "table" then return base[name] end
+            fail(path, ("'.%s' of %s is not a member"):format(name, tostring base))
+        end
+        -- syntax §16.3: the `__member` hook, then a field, then a method
+        local found = E.member_hook(path, place, base, name)
+        if found ~= nil then return found end
         if E.is_view base and name == "length" then
             local _, count = E.view_parts(path, base)
             return count
         end
-        if E.is_aggregate base then return E.part(path, base, name) end
-        if not is_native base and lua_type base == "table" then return base[name] end
-        fail(path, ("'.%s' of %s is not available yet"):format(name, tostring base))
+        if E.is_aggregate base and E.field_of(base.type, name) then return E.part(path, base, name) end
+        local method = E.member_value(path, place, base, name)
+        if method ~= nil then return method end
+        fail(path, ("%s has no member '%s'"):format(types.describe base.type, name))
     end
     -- the place `p[i]` names when `p` is a raw pointer: storage under the raw contract
     E.raw_place = do(path, base, key)
@@ -261,12 +267,11 @@ return do(E, core)
         if place then return E.load(path, place) end
         local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
         if E.is_view value then return E.view_element(path, value, key) end
-        if E.is_aggregate value and E.is_buffer value.type then
-            if types.owns value.type.element then
-                local receiver = E.is_cell base and E.reference_to(path, base) or base
-                return E.method(path, receiver, "element", { key }, false)
-            end
-            return E.method(path, base, "get", { key }, false)
+        -- the type's `__index` hook (syntax §16)
+        if is_native value then
+            local found = E.index_member(path, base, value, key)
+            if found ~= nil then return found end
+            fail(path, ("%s has no elements"):format(types.describe value.type))
         end
         if E.is_cell base then base = E.peek(path, base) end
         if not is_native base and lua_type base == "table" then return base[key] end
@@ -284,9 +289,8 @@ return do(E, core)
         if path.dead then return nil end
         local place = E.raw_place(path, base, key)
         if place then return cells.RawCell { .place, name = "an element" } end
-        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or nil
-        if value and E.is_aggregate value and E.is_buffer value.type then return cells.ElementCell { .base, .key, name = "an element" } end
-        fail(path, "assigning an element is not available yet")
+        if E.has_element_members(path, base) then return cells.ElementCell { .base, .key, name = "an element" } end
+        fail(path, "this has no element places to assign")
     end
 
     return E

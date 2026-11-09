@@ -21,7 +21,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
     --------------------------------------------------------------------------------------------
     -- releasing owners (syntax §9.2): a buffer through its library's release word, a record
@@ -31,11 +31,13 @@ return do(E, core)
     -- not released
     E.release_value = do(path, value, place, steps)
         if place and E.vacated_at(path, place, steps) then return end
-        if E.is_aggregate value and E.is_buffer value.type then
-            local words = library.buffer_words(value.type.element)
+        -- a type that owns allocations of its own releases them by its `__release` hook (the
+        -- buffer's release word, buffers §4.1): the owning contents first, then the storage
+        local release = is_native value and E.member_of(value.type, "__release")
+        if release then
             local holder = E.new_place(path, "released", value.type)
             path.flow.contents[holder.id] = data.Tracked { .value }
-            E.invoke(path, words.release, { E.reference_to(path, E.place_cell(holder.id, "released")) })
+            E.apply(path, release, { E.reference_to(path, E.place_cell(holder.id, "released")) }, false)
             path.flow.contents[holder.id] = data.Moved { at = origin_of path }
             return
         end
@@ -96,23 +98,5 @@ return do(E, core)
         return nil
     end
 
-    -- `value:name(arguments)`: a method of the value's type, given a reference to the value
-    E.method = do(path, base, name, arguments, boundary)
-        if path.dead then return nil end
-        local receiver_value = E.is_cell base and E.peek(path, base) or base
-        if E.is_reference receiver_value and data.BorrowForm.is(compilation.borrows[receiver_value.borrow].form, data.Selected) then
-            return E.dispatch_reference(path, receiver_value, |arm, selected| -> E.method(arm, selected, name, arguments, boundary))
-        end
-        local value = E.is_cell base and E.deref(path, E.peek(path, base)) or E.deref(path, base)
-        if not (E.is_aggregate value and E.is_buffer value.type) then fail(path, ("':%s' of %s is not available yet"):format(name, is_native value and types.describe value.type or tostring value)) end
-        local words = library.buffer_words(value.type.element)
-        local word = words[name]
-        if word == nil then fail(path, ("%s has no method '%s'"):format(types.describe value.type, name)) end
-        local receiver = E.is_cell base and E.reference_to(path, base) or base
-        if not E.is_reference receiver then fail(path, ("':%s' needs a local holding the %s"):format(name, types.describe value.type)) end
-        local supplied = { receiver }
-        for _, argument in ipairs arguments do supplied[#supplied + 1] = argument end
-        return E.apply(path, word, supplied, boundary)
-    end
 
 end

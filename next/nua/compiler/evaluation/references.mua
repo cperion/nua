@@ -22,7 +22,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
 
     -- references: `Ref x` is a held borrow of x's place; reading through it reads that place's
@@ -39,7 +39,7 @@ return do(E, core)
             return data.Reference { type = types.reference place_type, borrow = info.id }
         end
         FieldCell = |cell, recurse, path| -> E.part_reference(path, recurse(cell.base, path), data.FieldStep { name = cell.name })
-        ElementCell = |cell, recurse, path| -> E.method(path, cell.base, "element", { cell.key }, false)
+        ElementCell = |cell, recurse, path| -> E.index_place(path, cell.base, cell.key)
         HostCell = |cell, recurse, path| -> fail(path, ("Ref takes a place of the body; '%s' holds a host value"):format(cell.name))
         -- storage behind a raw pointer borrows nothing the compiler knows (syntax §9.5): a
         -- stored borrow of no origins, under the programmer's contract

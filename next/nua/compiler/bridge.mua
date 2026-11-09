@@ -1,0 +1,32 @@
+-- The host bridge (compiler activities §5.1): the one way a Lua function the evaluation calls
+-- (a hook, a host helper) reaches the evaluation it runs in. It is compilation-owned: `enter`
+-- binds a path for the extent of one call, pushing and popping on every exit; a staged host
+-- wrapper reaches its evaluation only through `current`. Semantic modules never consult it:
+-- they pass their path explicitly.
+
+local bridge = do()
+    local bindings = {}
+    local enter = do(binding, body)
+        bindings[#bindings + 1] = binding
+        local results = { pcall(body) }
+        bindings[#bindings] = nil
+        if not results[1] then error(results[2], 0) end
+        return results[2]
+    end
+    -- the binding of the innermost call, or nil outside every call
+    local active = || -> bindings[#bindings]
+    local current = do()
+        local binding = bindings[#bindings]
+        if binding == nil then error("a staged value is used outside the evaluation that made it", 3) end
+        return binding
+    end
+    return define
+        .enter
+        .active
+        .current
+    end
+end
+
+return define
+    .bridge
+end

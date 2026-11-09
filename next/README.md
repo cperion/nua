@@ -81,13 +81,13 @@ an aliased container slot is overwritten before the effect.
 known overwrite versus wildcard storage, aliasing, recursive/nonreturning groups and independent
 verifier replay after callee mutation. The original clear–store–clear stale-view probe is now
 refused; storing a fresh view after the final clear is accepted. Latest full check:
-**`make test-next`: 170 passed, 0 failed.**
+**`make test-next`: 177 passed, 0 failed.**
 
 ## Design-to-source gap inventory
 
 | Area | Present | Remaining obligation |
 |---|---|---|
-| Hosting/evaluation | Mua host, partial supply, known/residual scalars, records, control, direct calls | Rest supply, hosted callbacks/protected propagation, capture/dependency validation; replace remaining ad-hoc activity outcomes with the specified protocols |
+| Hosting/evaluation | Mua host, partial supply, saturated host application (in place under the host bridge, fully known from top-level code), staged host wrappers, `host`/`type_of`, known/residual scalars, records, control, direct calls; methods and hooks of native types (§8, §16) with library-registered families | Rest supply, hosted callbacks/protected propagation, capture/dependency validation, bridge signals (reconsideration/termination through hooks); replace remaining ad-hoc activity outcomes with the specified protocols |
 | Borrow flow | Held/stored selected-path joins, loop-carried references and views, nested-buffer paths, borrows of part of a place (`Ref s.field`, owner fields grown and replaced in place), explicit invalidation and real graph replay | Full stored-reference/aggregate transport, including held views through stored header references; lexical `LifetimeStart`/`LifetimeEnd` completion and escape checking |
 | Memory provenance | Resident component facts, pointerless provenance, strong/weak stores, load state preservation, resident-local branch/loop agreement | Extend component transport/proofs to the remaining aggregate forms and storage mechanisms; complete alias/provenance validation |
 | Native boundaries | Ordered contracts and substitution, returned-borrow re-rooting, alias requirements, recursive CFG agreement, independent call replay | Complete interface-key/capture/dependency protocols, global/foreign/indirect boundaries, owning ABI/parameter-payload transport and remaining component-path coverage |

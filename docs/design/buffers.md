@@ -315,8 +315,8 @@ general primitives, which any library word may use:
 | `truncate b n` | length n | `ends b (Shrank)` |
 | `clear b` | length 0 | `ends b (Cleared)` |
 | `b[i]` | the element as a place | none; bounds check unless proved |
-| `view b i j` | `Slice T` | none; a new borrow of `(b, i..j)` |
-| `release b` | – | `ends b (Released)`; releases initialized owning elements first |
+| `sub b i j` | `Slice T` | none; a new borrow of `(b, i..j)` |
+| `release b` (the `__release` hook, syntax §16) | – | `ends b (Released)`; releases initialized owning elements first |
 
 `Grow`, `Text`, `Store`, `Map` and their pinned variants are written over these words and
 inherit their effects. A container may refine `ends` by key or ID, as `Store:remove` and

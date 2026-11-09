@@ -132,7 +132,7 @@ test "rule 1: growth never ends a view you hold; it reads the new storage":
     local views = native("held_views", [[
 local held = do(n: U32): U32
     local xs = Grow(U32) { 1, 2, 3 }
-    local head = xs:view(0, 2)
+    local head = xs:sub(0, 2)
     for i: U32 = 1, n do
         xs:push(i)
     end
@@ -157,7 +157,7 @@ end
 export sum_view
 local out_of_view = do(i: U64): U32
     local xs = Grow(U32) { 1, 2, 3 }
-    local head = xs:view(0, 2)
+    local head = xs:sub(0, 2)
     return head[i]
 end
 export out_of_view
@@ -180,7 +180,7 @@ export broken
     refuses([[
 local broken = do(): U32
     local xs = Grow(U32) { 1, 2, 3 }
-    local head = xs:view(0, 1)
+    local head = xs:sub(0, 1)
     local last = xs:pop()
     return head[0] + last
 end
@@ -274,7 +274,7 @@ test "rule 3: a view stored in a container ends when its buffer grows":
 local broken = do(): U32
     local source = Grow(U32) { 1, 2, 3 }
     local tokens = Grow(Slice U32) {}
-    tokens:push(source:view(0, 2))
+    tokens:push(source:sub(0, 2))
     source:push(4)
     local first = tokens[0]
     return first[0]
@@ -286,8 +286,8 @@ export broken
 local fine = do(): U32
     local source = Grow(U32) { 10, 20, 30 }
     local tokens = Grow(Slice U32) {}
-    tokens:push(source:view(1, 2))
-    tokens:push(source:view(0, 1))
+    tokens:push(source:sub(1, 3))
+    tokens:push(source:sub(0, 1))
     local first = tokens[0]
     local second = tokens[1]
     return first[0] + first[1] + second[0] + U32(#first) * 1000
@@ -304,7 +304,7 @@ local either = do(flag: Bool): U32
     local source = Grow(U32) { 5, 6 }
     local tokens = Grow(Slice U32) {}
     if flag then
-        tokens:push(source:view(0, 1))
+        tokens:push(source:sub(0, 1))
     else
         source:push(7)
     end
@@ -322,7 +322,7 @@ export either
 local broken = do(flag: Bool): U32
     local source = Grow(U32) { 5, 6 }
     local tokens = Grow(Slice U32) {}
-    if flag then tokens:push(source:view(0, 1)) end
+    if flag then tokens:push(source:sub(0, 1)) end
     source:push(7)
     if tokens.length > 0 then
         local first = tokens[0]
@@ -337,7 +337,7 @@ export broken
 local broken = do(flag: Bool): U32
     local source = Grow(U32) { 5, 6 }
     local tokens = Grow(Slice U32) {}
-    tokens:push(source:view(0, 1))
+    tokens:push(source:sub(0, 1))
     if flag then source:push(7) end
     local first = tokens[0]
     return first[0]
@@ -375,7 +375,7 @@ export filled
 -- the callee's push moves the storage: a held view in the caller survives it
 local survives = do(): U32
     local xs = Grow(U32) { 1, 2 }
-    local head = xs:view(0, 2)
+    local head = xs:sub(0, 2)
     for i: U32 = 1, 100 do
         call append (Ref xs) i
     end
@@ -437,7 +437,7 @@ test "the lifetime rule: a word returns borrows of what it received, never of it
     refuses([[
 local first_two = do(): Slice U32
     local xs = Grow(U32) { 1, 2, 3 }
-    return xs:view(0, 2)
+    return xs:sub(0, 2)
 end
 local broken = do(): U32
     local view = first_two()
@@ -446,7 +446,7 @@ end
 export broken
 ]], "first_two returns a borrow of its own local 'xs', which ends with it")
     local returned = native("returned_views", [[
-local head = do(xs: Ref (Grow U32)): Slice U32 = xs:view(0, 1)
+local head = do(xs: Ref (Grow U32)): Slice U32 = xs:sub(0, 1)
 local fine = do(): U32
     local xs = Grow(U32) { 7, 8 }
     local h = head(Ref xs)
@@ -500,7 +500,7 @@ test "a view written into a record's field is stored (syntax §9.4, §9.7)":
 local Token = struct { kind: U32, text: Slice U8 }
 local broken = do(): U8
     local src = Grow(U8) { 104, 105 }
-    local tok = Token { kind = 1, text = src:view(0, 1) }
+    local tok = Token { kind = 1, text = src:sub(0, 1) }
     src:push(33)
     return tok.text[0]
 end
@@ -510,7 +510,7 @@ export broken
 local Token = struct { kind: U32, text: Slice U8 }
 local fine = do(): U32
     local src = Grow(U8) { 104, 105 }
-    local tok = Token { kind = 1, text = src:view(1, 1) }
+    local tok = Token { kind = 1, text = src:sub(1, 2) }
     return U32(tok.text[0]) + tok.kind
 end
 export fine
@@ -534,7 +534,7 @@ export fine
 -- a recursion under dynamic control is a native function by itself: it stores on every level
 local function split(tokens: Ref (Grow (Slice U32)), source: Ref (Grow U32), at: U64): Unit
     if at == 0 then return end
-    tokens:push(source:view(0, at))
+    tokens:push(source:sub(0, at))
     split(tokens, source, at - 1)
 end
 local prefixes = do(n: U64): U64

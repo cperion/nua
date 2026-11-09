@@ -22,7 +22,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
 
     E.is_cell = cells.is_cell
@@ -71,6 +71,9 @@ return do(E, core)
             E.check_local_borrow(path, place.id, converted)
             path.flow.contents[place.id] = data.Tracked { value = converted }
             if types.owns(type) then E.install_payload(path, place.id, converted) end
+        elseif types.owns type and not E.is_sum type then
+            -- an owner declared without a value starts empty (syntax §9.2)
+            path.flow.contents[place.id] = data.Tracked { value = E.zero_value type }
         else
             path.flow.contents[place.id] = data.Uninitialized {}
         end
@@ -123,7 +126,7 @@ return do(E, core)
             return part
         end
         RawCell = |cell, recurse, path| -> E.load(path, cell.place)
-        ElementCell = |cell, recurse, path| -> E.method(path, cell.base, "get", { cell.key }, false)
+        ElementCell = |cell, recurse, path| -> E.element(path, cell.base, cell.key)
     end
     local peek_cell = cells.Cell.pass "read a binding cell" with ..Peeking end
     E.peek = do(path, cell)
@@ -133,9 +136,7 @@ return do(E, core)
 
     -- writing a cell: one handler per kind of binding cell
     local Setting = define
-        ElementCell = do(cell, recurse, path, value)
-            E.method(path, cell.base, "set", { cell.key, value }, false)
-        end
+        ElementCell = |cell, recurse, path, value| -> E.assign_index(path, cell.base, cell.key, value)
         -- a field is assigned through a reference to it (an owner there is replaced)
         FieldCell = |cell, recurse, path, value| -> E.write_reference(path, E.reference_to(path, cell), value, cell.name)
         RawCell = do(cell, recurse, path, value)

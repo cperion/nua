@@ -21,7 +21,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
     --------------------------------------------------------------------------------------------
     -- computation
@@ -47,6 +47,8 @@ return do(E, core)
         if path.dead then return nil end
         if is_native left then left = E.deref(path, left) end
         if is_native right then right = E.deref(path, right) end
+        -- an operator of a type with hooks (syntax §16)
+        if E.operator_hook(operator, left, right) then return E.operate_by_hook(path, operator, left, right) end
         local unary = right == nil and (operator == "negate" or operator == "not" or operator == "bit_not")
         if not is_native left and (unary or not is_native right) then
             local host = E.host_operations[operator]

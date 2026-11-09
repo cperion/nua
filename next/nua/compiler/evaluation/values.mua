@@ -21,7 +21,7 @@ local is_native = value -> check(NativeValue, value)
 local lua_type = type
 
 return do(E, core)
-    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions, library = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions, core.library
+    local supply, fresh, tracking, memory, fail, site, origin_of, remember_borrows, enter, append, terminate, remember_reference, definitions = core.supply, core.fresh, core.tracking, core.memory, core.fail, core.site, core.origin_of, core.remember_borrows, core.enter, core.append, core.terminate, core.remember_reference, core.definitions
     local compilation = core.compilation
     --------------------------------------------------------------------------------------------
     -- values
@@ -36,6 +36,27 @@ return do(E, core)
     -- a host value met by a native type (syntax §7.2): numbers range-checked, booleans as Bool,
     -- a table of fields as a record
     E.from_host = do(path, type, value, what)
+        -- a value described in host code meets its own type only (syntax §2.2); a Lua number
+        -- described as an integer is converted as C converts it, toward zero, and must fit
+        if check(types.Described, value) then
+            if value.type ~= type then fail(path, ("%s is described as %s, not %s"):format(what, types.describe value.type, types.describe type)) end
+            local described = value.value
+            if rules.is_integer type and lua_type described == "number" and described ~= math.floor described then
+                described = described < 0 and math.ceil described or math.floor described
+            end
+            return E.from_host(path, type, described, what)
+        end
+        -- a value that is not yet a T, by T's `__cast` hook (syntax §16); a reference to a T
+        -- stands for its target
+        if types.NativeType.is(type, types.ReferenceType) and is_native value and not E.is_reference value then
+            local place = E.places_of_reads[value]
+            if place and place.type == type then return place end
+        end
+        local already = is_native value and (value.type == type or E.is_reference value and types.NativeType.is(value.type, types.ReferenceType) and value.type.target == type)
+        if not already and value ~= nil then
+            local cast = E.cast(path, type, value)
+            if cast ~= nil then return cast end
+        end
         if types.NativeType.is(type, types.RecordType) and not is_native value and lua_type value == "table" then
             return E.construct_record(path, type, value)
         end

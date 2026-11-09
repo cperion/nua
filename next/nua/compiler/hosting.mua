@@ -3,10 +3,12 @@
 -- `word { name, source, line, requirements, result, body }` is what a typed lambda becomes: a
 -- word with its requirements (a native type, or none for host supply) and its native result,
 -- both evaluated once, where the word is made. An untyped lambda in a typed body is a word with
--- no result type: it evaluates in place, its result whatever it returns (a match's handlers). Applying a word or an application in Lua
--- supplies arguments and nothing else: `affine 4 3` is an application that remembers 4 and 3
--- and runs no body. Evaluation happens only when an evaluation applies a saturated
--- application (`evaluate.apply`), never by building one.
+-- no result type: it evaluates in place, its result whatever it returns (a match's handlers).
+-- Applying a word or an application in Lua supplies arguments (syntax §3.8): `affine 4` is an
+-- application that remembers 4 and runs no body. A saturated application is applied (§3.7,
+-- compiler activities §5.1 `Hosting.apply`) by the applier of the compilation that made the
+-- word: inside a hook or host helper it evaluates in place, residualizing with its caller;
+-- from top-level host code it runs while compiling, its arguments all known.
 
 local types = require "nua.types"
 
@@ -26,12 +28,19 @@ local supply = do(application, arguments)
     return setmetatable({ word = application.word, .supplied }, Application)
 end
 
-Word.__call = |word, ...| -> supply(setmetatable({ .word, supplied = {} }, Application), { ... })
+-- supply from Lua: a saturated application is applied by its word's applier
+local supplied_from_lua = do(application, arguments)
+    local next = supply(application, arguments)
+    if #next.supplied == #next.word.requirements and next.word.applier then return next.word.applier(next) end
+    return next
+end
+Word.__call = |word, ...| -> supplied_from_lua(setmetatable({ .word, supplied = {} }, Application), { ... })
 Word.__tostring = word -> "word " .. word.name
-Application.__call = |application, ...| -> supply(application, { ... })
+Application.__call = |application, ...| -> supplied_from_lua(application, { ... })
 Application.__tostring = application -> ("application of %s (%d of %d supplied)"):format(application.word.name, #application.supplied, #application.word.requirements)
 
-local word = do(description)
+-- `applier(application)`: how the compilation making the word applies it saturated from Lua
+local word = do(description, applier)
     local name = description.name
     for index, requirement in ipairs description.requirements do
         if requirement.type ~= nil and not check(types.NativeType, requirement.type) then
@@ -51,6 +60,7 @@ local word = do(description)
         result = description.result
         body = description.body
         tail_calls = description.tail_calls == true
+        .applier
     end, Word)
 end
 

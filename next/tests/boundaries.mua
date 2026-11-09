@@ -17,7 +17,7 @@ end
 test "native returned views re-root in the caller and preserve their captured range":
     local library = native("boundary_returned", [[
 local range = do(xs: Ref (Grow U32), first: U64, count: U64): Slice U32
-    return xs:view(first, count)
+    return xs:sub(first, first + count)
 end
 local boundary_range = do(first: U64, count: U64, n: U32): U32
     local xs = (Grow U32) { 11, 13, 17, 19 }
@@ -30,7 +30,7 @@ local Token = struct { text: Slice U32 }
 local unwrap = do(token: Token): Slice U32 = token.text
 local boundary_component = do(): U32
     local xs = (Grow U32) { 23, 29 }
-    local token = Token { text = xs:view(1, 1) }
+    local token = Token { text = xs:sub(1, 2) }
     local view = call unwrap token
     for i: U32 = 1, 100 do xs:push i end
     return view[0] + U32(#view)
@@ -55,7 +55,7 @@ local forward_reference = do(holder: Holder): Ref U32
 end
 local boundary_forward_view = do(): U32
     local xs = (Grow U32) { 2, 7, 19 }
-    local view = call forward (xs:view(1, 2))
+    local view = call forward (xs:sub(1, 3))
     xs:push 23
     xs:push 29
     return view[0] + view[1]
@@ -79,7 +79,7 @@ test "stored header effects follow captured references, not their overwritten sl
 local Holder = struct { ref: Ref (Grow U32) }
 local change = do(a: Ref (Grow Holder), b: Ref (Grow Holder), replacement: Ref (Grow U32)): Unit
     local first = a[0].ref
-    b:set 0 (Holder { ref = replacement })
+    b[0] = Holder { ref = replacement }
     local second = a[0].ref
     %s:clear
 end
@@ -247,7 +247,7 @@ local resident_fresh = do(): U32
     local values = (Grow (Slice U32)) {}
     values:push (a:all())
     a:clear
-    values:set(0, b:all())
+    values[0] = b:all()
     local view = values[0]
     return view[0]
 end
@@ -335,7 +335,7 @@ end
 local memory_input = do(): U32
     local src = (Grow U32) { 37, 41 }
     local tokens = (Grow (Slice U32)) {}
-    tokens:push (src:view(1, 1))
+    tokens:push (src:sub(1, 2))
     local view = call take (Ref tokens)
     for i: U32 = 1, 100 do src:push i end
     return view[0] + U32(#view) + U32(tokens.length)
@@ -374,7 +374,7 @@ test "alias substitution reaches internal joined borrows, not only formal views"
     refuses([[
 local selected = do(a: Ref (Grow U32), b: Ref (Grow U32), flag: Bool): Slice U32
     local view = a:all()
-    if flag then view = a:view(1, 1) end
+    if flag then view = a:sub(1, 2) end
     b:clear
     return view
 end
@@ -390,7 +390,7 @@ end
 test "returned references and nested views recover caller path coordinates":
     local library = native("boundary_returned_paths", [[
 local element = do(xs: Ref (Grow U32), at: U64): Ref U32
-    return xs:element at
+    return Ref xs[at]
 end
 local ref_result = do(at: U64): U32
     local xs = (Grow U32) { 43, 47 }
@@ -400,7 +400,7 @@ local ref_result = do(at: U64): U32
     return value
 end
 export ref_result
-local head = do(xs: Ref (Grow U32)): Slice U32 = xs:view(0, 1)
+local head = do(xs: Ref (Grow U32)): Slice U32 = xs:sub(0, 1)
 local nested_result = do(at: U64): U32
     local rows = (Grow (Grow U32)) {}
     rows:push ((Grow U32) { 53 })

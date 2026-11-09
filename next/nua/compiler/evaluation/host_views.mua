@@ -1,0 +1,200 @@
+-- The evaluation vocabulary, part: Staged host wrappers (compiler activities §5.1, architecture
+-- §3): a Lua function the evaluation calls receives the native values it is given wrapped, so
+-- ordinary Lua operations on them (`w.head + i`, `w.items[k] = v`, `p.a`) are evaluation
+-- operations on the path the bridge binds for the call, folding when known and residualizing
+-- otherwise. What the function answers is unwrapped. A comparison must answer a Lua boolean,
+-- so only a known one is answered; one that is not known while compiling belongs in a native
+-- word (syntax §16.3).
+-- A part adds its verbs to the one vocabulary E (compiler activities §5.2); parts reach one
+-- another only through E, and the evaluation's construction capabilities through core.
+
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local hosting = require "nua.compiler.hosting"
+local graph = require "nua.compiler.graph"
+local facts = require "nua.compiler.facts"
+local rules = require "nua.compiler.rules"
+local paths_of = require "nua.compiler.evaluation.path"
+local NativeValue = data.NativeValue
+local is_native = value -> check(NativeValue, value)
+local lua_type = type
+-- the results of a call, counted (Lua passes them as varargs)
+local pack = function(...) return { n = select("#", ...), ... } end
+-- whether a 64-bit integer is exactly the Lua number
+local ffi_exact = |number, bits| -> number ~= nil and math.abs(number) < 2 ^ 53 and tostring(bits):gsub("U?LL$", "") == ("%d"):format(number)
+
+return do(E, core)
+    local fail, bridge = core.fail, core.bridge
+
+    local Staged
+    local wrapped = setmetatable({}, { __mode = "k" })
+    local wrap = do(value)
+        if not is_native value then return value end
+        local view = setmetatable({}, Staged)
+        wrapped[view] = value
+        return view
+    end
+    local unwrap
+    unwrap = do(value)
+        if lua_type value ~= "table" then return value end
+        local inner = wrapped[value]
+        if inner ~= nil then return inner end
+        if check(types.Described, value) then return types.Described { type = value.type, value = unwrap(value.value) } end
+        if check(types.Variant, value) then return types.Variant { sum = value.sum, alternative = value.alternative, payload = unwrap(value.payload) } end
+        if getmetatable value == nil then
+            local copy = {}
+            for key, item in pairs value do copy[key] = unwrap item end
+            return copy
+        end
+        return value
+    end
+    E.unwrap_host = unwrap
+    local path_now = || -> bridge.current().path
+
+    -- the place a wrapped reference names, or the value a wrapped value is
+    local is_place = value -> E.is_reference value and types.NativeType.is(value.type, types.ReferenceType)
+
+    local operator = name -> |a, b| -> wrap(E.operate(path_now(), name, unwrap a, unwrap b))
+    local comparison = do(name)
+        return do(a, b)
+            local path = path_now()
+            local result = E.operate(path, name, unwrap a, unwrap b)
+            local constant = E.constant_of(result)
+            if constant == nil then
+                fail(path, "a comparison of values not known while compiling is staged only in a typed body: write this hook as a native word (syntax §16)")
+            end
+            return constant.bits.value
+        end
+    end
+
+    Staged = define
+        __index = do(view, key)
+            local path = path_now()
+            local value = wrapped[view]
+            if lua_type key == "string" then
+                -- a field of a place is a place; of a value, a value
+                if is_place value then
+                    local target = value.type.target
+                    if E.is_record target and E.field_of(target, key) then return wrap(E.part_reference(path, value, data.FieldStep { name = key })) end
+                end
+                return wrap(E.dot(path, value, key))
+            end
+            return wrap(E.element(path, value, unwrap key))
+        end
+        __newindex = do(view, key, assigned)
+            local path = path_now()
+            local value = wrapped[view]
+            if lua_type key == "string" then
+                if not is_place value then fail(path, ("'.%s' is assigned through a place, not a value"):format(key)) end
+                return E.write_reference(path, E.part_reference(path, value, data.FieldStep { name = key }), unwrap assigned, key)
+            end
+            E.assign_index(path, value, unwrap key, unwrap assigned)
+        end
+        __add = operator "add"
+        __sub = operator "subtract"
+        __mul = operator "multiply"
+        __div = operator "divide"
+        __mod = operator "remainder"
+        __unm = a -> wrap(E.operate(path_now(), "negate", unwrap a))
+        __eq = comparison "equal"
+        __lt = comparison "less"
+        __le = comparison "less_equal"
+        -- Lua passes a call's arguments as varargs
+        __call = function(view, ...)
+            local arguments = { ... }
+            for index, argument in ipairs arguments do arguments[index] = unwrap argument end
+            return wrap(E.apply(path_now(), wrapped[view], arguments, false))
+        end
+        __tostring = view -> "staged " .. types.describe(wrapped[view].type)
+    end
+
+    -- a Lua function applied by the evaluation: its native arguments wrapped, the bridge bound
+    -- to this path for the call, its answer unwrapped
+    E.call_host = do(path, callee, arguments)
+        local given = {}
+        for index = 1, #arguments do given[index] = wrap(arguments[index]) end
+        local count = #arguments
+        -- every result, each unwrapped: a generator's (`ipairs entries`) are several
+        local results = bridge.enter({ .path }, || -> pack(callee(unpack(given, 1, count))))
+        for index = 1, results.n do results[index] = unwrap(results[index]) end
+        return unpack(results, 1, results.n)
+    end
+
+    -- whether a native value is known while compiling, all of it
+    local known
+    known = do(value)
+        if not is_native value then return true end
+        if NativeValue.is(value, data.Bits) then return data.Operand.is(value.operand, data.Constant) end
+        if NativeValue.is(value, data.Aggregate) then
+            if value.packed then return false end
+            for _, part in pairs value.parts do if not known(part) then return false end end
+            return true
+        end
+        if NativeValue.is(value, data.Tagged) then return value.payload == nil or known(value.payload) end
+        return false
+    end
+
+    -- a saturated application from Lua (syntax §3.7, compiler activities §5.1): inside a call
+    -- the bridge binds, evaluated in place on that path, residualizing with its caller; from
+    -- top-level host code, evaluated while compiling on a construction of its own, which must
+    -- leave no residual code: its answer is a known value
+    E.host_apply = do(application)
+        local binding = bridge.active()
+        local supplied = {}
+        for index, argument in ipairs application.supplied do supplied[index] = unwrap argument end
+        local unwrapped = hosting.application(application.word, supplied)
+        if binding then return wrap(E.apply(binding.path, unwrapped, {}, false)) end
+        local value, residual = nil, false
+        local outcome = graph.building(nil, core.supply, do(writer)
+            local entry = writer.block "host"
+            local path = paths_of.entry(writer, entry, facts.empty(), application.word.source, application.word.line, nil)
+            core.enter path
+            value = bridge.enter({ .path }, || -> E.apply(path, unwrapped, {}, false))
+            return "adopt"
+        end)
+        local fragment = outcome { built = f -> f, discarded = || -> nil }
+        -- residual code: an instruction, or control other than the plain jumps of a known
+        -- return joining its continuation
+        for _, id in ipairs fragment.order do
+            local block = fragment.blocks[id]
+            local terminator = block.terminator
+            local plain = terminator == nil or data.Terminator.is(terminator, data.Jump) and #terminator.edge.arguments == 0
+            if #block.instructions > 0 or not plain then residual = true end
+        end
+        if residual or not known(value) then
+            error(("%s:%d: %s is applied from host code with an argument not known while compiling (syntax §3.7)"):format(application.word.source or "?", application.word.line or 0, application.word.name), 0)
+        end
+        return value
+    end
+
+    -- `host(v)`: the Lua value of a value known while compiling (syntax §3.7)
+    E.host_value = do(value)
+        value = lua_type value == "table" and wrapped[value] or value
+        if not is_native value then return value end
+        if not known(value) then error("host: the value is not known while compiling", 2) end
+        if NativeValue.is(value, data.Bits) then
+            local constant = value.operand
+            if rules.is_integer constant.type then
+                local bits = rules.integer_value constant
+                local number = tonumber bits
+                if number == bits or ffi_exact(number, bits) then return number end
+                return bits
+            end
+            if constant.type == types.Unit then return nil end
+            return constant.bits.value
+        end
+        if NativeValue.is(value, data.Aggregate) then
+            local fields = {}
+            for name, part in pairs value.parts do fields[name] = E.host_value(part) end
+            return fields
+        end
+        return types.Variant { sum = value.type, alternative = value.alternative, payload = value.payload and E.host_value(value.payload) }
+    end
+
+    -- `type_of(v)`: the native type of a staged value; nil for a Lua value
+    E.type_of = do(value)
+        local inner = lua_type value == "table" and wrapped[value] or value
+        if not is_native inner then return nil end
+        return inner.type
+    end
+end

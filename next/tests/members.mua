@@ -1,0 +1,238 @@
+-- Methods and hooks (syntax §8, §16): a type's members are library code found in the order of
+-- §16.3 and applied while specializing, so they fold and residualize with the caller.
+
+local native = require "tests.support.native"
+local compile = require "nua.compile"
+
+local refuses = do(source, expected)
+    local done, problem = pcall(compile.compile, source, "refused.nua")
+    assert(not done, "expected the compiler to refuse")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+test "a method receives its receiver by reference and specializes like any word (§8)":
+    local library, text = native("members_counter", [[
+local Counter = struct
+    value: U32
+end
+
+function Counter:add(n: U32): Unit
+    self.value = self.value + n
+end
+
+function Counter:get(): U32
+    return self.value
+end
+
+local count3 = do(a: U32, b: U32, c: U32): U32
+    local counter = Counter { value = 0 }
+    counter:add a
+    counter:add b
+    counter:add c
+    return counter:get()
+end
+export count3
+export Counter.add as "counter_add"
+
+-- a method on a value, not a place: it is given a temporary place
+local of_value = do(a: U32): U32 = (Counter { value = a }):get()
+export of_value
+]])
+    assert(library.count3(1, 2, 3) == 6)
+    assert(library.of_value(9) == 9)
+    -- count3 is the sum, with no receiver in memory
+    local count3 = text:match("uint32_t count3%(.-\n}")
+    assert(not count3:find("&", 1, true), count3)
+    -- materialized, the method takes its receiver's address (§8)
+    assert(text:find("void counter_add%(Counter_%d+ %* p1, uint32_t p2%)"), text)
+    local ffi = require "ffi"
+    local counter = ffi.new("Counter_" .. text:match("typedef struct Counter_(%d+)") .. "[1]")
+    library.counter_add(counter, 5)
+    library.counter_add(counter, 6)
+    assert(counter[0].value == 11)
+end
+
+test "operators and conversions by hooks (§16)":
+    local library, text = native("members_fixed", [[
+local Fixed = struct { raw: I32 }
+
+function Fixed.__cast(v)
+    if type v == 'number' then
+        return Fixed { raw = I32(v * 65536) }
+    end
+end
+
+function Fixed.__add(a: Fixed, b: Fixed): Fixed
+    return Fixed { raw = a.raw + b.raw }
+end
+
+function Fixed.__mul(a: Fixed, b: Fixed): Fixed
+    local wide = I64 a.raw * I64 b.raw
+    return Fixed { raw = I32(wide / 65536) }
+end
+
+function Fixed.__lt(a: Fixed, b: Fixed): Bool
+    return a.raw < b.raw
+end
+
+local scale = do(x: Fixed, y: Fixed): Fixed
+    return x * 1.5 + y
+end
+local scaled_raw = do(x: I32, y: I32): I32 = (scale(Fixed { raw = x }, Fixed { raw = y })).raw
+export scaled_raw
+local below = do(x: I32, y: I32): Bool = Fixed { raw = x } < Fixed { raw = y }
+export below
+local above = do(x: I32, y: I32): Bool = Fixed { raw = x } > Fixed { raw = y }
+export above
+]])
+    -- 2.0 * 1.5 + 0.5 = 3.5
+    assert(library.scaled_raw(2 * 65536, 32768) == 3.5 * 65536)
+    assert(library.below(1, 2) == true and library.below(2, 1) == false)
+    assert(library.above(2, 1) == true and library.above(1, 2) == false)
+    -- the literal 1.5 is converted while compiling: the multiplication is by its raw bits
+    assert(text:find("98304", 1, true), text)
+end
+
+test "a library container: a struct holding a Grow, methods and a typed __index (§16)":
+    local library = native("members_ring", [[
+local Ring = do(E, capacity)
+    local R = struct { head: U32, len: U32, items: Grow E }
+
+    function R:push(v: E): Unit
+        if self.len < capacity then
+            self.items:push v
+            self.len = self.len + 1
+        else
+            self.items[self.head] = v
+            self.head = (self.head + 1) % capacity
+        end
+    end
+
+    -- r[i] is the i-th oldest element, checked against the live length
+    function R:__index(i: U32): Ref E
+        if i >= self.len then trap "ring index out of range" end
+        return self.items[(self.head + i) % capacity]
+    end
+
+    return R
+end
+
+local Ints = Ring(U32, 4)
+
+local ring_sum = do(n: U32): U32
+    local r = Ints { head = 0, len = 0, items = (Grow U32) {} }
+    for i: U32 = 1, n do
+        r:push(i * i)
+    end
+    local total = U32 0
+    for i: U32 = 0, r.len - 1 do
+        total = total + r[i]
+    end
+    r[0] = r[0] + 1000
+    return total * 10000 + r[0]
+end
+export ring_sum
+
+local Bytes = Ring(U8, 2)
+local ring_bytes = do(a: U8, b: U8, c: U8): U32
+    local r = Bytes { head = 0, len = 0, items = (Grow U8) {} }
+    r:push a
+    r:push b
+    r:push c
+    return U32 r[0] * 256 + U32 r[1]
+end
+export ring_bytes
+]])
+    -- six pushes into four slots keep 9, 16, 25, 36 (oldest first: 9)
+    assert(library.ring_sum(6) == (9 + 16 + 25 + 36) * 10000 + 1009)
+    assert(library.ring_bytes(1, 2, 3) == 2 * 256 + 3)
+end
+
+test "a __member hook answers computed members; fields and methods come after it (§16.3)":
+    local library = native("members_hooked", [[
+local Pair = struct { a: U32, b: U32 }
+function Pair.__member(p, name)
+    if name == 'sum' then return p.a + p.b end
+end
+function Pair:swap(): Unit
+    local a = self.a
+    self.a = self.b
+    self.b = a
+end
+local hooked = do(x: U32, y: U32): U32
+    local p = Pair { a = x, b = y }
+    p:swap()
+    return p.sum * 100 + p.a
+end
+export hooked
+]])
+    assert(library.hooked(3, 4) == 7 * 100 + 4)
+end
+
+test "what a type does not have is refused by name":
+    refuses([[
+local Pair = struct { a: U32 }
+function Pair:a(): U32
+    return 1
+end
+]], "the method 'a' has the name of a field")
+    refuses([[
+local Pair = struct { a: U32 }
+local f = do(): U32
+    local p = Pair { a = 1 }
+    return p:missing()
+end
+export f
+]], "Pair has no method 'missing'")
+end
+
+test "a word applied from host code with known arguments runs while compiling (§3.7)":
+    local compiled = compile.compile([[
+local affine = do(a: U32, x: U32, b: U32): U32 = a * x + b
+local answer = affine(4, 3, 10)
+assert(host(answer) == 22, "the answer is known: " .. tostring(host(answer)))
+-- a partial application only supplies: applying it later runs the body
+local times_four = affine(4)
+assert(host(times_four(3, 10)) == 22)
+local Point = struct { x: U32, y: U32 }
+local made = do(k: U32): Point = Point { x = k, y = k + 1 }
+local point = host(made 5)
+assert(point.x == 5 and point.y == 6)
+local f = do(k: U32): U32 = affine(k, 1, 0)
+export f
+]], "known.nua")
+    assert(compiled.program)
+    refuses([[
+local add = do(a: U32, b: U32): U32 = a + b
+local Box = struct { v: U32 }
+-- a host hook applying a word to a staged value evaluates it in place, residualizing
+function Box.__member(box, name)
+    if name == 'doubled' then return add(box.v, box.v) end
+end
+local doubled = do(k: U32): U32 = (Box { v = k }).doubled
+export doubled
+local leak = do(k: U32): U32 = add(k, host(k))
+export leak
+]], "host: the value is not known while compiling")
+end
+
+test "a Lua hook compares only what is known while compiling (§16.3)":
+    refuses([[
+local Box = struct { v: U32, w: U32 }
+function Box.__member(box, name)
+    if name == 'bigger' then return box.v > box.w end
+end
+local bigger = do(k: U32): Bool = (Box { v = k, w = 10 }).bigger
+export bigger
+]], "write this hook as a native word")
+    local library = native("members_staged_hook", [[
+local Box = struct { v: U32 }
+local add = do(a: U32, b: U32): U32 = a + b
+function Box.__member(box, name)
+    if name == 'doubled' then return add(box.v, box.v) end
+end
+local doubled = do(k: U32): U32 = (Box { v = k }).doubled
+export doubled
+]])
+    assert(library.doubled(21) == 42)
+end

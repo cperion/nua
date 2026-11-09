@@ -159,6 +159,9 @@ end
 -- A sum value described at host level: the alternative and its payload (a host value, or a
 -- native value inside a typed body). It becomes a native value where it meets the sum type.
 local Variant = struct { sum: SumType, alternative: String, payload: Any }
+-- A value of a native type described in host code (syntax §2.2: types are compile-time
+-- values): `I32(n)`, `Fixed { raw = … }`. It becomes a native value where it meets its type.
+local Described = struct { type: NativeType, value: Any }
 
 -- A constructor: `Shape.rect { … }`, `Opt.some x`, and for a Unit alternative `Opt.none` or
 -- `Direction.left()`. Applied, it answers the variant; a Unit constructor stands for its variant
@@ -336,6 +339,119 @@ local Laying = define
 end
 local layout = NativeType.pass "lay out a native type on a target" with ..Laying end
 
+------------------------------------------------------------------------------------------------
+-- Members (syntax §8, §16.3): the methods and hooks a library gives a native type, by name. A
+-- type's own members are stored for it; a kind constructed per component (`Buffer T`,
+-- `Slice T`, `Ptr T`, ...) is served per family, its provider answering the members of each
+-- type of the kind. A type's own members come before its family's: `Str` has its text words
+-- and the words of the `Slice` family.
+
+-- the members of one compilation: its own members, family providers and the family members
+-- made so far. A compilation installs its registry while it runs (`use_registry`); the native
+-- types are shared by every compilation, their members are not.
+local registry = || -> { own = setmetatable({}, { __mode = "k" }), providers = {}, made = setmetatable({}, { __mode = "k" }) }
+local current = nil
+-- install `next` (nil: none); answers the registry it replaces
+local use_registry = do(next)
+    local previous = current
+    current = next
+    return previous
+end
+local active = do()
+    if current == nil then error("the members of native types are defined while a compilation runs", 3) end
+    return current
+end
+-- the variant (kind) of each type constructor, for registering a family by its constructor
+local kinds_of_constructors = define
+    [pointer] = PointerType
+    [reference] = ReferenceType
+    [view] = ViewType
+    [fixed_array] = FixedArrayType
+    [buffer] = BufferType
+end
+
+local define_member = do(native_type, name, value)
+    if not check(NativeType, native_type) then error("a member is defined on a native type, not " .. tostring native_type, 2) end
+    if NativeType.is(native_type, RecordType) then
+        for _, field in ipairs native_type.fields do
+            if field.name == name then error(("%s: the method '%s' has the name of a field"):format(native_type.name, name), 2) end
+        end
+    end
+    local own = active().own
+    local members = own[native_type]
+    if members == nil then
+        members = {}
+        own[native_type] = members
+    end
+    if members[name] ~= nil then error(("%s already has a member '%s'"):format(describe native_type, name), 2) end
+    members[name] = value
+end
+
+-- `family(Buffer, provider)`: the members of every `Buffer T` are `provider(T)`'s
+local define_family = do(constructor, provider)
+    local kind = kinds_of_constructors[constructor]
+    if kind == nil then error("family: " .. tostring constructor .. " is not a type constructor served per family", 2) end
+    local providers = active().providers
+    if providers[kind] ~= nil then error("family: the family of " .. tostring kind .. " is registered already", 2) end
+    providers[kind] = provider
+end
+
+local family_of = do(native_type)
+    for kind, provider in pairs(active().providers) do
+        if NativeType.is(native_type, kind) then return provider end
+    end
+    return nil
+end
+-- what a provider answers for one type: the component its constructor took
+local Components = define
+    PointerType = |node, recurse| -> node.target
+    ReferenceType = |node, recurse| -> node.target
+    ViewType = |node, recurse| -> node.element
+    FixedArrayType = |node, recurse| -> node.element
+    BufferType = |node, recurse| -> node.element
+    IntegerType = |node, recurse| -> nil
+    FloatType = |node, recurse| -> nil
+    BooleanType = |node, recurse| -> nil
+    UnitType = |node, recurse| -> nil
+    RecordType = |node, recurse| -> nil
+    SumType = |node, recurse| -> nil
+    FunctionType = |node, recurse| -> nil
+end
+local component_of = NativeType.pass "the component a family type is made of" with ..Components end
+
+-- a member of a native type by name: its own, else its family's; nil when it has none
+local member = do(native_type, name)
+    if current == nil then return nil end
+    local own = current.own[native_type]
+    if own and own[name] ~= nil then return own[name] end
+    local provider = family_of native_type
+    if provider == nil then return nil end
+    local members = current.made[native_type]
+    if members == nil then
+        members = provider(component_of native_type, native_type) or {}
+        current.made[native_type] = members
+    end
+    return members[name]
+end
+
+-- host-level reads and assignments of a declared type's members: `function Fixed.__cast(v)`
+-- and `Fixed.__cast` (its descriptor's own fields answer first)
+for _, kind in ipairs { RecordType, ViewType, BufferType, FixedArrayType } do
+    kind.__index = |native_type, name| -> member(native_type, name)
+    kind.__newindex = |native_type, name, value| -> define_member(native_type, name, value)
+end
+-- a scalar, pointer or record type applied in host code describes a value of it
+for _, kind in ipairs { IntegerType, FloatType, BooleanType, PointerType, RecordType } do
+    kind.__call = |native_type, value| -> Described { type = native_type, .value }
+end
+local constructor_of_sum = SumType.__index
+SumType.__index = do(sum_type, name)
+    local found = constructor_of_sum(sum_type, name)
+    if found ~= nil then return found end
+    return member(sum_type, name)
+end
+SumType.__newindex = |sum_type, name, value| -> define_member(sum_type, name, value)
+
 return define
     .NativeType
     .IntegerType
@@ -376,10 +492,16 @@ return define
     .sum
     .alternative_of
     .Variant
+    .Described
     .is_constructor
     .variant_of
     .describe
     .owns
     .borrows
     .layout
+    .define_member
+    .define_family
+    .member
+    .registry
+    .use_registry
 end

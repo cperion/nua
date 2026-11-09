@@ -22,6 +22,7 @@ local verify_lifetimes = require "nua.compiler.verify_lifetimes"
 local front = require "nua.front"
 local emit_c = require "nua.emit_c"
 local platform = require "nua.compiler.platform"
+local bridge_module = require "nua.compiler.bridge"
 
 -- the Nua libraries of the replacement live beside its compiler, in next/lib
 local library_directory = (debug.getinfo(1, "S").source:match("^@(.*)/nua/compile%.mua$") or "next") .. "/lib"
@@ -76,9 +77,10 @@ end
 -- the host environment Nua sources run in: the prelude, the runtime the front end's output
 -- calls (`__nua`), `import` of the Nua library, and the primitives. Answers the environment
 -- and the loader of a source text.
-local hosting_environment = do(compilation, filename)
+local hosting_environment = do(compilation, filename, E)
     local runtime = define
-        word = hosting.word
+        -- a word applied saturated from Lua is applied by this compilation (syntax §3.7)
+        word = description -> hosting.word(description, E.host_apply)
         record = do(name, fields, line)
             for _, field in ipairs fields do
                 if not check(types.NativeType, field.type) then
@@ -94,6 +96,18 @@ local hosting_environment = do(compilation, filename)
             if not ok then error(("%s:%d: %s"):format(filename, line, tostring sum_or_problem), 0) end
             return sum_or_problem
         end
+        -- a member of a native type (syntax §8, §16), or a field of a Lua table
+        member = do(owner, name, value, line)
+            if not check(types.NativeType, owner) then
+                owner[name] = value
+                return
+            end
+            local ok, problem = pcall(types.define_member, owner, name, value)
+            if not ok then error(("%s:%d: %s"):format(filename, line, tostring problem), 0) end
+        end
+        -- the receiver of a method: a reference to its type's place; a Lua table's method
+        -- receives the table
+        receiver = owner -> check(types.NativeType, owner) and types.reference owner or nil
         export = do(value, c_name, line)
             if not (hosting.is_word value or hosting.is_application value) then
                 error(("%s:%d: export needs a word, got %s"):format(filename, line, tostring value), 0)
@@ -123,6 +137,12 @@ local hosting_environment = do(compilation, filename)
     end
     for _, name in ipairs { "trap", "moves", "ends", "view_of", "element_of", "initialize", "take", "drop" } do environment[name] = hosting.primitive name end
     environment.owns = types.owns
+    -- `family(Buffer, provider)`: a library serves the members of every type of a kind
+    environment.family = types.define_family
+    -- `host(v)`: the Lua value of a known value (syntax §3.7); `type_of(v)`: a staged value's
+    -- native type (syntax §2.2)
+    environment.host = E.host_value
+    environment.type_of = E.type_of
     return environment, load_nua
 end
 
@@ -177,20 +197,21 @@ end
 
 -- a source compiled: run it in the host environment, close its exports into definitions, keep
 -- what they reach, publish the facts, and verify
-local compiling = do(source, filename)
+local compiling_with_members = do(source, filename)
     local compilation = new_compilation()
     -- the evaluation and the definitions cooperate: each receives the other's vocabulary,
     -- wired here explicitly (compiler activities §1.1)
-    local definitions_capability, library_capability = {}, {}
-    local E = evaluate.evaluating(compilation, { definitions = definitions_capability, library = library_capability })
+    local definitions_capability = {}
+    local E = evaluate.evaluating(compilation, { definitions = definitions_capability, bridge = bridge_module.bridge() })
     local registry = definitions_module.defining(compilation, E)
     definitions_capability.request = registry.request
     definitions_capability.contract_of = registry.contract_of
     definitions_capability.bundle_of = registry.bundle_of
     definitions_capability.abi_of = registry.abi_of
-    local environment, load_nua = hosting_environment(compilation, filename)
+    local environment, load_nua = hosting_environment(compilation, filename, E)
     -- the words of buffers of each element type, from the Nua library
-    library_capability.buffer_words = element -> environment.import("buffer").words(element)
+    -- the built-in kinds the Nua library serves register their members (syntax §16.1)
+    environment.import "buffer"
     load_nua(source, filename)
 
     local exports = {}
@@ -222,6 +243,16 @@ local compiling = do(source, filename)
         .analysis
         .exports
     end
+end
+
+-- the members of native types belong to the compilation that defines them: its registry is
+-- installed while it runs, and the one it replaced restored, refused or not
+local compiling = do(source, filename)
+    local previous = types.use_registry(types.registry())
+    local results = { pcall(compiling_with_members, source, filename) }
+    types.use_registry previous
+    if not results[1] then error(results[2], 0) end
+    return results[2]
 end
 
 local compile_c = do(source, filename)

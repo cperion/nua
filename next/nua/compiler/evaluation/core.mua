@@ -1,7 +1,7 @@
 -- The core of an evaluation: what every part of the vocabulary uses to construct code: the
 -- identity supply, the borrow tracking and memory facts, diagnostics, and the writer verbs
 -- that keep facts with the instructions they emit. Capabilities from outside the evaluation
--- (the definitions, the library) are supplied by the compilation root.
+-- (the definitions) are supplied by the compilation root.
 
 local ffi = require "ffi"
 local identity = require "nua.identity"
@@ -112,6 +112,6 @@ return do(compilation, E, capabilities)
         .remember_reference
         .compilation
         definitions = capabilities.definitions
-        library = capabilities.library
+        bridge = capabilities.bridge
     end
 end

@@ -1,9 +1,10 @@
 -- Buffers (docs/design/buffers.md §2.2, §4.1): the one storage primitive, as Nua words.
 --
 -- A buffer is a header { data, length, capacity } and one allocation of `capacity` elements, the
--- first `length` initialized. `words(T)` makes the words of buffers of T once: each takes the
--- buffer by reference and declares its effect on the borrows of the contents: growth `moves`
--- them (a held view survives, a stored one ends), shrinking and clearing `ends` them.
+-- first `length` initialized. `words(T)` makes the members of buffers of T once (served for
+-- every `Buffer T` by the family registered below): each takes the buffer by reference and
+-- declares its effect on the borrows of the contents: growth `moves` them (a held view
+-- survives, a stored one ends), shrinking and clearing `ends` them.
 --
 -- Every operation builds its new storage, writes the header, then releases what it replaced:
 -- at a trap every header describes valid storage (buffers §2.5).
@@ -11,6 +12,14 @@
 local allocator = import "allocator"
 
 local made = {}
+
+-- an index is any unsigned integer type (syntax §9.12), or a Lua number known while compiling:
+-- checked here, while specializing; a signed index is refused
+local unsigned_index = do(index)
+    local index_type = type_of index
+    if index_type == nil then return end
+    if index_type.signed ~= false then error(("an index is an unsigned integer, not %s"):format(tostring(index_type.name)), 0) end
+end
 
 local words = do(T)
     if made[T] then return made[T] end
@@ -48,15 +57,13 @@ local words = do(T)
         moves self
     end
 
-    local get = do(self: Ref B, index: U64): T
-        if owning then trap "an element that owns storage is reached by reference, not copied" end
-        if index >= self.length then trap "index out of range" end
-        return element_of(self, index)
-    end
-
-    local element = do(self: Ref B, index: U64): Ref T
-        if index >= self.length then trap "index out of range" end
-        return element_of(self, index)
+    -- `b[i]` is the element's place (syntax §9.12, §16): its index checked at every use; an
+    -- element is read as a copy, or, when it owns storage, by reference
+    local element = do(self: Ref B, index): Ref T
+        unsigned_index index
+        local at = U64 index
+        if at >= self.length then trap "index out of range" end
+        return element_of(self, at)
     end
 
     -- release the elements from `first` up to the length (only for elements that own storage)
@@ -68,13 +75,6 @@ local words = do(T)
                 index = index + 1
             end
         end
-    end
-
-    local set = do(self: Ref B, index: U64, value: T): Unit
-        if index >= self.length then trap "index out of range" end
-        -- an owning element is replaced: the old one released after the new one is written
-        local destination = element_of(self, index)
-        destination = value
     end
 
     local pop = do(self: Ref B): T
@@ -102,22 +102,37 @@ local words = do(T)
         if self.capacity > 0 then allocator.release(Ptr(U8)(self.data), bytes_of self.capacity) end
     end
 
-    local length = do(self: Ref B): U64 = self.length
-
-    -- views: held borrows of the contents (buffers §2.3)
-    local view = do(self: Ref B, first: U64, count: U64): Slice T
-        if first > self.length or count > self.length - first then trap "view past the length" end
-        return view_of(self, first, count)
+    -- views: held borrows of the contents (buffers §2.3); `sub` views `[first, limit)`
+    local sub = do(self: Ref B, first: U64, limit: U64): Slice T
+        if first > limit or limit > self.length then trap "a view past the length" end
+        return view_of(self, first, limit - first)
     end
     local all = do(self: Ref B): Slice T = view_of(self, 0, self.length)
 
+    -- `Buffer(T) { … }` (syntax §16, `__cast`): an empty buffer, each entry pushed; the loop is
+    -- over the host table, so it runs while specializing
+    local construct = do(entries): B
+        local built: B
+        for _, entry in ipairs entries do
+            push(Ref built, entry)
+        end
+        return built
+    end
+    local cast = do(value, native_type)
+        if type value == "table" and getmetatable value == nil then return construct value end
+        return nil
+    end
+
     made[T] = {
-        reserve = reserve, push = push, get = get, set = set, pop = pop,
-        truncate = truncate, clear = clear, release = release, length = length,
-        view = view, all = all, element = element,
+        reserve = reserve, push = push, pop = pop, truncate = truncate, clear = clear,
+        sub = sub, all = all,
+        __index = element, __cast = cast, __release = release,
     }
     return made[T]
 end
+
+-- the members of every `Buffer T` (syntax §16.1: served once per family)
+family(Buffer, |element, native_type| -> words element)
 
 return {
     words = words,

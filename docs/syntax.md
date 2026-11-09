@@ -179,6 +179,11 @@ local t = { x = U32 }
 
 It is not a struct declaration merely because its value happens to be a type.
 
+A type applied in host code describes a value of it, converted where it meets that type:
+`I32(n)` (a Lua number converted as C converts it, toward zero, and range-checked) and
+`Fixed { raw = … }`. `type_of(x)` is the native type of a staged value, `nil` for a Lua value:
+host code chooses with it, as a library word checks that an index is unsigned (§9.12).
+
 
 ### 2.3 Generic types are ordinary Lua functions
 
@@ -2519,6 +2524,7 @@ caller. No runtime dispatch, inheritance or object model is involved (§22).
 | `__cast(v, T)` | a host value or other-typed value where a `T` is expected, and `T(v)` | a `T`, or `nil` to refuse |
 | `__add` `__sub` `__mul` `__div` `__mod` `__unm` | arithmetic | a `T`; the other operand is first converted through `__cast` |
 | `__eq` `__lt` `__le` | comparisons; `~=`, `>` and `>=` derive from them | a `Bool` |
+| `__release(r)` | the end of an owner's life, for a type owning allocations of its own (a buffer) | nothing; it releases the owning contents first |
 
 `__eq` is the one hook with a restriction outside its own type: a type that
 defines it, or a type a key encoding walks through, cannot be a map key (§15.2).
@@ -2598,6 +2604,11 @@ their hooks on their types. `Ptr`, `Slice`, `Atomic`, `Chan`, `Array`, `Pool` an
 Lua string where a `Str` is expected is `Str.__cast`. What remains outside the
 hooks is the default: struct fields, struct methods, and the error for a sum.
 
+A library serves a family with `family(Buffer, provider)`: `provider(T)` answers the members
+of every `Buffer T`, its methods and its hooks (`__index` returning the element's place,
+`__cast` building one from a table, `__release`). A type's own members come before its
+family's. Members belong to the compilation that defines them.
+
 ### 16.2 What this does not provide
 
 Hooks do not hide a representation: a struct's fields stay visible unless its
@@ -2637,7 +2648,10 @@ and per length. Types with computed members and built-in methods carry
 one generated `__member`. A Lua string where a `Str` is expected is `Str.__cast`.
 
 **Comparisons are native words.** Comparisons are staged only in typed bodies
-(§4), so a hook that compares must be a word that returns a `Bool`. An
+(§4), so a hook that compares must be a word that returns a `Bool`. A Lua hook receives
+staged values whose Lua operations are evaluation operations on its caller's path; a Lua
+comparison must answer a Lua boolean, so it is answered only when both sides are known (and
+Lua compares a staged value with a number not at all). An
 arithmetic or conversion hook may be an untyped Lua function that only builds
 values or chooses words.
 
