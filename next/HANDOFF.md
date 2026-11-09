@@ -18,11 +18,13 @@ requirements and packs, opening (records, tables, store slots, anonymous homes),
 **Done since this handoff was written:** work package 1, except what its section below lists
 as still open.
 
-**Not started:** the libgccjit backend, and the scheduler with the rest of §20. The old compiler
-in `nua/` still runs and stays until cutover.
+**Also done:** work package 2, the libgccjit backend, apart from what its section lists.
+
+**Not started:** the scheduler with the rest of §20. The old compiler in `nua/` still runs and
+stays until cutover.
 
 **Version control.** All work is in the jj stack below `@` on top of `master`; nothing is
-pushed. The top change is the optimizer's, described, on top of `pqumypyu`. `master` has
+pushed. The top two changes are the optimizer's and the libgccjit backend's, on top of `pqumypyu`. `master` has
 not moved.
 
 **Mua pin.** `tools/mua.lock` pins commit `50a7a86`, which exists only on branch
@@ -195,6 +197,28 @@ The list that follows is the original plan.
 **Contract:** C and libgccjit consume the same prepared IR, with no duplicated semantics or
 runtime definitions (`AGENTS.md`, compiler activities §1).
 `emit prepared target -> BackendProduct`. It depends on the certificate from work package 1.
+
+**Built:** `nua/emit_jit.mua`, `nua/compiler/gccjit.mua` (the FFI over
+`nua/gccjit_declarations.mua`), and `nua/compiler/probe.mua`. `make test-next-jit` runs every native
+test through libgccjit; `NUA_BACKEND=jit` or `options.backend` selects it in the harness.
+`tests/jit.mua` covers what is specific to it.
+
+**How it reaches C:**
+
+- Header knowledge (`ForeignValue`, `cstruct` layouts, `Foreign.reads`) comes from a small C
+  program compiled once and cached by its text under `NUA_CACHE`.
+- The mechanisms of `nua_platform.h` are one process-wide shared library, built from that header
+  with one entry point per binding of `platform.mua` (`jit_symbol`) and cached the same way. No
+  mechanism is written twice. Its state (the ledger, the allocator's context, the store-token
+  counter) is therefore per process under libgccjit and per unit under C.
+- So libgccjit needs a C compiler once per header version, unlike the old C reader in
+  `nua/cjit.lua`, which is not ported.
+
+**Still open:** `emit` takes a request table rather than `Target` and `BackendProduct` (§7.5). A
+`cstruct` with overlapping fields is refused, since a union's members have no one layout here. A
+foreign function that is a macro in its header does not link.
+
+The list that follows is the original plan.
 
 **What exists to reuse:** the old `nua/jitgen.lua` (993 lines), `nua/cjit.lua` (1890 lines, C
 type rules and a reader for the runtime header's C subset) and `nua/probe.lua` (257 lines,

@@ -31,7 +31,10 @@ fi
 if [[ $mode == install || $mode == all ]]; then
     [[ -d $src/mua ]] || { echo 'Mua is not fetched; run bash tools/mua.sh fetch.' >&2; exit 1; }
     rm -rf "$dest"; mkdir -p "$dest"
-    install -m 644 "$src"/mua/*.lua "$dest"/
+    # every module, including the subpackages (`mua/specialize`, `mua/runtime`)
+    while IFS= read -r module; do
+        install -D -m 644 "$src/$module" "$dest/${module#mua/}"
+    done < <(cd "$src" && find mua -name '*.lua' | sort)
     printf '%s\n' "$MUA_COMMIT" > "$mark"
     echo "Mua $MUA_COMMIT installed in .local/share/lua/5.1/mua."
 fi

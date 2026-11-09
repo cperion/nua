@@ -1,0 +1,864 @@
+-- The libgccjit backend (compiler activities §1, §7.5): the prepared program built with gccjit
+-- calls where `emit_c` writes C. It reads the same graph and the same native rules; what it knows
+-- of a header it learns from `probe`, and the platform mechanisms are the ones `nua_platform.h`
+-- defines, reached by their `jit_symbol`.
+--
+--   emit(prepared, { kind = "shared" | "object", path = ... })  -> { path = ... }
+--   emit(prepared, { kind = "loaded" })                         -> { exports, release }
+--
+-- gccjit converts nothing implicitly, so the conversions C would make are written here: narrow
+-- integers compute in 32 bits and are cast back to their width (syntax §7.1), a shift's count
+-- takes its operand's type, and variadic arguments get C's default promotions.
+
+local ffi = require "ffi"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local rules = require "nua.compiler.rules"
+local graph = require "nua.compiler.graph"
+local platform = require "nua.compiler.platform"
+local preparation = require "nua.compiler.prepare"
+local gccjit = require "nua.compiler.gccjit"
+local probe = require "nua.compiler.probe"
+local emit_c = require "nua.emit_c"
+
+local NativeType, Instruction, Terminator, Operand, NativeConstant = types.NativeType, data.Instruction, data.Terminator, data.Operand, data.NativeConstant
+local Component = data.Component
+local fields_of = emit_c.fields_of
+
+local fail = message -> error("libgccjit backend: " .. message, 2)
+local target = { pointer_bits = 64 }
+
+local is_kind = |native_type, kind| -> NativeType.is(native_type, kind)
+local is_sum = native_type -> is_kind(native_type, types.SumType)
+local is_array = native_type -> is_kind(native_type, types.FixedArrayType)
+local is_pointer_like = native_type -> rules.is_pointer native_type or is_kind(native_type, types.ReferenceType) or is_kind(native_type, types.FunctionType)
+local narrow = native_type -> rules.is_integer native_type and native_type.bits < 32
+local unwrapped = native_type -> is_kind(native_type, types.AtomicType) and native_type.target or native_type
+
+local memory_orders = define
+    relaxed = 0
+    consume = 1
+    acquire = 2
+    release = 3
+    acquire_release = 4
+    sequential = 5
+end
+local atomic_builtins = define
+    read = "load"
+    write = "store"
+    exchange = "exchange"
+    fetch_add = "fetch_add"
+    fetch_subtract = "fetch_sub"
+    fetch_and = "fetch_and"
+    fetch_or = "fetch_or"
+    fetch_xor = "fetch_xor"
+end
+
+-- one gccjit context: its types, globals, static data and imported functions
+local building_unit = do(program, answers)
+    local J = gccjit.library()
+    local context = J.gcc_jit_context_acquire()
+    J.gcc_jit_context_set_int_option(context, J.GCC_JIT_INT_OPTION_OPTIMIZATION_LEVEL, 2)
+    J.gcc_jit_context_set_bool_allow_unreachable_blocks(context, 1)
+    J.gcc_jit_context_set_bool_print_errors_to_stderr(context, 0)
+    J.gcc_jit_context_add_command_line_option(context, "-fPIC")
+    -- Nua's allocator and its reinterprets use storage at more than one pointer type
+    J.gcc_jit_context_add_command_line_option(context, "-fno-strict-aliasing")
+
+    local count = 0
+    local fresh_name = do(prefix)
+        count += 1
+        return prefix .. "_" .. count
+    end
+    local standard = name -> J.gcc_jit_context_get_type(context, J[name])
+    local void, bool, int, size = standard "GCC_JIT_TYPE_VOID", standard "GCC_JIT_TYPE_BOOL", standard "GCC_JIT_TYPE_INT", standard "GCC_JIT_TYPE_SIZE_T"
+    local integer_type = |bytes, signed| -> J.gcc_jit_context_get_int_type(context, bytes, signed and 1 or 0)
+    local int32, uint32, int64 = integer_type(4, true), integer_type(4, false), integer_type(8, true)
+    local bytes_type = integer_type(1, false)
+
+    local integer_rvalue = |gcc_type, value| -> J.gcc_jit_context_new_rvalue_from_long(context, gcc_type, ffi.cast("int64_t", value))
+    local cast = |rvalue, gcc_type| -> J.gcc_jit_context_new_cast(context, nil, rvalue, gcc_type)
+    local new_field = |gcc_type, name| -> J.gcc_jit_context_new_field(context, nil, gcc_type, name)
+    local array_of = gccjit.array_of
+
+    --------------------------------------------------------------------------------------------
+    -- Types. A struct is declared before its fields, so a pointer inside it can name it; `shapes`
+    -- holds what a field access needs.
+
+    local shapes, memo, opaque = {}, {}, {}
+    local gcc_type
+
+    local declaring_struct = do(native_type, label)
+        local handle = J.gcc_jit_context_new_opaque_struct(context, nil, fresh_name(label))
+        local shape = { struct = handle, type = J.gcc_jit_struct_as_type(handle), fields = {}, order = {} }
+        shapes[native_type] = shape
+        memo[native_type] = shape.type
+        return shape
+    end
+    local add_member = do(shape, name, member_type)
+        local field = new_field(member_type, name)
+        shape.fields[name] = field
+        shape.order[#shape.order + 1] = name
+        return field
+    end
+    local finish_struct = do(shape, handles)
+        J.gcc_jit_struct_set_fields(shape.struct, nil, #handles, array_of("gcc_jit_field", handles))
+        return shape.type
+    end
+    local array_type = |element, length| -> J.gcc_jit_context_new_array_type(context, nil, element, length)
+
+    local alignment_of = do(native_type)
+        if is_kind(native_type, types.RecordType) and native_type.c_name then return assert(answers.layout native_type).alignment end
+        return types.layout(native_type, target).alignment
+    end
+
+    -- A `cstruct`: its fields where the header puts them, padded with bytes between. The
+    -- members a program does not name are padding too; C's ABI sees the fields it names.
+    local header_struct = do(native_type, shape)
+        local layout = answers.layout native_type
+        if layout == nil then fail("no layout was probed for " .. native_type.c_name) end
+        local rows = {}
+        for index, field in ipairs native_type.fields do rows[index] = { .field, offset = tonumber(layout.offsets[index]) } end
+        table.sort(rows, |a, b| -> a.offset < b.offset)
+        local handles, cursor, strictest = {}, 0, 1
+        local pad_to = do(offset)
+            if offset > cursor then
+                handles[#handles + 1] = new_field(array_type(bytes_type, offset - cursor), fresh_name "padding")
+                cursor = offset
+            end
+        end
+        for _, row in ipairs rows do
+            if row.offset < cursor then fail(native_type.c_name .. ": overlapping fields have no libgccjit layout") end
+            local member = gcc_type row.field.type
+            local natural = alignment_of row.field.type
+            pad_to row.offset
+            if row.offset % natural ~= 0 then member = J.gcc_jit_type_get_aligned(member, 1) else strictest = math.max(strictest, natural) end
+            handles[#handles + 1] = add_member(shape, row.field.name, member)
+            cursor = row.offset + (is_kind(row.field.type, types.RecordType) and row.field.type.c_name and answers.layout(row.field.type).size or types.layout(row.field.type, target).size)
+        end
+        pad_to(tonumber layout.size)
+        finish_struct(shape, handles)
+        if tonumber layout.alignment > strictest then
+            shape.type = J.gcc_jit_type_get_aligned(shape.type, layout.alignment)
+            memo[native_type] = shape.type
+        end
+        return shape.type
+    end
+
+    local plain_struct = do(native_type, label)
+        local shape = declaring_struct(native_type, label)
+        local handles = {}
+        for _, field in ipairs(fields_of native_type) do handles[#handles + 1] = add_member(shape, field.name, gcc_type field.type) end
+        return finish_struct(shape, handles)
+    end
+
+    local integer_named = |node, recurse| -> integer_type(node.bits / 8, node.signed)
+    local Spelling = define
+        IntegerType = integer_named
+        FloatType = |node, recurse| -> standard(node.bits == 32 and "GCC_JIT_TYPE_FLOAT" or "GCC_JIT_TYPE_DOUBLE")
+        BooleanType = |node, recurse| -> bool
+        UnitType = |node, recurse| -> void
+        PointerType = |node, recurse| -> J.gcc_jit_type_get_pointer(gcc_type node.target)
+        ReferenceType = |node, recurse| -> J.gcc_jit_type_get_pointer(gcc_type node.target)
+        ViewType = |node, recurse| -> plain_struct(node, "view")
+        BufferType = |node, recurse| -> plain_struct(node, "buffer")
+        AtomicType = |node, recurse| -> gcc_type node.target
+        RecordType = do(node, recurse)
+            if node.c_name then return header_struct(node, declaring_struct(node, "header_record")) end
+            return plain_struct(node, "record")
+        end
+        FixedArrayType = do(node, recurse)
+            if node.count == 0 then fail "an array of no elements has no libgccjit layout" end
+            local shape = declaring_struct(node, "array")
+            return finish_struct(shape, { add_member(shape, "e", array_type(gcc_type node.element, node.count)) })
+        end
+        SumType = do(node, recurse)
+            local shape = declaring_struct(node, "sum")
+            local handles = { add_member(shape, "tag", uint32) }
+            local members = {}
+            shape.alternatives = {}
+            for _, alternative in ipairs node.alternatives do
+                if alternative.payload ~= types.Unit then
+                    local field = new_field(gcc_type alternative.payload, alternative.name)
+                    shape.alternatives[alternative.name] = field
+                    members[#members + 1] = field
+                end
+            end
+            if #members > 0 then
+                local union = J.gcc_jit_context_new_union_type(context, nil, fresh_name "payload", #members, array_of("gcc_jit_field", members))
+                handles[#handles + 1] = add_member(shape, "as", union)
+            end
+            return finish_struct(shape, handles)
+        end
+        FunctionType = do(node, recurse)
+            local parameters = {}
+            for index, parameter in ipairs node.parameters do parameters[index] = gcc_type parameter end
+            return J.gcc_jit_context_new_function_ptr_type(context, nil, gcc_type node.result, #parameters, array_of("gcc_jit_type", parameters), node.variadic and 1 or 0)
+        end
+        OpaqueType = do(node, recurse)
+            local found = opaque[node.name]
+            if found == nil then
+                found = J.gcc_jit_struct_as_type(J.gcc_jit_context_new_opaque_struct(context, nil, fresh_name "opaque"))
+                opaque[node.name] = found
+            end
+            return found
+        end
+    end
+    local spell_type = NativeType.pass "a native type in gccjit" with ..Spelling end
+    gcc_type = do(native_type)
+        local found = memo[native_type]
+        if found then return found end
+        found = spell_type native_type
+        memo[native_type] = found
+        return found
+    end
+    local shape_of = do(native_type)
+        gcc_type native_type
+        return shapes[native_type]
+    end
+
+    --------------------------------------------------------------------------------------------
+    -- Functions, globals and constants
+
+    local imported = {}
+    local import_function = do(name, parameter_types, result_type, variadic)
+        local key = name .. ":" .. tostring(variadic)
+        for _, parameter in ipairs parameter_types do key = key .. ":" .. types.describe parameter end
+        local found = imported[key]
+        if found then return found end
+        local parameters = {}
+        for index, parameter in ipairs parameter_types do parameters[index] = J.gcc_jit_context_new_param(context, nil, gcc_type parameter, "a" .. index) end
+        found = J.gcc_jit_context_new_function(context, nil, J.GCC_JIT_FUNCTION_IMPORTED, gcc_type result_type, name, #parameters, array_of("gcc_jit_param", parameters), variadic and 1 or 0)
+        imported[key] = found
+        return found
+    end
+
+    local builtin = do(name)
+        local found = J.gcc_jit_context_get_builtin_function(context, name)
+        if found == nil then
+            gccjit.check context
+            fail("no builtin " .. name)
+        end
+        return found
+    end
+    -- a builtin's call, each argument cast to the type the builtin declares
+    local call_builtin = do(name, arguments)
+        local function_handle = builtin name
+        local converted = {}
+        for index, argument in ipairs arguments do
+            local parameter = J.gcc_jit_function_get_param(function_handle, index - 1)
+            converted[index] = cast(argument, J.gcc_jit_rvalue_get_type(J.gcc_jit_param_as_rvalue parameter))
+        end
+        return J.gcc_jit_context_new_call(context, nil, function_handle, #converted, array_of("gcc_jit_rvalue", converted))
+    end
+
+    -- A text literal's bytes as one internal array, with the NUL C would give it
+    local static_arrays = {}
+    local static_array = do(bytes)
+        local found = static_arrays[bytes]
+        if found then return found end
+        local blob = bytes .. "\0"
+        found = J.gcc_jit_context_new_global(context, nil, J.GCC_JIT_GLOBAL_INTERNAL, array_type(bytes_type, #blob), fresh_name "static_bytes")
+        J.gcc_jit_global_set_initializer(found, blob, #blob)
+        static_arrays[bytes] = found
+        return found
+    end
+
+    local constant_rvalue
+    local zero_of = do(native_type)
+        local gcc = gcc_type native_type
+        if shapes[native_type] then return J.gcc_jit_context_new_struct_constructor(context, nil, gcc, 0, nil, nil) end
+        if is_pointer_like native_type then return J.gcc_jit_context_null(context, gcc) end
+        return J.gcc_jit_context_zero(context, gcc)
+    end
+
+    local unspelled = do(bits, recurse, constant)
+        fail("a constant of " .. types.describe constant.type .. " has no libgccjit form")
+    end
+    local global_handles, function_handles = {}, {}
+    local Constants = define
+        IntegerBits = do(bits, recurse, constant)
+            if is_pointer_like constant.type then
+                if bits.bits ~= 0ULL then fail "a pointer constant other than null has no form" end
+                return J.gcc_jit_context_null(context, gcc_type constant.type)
+            end
+            return integer_rvalue(gcc_type constant.type, rules.integer_value constant)
+        end
+        FloatBits = |bits, recurse, constant| -> J.gcc_jit_context_new_rvalue_from_double(context, gcc_type constant.type, bits.value)
+        BooleanBit = |bits, recurse, constant| -> J.gcc_jit_context_new_rvalue_from_int(context, bool, bits.value and 1 or 0)
+        UnitBits = unspelled
+        AggregateBits = do(bits, recurse, constant)
+            local shape = shape_of constant.type
+            local members, values = {}, {}
+            for index, field in ipairs(fields_of constant.type) do
+                members[index] = shape.fields[field.name]
+                values[index] = constant_rvalue(data.Constant { type = field.type, bits = bits.parts[index] })
+            end
+            return J.gcc_jit_context_new_struct_constructor(context, nil, shape.type, #values, array_of("gcc_jit_field", members), array_of("gcc_jit_rvalue", values))
+        end
+        StaticBytes = unspelled
+        SymbolAddress = do(bits, recurse, constant)
+            local global = global_handles[bits.name]
+            if global then return cast(J.gcc_jit_lvalue_get_address(global, nil), gcc_type constant.type) end
+            if is_kind(constant.type, types.FunctionType) then
+                local function_handle = import_function(bits.name, constant.type.parameters, constant.type.result, constant.type.variadic)
+                return J.gcc_jit_function_get_address(function_handle, nil)
+            end
+            fail("the symbol " .. bits.name .. " is not a global of the program")
+        end
+        ForeignValue = do(bits, recurse, constant)
+            local value = answers.value bits.name
+            if value == nil then fail("no value was probed for " .. bits.name) end
+            if rules.is_float constant.type then return J.gcc_jit_context_new_rvalue_from_double(context, gcc_type constant.type, value) end
+            if rules.is_boolean constant.type then return J.gcc_jit_context_new_rvalue_from_int(context, bool, value ~= 0 and 1 or 0) end
+            if is_pointer_like constant.type then return J.gcc_jit_context_new_bitcast(context, nil, integer_rvalue(int64, value), gcc_type constant.type) end
+            return integer_rvalue(gcc_type constant.type, value)
+        end
+        ZeroBits = |bits, recurse, constant| -> zero_of constant.type
+        StaticAddress = do(bits, recurse, constant)
+            local element = J.gcc_jit_context_new_array_access(context, nil, J.gcc_jit_lvalue_as_rvalue(static_array bits.bytes), J.gcc_jit_context_new_rvalue_from_int(context, int, bits.offset))
+            return cast(J.gcc_jit_lvalue_get_address(element, nil), gcc_type constant.type)
+        end
+        DefinitionAddress = do(bits, recurse, constant)
+            return cast(J.gcc_jit_function_get_address(function_handles[bits.definition], nil), gcc_type constant.type)
+        end
+    end
+    local constant_bits = NativeConstant.pass "a constant in gccjit" with ..Constants end
+    constant_rvalue = do(constant)
+        if is_kind(constant.type, types.AtomicType) then return constant_rvalue(data.Constant { type = constant.type.target, bits = constant.bits }) end
+        return constant_bits(constant.bits, constant)
+    end
+
+    local global_kind = do(global)
+        if global.imported then return J.GCC_JIT_GLOBAL_IMPORTED end
+        return global.exported and J.GCC_JIT_GLOBAL_EXPORTED or J.GCC_JIT_GLOBAL_INTERNAL
+    end
+    local declare_globals = do()
+        local ordered = {}
+        for _, global in pairs program.globals do ordered[#ordered + 1] = global end
+        table.sort(ordered, |a, b| -> a.id.serial < b.id.serial)
+        for _, global in ipairs ordered do
+            local handle = J.gcc_jit_context_new_global(context, nil, global_kind global, gcc_type global.type, global.name)
+            if global.policy == "thread_local" then J.gcc_jit_lvalue_set_tls_model(handle, J.GCC_JIT_TLS_MODEL_GLOBAL_DYNAMIC) end
+            global_handles[global.name] = handle
+        end
+        for _, global in ipairs ordered do
+            if not global.imported then
+                if not data.GlobalInitializer.is(global.initializer, data.StaticValue) then fail("the global " .. global.name .. " has no static initializer") end
+                local value = global.initializer.value
+                if not NativeConstant.is(value, data.ZeroBits) then
+                    J.gcc_jit_global_set_initializer_rvalue(global_handles[global.name], constant_rvalue(data.Constant { type = global.type, bits = value }))
+                end
+            end
+        end
+    end
+
+    return define
+        .J
+        .context
+        .void
+        .bool
+        .int
+        .size
+        .int32
+        .uint32
+        .int64
+        .integer_type
+        .integer_rvalue
+        .cast
+        .array_of
+        .fresh_name
+        .gcc_type
+        .shape_of
+        .constant_rvalue
+        .zero_of
+        .import_function
+        .builtin
+        .call_builtin
+        .static_array
+        .declare_globals
+        .function_handles
+        .answers
+    end
+end
+
+local binary_operators = define
+    add = "GCC_JIT_BINARY_OP_PLUS"
+    subtract = "GCC_JIT_BINARY_OP_MINUS"
+    multiply = "GCC_JIT_BINARY_OP_MULT"
+    divide = "GCC_JIT_BINARY_OP_DIVIDE"
+    remainder = "GCC_JIT_BINARY_OP_MODULO"
+    bit_and = "GCC_JIT_BINARY_OP_BITWISE_AND"
+    bit_or = "GCC_JIT_BINARY_OP_BITWISE_OR"
+    bit_xor = "GCC_JIT_BINARY_OP_BITWISE_XOR"
+    shift_left = "GCC_JIT_BINARY_OP_LSHIFT"
+    shift_right_signed = "GCC_JIT_BINARY_OP_RSHIFT"
+    shift_right_unsigned = "GCC_JIT_BINARY_OP_RSHIFT"
+end
+local comparisons = define
+    equal = "GCC_JIT_COMPARISON_EQ"
+    not_equal = "GCC_JIT_COMPARISON_NE"
+    less = "GCC_JIT_COMPARISON_LT"
+    less_equal = "GCC_JIT_COMPARISON_LE"
+end
+
+-- one definition's body (writing compilers §4.6): its locals, blocks and the block being written
+local building_definition = do(unit, program, definition)
+    local J, context, gcc_type, cast = unit.J, unit.context, unit.gcc_type, unit.cast
+    local function_handle = unit.function_handles[definition.id]
+    local values, homes, block_parameters, gcc_blocks = {}, {}, {}, {}
+    local current = nil
+
+    local new_local = |gcc, name| -> J.gcc_jit_function_new_local(function_handle, nil, gcc, name)
+    local value_local = do(id, native_type)
+        local found = values[id]
+        if found == nil then
+            found = new_local(gcc_type native_type, unit.fresh_name "value")
+            values[id] = found
+        end
+        return found
+    end
+    for position, block in ipairs definition.blocks do
+        gcc_blocks[block.id] = J.gcc_jit_function_new_block(function_handle, "block" .. position)
+        block_parameters[block.id] = {}
+        for index, parameter in ipairs block.arguments do
+            block_parameters[block.id][index] = new_local(gcc_type parameter.type, ("block%d_%d"):format(position, index))
+        end
+    end
+    local assign = |lvalue, rvalue| -> J.gcc_jit_block_add_assignment(current, nil, lvalue, rvalue)
+    local parameter_handle = index -> J.gcc_jit_function_get_param(function_handle, index - 1)
+
+    local Reading = define
+        Constant = |node, recurse| -> unit.constant_rvalue node
+        Parameter = |node, recurse| -> J.gcc_jit_param_as_rvalue(parameter_handle node.index)
+        BlockArgument = |node, recurse| -> J.gcc_jit_lvalue_as_rvalue(block_parameters[node.block][node.index])
+        Result = |node, recurse| -> J.gcc_jit_lvalue_as_rvalue(value_local(node.value, node.type))
+    end
+    local operand = Operand.pass "an operand as a gccjit rvalue" with ..Reading end
+
+    -- an operand as an lvalue, for reaching into an aggregate; a constant gets a temporary
+    local Locating = define
+        Constant = do(node, recurse)
+            local temporary = new_local(gcc_type node.type, unit.fresh_name "constant")
+            assign(temporary, unit.constant_rvalue node)
+            return temporary
+        end
+        Parameter = |node, recurse| -> J.gcc_jit_param_as_lvalue(parameter_handle node.index)
+        BlockArgument = |node, recurse| -> block_parameters[node.block][node.index]
+        Result = |node, recurse| -> value_local(node.value, node.type)
+    end
+    local operand_lvalue = Operand.pass "an operand as a gccjit lvalue" with ..Locating end
+
+    -- one step into an aggregate: the lvalue reached and the type it has
+    local step_into = do(lvalue, native_type, component)
+        if Component.is(component, data.FieldComponent) then
+            local shape = unit.shape_of native_type
+            local field = shape and shape.fields[component.name]
+            if field == nil then fail(types.describe native_type .. " has no field " .. component.name) end
+            local next_type
+            if is_sum native_type then
+                next_type = types.U32
+            else
+                for _, candidate in ipairs(fields_of native_type) do
+                    if candidate.name == component.name then next_type = candidate.type end
+                end
+            end
+            return J.gcc_jit_lvalue_access_field(lvalue, nil, field), next_type
+        end
+        if Component.is(component, data.AlternativeComponent) then
+            local shape = unit.shape_of native_type
+            local payload = J.gcc_jit_lvalue_access_field(lvalue, nil, shape.fields["as"])
+            return J.gcc_jit_lvalue_access_field(payload, nil, shape.alternatives[component.name]), types.alternative_of(native_type, component.name).payload
+        end
+        if Component.is(component, data.ElementComponent) and is_array native_type then
+            local elements = J.gcc_jit_lvalue_access_field(lvalue, nil, unit.shape_of(native_type).fields.e)
+            return J.gcc_jit_context_new_array_access(context, nil, J.gcc_jit_lvalue_as_rvalue elements, operand component.index), native_type.element
+        end
+        fail("this component of " .. types.describe native_type .. " has no libgccjit form")
+    end
+    local walk_path = do(lvalue, native_type, path)
+        for _, component in ipairs path do lvalue, native_type = step_into(lvalue, unwrapped native_type, component) end
+        return lvalue
+    end
+
+    -- A local that needs memory has one home per root; its components are paths from it.
+    local root_place = do(place)
+        if #place.path == 0 then return place end
+        for _, candidate in pairs definition.places do
+            if candidate.root == place.root and #candidate.path == 0 then return candidate end
+        end
+        fail "a component place has no root place"
+    end
+    local home_of = do(place)
+        local found = homes[place.root]
+        if found == nil then
+            found = new_local(gcc_type place.type, unit.fresh_name "home")
+            homes[place.root] = found
+        end
+        return found
+    end
+    local through_pointer = do(root, recurse, place)
+        return J.gcc_jit_rvalue_dereference(operand root.pointer, nil), root.pointer.type.target
+    end
+    local unspelled_root = |root, recurse, place| -> fail("a place rooted in " .. tostring(getmetatable root) .. " has no libgccjit form")
+    local Roots = define
+        LocalRoot = do(root, recurse, place)
+            local base = root_place place
+            return home_of base, base.type
+        end
+        GlobalRoot = unspelled_root
+        ParameterRoot = do(root, recurse, place)
+            local pointer = J.gcc_jit_param_as_rvalue(parameter_handle root.parameter)
+            return J.gcc_jit_rvalue_dereference(pointer, nil), definition.signature.parameters[root.parameter].target
+        end
+        IndirectRoot = through_pointer
+        ForeignRoot = unspelled_root
+        RawRoot = through_pointer
+    end
+    local root_lvalue = data.PlaceRoot.pass "a place's root in gccjit" with ..Roots end
+    local place_lvalue = do(place)
+        local lvalue, native_type = root_lvalue(place.root, place)
+        return walk_path(lvalue, native_type, place.path)
+    end
+
+    local int_constant = value -> J.gcc_jit_context_new_rvalue_from_int(context, unit.int, value)
+    local binary = |operator, gcc, a, b| -> J.gcc_jit_context_new_binary_op(context, nil, J[operator], gcc, a, b)
+    local unary = |operator, gcc, a| -> J.gcc_jit_context_new_unary_op(context, nil, J[operator], gcc, a)
+    local wide_of = native_type -> native_type.signed and unit.int32 or unit.uint32
+
+    local general_binary = do(node, a, b)
+        local opcode = node.opcode
+        local left, right = operand a, operand b
+        if comparisons[opcode] then return J.gcc_jit_context_new_comparison(context, nil, J[comparisons[opcode]], left, right) end
+        local result_type = gcc_type node.type
+        if node.type == types.Bool then
+            if opcode == "bit_xor" then return J.gcc_jit_context_new_comparison(context, nil, J.GCC_JIT_COMPARISON_NE, left, right) end
+            return binary(opcode == "bit_and" and "GCC_JIT_BINARY_OP_LOGICAL_AND" or "GCC_JIT_BINARY_OP_LOGICAL_OR", result_type, left, right)
+        end
+        local operator = binary_operators[opcode]
+        if operator == nil then fail("the opcode " .. opcode .. " has no form") end
+        if narrow node.type and node.type == a.type then
+            local wide = wide_of node.type
+            return cast(binary(operator, wide, cast(left, wide), cast(right, wide)), result_type)
+        end
+        -- gccjit wants both operands of one type; only a shift's may differ
+        if a.type ~= b.type then right = cast(right, gcc_type a.type) end
+        return binary(operator, result_type, left, right)
+    end
+    local scalar_bits = from -> rules.is_numeric from or rules.is_boolean from
+    local Opcodes = define
+        convert = |node, a, b| -> cast(operand a, gcc_type node.type)
+        pointer_offset = do(node, a, b)
+            return J.gcc_jit_lvalue_get_address(J.gcc_jit_context_new_array_access(context, nil, operand a, operand b), nil)
+        end
+        pointer_difference = do(node, a, b)
+            local bits = value -> J.gcc_jit_context_new_bitcast(context, nil, value, unit.int64)
+            local left, right = bits(operand a), bits(operand b)
+            local element = cast(J.gcc_jit_context_new_sizeof(context, gcc_type a.type.target), unit.int64)
+            return binary("GCC_JIT_BINARY_OP_DIVIDE", unit.int64, binary("GCC_JIT_BINARY_OP_MINUS", unit.int64, left, right), element)
+        end
+        reinterpret = do(node, a, b)
+            local from, to = unwrapped a.type, unwrapped node.type
+            local result_type = gcc_type node.type
+            if is_pointer_like from and is_pointer_like to then return cast(operand a, result_type) end
+            if is_pointer_like from or is_pointer_like to then return J.gcc_jit_context_new_bitcast(context, nil, operand a, result_type) end
+            if scalar_bits from and scalar_bits to and (rules.is_float from or rules.is_float to) then return J.gcc_jit_context_new_bitcast(context, nil, operand a, result_type) end
+            return cast(operand a, result_type)
+        end
+        negate = do(node, a, b)
+            local result_type = gcc_type node.type
+            if rules.is_float node.type then return unary("GCC_JIT_UNARY_OP_MINUS", result_type, operand a) end
+            if narrow node.type then
+                local wide = wide_of node.type
+                return cast(unary("GCC_JIT_UNARY_OP_MINUS", wide, cast(operand a, wide)), result_type)
+            end
+            if not node.type.signed then return binary("GCC_JIT_BINARY_OP_MINUS", result_type, J.gcc_jit_context_zero(context, result_type), operand a) end
+            return unary("GCC_JIT_UNARY_OP_MINUS", result_type, operand a)
+        end
+        bit_not = do(node, a, b)
+            local result_type = gcc_type node.type
+            if node.type == types.Bool then return unary("GCC_JIT_UNARY_OP_LOGICAL_NEGATE", result_type, operand a) end
+            if narrow node.type then
+                local wide = wide_of node.type
+                return cast(unary("GCC_JIT_UNARY_OP_BITWISE_NEGATE", wide, cast(operand a, wide)), result_type)
+            end
+            return unary("GCC_JIT_UNARY_OP_BITWISE_NEGATE", result_type, operand a)
+        end
+    end
+
+    -- arguments in the C calling convention's variadic form: default promotions
+    local promoted = do(argument)
+        local value = operand argument
+        local native_type = argument.type
+        if rules.is_float native_type and native_type.bits == 32 then return cast(value, gcc_type types.F64) end
+        if rules.is_boolean native_type then return cast(value, unit.int) end
+        if narrow native_type then return cast(value, unit.int) end
+        return value
+    end
+    local foreign_function = callee -> unit.import_function(callee.pointer.bits.name, callee.signature.parameters, callee.signature.result, callee.signature.variadic)
+
+    local finish_call = do(node, call, result_type)
+        if node.result and result_type ~= types.Unit then
+            assign(value_local(node.result, result_type), call)
+        else
+            J.gcc_jit_block_add_eval(current, nil, call)
+        end
+    end
+    local operands_of = do(list)
+        local rvalues = {}
+        for index, argument in ipairs list do rvalues[index] = operand argument end
+        return rvalues
+    end
+    local call_of = |function_value, rvalues| -> J.gcc_jit_context_new_call(context, nil, function_value, #rvalues, unit.array_of("gcc_jit_rvalue", rvalues))
+
+    local by_bits = native_type -> rules.is_float native_type or is_pointer_like native_type
+    local atomic_bits = do(value, native_type, bits_type)
+        if by_bits native_type then return J.gcc_jit_context_new_bitcast(context, nil, value, bits_type) end
+        return cast(value, bits_type)
+    end
+    local atomic_value = do(value, native_type, bits_type)
+        if by_bits native_type then return J.gcc_jit_context_new_bitcast(context, nil, value, gcc_type native_type) end
+        return cast(value, gcc_type native_type)
+    end
+
+    local nothing = |node, recurse| -> nil
+    local Building = define
+        Compute = do(node, recurse)
+            local spell = Opcodes[node.opcode] or general_binary
+            assign(value_local(node.result, node.type), spell(node, node.arguments[1], node.arguments[2]))
+        end
+        Pack = do(node, recurse)
+            local result = value_local(node.result, node.type)
+            if is_sum node.type then
+                assign(result, unit.zero_of node.type)
+                local shape = unit.shape_of node.type
+                assign(J.gcc_jit_lvalue_access_field(result, nil, shape.fields.tag), operand(node.components[1]))
+                if node.components[2] then
+                    local alternative = node.type.alternatives[tonumber(node.components[1].bits.bits) + 1]
+                    local payload = J.gcc_jit_lvalue_access_field(result, nil, shape.fields["as"])
+                    assign(J.gcc_jit_lvalue_access_field(payload, nil, shape.alternatives[alternative.name]), operand(node.components[2]))
+                end
+                return
+            end
+            local shape = unit.shape_of node.type
+            if is_array node.type then
+                local elements = J.gcc_jit_lvalue_access_field(result, nil, shape.fields.e)
+                for index, component in ipairs node.components do
+                    assign(J.gcc_jit_context_new_array_access(context, nil, J.gcc_jit_lvalue_as_rvalue elements, int_constant(index - 1)), operand component)
+                end
+                return
+            end
+            if shape == nil then fail("packing " .. types.describe node.type .. " has no form") end
+            if NativeType.is(node.type, types.RecordType) and node.type.c_name then assign(result, unit.zero_of node.type) end
+            for index, field in ipairs(fields_of node.type) do
+                assign(J.gcc_jit_lvalue_access_field(result, nil, shape.fields[field.name]), operand(node.components[index]))
+            end
+        end
+        Extract = do(node, recurse)
+            local reached = walk_path(operand_lvalue node.aggregate, node.aggregate.type, node.path)
+            assign(value_local(node.result, node.type), J.gcc_jit_lvalue_as_rvalue reached)
+        end
+        Load = do(node, recurse)
+            local place = definition.places[node.place]
+            assign(value_local(node.result, place.type), J.gcc_jit_lvalue_as_rvalue(place_lvalue place))
+        end
+        Store = |node, recurse| -> assign(place_lvalue(definition.places[node.place]), operand node.value)
+        Address = do(node, recurse)
+            local place = definition.places[node.place]
+            assign(value_local(node.result, types.pointer place.type), J.gcc_jit_lvalue_get_address(place_lvalue place, nil))
+        end
+        Check = |node, recurse| -> fail "a check has no form yet"
+        Invoke = do(node, recurse)
+            local callee = node.callee
+            if data.Callee.is(callee, data.DirectNua) then
+                local target_definition = program.definitions[callee.definition]
+                return finish_call(node, call_of(unit.function_handles[callee.definition], operands_of node.arguments), target_definition.signature.result)
+            end
+            if data.Callee.is(callee, data.IndirectNua) then
+                local rvalues = operands_of node.arguments
+                return finish_call(node, J.gcc_jit_context_new_call_through_ptr(context, nil, operand callee.pointer, #rvalues, unit.array_of("gcc_jit_rvalue", rvalues)), callee.signature.result)
+            end
+            local result_type = callee.signature.result
+            if callee.reads then
+                local getter = unit.import_function(unit.answers.getter_name(callee.pointer.bits.name), {}, result_type, false)
+                return finish_call(node, call_of(getter, {}), result_type)
+            end
+            local rvalues = {}
+            for index, argument in ipairs node.arguments do
+                if index > #callee.signature.parameters then
+                    rvalues[index] = promoted argument
+                else
+                    rvalues[index] = cast(operand argument, gcc_type callee.signature.parameters[index])
+                end
+            end
+            finish_call(node, call_of(foreign_function callee, rvalues), result_type)
+        end
+        Atomic = do(node, recurse)
+            local target_type = unwrapped node.address.type.target
+            local size = types.layout(target_type, target).size
+            local bits_type = unit.integer_type(size, false)
+            local address = operand node.address
+            local order = int_constant(memory_orders[node.order])
+            local given = {}
+            for index, argument in ipairs node.arguments do given[index] = atomic_bits(operand argument, target_type, bits_type) end
+            if node.opcode == "compare_exchange" then
+                local expected = new_local(bits_type, unit.fresh_name "expected")
+                assign(expected, given[1])
+                local expected_address = J.gcc_jit_lvalue_get_address(expected, nil)
+                local failure = int_constant(memory_orders[node.failure_order])
+                J.gcc_jit_block_add_eval(current, nil, unit.call_builtin(("__atomic_compare_exchange_%d"):format(size), { address, expected_address, given[2], int_constant 0, order, failure }))
+                if node.result then assign(value_local(node.result, target_type), atomic_value(J.gcc_jit_lvalue_as_rvalue expected, target_type, bits_type)) end
+                return
+            end
+            local name = ("__atomic_%s_%d"):format(atomic_builtins[node.opcode], size)
+            local arguments = { address }
+            for _, value in ipairs given do arguments[#arguments + 1] = value end
+            arguments[#arguments + 1] = order
+            local call = unit.call_builtin(name, arguments)
+            if node.opcode == "write" or node.result == nil then
+                J.gcc_jit_block_add_eval(current, nil, call)
+            else
+                assign(value_local(node.result, target_type), atomic_value(call, target_type, bits_type))
+            end
+        end
+        Fence = do(node, recurse)
+            J.gcc_jit_block_add_eval(current, nil, unit.call_builtin("__atomic_thread_fence", { int_constant(memory_orders[node.order]) }))
+        end
+        LifetimeStart = nothing
+        LifetimeEnd = nothing
+        Moves = nothing
+        Ends = nothing
+        Budget = nothing
+        Mechanism = do(node, recurse)
+            local binding = platform.bindings[node.binding]
+            if binding == nil then fail("the mechanism " .. node.binding .. " is not declared") end
+            local rvalues = {}
+            for index, argument in ipairs node.arguments do rvalues[index] = cast(operand argument, gcc_type binding.parameters[index]) end
+            finish_call(node, call_of(unit.import_function(binding.jit_symbol, binding.parameters, binding.result, false), rvalues), binding.result)
+        end
+    end
+    local build_instruction = Instruction.pass "build an instruction with gccjit" with ..Building end
+
+    -- an edge's arguments are assigned at once, through temporaries
+    local pass_arguments = do(edge)
+        local temporaries = {}
+        local targets = block_parameters[edge.target]
+        for index, argument in ipairs edge.arguments do
+            local temporary = new_local(gcc_type argument.type, unit.fresh_name "edge")
+            assign(temporary, operand argument)
+            temporaries[index] = temporary
+        end
+        for index, temporary in ipairs temporaries do assign(targets[index], J.gcc_jit_lvalue_as_rvalue temporary) end
+    end
+    -- the block a branch jumps to for an edge: a landing block when the edge carries arguments
+    local landing = do(edge)
+        if #edge.arguments == 0 then return gcc_blocks[edge.target] end
+        local branching = current
+        current = J.gcc_jit_function_new_block(function_handle, unit.fresh_name "edge_block")
+        local block = current
+        pass_arguments edge
+        J.gcc_jit_block_end_with_jump(current, nil, gcc_blocks[edge.target])
+        current = branching
+        return block
+    end
+    local Endings = define
+        Jump = do(node, recurse)
+            pass_arguments node.edge
+            J.gcc_jit_block_end_with_jump(current, nil, gcc_blocks[node.edge.target])
+        end
+        Branch = do(node, recurse)
+            local condition = operand node.condition
+            local when_true, when_false = landing node.when_true, nil
+            when_false = landing node.when_false
+            J.gcc_jit_block_end_with_conditional(current, nil, condition, when_true, when_false)
+        end
+        Return = do(node, recurse)
+            if node.value == nil or node.value.type == types.Unit then return J.gcc_jit_block_end_with_void_return(current, nil) end
+            J.gcc_jit_block_end_with_return(current, nil, operand node.value)
+        end
+        Trap = do(node, recurse)
+            local message = node.message
+            if Operand.is(message, data.Constant) and NativeConstant.is(message.bits, data.StaticBytes) then
+                local bytes = message.bits.bytes
+                local binding = platform.bindings.fatal_trap
+                local array = J.gcc_jit_lvalue_as_rvalue(unit.static_array bytes)
+                local first = J.gcc_jit_lvalue_get_address(J.gcc_jit_context_new_array_access(context, nil, array, int_constant 0), nil)
+                local arguments = { cast(first, gcc_type binding.parameters[1]), unit.integer_rvalue(gcc_type types.U64, #bytes) }
+                J.gcc_jit_block_add_eval(current, nil, call_of(unit.import_function(binding.jit_symbol, binding.parameters, binding.result, false), arguments))
+            else
+                J.gcc_jit_block_add_eval(current, nil, unit.call_builtin("__builtin_trap", {}))
+            end
+            J.gcc_jit_block_add_eval(current, nil, unit.call_builtin("__builtin_unreachable", {}))
+            J.gcc_jit_block_end_with_jump(current, nil, current)
+        end
+    end
+    local build_terminator = Terminator.pass "build a terminator with gccjit" with ..Endings end
+
+    return do()
+        for _, block in ipairs definition.blocks do
+            current = gcc_blocks[block.id]
+            for _, instruction in ipairs block.instructions do build_instruction instruction end
+            build_terminator block.terminator
+        end
+    end
+end
+
+-- every definition declared first, so definitions may call one another in any order
+local declare_definitions = do(unit, program)
+    local J = unit.J
+    local names, exported = {}, {}
+    for _, export in ipairs program.exports do
+        names[export.definition] = export.name
+        exported[export.definition] = true
+    end
+    for position, definition in ipairs(graph.definitions_in_order program) do
+        local parameters = {}
+        for index, parameter in ipairs definition.signature.parameters do parameters[index] = J.gcc_jit_context_new_param(unit.context, nil, unit.gcc_type parameter, "p" .. index) end
+        local kind = exported[definition.id] and J.GCC_JIT_FUNCTION_EXPORTED or J.GCC_JIT_FUNCTION_INTERNAL
+        local name = names[definition.id] or ("definition_%d"):format(position)
+        unit.function_handles[definition.id] = J.gcc_jit_context_new_function(unit.context, nil, kind, unit.gcc_type definition.signature.result, name, #parameters, unit.array_of("gcc_jit_param", parameters), 0)
+    end
+end
+
+local output_kinds = define
+    shared = "GCC_JIT_OUTPUT_KIND_DYNAMIC_LIBRARY"
+    object = "GCC_JIT_OUTPUT_KIND_OBJECT_FILE"
+end
+
+local emit = do(prepared, request)
+    local program = preparation.certified prepared
+    probe.load_platform()
+    local unit = building_unit(program, probe.answers_for program)
+    local J, context = unit.J, unit.context
+    local built, outcome = pcall(do()
+        unit.declare_globals()
+        declare_definitions(unit, program)
+        for _, definition in ipairs(graph.definitions_in_order program) do
+            building_definition(unit, program, definition)()
+        end
+        gccjit.check context
+        if request.kind == "loaded" then
+            local result = gccjit.compile_in_memory context
+            local exports = {}
+            for _, export in ipairs program.exports do
+                exports[export.name] = { signature = program.definitions[export.definition].signature, address = J.gcc_jit_result_get_code(result, export.name) }
+            end
+            return define
+                .exports
+                release = || -> J.gcc_jit_result_release(result)
+            end
+        end
+        local kind = output_kinds[request.kind]
+        if kind == nil then fail("no output kind " .. tostring(request.kind)) end
+        gccjit.compile_to_file(context, J[kind], request.path)
+        return { path = request.path }
+    end)
+    J.gcc_jit_context_release context
+    if not built then error(outcome, 0) end
+    return outcome
+end
+
+return define
+    .emit
+    available = gccjit.available
+end

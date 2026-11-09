@@ -1,0 +1,85 @@
+-- libgccjit through the FFI: the library, one context's lifetime, and its compilation. The
+-- emitter calls the API by its own names through `library()`; only what needs more than one
+-- call, or a rule of its own, is here.
+
+local ffi = require "ffi"
+
+local fail = message -> error("libgccjit backend: " .. message, 2)
+
+local loaded = nil
+local library = do()
+    if loaded then return loaded end
+    ffi.cdef(require "nua.gccjit_declarations")
+    ffi.cdef [[ int setenv(const char *, const char *, int); int unsetenv(const char *); ]]
+    local name = os.getenv "NUA_GCCJIT" or "libgccjit.so.0"
+    local found, handle = pcall(ffi.load, name)
+    if not found then fail("cannot load " .. name .. " (" .. tostring(handle) .. ")") end
+    loaded = handle
+    return loaded
+end
+
+local available = do()
+    return (pcall(library))
+end
+
+-- the first error of a context, as a refusal
+local check = do(context)
+    local message = library().gcc_jit_context_get_first_error(context)
+    if message ~= nil then fail(ffi.string message) end
+end
+
+-- a list of handles as the array the API takes; nil for none
+local array_of = do(element, list)
+    if #list == 0 then return nil end
+    return ffi.new(element .. "*[?]", #list, list)
+end
+
+local root = debug.getinfo(1, "S").source:match("^@(.*)/next/nua/compiler/gccjit%.mua$") or "."
+local toolchain = root .. "/.local/bin"
+
+local restore_variable = do(name, before)
+    if os.getenv name == before then return end
+    if before then ffi.C.setenv(name, before, 1) else ffi.C.unsetenv name end
+end
+
+-- libgccjit runs the GCC driver by name, so the pinned toolchain goes first on the search path,
+-- and it sets GCC_EXEC_PREFIX in the process environment. The process gets its own environment
+-- back, or a C compiler started later finds the wrong passes.
+local keeping_environment = do(body)
+    local prefix_before, path_before = os.getenv "GCC_EXEC_PREFIX", os.getenv "PATH"
+    local driver = io.open(toolchain .. "/gcc")
+    if driver then
+        driver:close()
+        ffi.C.setenv("PATH", toolchain .. ":" .. (path_before or ""), 1)
+    end
+    local completed, result = pcall body
+    restore_variable("GCC_EXEC_PREFIX", prefix_before)
+    restore_variable("PATH", path_before)
+    if not completed then error(result, 0) end
+    return result
+end
+
+local compile_in_memory = do(context)
+    return keeping_environment(do()
+        local result = library().gcc_jit_context_compile(context)
+        check context
+        if result == nil then fail "the compilation produced no result" end
+        return result
+    end)
+end
+
+local compile_to_file = do(context, kind, path)
+    keeping_environment(do()
+        library().gcc_jit_context_compile_to_file(context, kind, path)
+        check context
+    end)
+end
+
+return define
+    .library
+    .available
+    .check
+    .array_of
+    .compile_in_memory
+    .compile_to_file
+end

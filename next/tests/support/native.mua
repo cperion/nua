@@ -1,10 +1,13 @@
--- Compile Nua source with the replacement compiler, build the C into a shared library under
--- build/next/, and load it: `native(name, source)` answers the loaded library, with each
--- export's prototype declared, and the C text. `options` go to `compile_c`; `optimize = false`
--- builds the program as evaluation left it, whose dead block parameters C must tolerate.
+-- Compile Nua source with the replacement compiler, build it into a shared library under
+-- build/next/ with the backend `options.backend` or NUA_BACKEND names (`c` unless told), and
+-- load it; `native(name, source)` answers the loaded library, with each export's prototype
+-- declared, and the C text, which is made either way from the same prepared program. `options`
+-- go to `compile_c`; `optimize = false` builds the program as evaluation left it, whose dead
+-- block parameters C must tolerate.
 
 local ffi = require "ffi"
 local compile = require "nua.compile"
+local emit_jit = require "nua.emit_jit"
 
 local here = package.searchpath("nua.compile", package.path:gsub("%.lua", ".mua")) or debug.getinfo(1, "S").source:sub(2)
 local root = (package.searchpath("nua.compile", "./next/?.mua") and ".") or here:match("^(.*)/next/") or "."
@@ -14,23 +17,9 @@ local compiler = os.getenv("CC") or (root .. "/.local/bin/gcc")
 local declared = {}
 local declared_names = {}
 
-return do(name, source, options)
-    local text, prototypes = compile.compile_c(source, name .. ".nua", options)
-    os.execute("mkdir -p " .. build)
-    local c_path = ("%s/%s.c"):format(build, name)
-    local library = ("%s/lib%s.so"):format(build, name)
-    local file = assert(io.open(c_path, "w"))
-    file:write(text)
-    file:close()
-    -- the exit status is captured in the output: this LuaJIT's popen close does not report it
-    local command = ("%s -std=c11 -O1 -I%s -Wall -Werror -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -fPIC -shared -o %s %s 2>&1; printf '\\n__STATUS__%%d' $?"):format(compiler, root .. "/next/runtime", library, c_path)
-    local pipe = io.popen(command)
-    local output = pipe:read "*a"
-    pipe:close()
-    local messages, status = output:match("^(.-)\n__STATUS__(%d+)$")
-    if status ~= "0" then error("the C compiler refused " .. c_path .. ":\n" .. tostring(messages or output) .. "\n" .. text, 0) end
-    -- LuaJIT's C declarations are one namespace for the whole run: an export named like an
-    -- earlier test's, with another prototype, is refused here rather than miscalled later
+-- LuaJIT's C declarations are one namespace for the whole run: an export named like an
+-- earlier test's, with another prototype, is refused here rather than miscalled later
+local declared_library = do(library, prototypes, name)
     for _, prototype in ipairs prototypes do
         local function_name = not prototype:find("^typedef") and prototype:match("([%w_]+)%s*%(")
         local earlier = function_name and declared_names[function_name]
@@ -43,5 +32,28 @@ return do(name, source, options)
             if function_name then declared_names[function_name] = prototype end
         end
     end
-    return ffi.load(library), text
+    return ffi.load(library)
+end
+
+return do(name, source, options)
+    local text, prototypes, _, prepared = compile.compile_c(source, name .. ".nua", options)
+    os.execute("mkdir -p " .. build)
+    local backend = options and options.backend or os.getenv "NUA_BACKEND" or "c"
+    local c_path = ("%s/%s.c"):format(build, name)
+    local library = ("%s/lib%s%s.so"):format(build, name, backend == "jit" and "_jit" or "")
+    local file = assert(io.open(c_path, "w"))
+    file:write(text)
+    file:close()
+    if backend == "jit" then
+        emit_jit.emit(prepared, { kind = "shared", path = library })
+        return declared_library(library, prototypes, name), text
+    end
+    -- the exit status is captured in the output: this LuaJIT's popen close does not report it
+    local command = ("%s -std=c11 -O1 -I%s -Wall -Werror -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -fPIC -shared -o %s %s 2>&1; printf '\\n__STATUS__%%d' $?"):format(compiler, root .. "/next/runtime", library, c_path)
+    local pipe = io.popen(command)
+    local output = pipe:read "*a"
+    pipe:close()
+    local messages, status = output:match("^(.-)\n__STATUS__(%d+)$")
+    if status ~= "0" then error("the C compiler refused " .. c_path .. ":\n" .. tostring(messages or output) .. "\n" .. text, 0) end
+    return declared_library(library, prototypes, name), text
 end

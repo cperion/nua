@@ -1,0 +1,125 @@
+-- What is particular to the libgccjit backend (compiler activities §7.5). Every native test also
+-- runs through it under `make test-next-jit`; here are its products and its refusals, and the
+-- conversions C would have made that gccjit does not.
+
+local ffi = require "ffi"
+local compile = require "nua.compile"
+local emit_jit = require "nua.emit_jit"
+local data = require "nua.compiler.data"
+local native = require "tests.support.native"
+
+local jit = { backend = "jit" }
+
+local refuses = do(body, expected)
+    local done, problem = pcall body
+    assert(not done, "expected a refusal")
+    assert(tostring(problem):find(expected, 1, true), tostring problem)
+end
+
+local prepared_of = do(source, name)
+    local _, _, _, prepared = compile.compile_c(source, name .. ".nua")
+    return prepared
+end
+
+local small = [[
+local jit_small = do(a: U32): U32 = a * 3
+export jit_small
+]]
+
+test "a program loaded in this process is called and released":
+    local loaded = emit_jit.emit(prepared_of(small, "jit_loaded"), { kind = "loaded" })
+    local entry = loaded.exports.jit_small
+    assert(entry.signature.result ~= nil)
+    assert(ffi.cast("uint32_t (*)(uint32_t)", entry.address)(14) == 42)
+    loaded.release()
+end
+
+test "an object file is written":
+    os.execute "mkdir -p build/next"
+    local path = "build/next/jit_object.o"
+    os.remove path
+    local product = emit_jit.emit(prepared_of(small, "jit_object"), { kind = "object", path = path })
+    assert(product.path == path)
+    local file = assert(io.open(path, "rb"))
+    assert(file:read(4) == "\127ELF")
+    file:close()
+end
+
+test "the backend refuses a bare program, and an output it does not know":
+    local compiled = compile.compile(small, "jit_bare.nua")
+    refuses(|| -> emit_jit.emit(compiled.program, { kind = "loaded" }), "takes a prepared program")
+    refuses(|| -> emit_jit.emit(prepared_of(small, "jit_kind"), { kind = "nothing" }), "no output kind")
+end
+
+test "the C text does not depend on the libgccjit backend":
+    local text = compile.compile_c(small, "jit_text.nua")
+    emit_jit.emit(prepared_of(small, "jit_text_again"), { kind = "loaded" }).release()
+    assert(text == compile.compile_c(small, "jit_text.nua"))
+    assert(not text:find("jit", 1, true) or text:find("jit_small", 1, true))
+end
+
+local conversions = [[
+local jit_wrap_add = do(a: U8, b: U8): U8 = a + b
+export jit_wrap_add
+local jit_signed_narrow = do(a: I8): I8 = -a
+export jit_signed_narrow
+local jit_shift_mixed = do(a: U32, count: U8): U32 = a << U32 count
+export jit_shift_mixed
+local jit_float_bits = do(x: F32): U32 = reinterpret(U32, x)
+export jit_float_bits
+local jit_text_last = do(index: U64): U8
+    local text: Str = "a\0b"
+    return text[index]
+end
+export jit_text_last
+local jit_flag_xor = do(a: Bool, b: Bool): Bool = a ~= b
+export jit_flag_xor
+]]
+
+test "narrow arithmetic, shifts, float bits, Booleans and text with a NUL":
+    local library = native("jit_conversions", conversions, jit)
+    assert(library.jit_wrap_add(200, 100) == 44)
+    assert(library.jit_signed_narrow(5) == -5)
+    assert(library.jit_shift_mixed(1, 4) == 16)
+    assert(library.jit_float_bits(1.0) == 0x3f800000)
+    assert(library.jit_text_last(1) == 0 and library.jit_text_last(2) == 98)
+    assert(library.jit_flag_xor(true, false) and not library.jit_flag_xor(true, true))
+end
+
+local atomics = [[
+local jit_atomic_pointer = do(p: Ptr U32): U64
+    local cell: Atomic U64 = U64 1
+    cell:add 41
+    return cell:load "acquire"
+end
+export jit_atomic_pointer
+local jit_compare = do(k: U32): U32
+    local a: Atomic U32 = k
+    local before = a:exchange 7
+    return before * 10 + a:load "relaxed"
+end
+export jit_compare
+]]
+
+test "atomics reach gcc's builtins by size":
+    local library = native("jit_atomics", atomics, jit)
+    assert(library.jit_atomic_pointer(nil) == 42)
+    assert(library.jit_compare(3) == 37)
+end
+
+local header_facts = [[
+local Spec = cstruct("struct timespec", "<time.h>", { { "tv_sec", I64 }, { "tv_nsec", I64 } })
+local jit_spec_size = do(): U64 = size_of Spec
+export jit_spec_size
+local jit_spec_sum = do(a: I64, b: I64): I64
+    local spec = Spec { tv_sec = a, tv_nsec = b }
+    return spec.tv_sec * 2 + spec.tv_nsec
+end
+export jit_spec_sum
+]]
+
+test "a cstruct has the header's layout, learned by probing":
+    local library = native("jit_header_facts", header_facts, jit)
+    assert(library.jit_spec_size() == ffi.sizeof "struct { int64_t a; int64_t b; }")
+    assert(library.jit_spec_sum(20, 2) == 42)
+end

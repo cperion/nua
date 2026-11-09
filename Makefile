@@ -7,7 +7,7 @@ ifeq ($(LOCAL_DEPS),1)
 DEPS_PREFIX := $(CURDIR)/.local
 # Subprocesses in the existing harnesses also invoke luajit by name. Keep
 # this PATH target-specific so make deps still finds the host bootstrap GCC.
-NUA_TARGETS := doctor runtime test test-next test-mua test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite test-canvas test-ui
+NUA_TARGETS := doctor runtime test test-next test-next-jit test-mua test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite test-canvas test-ui
 $(NUA_TARGETS): export PATH := $(DEPS_PREFIX)/bin:$(PATH)
 LUA ?= $(DEPS_PREFIX)/bin/luajit
 ifeq ($(origin CC),default)
@@ -35,7 +35,7 @@ export NUA_GCCJIT := $(CURDIR)/.local/lib/libgccjit.so.0
 endif
 endif
 
-.PHONY: mua help doctor dirs runtime test test-next test-mua test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite deps-fetch deps bootstrap test-build
+.PHONY: mua help doctor dirs runtime test test-next test-next-jit test-mua test-format test-modules test-native test-scheduler direct test-direct run tree-sitter test-tree-sitter dist test-dist test-dist-suite deps-fetch deps bootstrap test-build
 
 # Fetching is explicit; deps itself can run with the network disconnected.
 deps-fetch:
@@ -63,7 +63,7 @@ test-tree-sitter: tree-sitter
 	$(NVIM) --headless -u NONE -l tools/nvim-nua/tests/check.lua
 help:
 	@printf '%s\n' 'make bootstrap    Fetch pinned sources, build local dependencies and Nua (64-bit Linux)' 'make deps-fetch   Fetch and verify pinned sources only' 'make deps         Build/install fetched dependencies offline under .local/' 'make test-build   Check build setup without downloading or compiling GCC' 'LOCAL_DEPS=0      Use host dependencies instead of a completed local toolchain'
-	@printf '%s\n' 'make doctor       Check LuaJIT, Mua, C compiler and optional libgccjit' 'make test         Mua checks and complete packaged C/JIT test suite' 'make test-next    The replacement compiler in next/ (upstream LuaJIT from make deps)' 'make test-mua     Nua's front end over Mua, and Mua's own tests' 'make test-format  Formatter semantics, style and CLI regressions' 'make test-modules Lua require and compilation cache regressions' 'make test-native  Require libgccjit and run in-process checks' 'make run PROGRAM=examples/csv.nua ARGS="examples/data/sales.csv price"' 'make tree-sitter  Build the local Nua parser for Neovim' 'make test-tree-sitter  Check parsing and Neovim highlighting'
+	@printf '%s\n' 'make doctor       Check LuaJIT, Mua, C compiler and optional libgccjit' 'make test         Mua checks and complete packaged C/JIT test suite' 'make test-next    The replacement compiler in next/ (upstream LuaJIT from make deps)' 'make test-next-jit The same tests through libgccjit' 'make test-mua     Nua's front end over Mua, and Mua's own tests' 'make test-format  Formatter semantics, style and CLI regressions' 'make test-modules Lua require and compilation cache regressions' 'make test-native  Require libgccjit and run in-process checks' 'make run PROGRAM=examples/csv.nua ARGS="examples/data/sales.csv price"' 'make tree-sitter  Build the local Nua parser for Neovim' 'make test-tree-sitter  Check parsing and Neovim highlighting'
 
 dirs:
 ifeq ($(LOCAL_DEPS),1)
@@ -84,6 +84,9 @@ mua:
 # the pinned checkout
 test-next:
 	$(LUA) next/test.lua
+
+test-next-jit:
+	NUA_BACKEND=jit $(LUA) next/test.lua
 
 test-mua: dirs
 	$(LUA) tests/nua_corpus.lua

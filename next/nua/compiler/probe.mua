@@ -1,0 +1,298 @@
+-- What only a C compiler can say (compiler activities §7.5; architecture §11). libgccjit reads no
+-- headers and no C, so the libgccjit backend asks one, once, and caches the answer by its text:
+--
+--   request/run   a program's header knowledge: the values of its `ForeignValue` constants, the
+--                 layouts of its `cstruct` records, getters for the C variables it reads
+--   platform      the platform mechanisms of nua_platform.h as one process-wide library, its
+--                 entry points generated from the same bindings table the C backend spells
+--
+-- C text is written here only to reach those two; the program itself never goes through it.
+
+local ffi = require "ffi"
+local bit = require "bit"
+local types = require "nua.types"
+local data = require "nua.compiler.data"
+local graph = require "nua.compiler.graph"
+local rules = require "nua.compiler.rules"
+local verify = require "nua.compiler.verify"
+local platform = require "nua.compiler.platform"
+
+local NativeType = types.NativeType
+local fail = message -> error("libgccjit backend: " .. message, 2)
+
+local root = debug.getinfo(1, "S").source:match("^@(.*)/next/nua/compiler/probe%.mua$") or "."
+local runtime_directory = root .. "/next/runtime"
+
+local exists = do(path)
+    local file = io.open path
+    if file then file:close() end
+    return file ~= nil
+end
+local read_file = do(path)
+    local file = assert(io.open path)
+    local text = file:read "*a"
+    file:close()
+    return text
+end
+local write_file = do(path, text)
+    local file = assert(io.open(path, "w"))
+    file:write text
+    file:close()
+end
+
+local cache_directory = do()
+    local directory = os.getenv "NUA_CACHE" or (root .. "/build/cache")
+    os.execute(("mkdir -p '%s'"):format(directory))
+    return directory
+end
+local compiler = do()
+    local local_compiler = root .. "/.local/bin/gcc"
+    return os.getenv "CC" or (exists local_compiler and local_compiler or "cc")
+end
+local text_key = do(text)
+    local hash = 2166136261
+    for position = 1, #text do
+        hash = bit.band(bit.bxor(hash, text:byte position) * 16777619, 0xffffffff)
+    end
+    return bit.tohex hash .. ("%x"):format(#text)
+end
+-- the exit status is captured in the output: this LuaJIT's popen close does not report it
+local run = do(command)
+    local pipe = io.popen("(" .. command .. ") 2>&1; printf '\\n__STATUS__%d' $?")
+    local output = pipe:read "*a"
+    pipe:close()
+    local messages, status = output:match("^(.-)\n__STATUS__(%d+)$")
+    return status == "0", messages or output
+end
+
+------------------------------------------------------------------------------------------------
+-- What a program asks of its headers
+
+local each_constant
+each_constant = do(constant_type, bits, visit)
+    visit(constant_type, bits)
+    if data.NativeConstant.is(bits, data.AggregateBits) then
+        local fields = NativeType.is(constant_type, types.RecordType) and constant_type.fields or {}
+        for index, part in ipairs bits.parts do each_constant(fields[index] and fields[index].type or constant_type, part, visit) end
+    end
+end
+
+local requests_of = do(program)
+    local values, value_order = {}, {}
+    local layouts, layout_order = {}, {}
+    local reads, read_order = {}, {}
+    local headers = {}
+    for header in pairs(program.headers or {}) do headers[header] = true end
+    local seen_types = {}
+    local visit_type
+    visit_type = do(native_type)
+        if native_type == nil or seen_types[native_type] then return end
+        seen_types[native_type] = true
+        if NativeType.is(native_type, types.PointerType) or NativeType.is(native_type, types.ReferenceType) or NativeType.is(native_type, types.AtomicType) then
+            visit_type native_type.target
+        elseif NativeType.is(native_type, types.ViewType) or NativeType.is(native_type, types.BufferType) or NativeType.is(native_type, types.FixedArrayType) then
+            visit_type native_type.element
+        elseif NativeType.is(native_type, types.SumType) then
+            for _, alternative in ipairs native_type.alternatives do visit_type alternative.payload end
+        elseif NativeType.is(native_type, types.FunctionType) then
+            visit_type native_type.result
+            for _, parameter in ipairs native_type.parameters do visit_type parameter end
+        elseif NativeType.is(native_type, types.RecordType) then
+            for _, field in ipairs native_type.fields do visit_type field.type end
+            if native_type.c_name then
+                layouts[native_type] = true
+                layout_order[#layout_order + 1] = native_type
+            end
+        end
+    end
+    local visit_bits = do(constant_type, bits)
+        if data.NativeConstant.is(bits, data.ForeignValue) and not values[bits.name] then
+            values[bits.name] = constant_type
+            value_order[#value_order + 1] = bits.name
+        end
+    end
+    local visit_operand = do(operand)
+        visit_type operand.type
+        if data.Operand.is(operand, data.Constant) then each_constant(operand.type, operand.bits, visit_bits) end
+    end
+    local visit_signature = do(signature)
+        visit_type signature.result
+        for _, parameter in ipairs signature.parameters do visit_type parameter end
+    end
+    for _, global in pairs program.globals do
+        visit_type global.type
+        if global.imported and global.header then headers[global.header] = true end
+        if data.GlobalInitializer.is(global.initializer, data.StaticValue) then each_constant(global.type, global.initializer.value, visit_bits) end
+    end
+    for _, definition in ipairs(graph.definitions_in_order program) do
+        visit_signature definition.signature
+        for _, place in pairs definition.places do
+            visit_type place.type
+            if place.root.pointer then visit_operand place.root.pointer end
+        end
+        for _, block in ipairs definition.blocks do
+            for _, parameter in ipairs block.arguments do visit_type parameter.type end
+            for _, instruction in ipairs block.instructions do
+                visit_type instruction.type
+                for _, operand in ipairs(verify.operands_of instruction) do visit_operand operand end
+                local callee = instruction.callee
+                if callee and not data.Callee.is(callee, data.DirectNua) then visit_signature callee.signature end
+                if callee and data.Callee.is(callee, data.Foreign) then
+                    if callee.header then headers[callee.header] = true end
+                    if callee.reads and not reads[callee.pointer.bits.name] then
+                        reads[callee.pointer.bits.name] = callee.signature.result
+                        read_order[#read_order + 1] = callee.pointer.bits.name
+                    end
+                end
+            end
+            for _, operand in ipairs(verify.terminator_operands block.terminator) do visit_operand operand end
+        end
+    end
+    table.sort value_order
+    table.sort read_order
+    table.sort(layout_order, |a, b| -> a.c_name < b.c_name)
+    local header_order = {}
+    for header in pairs headers do header_order[#header_order + 1] = header end
+    table.sort header_order
+    return define
+        .values
+        .value_order
+        .layout_order
+        .reads
+        .read_order
+        .header_order
+    end
+end
+
+local getter_name = name -> "nua_probe_" .. name:gsub("[^%w_]", "_")
+
+-- a C variable's getter answers it as the width it is; a pointer's target is not this C unit's
+local getter_type = do(native_type)
+    if rules.is_pointer native_type or NativeType.is(native_type, types.ReferenceType) then return "void *" end
+    if rules.is_float native_type then return native_type.bits == 32 and "float" or "double" end
+    if rules.is_boolean native_type then return "_Bool" end
+    if rules.is_integer native_type then return ("%sint%d_t"):format(native_type.signed and "" or "u", native_type.bits) end
+    fail("a C variable of " .. types.describe native_type .. " cannot be read through a getter")
+end
+
+local print_value = do(native_type, expression)
+    if rules.is_float native_type then return ('printf("%%.17g,\\n", (double)(%s));'):format(expression) end
+    if rules.is_pointer native_type or NativeType.is(native_type, types.ReferenceType) then return ('printf("%%lldLL,\\n", (long long)(intptr_t)(%s));'):format(expression) end
+    if rules.is_integer native_type and not native_type.signed then return ('printf("%%lluULL,\\n", (unsigned long long)(%s));'):format(expression) end
+    return ('printf("%%lldLL,\\n", (long long)(%s));'):format(expression)
+end
+
+-- the probe's C: a main that prints the answers as a Lua chunk, in request order
+local probe_source = do(requests)
+    local lines = { "#include <stdio.h>", "#include <stddef.h>", "#include <stdint.h>", "#include <stdbool.h>" }
+    for _, header in ipairs requests.header_order do lines[#lines + 1] = "#include " .. header end
+    lines[#lines + 1] = "#ifdef NUA_PROBE_MAIN"
+    lines[#lines + 1] = "int main(void) {"
+    lines[#lines + 1] = '    printf("return { values = {\\n");'
+    for _, name in ipairs requests.value_order do lines[#lines + 1] = "    " .. print_value(requests.values[name], name) end
+    lines[#lines + 1] = '    printf("}, layouts = {\\n");'
+    for _, record in ipairs requests.layout_order do
+        lines[#lines + 1] = ('    printf("{ size = %%zu, alignment = %%zu, offsets = {", sizeof(%s), _Alignof(%s));'):format(record.c_name, record.c_name)
+        for _, field in ipairs record.fields do
+            lines[#lines + 1] = ('    printf("%%zu,", offsetof(%s, %s));'):format(record.c_name, rawget(field, "c_member") or field.name)
+        end
+        lines[#lines + 1] = '    printf("} },\\n");'
+    end
+    lines[#lines + 1] = '    printf("} }\\n");'
+    lines[#lines + 1] = "    return 0;"
+    lines[#lines + 1] = "}"
+    lines[#lines + 1] = "#else"
+    for _, name in ipairs requests.read_order do
+        local type_text = getter_type(requests.reads[name])
+        lines[#lines + 1] = ("%s %s(void) { return (%s)(%s); }"):format(type_text, getter_name name, type_text, name)
+    end
+    lines[#lines + 1] = "#endif"
+    return table.concat(lines, "\n") .. "\n"
+end
+
+-- libraries loaded for their symbols stay loaded with the process
+local retained = {}
+
+-- a program's answers: `value(name)`, `layout(record)`, `getter(name)`
+local answers_for = do(program)
+    local requests = requests_of program
+    local values, layouts = {}, {}
+    local needed = #requests.value_order > 0 or #requests.layout_order > 0 or #requests.read_order > 0
+    if needed then
+        local source = probe_source requests
+        local base = ("%s/probe-%s"):format(cache_directory(), text_key(compiler() .. "\n" .. source))
+        local answers_path = base .. ".lua"
+        if not exists answers_path then
+            write_file(base .. ".c", source)
+            local built, messages = run(("%s -std=gnu11 -DNUA_PROBE_MAIN -o %s.bin %s.c && %s.bin > %s.tmp && mv %s.tmp %s"):format(compiler(), base, base, base, base, base, answers_path))
+            if not built then fail("the header probe failed:\n" .. messages) end
+        end
+        local answers = dofile answers_path
+        for index, name in ipairs requests.value_order do values[name] = answers.values[index] end
+        for index, record in ipairs requests.layout_order do layouts[record] = answers.layouts[index] end
+        if #requests.read_order > 0 then
+            local shared = base .. ".so"
+            if not exists shared then
+                local built, messages = run(("%s -std=gnu11 -O1 -fPIC -shared -o %s %s.c"):format(compiler(), shared, base))
+                if not built then fail("the header probe's getters failed:\n" .. messages) end
+            end
+            retained[#retained + 1] = ffi.load(shared, true)
+        end
+    end
+    return define
+        .getter_name
+        value = name -> values[name]
+        layout = record -> layouts[record]
+    end
+end
+
+------------------------------------------------------------------------------------------------
+-- The platform library
+
+local c_scalar
+c_scalar = do(native_type)
+    if native_type == types.Unit then return "void" end
+    if rules.is_pointer native_type then return c_scalar native_type.target .. " *" end
+    return ("%sint%d_t"):format(native_type.signed and "" or "u", native_type.bits)
+end
+
+local platform_loaded = false
+
+-- nua_platform.h once more as a library, with an external entry point for each binding
+local platform_source = do()
+    local names = {}
+    for name in pairs platform.bindings do names[#names + 1] = name end
+    table.sort names
+    local lines = { '#include "nua_platform.h"' }
+    for _, name in ipairs names do
+        local binding = platform.bindings[name]
+        local parameters, arguments = {}, {}
+        for index, parameter in ipairs binding.parameters do
+            parameters[index] = ("%s a%d"):format(c_scalar parameter, index)
+            arguments[index] = "a" .. index
+        end
+        local call = ("%s(%s)"):format(binding.c_symbol, table.concat(arguments, ", "))
+        lines[#lines + 1] = ("%s %s(%s) { %s%s; }"):format(c_scalar binding.result, binding.jit_symbol, #parameters > 0 and table.concat(parameters, ", ") or "void", binding.result == types.Unit and "" or "return ", call)
+    end
+    return table.concat(lines, "\n") .. "\n"
+end
+
+local load_platform = do()
+    if platform_loaded then return end
+    local source = platform_source()
+    local header = read_file(runtime_directory .. "/nua_platform.h")
+    local base = ("%s/platform-%s"):format(cache_directory(), text_key(compiler() .. "\n" .. header .. source))
+    local shared = base .. ".so"
+    if not exists shared then
+        write_file(base .. ".c", source)
+        local built, messages = run(("%s -std=gnu11 -O2 -I%s -fPIC -shared -o %s %s.c"):format(compiler(), runtime_directory, shared, base))
+        if not built then fail("the platform library failed:\n" .. messages) end
+    end
+    retained[#retained + 1] = ffi.load(shared, true)
+    platform_loaded = true
+end
+
+return define
+    .answers_for
+    .load_platform
+end

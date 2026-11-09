@@ -401,7 +401,7 @@ local compile_c = do(source, filename, options)
     local compiled = compiling(source, filename)
     local prepared = preparation.prepare(compiled.program, compiled.analysis, options)
     local text, prototypes = emit_c.emit prepared
-    return text, prototypes, prepared.program
+    return text, prototypes, prepared.program, prepared
 end
 
 return define

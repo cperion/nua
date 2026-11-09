@@ -16,7 +16,7 @@ local Mechanism = {}
 Mechanism.__index = Mechanism
 Mechanism.__tostring = mechanism -> "the mechanism " .. mechanism.name
 
-local declare = |name, parameters, result| -> setmetatable({ .name, .parameters, .result, c_symbol = "nua_" .. name }, Mechanism)
+local declare = |name, parameters, result| -> setmetatable({ .name, .parameters, .result, c_symbol = "nua_" .. name, jit_symbol = "nua_jit_" .. name }, Mechanism)
 
 local bindings = define
     map_pages = declare("map_pages", { types.U64 }, bytes)

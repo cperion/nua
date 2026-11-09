@@ -784,6 +784,7 @@ end
 
 return define
     .emit
+    .fields_of
     .c_type
     .constant_text
 end
