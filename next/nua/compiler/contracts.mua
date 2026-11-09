@@ -37,10 +37,13 @@ local Taken = struct { edge: EdgeId }
 local Known = struct { claim: CheckClaim }
 Proof { Checked, Taken, Known }
 
--- `vacated` holds the parts of places whose owners were moved out, keyed by place and path
+-- `vacated` holds the parts of places whose owners were moved out, keyed by place and path;
+-- `proved`, `bounds` and `available` are what branches prove about operands and the
+-- extractions already made (nua/compiler/proofs.mua)
 local FlowFacts = struct {
     contents: map_of(PlaceId, Contents), borrows: map_of(BorrowId, BorrowState),
-    live_lifetimes: set_of(LifetimeId), vacated: map_of(String, places.Vacated)
+    live_lifetimes: set_of(LifetimeId), vacated: map_of(String, places.Vacated),
+    proved: Table, bounds: Table, available: Table
 }
 local EdgeFacts = struct { edge: EdgeId, flow: FlowFacts, arguments: list_of(ValueInfo) }
 local JoinRelation = struct { block: BlockId, incoming: list_of(EdgeFacts) }

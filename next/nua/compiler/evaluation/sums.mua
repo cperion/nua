@@ -75,9 +75,7 @@ return do(E, core)
     -- the tag of a sum value, as a U32 value: known for a tagged value, read otherwise
     E.tag_of = do(path, value)
         if E.is_tagged value then return E.known(E.tag_constant(path, value.type, value.alternative)) end
-        local result = fresh identity.ValueId
-        append(path, data.Extract { site = site path, .result, type = types.U32, aggregate = value.operand, path = { data.FieldComponent { name = "tag" } } })
-        return E.bits(types.U32, data.Result { value = result, type = types.U32 })
+        return E.bits(types.U32, E.extract(path, value.operand, data.FieldComponent { name = "tag" }, types.U32))
     end
 
     -- the payload of an alternative of a sum value whose tag is that alternative: a tagged

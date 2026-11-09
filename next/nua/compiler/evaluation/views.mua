@@ -88,10 +88,9 @@ return do(E, core)
                 if Operand.is(packed, data.Constant) and data.NativeConstant.is(packed.bits, data.AggregateBits) then
                     return E.known(data.Constant { type = pointer_type, bits = packed.bits.parts[1] }), E.known(data.Constant { type = types.U64, bits = packed.bits.parts[2] })
                 end
-                local start, count = fresh identity.ValueId, fresh identity.ValueId
-                append(path, data.Extract { site = site path, result = start, type = pointer_type, aggregate = packed, path = { data.FieldComponent { name = "data" } } })
-                append(path, data.Extract { site = site path, result = count, type = types.U64, aggregate = packed, path = { data.FieldComponent { name = "length" } } })
-                return E.bits(pointer_type, data.Result { value = start, type = pointer_type }), E.bits(types.U64, data.Result { value = count, type = types.U64 })
+                local start = E.extract(path, packed, data.FieldComponent { name = "data" }, pointer_type)
+                local count = E.extract(path, packed, data.FieldComponent { name = "length" }, types.U64)
+                return E.bits(pointer_type, start), E.bits(types.U64, count)
             end
             select = selected -> error("a selected view must be dispatched", 0)
             cached = pointer -> fail(path, "a cached view pointer is not available yet")

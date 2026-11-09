@@ -447,7 +447,9 @@ Proof           = Checked(site: InstructionId) | Taken(edge: EdgeId)
 FlowFacts       { contents: Map PlaceId Contents,
                   borrows: Map BorrowId BorrowState,
                   live_lifetimes: Set LifetimeId,
-                  vacated: Map (PlaceId, AccessPath) Vacated }
+                  vacated: Map (PlaceId, AccessPath) Vacated,
+                  proved: Map Comparison Bool, bounds: Map Operand Interval,
+                  available: Map (Operand, Component) Operand }
 Vacated         { place: PlaceId, path: AccessPath, at: OriginId }
 EdgeFacts       { edge: EdgeId, flow: FlowFacts, arguments: List ValueInfo }
 JoinRelation    { block: BlockId, incoming: List EdgeFacts }
@@ -459,6 +461,15 @@ DefinitionFacts { values: Map Operand ValueInfo, borrows: Map BorrowId BorrowInf
 Analysis        { revision: U64, definitions: Map DefinitionId DefinitionFacts,
                   contracts: Map DefinitionId BoundaryContract }
 ```
+
+`proved`, `bounds` and `available` are what branches prove (syntax §12.2): on each arm
+the condition's comparison holds or not, with the comparisons it decides (its reverse
+and negation) and the bounds it gives an operand against a constant; `available` keeps
+an extraction already made on the path, so one view's length is one operand wherever it
+is read. Operands never change, so a fact holds wherever its arm's point dominates: a
+join keeps what every incoming path proves, a loop header its entry's. A computation
+the facts decide is known (an operand compared with itself too, except a float); a
+proved check is not emitted. These are the evaluation's `Known(Condition)` proofs.
 
 `Map Operand` uses canonical operand identity, not a deep Lua-table key comparison.
 Facts are tied to `Program.revision`. A rewrite returns a new revision and the

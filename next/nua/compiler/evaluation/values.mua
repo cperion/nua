@@ -10,6 +10,7 @@ local cells = require "nua.compiler.evaluation.cells"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
+local proofs = require "nua.compiler.proofs"
 local hosting = require "nua.compiler.hosting"
 local platform = require "nua.compiler.platform"
 local effects = require "nua.compiler.effects"
@@ -104,10 +105,26 @@ return do(E, core)
         return value.operand
     end
 
+    -- how each computed operand was computed, for what a branch on it proves
+    local computations = setmetatable({}, { __mode = "k" })
+    E.computation_of = operand -> Operand.is(operand, data.Result) and computations[operand.value] or nil
     E.emit_compute = do(path, opcode, type, operands)
         local result = fresh identity.ValueId
         append(path, data.Compute { site = site path, .result, .type, .opcode, arguments = operands })
+        computations[result] = { .opcode, .operands }
         return E.bits(type, data.Result { value = result, .type })
+    end
+
+    -- `component` of an aggregate operand, extracted once on a path: an extraction already
+    -- made where this point is reached is the same operand (syntax §12.2: one view's length)
+    E.extract = do(path, aggregate, component, result_type)
+        local key = aggregate and not Operand.is(aggregate, data.Constant) and (proofs.key_of(aggregate) .. "." .. component.name)
+        if key and path.flow.available[key] then return path.flow.available[key] end
+        local result = fresh identity.ValueId
+        append(path, data.Extract { site = site path, .result, type = result_type, .aggregate, path = { component } })
+        local operand = data.Result { value = result, type = result_type }
+        if key then path.flow.available[key] = operand end
+        return operand
     end
 
 end

@@ -1,0 +1,198 @@
+-- What branches prove (syntax §12.2, §14.1; compiler activities §3.4, `Proof`): on each arm of
+-- a dynamic branch the facts record what its condition proves about operands, which never
+-- change (SSA values: a local's later value is another operand), so a fact holds wherever the
+-- arm's point dominates. A comparison the facts decide is known; a check that is proved is
+-- not emitted. The facts are the comparisons proved (`proved`), the integer bounds of operands
+-- against constants (`bounds`) and the extractions already made (`available`, so one view's
+-- length is one operand wherever it is read). A join keeps what every incoming path proves.
+-- This module decides; it neither emits code nor raises diagnostics.
+
+local ffi = require "ffi"
+local data = require "nua.compiler.data"
+local rules = require "nua.compiler.rules"
+local types = require "nua.types"
+
+local Operand = data.Operand
+
+-- each operand identity (a value, an interned parameter position) numbered once
+local numbers = setmetatable({}, { __mode = "k" })
+local count = 0
+local number_of = do(identity)
+    local found = numbers[identity]
+    if found == nil then
+        count += 1
+        found = count
+        numbers[identity] = found
+    end
+    return found
+end
+-- an operand's identity in a fact: a constant by its type and bits, another by its identity
+local key_of = do(operand)
+    if Operand.is(operand, data.Constant) then
+        local bits = operand.bits
+        if data.NativeConstant.is(bits, data.IntegerBits) then return "c:" .. types.describe(operand.type) .. ":" .. tostring(bits.bits) end
+        if data.NativeConstant.is(bits, data.BooleanBit) then return "c:Bool:" .. tostring(bits.value) end
+        return nil
+    end
+    return "v:" .. number_of(data.operand_key operand)
+end
+local comparison_key = |opcode, left, right| -> opcode .. "(" .. left .. "," .. right .. ")"
+
+-- the comparisons a result of each comparison decides, besides itself
+local Relations = define
+    equal = |a, b, v| -> { { "equal", b, a, v }, { "not_equal", a, b, not v }, { "not_equal", b, a, not v } }
+    not_equal = |a, b, v| -> { { "not_equal", b, a, v }, { "equal", a, b, not v }, { "equal", b, a, not v } }
+    less = |a, b, v| -> { { "less_equal", b, a, not v } }
+    less_equal = |a, b, v| -> { { "less", b, a, not v } }
+end
+
+-- a constant integer operand's value, else nil
+local integer_constant = do(operand)
+    if Operand.is(operand, data.Constant) and rules.is_integer(operand.type) then return rules.integer_value operand end
+    return nil
+end
+
+-- an interval of an integer operand, its ends of the operand's own signedness (nil: open)
+local Interval = struct { low: Any, high: Any }
+local narrowed = do(previous, low, high)
+    local result_low, result_high = previous and previous.low, previous and previous.high
+    if low ~= nil and (result_low == nil or low > result_low) then result_low = low end
+    if high ~= nil and (result_high == nil or high < result_high) then result_high = high end
+    return Interval { low = result_low, high = result_high }
+end
+-- the next and previous integers within the type, or nil past its end
+local successor = do(value, native_type)
+    local maximum = native_type.signed and bit.lshift(1LL, native_type.bits - 1) - 1 or (native_type.bits == 64 and 0xffffffffffffffffULL or bit.lshift(1ULL, native_type.bits) - 1)
+    if value >= maximum then return nil end
+    return value + 1
+end
+local predecessor = do(value, native_type)
+    local minimum = native_type.signed and -bit.lshift(1LL, native_type.bits - 1) or 0ULL
+    if value <= minimum then return nil end
+    return value - 1
+end
+
+-- a relation that does not hold: its negation
+local negations = define
+    less = "greater_equal"
+    less_equal = "greater"
+    greater = "less_equal"
+    greater_equal = "less"
+    equal = "not_equal"
+    not_equal = "equal"
+end
+
+-- the bounds a comparison with a constant proves of the other operand: `holds` is its result
+local bound = do(flow, opcode, left, right, holds)
+    local constant, other, constant_right = integer_constant right, left, true
+    if constant == nil then constant, other, constant_right = integer_constant left, right, false end
+    if constant == nil or integer_constant other ~= nil or not rules.is_integer(other.type) then return end
+    local key = key_of other
+    if key == nil then return end
+    local native_type = other.type
+    local low, high = nil, nil
+    -- the comparison read as `other OP constant`
+    local relation = opcode
+    if not constant_right then
+        relation = (opcode == "less" and "greater") or (opcode == "less_equal" and "greater_equal") or opcode
+    end
+    if not holds then relation = negations[relation] end
+    if relation == "equal" then low, high = constant, constant
+    elseif relation == "less" then high = predecessor(constant, native_type); if high == nil then return end
+    elseif relation == "less_equal" then high = constant
+    elseif relation == "greater" then low = successor(constant, native_type); if low == nil then return end
+    elseif relation == "greater_equal" then low = constant
+    else return end
+    flow.bounds[key] = narrowed(flow.bounds[key], low, high)
+end
+
+-- what holding `condition` (or not) proves: the comparison it computes, the ones that
+-- decides, and the bounds against constants; `computation` answers how an operand was computed
+local prove
+prove = do(flow, condition, holds, computation)
+    local key = key_of condition
+    if key then flow.proved["is(" .. key .. ")"] = holds end
+    local computed = computation(condition)
+    if computed == nil then return end
+    local opcode, operands = computed.opcode, computed.operands
+    if opcode == "bit_not" and operands[1].type == types.Bool then return prove(flow, operands[1], not holds, computation) end
+    local relate = Relations[opcode]
+    if relate == nil then return end
+    local left, right = key_of operands[1], key_of operands[2]
+    if left == nil or right == nil then return end
+    flow.proved[comparison_key(opcode, left, right)] = holds
+    for _, implied in ipairs(relate(left, right, holds)) do flow.proved[comparison_key(implied[1], implied[2], implied[3])] = implied[4] end
+    bound(flow, opcode, operands[1], operands[2], holds)
+end
+
+-- the result of a comparison the facts decide, or nil
+local decide = do(flow, opcode, operands)
+    if Relations[opcode] == nil then return nil end
+    local left, right = key_of operands[1], key_of operands[2]
+    if left and right then
+        -- an operand compared with itself (not a float: NaN differs from itself)
+        if left == right and not rules.is_float(operands[1].type) then return opcode == "less_equal" or opcode == "equal" end
+        local proved = flow.proved[comparison_key(opcode, left, right)]
+        if proved ~= nil then return proved end
+    end
+    -- against the bounds of each side: a constant, or an interval
+    local interval = do(operand)
+        local constant = integer_constant operand
+        if constant ~= nil then return Interval { low = constant, high = constant } end
+        local key = key_of operand
+        return key and flow.bounds[key]
+    end
+    if not rules.is_integer(operands[1].type) then return nil end
+    local a, b = interval(operands[1]), interval(operands[2])
+    if a == nil or b == nil then return nil end
+    local below = |x, y| -> x.high ~= nil and y.low ~= nil and x.high < y.low
+    local at_most = |x, y| -> x.high ~= nil and y.low ~= nil and x.high <= y.low
+    local exact = x -> x.low ~= nil and x.high ~= nil and x.low == x.high
+    if opcode == "less" then
+        if below(a, b) then return true end
+        if at_most(b, a) then return false end
+    elseif opcode == "less_equal" then
+        if at_most(a, b) then return true end
+        if below(b, a) then return false end
+    elseif opcode == "equal" or opcode == "not_equal" then
+        local same = exact a and exact b and a.low == b.low
+        local apart = below(a, b) or below(b, a)
+        if same then return opcode == "equal" end
+        if apart then return opcode == "not_equal" end
+    end
+    return nil
+end
+
+-- the facts after a join: what every incoming path proves (a loop header keeps its entry's)
+local agree = do(incoming, joined)
+    local first = incoming[1]
+    for key, value in pairs first.proved do
+        local everywhere = true
+        for position = 2, #incoming do if incoming[position].proved[key] ~= value then everywhere = false end end
+        if everywhere then joined.proved[key] = value end
+    end
+    for key, interval in pairs first.bounds do
+        local low, high = interval.low, interval.high
+        for position = 2, #incoming do
+            local other = incoming[position].bounds[key]
+            if other == nil then low, high = nil, nil
+            else
+                if low ~= nil and (other.low == nil or other.low < low) then low = other.low end
+                if high ~= nil and (other.high == nil or other.high > high) then high = other.high end
+            end
+        end
+        if low ~= nil or high ~= nil then joined.bounds[key] = Interval { .low, .high } end
+    end
+    for key, operand in pairs first.available do
+        local everywhere = true
+        for position = 2, #incoming do if incoming[position].available[key] ~= operand then everywhere = false end end
+        if everywhere then joined.available[key] = operand end
+    end
+end
+
+return define
+    .key_of
+    .prove
+    .decide
+    .agree
+end

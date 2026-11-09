@@ -11,6 +11,7 @@ local paths_of = require "nua.compiler.evaluation.path"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
+local proofs = require "nua.compiler.proofs"
 local hosting = require "nua.compiler.hosting"
 local platform = require "nua.compiler.platform"
 local effects = require "nua.compiler.effects"
@@ -91,11 +92,12 @@ return do(E, core)
             local request = nil
             if operand ~= nil then
                 local body_entry, body_state = E.build_arm(round_path, "round", do(arm)
+                    proofs.prove(arm.flow, operand, true, E.computation_of)
                     body arm
                     if not arm.dead then E.next_loop arm end
                 end)
                 request = body_state.request
-                local exit_entry, exit_state = E.build_arm(round_path, "leave", arm -> nil)
+                local exit_entry, exit_state = E.build_arm(round_path, "leave", arm -> proofs.prove(arm.flow, operand, false, E.computation_of))
                 local edge = target -> data.Edge { id = fresh identity.EdgeId, .target, arguments = {} }
                 terminate(round_path, data.Branch { origin = origin_of round_path, condition = operand, when_true = edge body_entry, when_false = edge exit_entry })
                 exits_at_false = exit_state

@@ -365,7 +365,7 @@ local replaying = do(program, definition, published, analysis, report)
     -- not two consecutive transfers)
     local replay_block = do(block, states, moved, reporting)
         local state = define
-            flow = data.FlowFacts { contents = {}, borrows = states, live_lifetimes = {}, vacated = {} }
+            flow = data.FlowFacts { contents = {}, borrows = states, live_lifetimes = {}, vacated = {}, proved = {}, bounds = {}, available = {} }
             .moved
             previous = published.entries[block.id]
             observed = {}

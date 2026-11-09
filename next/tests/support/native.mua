@@ -12,6 +12,7 @@ local build = root .. "/build/next"
 local compiler = os.getenv("CC") or (root .. "/.local/bin/gcc")
 
 local declared = {}
+local declared_names = {}
 
 return do(name, source)
     local text, prototypes = compile.compile_c(source, name .. ".nua")
@@ -28,10 +29,18 @@ return do(name, source)
     pipe:close()
     local messages, status = output:match("^(.-)\n__STATUS__(%d+)$")
     if status ~= "0" then error("the C compiler refused " .. c_path .. ":\n" .. tostring(messages or output) .. "\n" .. text, 0) end
+    -- LuaJIT's C declarations are one namespace for the whole run: an export named like an
+    -- earlier test's, with another prototype, is refused here rather than miscalled later
     for _, prototype in ipairs prototypes do
+        local function_name = prototype:match("([%w_]+)%s*%(")
+        local earlier = function_name and declared_names[function_name]
+        if earlier and earlier ~= prototype then
+            error(("the export '%s' of %s is declared by an earlier test as\n  %s\nnot\n  %s\nname it uniquely"):format(function_name, name, earlier, prototype), 0)
+        end
         if not declared[prototype] then
             ffi.cdef(prototype)
             declared[prototype] = true
+            if function_name then declared_names[function_name] = prototype end
         end
     end
     return ffi.load(library), text

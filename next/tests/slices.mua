@@ -2,6 +2,7 @@
 -- compiler's view primitives. Indexes and ranges are checked at run time, or refused while
 -- compiling when known to be outside; a read-only view is not a place to assign.
 
+local ffi = require "ffi"
 local native = require "tests.support.native"
 local compile = require "nua.compile"
 
@@ -98,4 +99,53 @@ local f = do(values: Slice U32): Unit
 end
 export f
 ]], "not-a-place: a view is read-only")
+end
+
+test "a check a branch already proved is dropped; what is not proved keeps its check (§12.2)":
+    local library, text = native("slices_proofs", [[
+-- the loop condition proves i < length inside the body: no check there
+local proof_total = do(values: Slice U32): U64
+    local sum: U64 = 0
+    local i: U64 = 0
+    while i < values.length do
+        sum = sum + U64(values[i])
+        i = i + 1
+    end
+    return sum
+end
+export proof_total
+-- an arm that returns: what follows is reached through the other one, whose facts hold
+local proof_third = do(values: Slice U32): U32
+    if values.length < 3 then return 0 end
+    return values[2]
+end
+export proof_third
+-- i changes after the test: the fact is about the old i, so the check stays
+local proof_moved = do(values: Slice U32, i: U64): U32
+    if i < values.length then
+        i = i + 1
+        return values[i]
+    end
+    return 0
+end
+export proof_moved
+-- proved on one arm only: after the join it is not proved
+local proof_joined = do(values: Slice U32, i: U64, flag: Bool): U32
+    local ok: Bool = false
+    if flag then
+        if i < values.length then ok = true end
+    end
+    return values[i]
+end
+export proof_joined
+]])
+    local function_text = name -> text:match("\n[%w_]+ " .. name .. "%([^)]*%) {.-\n}")
+    assert(not function_text("proof_total"):find("slice index out of range", 1, true), function_text "proof_total")
+    assert(not function_text("proof_third"):find("slice index out of range", 1, true), function_text "proof_third")
+    assert(function_text("proof_moved"):find("slice index out of range", 1, true), function_text "proof_moved")
+    assert(function_text("proof_joined"):find("slice index out of range", 1, true), function_text "proof_joined")
+    local values = ffi.new("uint32_t[3]", { 4, 5, 6 })
+    local view = ffi.new(text:match("typedef struct (View_%d+) {"))
+    view.data, view.length = values, 3
+    assert(library.proof_total(view) == 15 and library.proof_third(view) == 6 and library.proof_moved(view, 1) == 6)
 end

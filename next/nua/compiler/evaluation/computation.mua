@@ -10,6 +10,7 @@ local cells = require "nua.compiler.evaluation.cells"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
+local proofs = require "nua.compiler.proofs"
 local hosting = require "nua.compiler.hosting"
 local platform = require "nua.compiler.platform"
 local effects = require "nua.compiler.effects"
@@ -97,6 +98,9 @@ return do(E, core)
         end
         local reason = rules.check_types(opcode, type, argument_types)
         if reason then fail(path, reason) end
+        -- a comparison the branches before it decide (syntax §12.2)
+        local proved = proofs.decide(path.flow, opcode, operands)
+        if proved ~= nil then return E.known(rules.boolean proved) end
         local decision = rules.fold(opcode, type, operands)
         local result = decision with
             folded = constant_bits -> E.known(data.Constant { .type, bits = constant_bits })

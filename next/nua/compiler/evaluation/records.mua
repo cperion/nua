@@ -68,9 +68,7 @@ return do(E, core)
         local found = value.parts[name]
         if found then return found end
         if value.packed == nil then fail(path, ("the field '%s' of %s has no value"):format(name, types.describe value.type)) end
-        local result = fresh identity.ValueId
-        append(path, data.Extract { site = site path, .result, type = field.type, aggregate = value.packed, path = { data.FieldComponent { .name } } })
-        local extracted = data.Result { value = result, type = field.type }
+        local extracted = E.extract(path, value.packed, data.FieldComponent { .name }, field.type)
         local components = {}
         for component_path, component in pairs E.information(path, value).components do
             if component_path[1] and data.Component.is(component_path[1], data.FieldComponent) and component_path[1].name == name then

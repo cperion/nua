@@ -11,6 +11,7 @@ local paths_of = require "nua.compiler.evaluation.path"
 local graph = require "nua.compiler.graph"
 local facts = require "nua.compiler.facts"
 local rules = require "nua.compiler.rules"
+local proofs = require "nua.compiler.proofs"
 local hosting = require "nua.compiler.hosting"
 local platform = require "nua.compiler.platform"
 local effects = require "nua.compiler.effects"
@@ -258,8 +259,15 @@ return do(E, core)
 
     -- a branch on an operand: both arms built and joined; `value_type` when the arms yield values
     E.residual_branch = do(path, condition, run_true, run_false, wants_value)
-        local true_entry, true_state = E.build_arm(path, "then", run_true)
-        local false_entry, false_state = E.build_arm(path, "else", run_false)
+        -- each arm knows what its condition proves (syntax §12.2)
+        local proving = do(holds, run)
+            return do(arm)
+                proofs.prove(arm.flow, condition, holds, E.computation_of)
+                return run arm
+            end
+        end
+        local true_entry, true_state = E.build_arm(path, "then", proving(true, run_true))
+        local false_entry, false_state = E.build_arm(path, "else", proving(false, run_false))
         -- an arm stopped by a reconsideration request: the branch does not join, it propagates
         local request = true_state.request or false_state.request
         if request then
