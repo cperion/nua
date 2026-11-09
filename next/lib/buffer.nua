@@ -102,6 +102,8 @@ local words = do(T)
         return view_of(self, first, limit - first)
     end
     local all = do(self: Ref B): Slice T = view_of(self, 0, self.length)
+    -- the elements lent for writing (syntax §12.2: marked at the call, `f(Ref xs)`)
+    local all_mut = do(self: Ref B): Slice.mut T = view_of(self, 0, self.length, Slice.mut T)
 
     -- `Buffer(T) { … }` (syntax §16, `__cast`): an empty buffer, each entry pushed; the loop is
     -- over the host table, so it runs while specializing
@@ -117,12 +119,25 @@ local words = do(T)
         return nil
     end
 
-    made[T] = {
-        reserve = reserve, push = push, pop = pop, truncate = truncate, clear = clear,
-        sub = sub, all = all,
-        __index = element, __cast = cast, __release = release,
-    }
-    return made[T]
+    local members = define
+        .reserve
+        .push
+        .pop
+        .truncate
+        .clear
+        .sub
+        .all
+        .all_mut
+        __index = element
+        __cast = cast
+        __release = release
+    end
+    -- a buffer of bytes is text being built (syntax §14.2): it lends a `Str`
+    if T == U8 then
+        members.str = do(self: Ref B): Str = view_of(self, 0, self.length, Str)
+    end
+    made[T] = members
+    return members
 end
 
 -- the members of every `Buffer T` (syntax §16.1: served once per family)

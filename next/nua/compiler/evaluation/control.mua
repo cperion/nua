@@ -78,6 +78,7 @@ return do(E, core)
     -- of its loop; the first one met discards the attempt that found it (syntax §6.2)
     E.return_tail = do(path, callee, arguments)
         if path.dead then return nil end
+        arguments = E.supplied_arguments(path, callee, arguments, 0)
         local invocation = path.invocation
         local word, supplied = hosting.supplied_of callee
         if word ~= nil and word == invocation.word then

@@ -54,7 +54,7 @@ return do(E, core)
             local element = E.element_reference(path, reference_argument(path, arguments[1]), arguments[2])
             E.initialize_reference(path, element, arguments[3], "an element")
         end
-        view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3])
+        view_of = |path, arguments, boundary| -> E.make_view(path, reference_argument(path, arguments[1]), arguments[2], arguments[3], arguments[4])
         static_text = |path, arguments, boundary| -> E.static_text(path, arguments[1])
         view_length = |path, arguments, boundary| -> E.view_length(path, E.deref(path, reference_argument(path, arguments[1])))
         view_element_of = |path, arguments, boundary| -> E.view_element_of(path, E.deref(path, reference_argument(path, arguments[1])), arguments[2])
@@ -149,7 +149,9 @@ return do(E, core)
     E.apply_word = do(path, callee, arguments, boundary)
     local word, supplied = hosting.supplied_of callee
     if word == nil then
-        if lua_type callee == "function" then return E.call_host(path, callee, arguments) end
+        -- a host callable: a Lua function, or a table with `__call` (`Slice`, a type constructor)
+        local metatable = lua_type callee == "table" and getmetatable callee
+        if lua_type callee == "function" or metatable and metatable.__call then return E.call_host(path, callee, arguments) end
         fail(path, tostring callee .. " is not something to apply")
     end
     local application = hosting.supply(hosting.application(word, supplied), arguments)
@@ -164,6 +166,10 @@ return do(E, core)
     -- application: a reference of a local, a primitive, a native type, a mechanism, or a word
     E.apply = do(path, callee, arguments, boundary)
         if path.dead then return nil end
+        if lua_type arguments == "function" then
+            local value = E.is_cell callee and not cells.Cell.is(callee, cells.ElementCell) and E.peek(path, callee) or callee
+            arguments = E.supplied_arguments(path, value, arguments, 0)
+        end
         -- a local applied: a sum it holds is matched in place, anything else applied as its value
         local place = nil
         if E.is_cell callee then

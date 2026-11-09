@@ -9,8 +9,11 @@ str.Found = oneof { at: U64, missing: Unit }
 str.Order = oneof { less: Unit, same: Unit, greater: Unit }
 
 -- a Lua string where a `Str` is expected: static text, known while compiling (§16.1)
+-- a buffer of bytes (a `Text`) where a `Str` is expected lends its text (syntax §9.2)
+local lent_text = Ref(Buffer U8)
 function Str.__cast(value)
     if type value == "string" then return static_text value end
+    if type_of value == lent_text then return value:str() end
     return nil
 end
 

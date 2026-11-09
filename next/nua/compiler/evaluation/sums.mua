@@ -315,6 +315,7 @@ return do(E, core)
     E.apply_continued = do(path, callee, arguments, boundary, handlers, outer_boundary)
         if path.dead then return nil end
         local producer = E.is_cell callee and E.peek(path, callee) or callee
+        arguments = E.supplied_arguments(path, producer, arguments, 0)
         local word, supplied = hosting.supplied_of producer
         if word and not boundary and not outer_boundary and word.result and E.is_sum word.result then
             local application = hosting.supply(hosting.application(word, supplied), arguments)

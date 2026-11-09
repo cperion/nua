@@ -5,6 +5,7 @@
 -- length are known (`index-range`), so the check costs nothing then.
 
 local index = import "index"
+local buffer = import "buffer"
 
 local made = setmetatable({}, { __mode = "k" })
 
@@ -44,9 +45,19 @@ local words = do(T, V)
         return nil
     end
 
+    -- an owner where a view is expected lends its elements (syntax §9.2): a reference to a
+    -- buffer of T, given by capture (a `Slice`) or marked at the call (`f(Ref xs)`)
+    local lent = Ref(Buffer T)
+    local cast = do(value, view_type)
+        if type_of value ~= lent then return nil end
+        if V.mutable then return buffer.words(T).all_mut value end
+        return buffer.words(T).all value
+    end
+
     local members = define
         __index = element
         __member = member
+        __cast = cast
         .sub
     end
     -- a read-only view is not a place to assign (`not-a-place`); a `Slice.mut` is

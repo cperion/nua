@@ -90,6 +90,10 @@ local view = do(element, mutable)
 end
 -- Str is the read-only view of bytes with the text words
 local Str = ViewType { element = U8, mutable = false, text = true }
+-- `Slice T`, `Slice.mut T`: the view constructors, as one object (the family's constructor)
+local slice = setmetatable(define
+    mut = element -> view(element, true)
+end, { __call = |_, element| -> view element, __tostring = || -> "Slice" })
 local fixed_array = do(element, count)
     need_type(element, "Array")
     if not check(Natural, count) then error("Array(T, n) expects a natural count, got " .. tostring count, 2) end
@@ -366,6 +370,7 @@ local kinds_of_constructors = define
     [pointer] = PointerType
     [reference] = ReferenceType
     [view] = ViewType
+    [slice] = ViewType
     [fixed_array] = FixedArrayType
     [buffer] = BufferType
 end
@@ -485,6 +490,7 @@ return define
     .pointer
     .reference
     .view
+    .slice
     .fixed_array
     .buffer
     .function_type

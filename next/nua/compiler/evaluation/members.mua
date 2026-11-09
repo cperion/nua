@@ -19,6 +19,7 @@ return do(E, core)
     local fail = core.fail
     local compilation = core.compilation
 
+    local cell_name = cell -> cell.name or "the owner"
     -- the types whose hooks are running, with how deeply
     local suspended = {}
     -- an element read is a copy that knows the place it was read from: where a `Ref` to that
@@ -87,6 +88,14 @@ return do(E, core)
     -- table's method receives the table
     E.method = do(path, base, name, arguments, boundary)
         if path.dead then return nil end
+        -- the arguments are captured once the member is known: its first requirement is the
+        -- receiver
+        if lua_type arguments == "function" then
+            local producer = arguments
+            local value = value_of(path, base)
+            local member = is_native value and name:sub(1, 2) ~= "__" and E.member_of(value.type, name)
+            arguments = E.supplied_arguments(path, member or nil, producer, 1)
+        end
         local receiver_value = E.is_cell base and E.peek(path, base) or base
         if E.is_reference receiver_value and data.BorrowForm.is(compilation.borrows[receiver_value.borrow].form, data.Selected) then
             return E.dispatch_reference(path, receiver_value, |arm, selected| -> E.method(arm, selected, name, arguments, boundary))
@@ -112,6 +121,41 @@ return do(E, core)
         local hook = E.hook_of(value.type, "__member")
         if hook == nil then return nil end
         return E.apply_member(path, base, value, hook, { name }, false, true)
+    end
+
+    -- Capturing an application's arguments (compiler activities §5.1, syntax §9.2): each in
+    -- order, once the callee is known, under the requirement it fills. An argument given as a
+    -- place (a local, a field of one) is read for a value requirement (an owner moves) and
+    -- lent for a view requirement: an owner where a `Slice` or `Str` is expected lends its
+    -- elements; a `Slice.mut` takes them only when the call marks them, `f(Ref xs)`.
+    local requirement_of = do(callee, position)
+        local word, supplied = hosting.supplied_of callee
+        if word == nil then return nil end
+        return word.requirements[#supplied + position]
+    end
+    -- the value use of a place: its value, an owner moved
+    local value_use = do(path, cell)
+        if cells.Cell.is(cell, cells.FieldCell) then return E.dot(path, cell.base, cell.name) end
+        return E.get(path, cell)
+    end
+    E.capture_argument = do(path, callee, position, argument)
+        if not E.is_cell argument or cells.Cell.is(argument, cells.HostCell) then return E.is_cell argument and E.get(path, argument) or argument end
+        local requirement = requirement_of(callee, position)
+        local wanted = requirement and requirement.type
+        if wanted and types.NativeType.is(wanted, types.ViewType) then
+            local held = E.deref(path, E.peek(path, argument))
+            if is_native held and types.owns held.type then
+                if wanted.mutable then
+                    fail(path, ("a %s takes the elements of an owner marked at the call: f(Ref %s)"):format(types.describe wanted, cell_name argument))
+                end
+                return E.reference_to(path, argument)
+            end
+        end
+        return value_use(path, argument)
+    end
+    E.supplied_arguments = do(path, callee, producer, offset)
+        if lua_type producer ~= "function" then return producer end
+        return producer(|position, argument| -> E.capture_argument(path, callee, position + offset, argument))
     end
 
     -- `x.name` of a native value by its members: the `__member` hook, else a method bound to

@@ -46,7 +46,7 @@ local prelude = define
     Ref = types.reference
     Buffer = types.buffer
     Grow = types.buffer
-    Slice = types.view
+    Slice = types.slice
     size_of = native_type -> types.layout(native_type, { pointer_bits = 64 }).size
 end
 

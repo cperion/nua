@@ -84,6 +84,16 @@ return do(E, core)
                     local target = value.type.target
                     if E.is_record target and E.field_of(target, key) then return wrap(E.part_reference(path, value, data.FieldStep { name = key })) end
                 end
+                -- a method: `x:name(...)` in Lua passes the wrapper as its first argument
+                local held = E.deref(path, value)
+                if is_native held and key:sub(1, 2) ~= "__" and types.member(held.type, key) ~= nil then
+                    return function(first, ...)
+                        local arguments = { ... }
+                        if not rawequal(first, view) then table.insert(arguments, 1, first) end
+                        for position, argument in ipairs arguments do arguments[position] = unwrap argument end
+                        return wrap(E.method(path_now(), value, key, arguments, false))
+                    end
+                end
                 return wrap(E.dot(path, value, key))
             end
             return wrap(E.element(path, value, unwrap key))

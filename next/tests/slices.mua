@@ -149,3 +149,62 @@ export proof_joined
     view.data, view.length = values, 3
     assert(library.proof_total(view) == 15 and library.proof_third(view) == 6 and library.proof_moved(view, 1) == 6)
 end
+
+test "an owner where a view is expected lends its elements; a Slice.mut only when marked (§9.2)":
+    local library = native("slices_lending", [[
+local sum_of = do(values: Slice U32): U64
+    local sum: U64 = 0
+    local i: U64 = 0
+    while i < values.length do
+        sum = sum + U64(values[i])
+        i = i + 1
+    end
+    return sum
+end
+local scale = do(values: Slice.mut U32, by: U32): Unit
+    local i: U64 = 0
+    while i < values.length do
+        values[i] = values[i] * by
+        i = i + 1
+    end
+end
+local spaces = do(text: Str): U64
+    local count: U64 = 0
+    local i: U64 = 0
+    while i < text.length do
+        if text[i] == 32 then count = count + 1 end
+        i = i + 1
+    end
+    return count
+end
+local Bag = struct { xs: Grow U32 }
+local keep = do(xs: Grow U32): U64 = xs.length
+local lent = do(n: U32): U64
+    local xs = Grow(U32) {}
+    for i: U32 = 1, n do
+        xs:push i
+    end
+    local before = sum_of xs
+    scale(Ref xs, 2)
+    local after = sum_of xs
+    local b = Bag { xs = Grow(U32) { 5, 6 } }
+    local field = sum_of b.xs
+    local text = Grow(U8) { 97, 32, 98, 32 }
+    -- lent, not moved: each is still the caller's, then moved into keep
+    return before * 1000000 + after * 1000 + field + spaces(text) * 100 + keep xs * 0
+end
+export lent
+]])
+    -- 1..4: 10, doubled 20; the field 11; two spaces
+    assert(library.lent(4) == 10 * 1000000 + 20 * 1000 + 11 + 200)
+    refuses([[
+local scale = do(values: Slice.mut U32): Unit
+    values[0] = 1
+end
+local f = do(): Unit
+    local xs = Grow(U32) { 1 }
+    scale xs
+end
+export f
+]], "a Slice.mut U32 takes the elements of an owner marked at the call: f(Ref xs)")
+end

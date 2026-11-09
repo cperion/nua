@@ -173,6 +173,18 @@ local generating = do(filename, start_line)
         return expression node
     end
     local callee_of = node -> node.fn.k == "call" and expression node.fn or host_or_value(node.fn)
+    -- the arguments of an application, captured one by one in order once the callee is known
+    -- (compiler activities §5.1): a local or a field of one is passed as its place, so the
+    -- requirement it fills decides whether it is read, moved or lent (syntax §9.2)
+    local supplied = do(nodes)
+        local items = {}
+        for index, node in ipairs nodes do
+            local place = node.k == "name" and lookup(node.name) == "cell" and node.name
+                or node.k == "field" and place_chain(node.obj) and node.obj.k ~= "index" and target(node)
+            items[index] = ("__capture(%d, %s)"):format(index, place or expression node)
+        end
+        return ("function(__capture) return { %s } end"):format(table.concat(items, ", "))
+    end
     local lambda_arm = node -> ("function(__path) return %s end"):format(expression node)
     local boundary_flag = node -> node.boundary and "true" or "false"
 
@@ -208,16 +220,16 @@ local generating = do(filename, start_line)
             if node.fn.k == "call" and #node.args == 1 and node.args[1].k == "table" then
                 local inner = node.fn
                 local producer = inner.fn.k == "name" and lookup(inner.fn.name) == "cell" and inner.fn.name or callee_of inner
-                return ("__E.apply_continued(__path, %s, { %s }, %s, %s, %s)"):format(producer, list(inner.args, expression), boundary_flag inner, expression(node.args[1]), boundary_flag node)
+                return ("__E.apply_continued(__path, %s, %s, %s, %s, %s)"):format(producer, supplied(inner.args), boundary_flag inner, expression(node.args[1]), boundary_flag node)
             end
             -- a place applied keeps its cell (a local, or a field or element of one): a sum
             -- matched in place lends its payload to `Ref` handlers (syntax §11.2)
             local callee = node.fn.k == "name" and lookup(node.fn.name) == "cell" and node.fn.name
                 or node.fn.k ~= "name" and place_chain(node.fn) and target(node.fn)
                 or callee_of node
-            return ("__E.apply(__path, %s, { %s }, %s)"):format(callee, list(node.args, expression), boundary_flag node)
+            return ("__E.apply(__path, %s, %s, %s)"):format(callee, supplied(node.args), boundary_flag node)
         end
-        method = node -> ("__E.method(__path, %s, %q, { %s }, %s)"):format(base node.obj, node.name, list(node.args, expression), boundary_flag node)
+        method = node -> ("__E.method(__path, %s, %q, %s, %s)"):format(base node.obj, node.name, supplied(node.args), boundary_flag node)
         -- a table of a typed body names each entry once: Lua would keep the last of two, and a
         -- match must handle each alternative exactly once (syntax §11.2)
         table = do(node)
@@ -366,7 +378,7 @@ local generating = do(filename, start_line)
         local continued = returned.k == "call" and returned.fn.k == "call" and #returned.args == 1 and returned.args[1].k == "table"
         if returned.k == "call" and not returned.boundary and not continued and not place_reference returned then
             tail_calls = true
-            emit(("do return __E.return_tail(__path, %s, { %s }) end;"):format(callee_of returned, list(returned.args, expression)))
+            emit(("do return __E.return_tail(__path, %s, %s) end;"):format(callee_of returned, supplied(returned.args)))
             return
         end
         emit(("do return __E.return_value(__path, %s) end;"):format(expression returned))

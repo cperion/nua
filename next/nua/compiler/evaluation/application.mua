@@ -204,7 +204,9 @@ return do(E, core)
                     E.install_payload(callee, place.id, argument)
                     invocation.arguments[index] = E.place_cell(place.id, requirement.name)
                 else
-                    local value = E.from_host(path, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
+                    -- converted on the callee's path: what conversion makes (a lent view) is
+                    -- known where the body runs
+                    local value = E.from_host(callee, requirement.type, argument, ("the argument '%s' of %s"):format(requirement.name, word.name))
                     invocation.argument_values[index] = value
                     local place = E.new_place(callee, requirement.name, requirement.type)
                     callee.flow.contents[place.id] = data.Tracked { .value }
