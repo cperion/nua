@@ -5667,6 +5667,17 @@ end
 
 S.export = S.export_word
 
+do
+local labels = require 'mua.runtime'
+-- Human identity is Mua metadata, never a native symbol or specialization key.
+-- Native text must already be known; labeling never residualizes runtime work.
+function S.label(name)
+    local text = type(name) == 'string' and name or (is_value(name) and name.k == 'known' and name.v) or nil
+    if type(text) ~= 'string' then fail('label needs text known while compiling', 2) end
+    return labels.label(text)
+end
+S.label_of = labels.label_of
+
 -- A named diagnostic scope, not a residual function or a registered test.
 -- The body follows ordinary application rules: Lua code runs now, and a native
 -- word must be saturated and entirely evaluable while constructing the program.
@@ -5687,9 +5698,12 @@ function S.test(name, body)
     if is_word(body) and #body.supplied < #body.params then
         fail('test "name" do ... end: the body must take no arguments', 2)
     end
+    labels.label(nm)(body)
     local site = S.site('test', true)
     local ok, err = pcall(body)
-    if not ok then error(('test %q (%s):\n%s'):format(nm, site, tostring(err)), 0) end
+    if not ok then error(('test %q (%s):\n%s'):format(labels.label_of(body), site, tostring(err)), 0) end
+end
+
 end
 
 -- Lua assertions keep their truthiness and multiple-result contract. A native

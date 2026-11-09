@@ -100,6 +100,8 @@ function nua.prelude()
     end
     env.cformat = S.cformat
     env.Args = S.args_type()
+    env.label = S.label
+    env.label_of = S.label_of
     env.test = S.test
     env.assert = S.assert
     env.Ptr = S.Ptr

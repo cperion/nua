@@ -63,6 +63,31 @@ end
 test "return is not an assertion" do
     return false
 end
+
+local callback
+callback = do()
+    assert(label_of(callback) == "shared body identity")
+end
+local original = callback
+assert(label "previous description" (callback) == original)
+test "shared body identity" (callback)
+assert(callback == original and label_of(callback) == "shared body identity")
+assert(__mua.label_of(callback) == label_of(callback))
+
+-- Native words retain their semantic names and metatables when labeled.
+local mt = getmetatable(add)
+assert(label "Sum two unsigned integers" (add) == add)
+assert(getmetatable(add) == mt)
+assert(label_of(add) == "Sum two unsigned integers")
+assert(host(add 2 3) == 5)
+local native_test = do(): Unit
+    assert(add 3 4 == 7)
+end
+test "native body identity" (native_test)
+assert(label_of(native_test) == "native body identity")
+local first, second = {}, {}
+assert(label "first" (first) == first)
+assert(label_of(first) == "first" and label_of(second) == nil)
 ]]
 local code, mod = compile(source)
 local empty = compile('')
@@ -155,6 +180,7 @@ test "partial body" (body)
 ]], { 'the body must take no arguments' })
 reject('invalid name', [[test 42 do end]], { 'the name must be text known while compiling' })
 reject('invalid body', [[test "not a block" 42]], { 'takes a block' })
+reject('invalid label text', [[local value = label 42 {}]], { 'label needs text known while compiling' })
 
 -- A failed assertion stops module construction; no subsequent block is run.
 local reached = false
